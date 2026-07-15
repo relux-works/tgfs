@@ -10,6 +10,8 @@ Concept: expose a user's Telegram account as a file tree — **folder per chat**
 
 **Research phase.** No code yet. The technology survey is complete; architecture and stack are proposed but not finally decided.
 
+Start with the [specification index](.spec/README.md). Product implementation is intentionally deferred until the task-board decomposition and plan are reviewed and approved.
+
 Working name note: "tgfs" collides with the existing [TheodoreKrypton/tgfs](https://github.com/TheodoreKrypton/tgfs) (opposite direction — Telegram as backing storage over WebDAV). Rename before going public.
 
 ## Current direction (from research, 2026-07-15)

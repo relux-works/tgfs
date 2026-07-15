@@ -1,0 +1,20 @@
+# Glossary
+
+- **Canonical record:** Structured source-of-truth metadata from which provider views and exports are derived.
+- **CfAPI / Cloud Files API:** Windows API for sync roots, placeholders, hydration, pin state, and provider callbacks.
+- **Change cursor:** Opaque durable token identifying a consumed position in a normalized change stream.
+- **Dataless placeholder:** Provider-visible file whose content is not currently materialized locally.
+- **Drive source:** Provider-neutral backend used by the shared Rust core; local TDLib, remote HTTP, or deterministic fake.
+- **File Provider:** Apple framework that exposes remote storage through Finder or Files.
+- **FUSE:** Userspace filesystem mechanism used for the Linux mount.
+- **Hydration:** Fetching and materializing some or all content for a placeholder.
+- **Materialized:** Content bytes are present locally and valid for a declared item version.
+- **NDJSON:** Newline-delimited JSON, one record per line; the lossless structured export format.
+- **Provider adapter:** Thin native layer translating File Provider/CfAPI/DocumentsProvider/FUSE callbacks to the shared core.
+- **Source version:** Version of metadata or content returned by a drive source.
+- **Stable item ID:** Opaque identity that remains unchanged across title, path, and order changes.
+- **Takeout:** Telegram API session designed for user-initiated account data export.
+- **TDLib / tdjson:** Telegram's official client library and its C JSON interface.
+- **Tombstone:** Local structured record that an observed item/message was deleted, when the selected retention policy preserves that fact.
+- **UniFFI:** Rust binding generator used to expose the shared core to Swift and Kotlin.
+- **Virtual appearance:** One provider path/view pointing to a canonical chat/item that may also appear elsewhere.
