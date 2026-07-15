@@ -1,0 +1,30 @@
+## Status
+backlog
+
+## Assigned To
+(none)
+
+## Created
+2026-07-15T00:52:48Z
+
+## Last Update
+2026-07-15T00:53:03Z
+
+## Blocked By
+- TASK-260715-kkglhx
+- TASK-260715-3s461k
+- TASK-260715-1dk9ik
+
+## Blocks
+- (none)
+
+## Checklist
+(empty)
+
+## Notes
+
+## Precondition Resources
+(none)
+
+## Outcome Resources
+(none)

@@ -8,9 +8,9 @@ Concept: expose a user's Telegram account as a file tree — **folder per chat**
 
 ## Status
 
-**Research phase.** No code yet. The technology survey is complete; architecture and stack are proposed but not finally decided.
+**Planning phase.** No product code yet. The technology survey, specification baseline, and complete service decomposition are committed; architecture decisions marked provisional still require their explicit decision tasks.
 
-Start with the [specification index](.spec/README.md). Product implementation is intentionally deferred until the task-board decomposition and plan are reviewed and approved.
+Start with the [specification index](.spec/README.md) and the [generated project plan](.planning/260715_045337_project.md). Product implementation is intentionally deferred until the plan is reviewed and approved.
 
 Working name note: "tgfs" collides with the existing [TheodoreKrypton/tgfs](https://github.com/TheodoreKrypton/tgfs) (opposite direction — Telegram as backing storage over WebDAV). Rename before going public.
 
@@ -37,6 +37,19 @@ Working name note: "tgfs" collides with the existing [TheodoreKrypton/tgfs](http
 | `.research/260715-prior-art.md` | Exporter, archive, Telegram-FUSE, and WebDAV prior art |
 | `.research/260715-shared-core-feasibility.md` | Rust/UniFFI precedents, TDLib extension constraints, gomobile and grammers analysis |
 | `docs/OPEN_QUESTIONS.md` | Open product and architecture decisions |
+
+## Delivery decomposition
+
+The canonical local board is stored in `.task-board/` and must be changed through the `task-board` CLI. The current baseline contains 10 epics, 50 stories, and 138 atomic tasks; all remain unstarted.
+
+The project-level dependency plan has four phases:
+
+1. product foundation and human decisions;
+2. shared Rust core;
+3. local TDLib source and the optional remote tier;
+4. native drive integrations plus cross-platform quality, security, and release work.
+
+Detailed generated plans for every epic are in [`.planning/`](.planning/). The remote tier is decomposed to preserve interface and sizing clarity, but remains optional and does not authorize hosted-service implementation.
 
 ## Tools
 
