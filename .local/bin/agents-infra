@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -eu
+export AGENTS_INFRA_SOURCE_DIR="/Users/iv/Developer/ReluxWorks/alexis-agents-infra"
+cd "$AGENTS_INFRA_SOURCE_DIR/tools/agents-infra"
+exec go run . "$@"

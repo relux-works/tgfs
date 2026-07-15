@@ -1,0 +1,9 @@
+{
+  "local": {
+    "board_dir": ".task-board"
+  },
+  "mode": "local",
+  "spawn": {
+    "max_parallel": 20
+  }
+}

@@ -1,0 +1,320 @@
+# alexis-agents-infra
+
+Source repo for shared AI agent configurations, instructions, skills, and rules.
+
+Works with:
+- **Claude Code** (`~/.claude/`)
+- **Codex CLI** (`~/.codex/`)
+
+## Quick Start
+
+```bash
+# Bootstrap the launcher, then immediately sync the global runtime
+cd /path/to/alexis-agents-infra
+./setup.sh
+
+# Use the installed CLI after bootstrap
+agents-infra setup global
+agents-infra setup local /path/to/project
+agents-infra doctor global
+agents-infra doctor local /path/to/project
+```
+
+`setup.sh` is a bootstrap wrapper. It installs or updates the `agents-infra`
+launcher into `~/.local/bin/` and then immediately runs `agents-infra setup global`.
+
+The canonical interface after bootstrap is:
+- `agents-infra setup global`
+- `agents-infra setup local [PATH]`
+- `agents-infra doctor global|local`
+
+Setup syncs the repo into `.agents`, promotes `alexis-agents-infra` and
+`skill-creator` into the public skills registry, then refreshes symlinks in
+`.claude/`, `.codex/`, and `.local/bin`.
+
+Author shared changes in this source repo. Do **not** edit `~/.agents/`
+directly.
+The installed `~/.agents/` copy is runtime state and should not keep git metadata.
+
+For project-local installs, use `agents-infra setup local /abs/path/to/project`.
+That creates a local runtime layout under the project root:
+- `.agents/` — the installed runtime copy; put the actual contents here
+- `.claude/` — thin Claude shim that points into `.agents`
+- `.codex/` — thin Codex shim that points into `.agents`
+- `.local/bin/` — helper CLIs for the local setup, including `agents-infra`
+
+## Structure
+
+```
+~/.agents/
+├── .instructions/          # Global instructions (modular .md files)
+│   ├── INSTRUCTIONS.md     # Entry point (loads all modules)
+│   ├── AGENTS.md           # Entry point for Codex CLI
+│   ├── INSTRUCTIONS_ATTACHMENTS.md
+│   ├── INSTRUCTIONS_PLATFORM.md
+│   ├── INSTRUCTIONS_STRUCTURE.md
+│   ├── INSTRUCTIONS_TOOLS.md
+│   ├── INSTRUCTIONS_SKILLS.md
+│   ├── INSTRUCTIONS_DIAGRAMS.md
+│   ├── INSTRUCTIONS_TESTING.md
+│   ├── INSTRUCTIONS_WORKFLOW.md
+│   ├── INSTRUCTIONS_DOCS.md
+│   └── INSTRUCTIONS_STYLE.md
+│
+├── .skills/                # Skills for Claude Code & Codex CLI
+│   ├── algorithmic-art/
+│   ├── architecture-diagrams/
+│   ├── brand-guidelines/
+│   ├── canvas-design/
+│   ├── doc-coauthoring/
+│   ├── docx/
+│   ├── frontend-design/
+│   ├── internal-comms/
+│   ├── ios-ui-validation/
+│   ├── mcp-builder/
+│   ├── pdf/
+│   ├── pptx/
+│   ├── skill-creator/
+│   ├── slack-gif-creator/
+│   ├── theme-factory/
+│   ├── web-artifacts-builder/
+│   ├── web-search/
+│   ├── webapp-testing/
+│   └── xlsx/
+│
+├── .scripts/               # Setup and utility scripts
+│   ├── setup-symlinks.sh   # Internal compatibility wrapper over agents-infra
+│   └── agents-attachments  # Helper for agents-attachments-manifest.json
+│
+├── .configs/               # Tool configurations
+│   ├── claude-settings.json    # Claude Code settings (reference)
+│   └── codex-config.toml       # Codex CLI config
+│
+├── tools/
+│   └── agents-infra/       # Go CLI source
+│
+└── .rules/                 # Codex CLI rules
+    └── default.rules       # Pre-approved commands
+```
+
+## Instructions
+
+Modular instruction files in `.instructions/`:
+
+| File | Purpose |
+|------|---------|
+| `INSTRUCTIONS.md` | Entry point for Claude Code |
+| `AGENTS.md` | Entry point for Codex CLI |
+| `INSTRUCTIONS_PLATFORM.md` | Target platform preferences (iOS > macOS) |
+| `INSTRUCTIONS_STRUCTURE.md` | Project structure conventions |
+| `INSTRUCTIONS_TOOLS.md` | Allowed CLI tools |
+| `INSTRUCTIONS_SKILLS.md` | Skills system usage |
+| `INSTRUCTIONS_DIAGRAMS.md` | C4/PlantUML diagram rules |
+| `INSTRUCTIONS_TESTING.md` | Swift Testing, refactoring workflow |
+| `INSTRUCTIONS_WORKFLOW.md` | Git, task tracking, logging |
+| `INSTRUCTIONS_DOCS.md` | Documentation requirements |
+| `INSTRUCTIONS_STYLE.md` | Communication style |
+
+## Skills
+
+Each skill follows the structure:
+
+```
+skill-name/
+├── SKILL.md              # Required: frontmatter + instructions
+├── scripts/              # Optional: executable code
+├── references/           # Optional: docs/schemas
+└── assets/               # Optional: templates/resources
+```
+
+### Available Skills
+
+| Skill | Description |
+|-------|-------------|
+| `ios-ui-validation` | UI testing with screenshot validation, Page Object pattern |
+| `skill-creator` | Scaffold new skills |
+| `architecture-diagrams` | C4/PlantUML diagrams |
+| `frontend-design` | Production-grade frontend interfaces |
+| `docx` / `pdf` / `pptx` / `xlsx` | Office document manipulation |
+| `webapp-testing` | Playwright-based web testing |
+| `mcp-builder` | Build MCP servers |
+| `web-search` | Web search integration |
+| `canvas-design` | Visual art in PNG/PDF |
+| `algorithmic-art` | p5.js generative art |
+| `theme-factory` | Artifact styling toolkit |
+| `brand-guidelines` | Anthropic brand colors/typography |
+| `internal-comms` | Internal communications templates |
+| `slack-gif-creator` | Animated GIFs for Slack |
+| `doc-coauthoring` | Documentation co-authoring workflow |
+| `web-artifacts-builder` | Multi-component HTML artifacts |
+
+## Standalone Skill Install Pattern
+
+For standalone skill repos outside this repo, keep the skill source in its own
+repository and vendor the install helper from:
+
+```text
+.scripts/standalone-skill-install/
+```
+
+This exists so standalone skill repos can be installed directly from their own
+checkout while still producing the same baseline wiring as
+`alexis-agents-infra`.
+
+Minimal skill-repo layout:
+
+```text
+skill-repo/
+├── scripts/
+│   ├── setup.sh
+│   ├── setup_main.py
+│   └── setup_support.py
+├── SKILL.md
+├── agents/openai.yaml
+└── locales/metadata.json
+```
+
+Usage:
+
+- copy the full `.scripts/standalone-skill-install/` directory into the skill
+  repo's `scripts/` directory
+- run `./scripts/setup.sh global --locale <mode>`
+- run `./scripts/setup.sh local /path/to/repo --locale <mode>`
+
+Result:
+
+- global installs register skill triggers in the shared global instructions
+- local installs provision `.agents/.instructions/INSTRUCTIONS_TESTING.md`
+- local installs ensure the repo-root `AGENTS.md` contains
+  `@.agents/.instructions/INSTRUCTIONS_TESTING.md` in `Modules`
+- installs use managed runtime copies instead of linking tools directly to the
+  source checkout
+
+## Configs
+
+### Claude Code (`claude-settings.json`)
+
+Reference config with:
+- Allowed tools (Bash, Read, Edit, Write, etc.)
+- Default model: `sonnet` (currently Sonnet 4.6)
+- Enabled plugins: `swift-lsp`
+
+### Codex CLI (`codex-config.toml`)
+
+- Model: `gpt-5.4`
+- Reasoning effort: `xhigh`
+- Trusted projects list
+- Profile overlays and model catalogs from `.configs/`, linked into `~/.codex/`
+
+## Attachments
+
+This repo defines a generic agent attachment contract:
+
+- manifest file name: `agents-attachments-manifest.json`
+- env var: `AGENTS_ATTACHMENTS_MANIFEST`
+- helper CLI: `agents-attachments`
+
+The repo does not itself ingest chat attachments. A separate runtime or launcher
+must materialize files locally, write the manifest, and export the env var before
+starting the agent process.
+
+For Codex sessions, the helper can bootstrap a local manifest from rollout
+history when `CODEX_THREAD_ID` is available:
+
+```bash
+agents-attachments materialize
+```
+
+## Rules
+
+`.rules/default.rules` — pre-approved Codex CLI commands:
+- PlantUML download and rendering
+- Temporary directory creation
+
+## How It Works
+
+After running `agents-infra setup global`:
+
+```
+~/.agents/
+├── skills/
+│   ├── alexis-agents-infra -> ~/.agents
+│   ├── skill-creator -> ~/.agents/.skills/skill-creator
+│   └── ...
+
+~/.claude/
+├── CLAUDE.md           # Points to ~/.agents/.instructions/INSTRUCTIONS.md
+├── instructions/ -> ~/.agents/.instructions/
+└── skills/
+    ├── alexis-agents-infra -> ~/.agents/skills/alexis-agents-infra
+    ├── skill-creator/ -> ~/.agents/skills/skill-creator
+    └── ...
+
+~/.codex/
+├── AGENTS.md -> ~/.agents/.instructions/AGENTS.md
+├── config.toml -> ~/.agents/.configs/codex-config.toml
+├── <profile>.config.toml -> ~/.agents/.configs/<profile>.config.toml
+├── <profile>.model-catalog.json -> ~/.agents/.configs/<profile>.model-catalog.json
+├── skills/
+│   └── ... -> ~/.agents/skills/...
+└── rules/
+    └── default.rules -> ~/.agents/.rules/default.rules
+```
+
+`~/.agents` is the installed runtime copy. It should not be used as a git checkout.
+
+Project-local install example:
+
+```
+project-root/
+├── .agents/
+│   ├── .instructions/
+│   ├── .configs/
+│   ├── .scripts/
+│   ├── .skills/
+│   └── skills/
+├── .claude/
+│   ├── CLAUDE.md
+│   └── skills/ -> .agents/skills/...
+├── .codex/
+│   ├── AGENTS.md -> .agents/.instructions/AGENTS.md
+│   ├── config.toml -> .agents/.configs/codex-config.toml
+│   └── skills/ -> .agents/skills/...
+└── .local/bin/
+    ├── agents-attachments -> .agents/.scripts/agents-attachments
+    └── agents-infra       # launcher for the Go CLI
+```
+
+In local-project mode, treat `.agents/` as the one place where the installed runtime is populated. `.claude/` and `.codex/` should stay thin wrappers around it.
+
+## Adding New Skills
+
+1. Create skill in `.skills/<skill-name>/`
+2. Add `SKILL.md` with frontmatter
+3. Run `agents-infra setup global` to propagate
+
+Use `./setup.sh` only as bootstrap when the `agents-infra` launcher is missing
+or needs reinstalling.
+
+Or use the `skill-creator` skill:
+
+```
+/skill-creator
+```
+
+## Updating Instructions
+
+Edit files in this source repo, then run `agents-infra setup global` to sync them
+into `~/.agents` and refresh the installed runtime state.
+
+## Git
+
+This repo is version-controlled. Commit your changes:
+
+```bash
+cd /path/to/alexis-agents-infra
+git add -A
+git commit -m "Update skills/instructions"
+git push
+agents-infra setup global
+```

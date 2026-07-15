@@ -1,0 +1,53 @@
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+
+[model_providers."lev-llama.cpp"]
+name = "lev llama.cpp"
+base_url = "http://100.67.190.45:8080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[projects."/Users/aagrigore1"]
+trust_level = "trusted"
+
+[projects."/Users/aagrigore1/src/mts/mymts/app"]
+trust_level = "trusted"
+
+[projects."/Users/aagrigore1/Downloads"]
+trust_level = "trusted"
+
+[projects."/Users/aagrigore1/src/mts/membrana/ios/packages/darwin-httpclient"]
+trust_level = "trusted"
+
+[projects."/Users/aagrigore1/src/mts/bsim"]
+trust_level = "trusted"
+
+[projects."/Users/aagrigore1/src/mts/membrana/ios/ios-membrana-app-redesign"]
+trust_level = "trusted"
+
+[projects."/Users/aagrigore1/src/deps_duplicate_sample"]
+trust_level = "trusted"
+
+[projects."/Users/aagrigore1/.claude/skills"]
+trust_level = "untrusted"
+
+[projects."/Users/iv/Developer/ReluxWorks/relux-works-landing"]
+trust_level = "trusted"
+
+[projects."/Users/iv/Developer/IV"]
+trust_level = "trusted"
+
+[notice]
+"hide_gpt-5.1-codex-max_migration_prompt" = true
+hide_rate_limit_model_nudge = true
+
+[notice.model_migrations]
+"gpt-5.4" = "gpt-5.4-codex"
+
+[mcp_servers.relux_works]
+enabled = true
+url = "https://api.relux.works/mcp"
+
+[tui.model_availability_nux]
+"gpt-5.6-sol" = 1

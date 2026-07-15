@@ -1,0 +1,6 @@
+model_provider = "lev-llama.cpp"
+model = "Qwen3.6-27B"
+model_catalog_json = "lev-qwen36.model-catalog.json"
+model_context_window = 160000
+model_auto_compact_token_limit = 144000
+model_reasoning_effort = "high"
