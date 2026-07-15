@@ -1,0 +1,19 @@
+# Local agent/runtime artifacts
+.temp/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Build output
+build/
+dist/
+target/
+DerivedData/
+
+# IDE and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.log
