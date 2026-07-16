@@ -5,6 +5,39 @@
 
 ## 2026-07-17
 
+### 0342 — Review #2: arch-check rework accepted, task done (TASK-260715-3o8wpt)
+- DECISION: rework accepted → done. All gates independently re-run on the real tree (build / test 14 suites 10 passed / fmt / clippy / deny / arch-check / `make check`), board harness re-run reproduces its log 1:1, and 10/10 reviewer probes beyond the harness behaved as claimed — incl. target-gated dev/build deps, plain-triple `[target.x86_64-pc-windows-msvc.dependencies]` (no cfg syntax at all), renamed target-gated dep, banned dep in dev section. Scope honored: only the check script + `crates/README.md` changed (mtime-verified), no probe leftovers in `crates/`.
+- FINDING: `target_arch`/`target_env` predicates (e.g. `cfg(target_env = "msvc")`) are outside `PLATFORM_PREDICATE_RE` — consistent with the documented scope and review #1's required set, so not a defect; becomes worth adding only if arch/env-gating turns into a real leakage vector.
+- NOTE: `TASK-260715-3o8wpt_negative-check-harness.py` resolves the repo root as `parents[2]` of its own path — it only runs from exactly two levels below the repo root (e.g. `.temp/<dir>/probe.py`); a copy run from its board-resource location fails on `fresh_copy()`.
+- SCOPE: review-only; evidence `TASK-260715-3o8wpt_review2-verdict.md` + `TASK-260715-3o8wpt_review2-probes.log` (board), `.temp/TASK-260715-3o8wpt/review2/`.
+- STATUS: TASK-260715-3o8wpt done; cross-target builds remain TASK-260715-2cn768.
+
+### 0352 — Arch-check enforcement gaps closed; scan is now fail-closed (TASK-260715-3o8wpt)
+- DECISION: cfg detection scans the **balanced-paren argument span** of every `cfg`/`cfg!`/`cfg_attr` invocation, not the line. Chosen over the reviewer's suggested line match (framed as "at minimum"): strictly stronger — also catches predicates rustfmt wraps across lines, which a line match misses — and *fewer* false positives, since the predicate must sit inside the cfg args. ~15 lines.
+- DECISION: platform-neutral crates now error on **any non-null `target`** on a `cargo metadata` dep (any section, dev included), not on a dep-name list. A target-gated dep is leakage regardless of name, so this also covers external crates the ban list has never heard of.
+- DECISION: added a `std::os::` source scan (reviewer's optional item). `std::os::unix::...` compiles per-platform with no cfg and no dep, so neither of the above sees it. Genuine cross-target builds remain the real gap → TASK-260715-2cn768, now named as a limitation in `crates/README.md` instead of implied away.
+- FINDING: scans are deliberately fail-closed and this is now documented, not incidental — a predicate word in a block comment or string literal is flagged (false positive = one rename; miss = the platform-neutrality guarantee). Known residual miss: `//` inside a string literal truncates the line before its predicate.
+- NOTE: `crates/README.md` "Everything in this document is enforced by ..." was false in *both* directions — it also implied the script owned the license gate. Now scoped, with the un-enforced conventions (sources-as-crates DEC-003/DEC-005, no-cargo-features baseline, layer numbering, cross-target) listed explicitly. Doc claims about enforcement are worth auditing against the checker, not just the checker against the docs.
+- NOTE: negative evidence is now a reproducible harness (`TASK-260715-3o8wpt_negative-check-harness.py`), not hand-run injections: 12 violation cases + 2 controls, scratch-copy tree. Controls matter — they prove the fail-closed scan does not fire on the crates' own `//!` docs, which do name `cfg(target_os/windows/unix)` in prose.
+- SCOPE: .scripts/check_crate_architecture.py, crates/README.md (no product code touched — workspace accepted as designed)
+- STATUS: all gates green (build/test/fmt/clippy/deny/arch-check); to-review.
+
+### 0328 — Review: arch-check script has 5 confirmed enforcement bypasses (TASK-260715-3o8wpt)
+- FINDING: `.scripts/check_crate_architecture.py` cfg scan (check 7) misses 4 real predicate forms in platform-neutral crate sources: `#[cfg(all(unix, ...))]`, `#[cfg(not(windows))]`, `#[cfg_attr(windows, ...)]`, `cfg!(target_os = ...)` — regex only handles `cfg(` with optional `any(`. Verified: all 4 injected into gramdrive-model → check passes, exit 0.
+- FINDING: manifest-level platform gating invisible — a `[target.'cfg(target_os = "macos")'.dependencies]` section in a neutral crate passes (cargo metadata dep `target` field ignored). Verified same way.
+- NOTE: contradicts the script docstring and `crates/README.md` "Everything in this document is enforced by" claim; positive gates (build/test/fmt/clippy/deny/arch/direction/cycles/README sections) all independently re-verified green. Probes: `.temp/TASK-260715-3o8wpt/review-probe-01.log`, board artifact `TASK-260715-3o8wpt_review-probe.log`.
+- STATUS: verdict to-dev — strengthen regex + flag non-null dep `target`, extend negative checks; workspace itself accepted as designed.
+
+### 0323 — Shared-core Rust workspace skeleton stood up (TASK-260715-3o8wpt)
+- MILESTONE: First product code. Cargo workspace (root `Cargo.toml`, edition 2024, Rust 1.91, resolver 3) with 7 crates under `crates/`: gramdrive-{model,source,state,render,engine,ffi,testkit}. Layering doc `crates/README.md`; per-crate READMEs with Ownership + Test command; build/test/clippy/fmt green on macOS arm64.
+- DECISION: Source implementations are separate crates, not feature flags (DEC-003/DEC-005) — features unify transitively across a workspace, a feature-gated tdjson would leak TDLib linkage into builds that never asked for it. Reserved: `gramdrive-source-tdjson`, `gramdrive-source-remote`.
+- DECISION: Crate names use `gramdrive-*` (POL-7), not the tgfs codename — crate names leak into shipped artifacts (`libgramdrive_ffi.dylib`, symbol names), where tgfs is forbidden.
+- DECISION: `deny.toml` allow-list is exactly the POL-6 set (MIT/Apache-2.0/BSD-2/BSD-3/BSL-1.0/Zlib/ISC), fail-closed: even permissive licenses outside it (Unicode-3.0 arrives with syn/unicode-ident) fail `cargo deny check licenses` until an owner decision row exists. First serde/proc-macro dependency will trip this by design.
+- NOTE: Architecture enforced by `.scripts/check_crate_architecture.py` (member set = policy table, direction allow-list, no cycles, testkit dev-only, platform-dep ban + cfg scan in core crates, README sections). Negative-tested: 4 injected violation classes all fail correctly (`TASK-260715-3o8wpt_negative-checks.log` on the board).
+- NOTE: `cargo remove` gc's unused `[workspace.dependencies]` entries (render/ffi/testkit were dropped during a negative test and restored) — watch for silent manifest churn after cargo add/remove.
+- SCOPE: Cargo.toml, deny.toml, Makefile, crates/*, .scripts/check_crate_architecture.py, README.md
+- STATUS: to-review; toolchain pinning → TASK-260715-2cn768, UniFFI wiring → TASK-260715-265gqq.
+
 ### 0305 — Telegram API compliance checklist baselined (TASK-260715-pyqm1k)
 - MILESTONE: `docs/TELEGRAM_API_COMPLIANCE.md` — 22 rules (TGC-01..22) extracted verbatim from core.telegram.org primary sources (terms, obtaining_api_id, content-protection, takeout + method page, errors, sponsored-messages; all fetched 2026-07-17), each mapped to owning board tasks or an explicit gap.
 - FINDING: Most ToS obligations already have owners — branding POL-7, protected content POL-4/SEC-032, flood pacing SEC-031/NFR-033, api_id hygiene SEC-001/003/NFR-053, AI-training ban SEC-051, GPL avoidance POL-6. Checklist largely confirms coverage rather than discovering it.

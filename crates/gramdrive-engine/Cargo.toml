@@ -1,0 +1,12 @@
+[package]
+name = "gramdrive-engine"
+description = "GramDrive transfer and cache engine: hydration, quota, eviction, resumable downloads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+gramdrive-model = { workspace = true }
+gramdrive-source = { workspace = true }
+gramdrive-state = { workspace = true }

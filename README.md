@@ -8,7 +8,7 @@ Concept: expose a user's Telegram account as a file tree — **folder per chat**
 
 ## Status
 
-**Planning phase.** No product code yet. The technology survey, specification baseline, and complete service decomposition are committed; architecture decisions marked provisional still require their explicit decision tasks.
+**Early implementation.** The technology survey, specification baseline, and complete service decomposition are committed; architecture decisions marked provisional still require their explicit decision tasks. Product code so far: the shared Rust core workspace skeleton (`crates/`, see below) — crate boundaries, dependency-direction rules, and quality gates; domain logic is still to come.
 
 Start with the [specification index](.spec/README.md) and the [generated project plan](.planning/260715_045337_project.md). Product implementation is intentionally deferred until the plan is reviewed and approved.
 
@@ -58,9 +58,10 @@ Detailed generated plans for every epic are in [`.planning/`](.planning/). The r
 
 ## Tools
 
-No project build tooling yet (research phase). Conventions:
+Conventions:
 
 - `.spec/` — product and architecture source of truth.
+- `crates/` — the shared Rust core workspace (`crates/README.md` documents layers, dependency direction, and feature policy).
 - `.research/` — permanent research archive.
 - `.task-board/` and `.planning/` — project decomposition and generated execution plans.
 - `.scripts/` — reusable repo utilities.
@@ -71,4 +72,8 @@ Available utilities:
 
 | Tool | Purpose | Run | Output |
 |---|---|---|---|
+| `cargo` (Rust 1.91+, edition 2024) | Build and test the shared core workspace | `cargo build --workspace` / `cargo test --workspace` (repo root); per-crate commands in each `crates/*/README.md` | Binaries/test results under `target/` (gitignored) |
+| `.scripts/check_crate_architecture.py` | Enforces `crates/README.md`: dependency direction, no cycles, no platform leakage in core crates, testkit dev-only, per-crate README sections | `python3 .scripts/check_crate_architecture.py` (repo root; stdlib only, needs `cargo` on PATH) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
+| `cargo-deny` (installed via `brew install cargo-deny`) | POL-6 license gate: permissive-only dependency licenses, config in `deny.toml` | `cargo deny check licenses` (repo root) | `licenses ok`, or non-zero exit with the offending dependency tree |
+| `make` | Aggregated repo checks | `make check` (arch + licenses + traceability + build + test); individual targets in `Makefile` | Fails on first broken gate |
 | `.scripts/validate_traceability.py` | Validates `docs/TRACEABILITY.md` against `.spec/` and `.task-board/`: every requirement mapped exactly once, no orphan board elements, no stale requirement references on the board | `python3 .scripts/validate_traceability.py` (repo root; stdlib only) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |

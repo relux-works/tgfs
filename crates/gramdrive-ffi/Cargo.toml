@@ -1,0 +1,16 @@
+[package]
+name = "gramdrive-ffi"
+description = "GramDrive UniFFI boundary: Swift/Kotlin bindings over the drive core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+# rlib for direct Rust consumers (Windows CfAPI host, Linux FUSE host),
+# staticlib/cdylib for the UniFFI-generated Swift and Kotlin bindings.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+gramdrive-engine = { workspace = true }
+gramdrive-model = { workspace = true }

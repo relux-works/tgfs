@@ -1,0 +1,24 @@
+# GramDrive shared Rust core workspace.
+#
+# Architecture, dependency-direction rules, and feature policy: crates/README.md.
+# Layering is enforced by `python3 .scripts/check_crate_architecture.py`.
+# License gate (POL-6): deny.toml, run with `cargo deny check licenses`.
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[workspace.dependencies]
+gramdrive-model = { path = "crates/gramdrive-model" }
+gramdrive-source = { path = "crates/gramdrive-source" }
+gramdrive-state = { path = "crates/gramdrive-state" }
+gramdrive-render = { path = "crates/gramdrive-render" }
+gramdrive-engine = { path = "crates/gramdrive-engine" }
+gramdrive-ffi = { path = "crates/gramdrive-ffi" }
+gramdrive-testkit = { path = "crates/gramdrive-testkit" }

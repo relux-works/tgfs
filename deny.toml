@@ -1,0 +1,31 @@
+# cargo-deny configuration — license gate required by POL-6 (DEC-018).
+#
+# The product is proprietary; every third-party dependency must carry a
+# permissive license. The allow list below is exactly the POL-6 set
+# (BSD expressed as its 2- and 3-clause SPDX forms). Any other license —
+# including permissive ones outside this set (e.g. Unicode-3.0) — fails the
+# gate and requires an explicit owner-approved decision row in
+# .spec/decisions.md before being added here.
+#
+# Run: cargo deny check licenses
+
+[graph]
+# Evaluate every feature combination a consumer could enable, so a
+# platform- or feature-gated dependency cannot smuggle in a license.
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "Zlib",
+    "ISC",
+]
+# Workspace crates are proprietary and unpublished (publish = false);
+# they are the product, not dependencies, so the gate skips them.
+private = { ignore = true }
+# Allow-list entries may be unused while the dependency tree is small.
+unused-allowed-license = "allow"
