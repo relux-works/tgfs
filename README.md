@@ -12,7 +12,7 @@ Concept: expose a user's Telegram account as a file tree — **folder per chat**
 
 Start with the [specification index](.spec/README.md) and the [generated project plan](.planning/260715_045337_project.md). Product implementation is intentionally deferred until the plan is reviewed and approved.
 
-Working name note: "tgfs" collides with the existing [TheodoreKrypton/tgfs](https://github.com/TheodoreKrypton/tgfs) (opposite direction — Telegram as backing storage over WebDAV). Rename before going public.
+Naming (DEC-019): public product name is **GramDrive** (`com.reluxworks.gramdrive.*`); `tgfs` remains the internal repo/codename only — it collides with [TheodoreKrypton/tgfs](https://github.com/TheodoreKrypton/tgfs). Trademark/handle check happens before public release.
 
 ## Current direction (from research, 2026-07-15)
 
@@ -30,6 +30,7 @@ Working name note: "tgfs" collides with the existing [TheodoreKrypton/tgfs](http
 | Artifact | Contents |
 |---|---|
 | `.spec/architecture.md` | Native-drive architecture with the shared Rust core and interchangeable local/remote sources |
+| `.spec/policies.md` | Accepted product policies POL-1…POL-8 (ordering, media/Archive Mode, retention, restricted content, support matrix, licensing, naming, approval gates) |
 | `.research/260715-telegram-filesystem-landscape.md` | Synthesized library, API, platform, architecture, and prior-art report |
 | `.research/260715-core-libraries.md` | MTProto/TDLib library landscape |
 | `.research/260715-oss-clients.md` | Official/OSS Telegram clients, licenses, and API terms |
@@ -40,11 +41,13 @@ Working name note: "tgfs" collides with the existing [TheodoreKrypton/tgfs](http
 
 ## Delivery decomposition
 
-The canonical local board is stored in `.task-board/` and must be changed through the `task-board` CLI. The current baseline contains 10 epics, 50 stories, and 138 atomic tasks; all remain unstarted.
+The canonical local board is stored in `.task-board/` and must be changed through the `task-board` CLI. The current baseline contains 11 epics, 53 stories, and 142 atomic tasks; all remain unstarted.
+
+Human-only work is isolated in the `manual-actions` epic (EPIC-260716-3vc5ay): product decisions and ADR ratification, external credentials (Telegram api_id/api_hash, Apple signing assets, Windows signing identity, test devices), and manual on-device release validation. Every other epic is designed to run autonomously in an agent loop once its `manual-actions` dependencies are done.
 
 The project-level dependency plan has four phases:
 
-1. product foundation and human decisions;
+1. manual decisions/credentials plus autonomous product-foundation analysis;
 2. shared Rust core;
 3. local TDLib source and the optional remote tier;
 4. native drive integrations plus cross-platform quality, security, and release work.
