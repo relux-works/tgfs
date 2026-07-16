@@ -4,6 +4,7 @@
   },
   "mode": "local",
   "spawn": {
-    "max_parallel": 20
+    "enabled": true,
+    "max_parallel": 1
   }
 }
