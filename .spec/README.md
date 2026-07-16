@@ -22,6 +22,7 @@ Supporting material:
 
 - [../docs/OPEN_QUESTIONS.md](../docs/OPEN_QUESTIONS.md)
 - [../docs/RISK_REGISTER.md](../docs/RISK_REGISTER.md)
+- [../docs/TELEGRAM_API_COMPLIANCE.md](../docs/TELEGRAM_API_COMPLIANCE.md)
 - [../docs/GLOSSARY.md](../docs/GLOSSARY.md)
 - [../.research/260715-telegram-filesystem-landscape.md](../.research/260715-telegram-filesystem-landscape.md)
 

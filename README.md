@@ -38,6 +38,7 @@ Naming (DEC-019, POL-7): the public product name is **GramDrive**, and every shi
 | `.research/260715-prior-art.md` | Exporter, archive, Telegram-FUSE, and WebDAV prior art |
 | `.research/260715-shared-core-feasibility.md` | Rust/UniFFI precedents, TDLib extension constraints, gomobile and grammers analysis |
 | `docs/OPEN_QUESTIONS.md` | Open product and architecture decisions |
+| `docs/TELEGRAM_API_COMPLIANCE.md` | Telegram API terms → verifiable controls, rule-to-task mapping (TGC-nn) |
 | `docs/TRACEABILITY.md` | Requirement coverage matrix: every PRD/DOM/SYNC/PLAT/SEC/NFR/DEC/POL ID mapped to board elements |
 
 ## Delivery decomposition

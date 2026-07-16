@@ -5,6 +5,23 @@
 
 ## 2026-07-17
 
+### 0305 — Telegram API compliance checklist baselined (TASK-260715-pyqm1k)
+- MILESTONE: `docs/TELEGRAM_API_COMPLIANCE.md` — 22 rules (TGC-01..22) extracted verbatim from core.telegram.org primary sources (terms, obtaining_api_id, content-protection, takeout + method page, errors, sponsored-messages; all fetched 2026-07-17), each mapped to owning board tasks or an explicit gap.
+- FINDING: Most ToS obligations already have owners — branding POL-7, protected content POL-4/SEC-032, flood pacing SEC-031/NFR-033, api_id hygiene SEC-001/003/NFR-053, AI-training ban SEC-051, GPL avoidance POL-6. Checklist largely confirms coverage rather than discovering it.
+- NOTE: 4 gaps need orchestrator action: G-1 ToS 2.2 "uses Telegram API" disclosure ACs (TASK-260715-13pxnu/32gjo8/1dk9ik); G-2 read-state-neutrality AC — crawl must never emit viewMessages/openChat (TASK-260715-26dnp6/10p5zp, verified via 3e8q4m); G-3 sponsored messages (below); G-4 breach-notice/ban-recovery ops runbook (TASK-260715-32gjo8).
+- SCOPE: docs/TELEGRAM_API_COMPLIANCE.md, README.md, .spec/README.md (index rows)
+- STATUS: validator OK 201/201; all 34 cited board IDs verified to exist; task to-review.
+
+### 0304 — Protected-content "copying disabled" covers exported TEXT, not just media
+- FINDING: api/content-protection requires "forwards, downloads, copying, screenshots must be disabled" for all messages in noforwards chats. Writing protected-chat message text into NDJSON/Markdown exports is copying — so text export must be excluded for protected chats, same as media. Official Telegram Desktop export behaves this way.
+- NOTE: Does not contradict accepted POL-4 ("text is exported only where Telegram permits") — it resolves what "permits" means: nothing, for protected chats. Recorded as normative reading (TGC-15, fact-check F-2) unless owner overrides. Implementers: TASK-260715-23arcu, renderers STORY-260715-1oq9jg.
+- STATUS: flagged for reviewer attention in the checklist.
+
+### 0303 — Sponsored messages (ToS 3.3) is the one open compliance decision — owner call
+- FINDING: ToS 3.3: apps that allow "accessing content from Telegram channels" must support official sponsored messages. GramDrive exposes channel media/history as files → clause arguably triggered, but documented mechanics (getSponsoredMessages "each time the user opens a channel", 5-min cache, view/click reporting) presuppose a chat-feed UI that a filesystem projection lacks.
+- DECISION NEEDED: no board task owns this. Proposed: decision task under STORY-260715-1rmrtu producing a DEC row; POL-8 escalation (ToS risk beyond approved behaviors). Recommended position: reasoned non-applicability for v1 (no channel-feed surface), owner sign-off, re-evaluate if any feed-like UI appears; blocks the public-release gate (TASK-260715-1nxcst) until decided.
+- STATUS: pending owner decision; analysis in docs/TELEGRAM_API_COMPLIANCE.md § Gaps G-3.
+
 ### 0255 — Prefix twin closed: architecture.md and README defer to the owning section
 - FIX: `.spec/architecture.md:76` no longer enumerates App Group among identifiers taking the `com.reluxworks.gramdrive.*` prefix. It now states identifiers are "derived from the `com.reluxworks.gramdrive` namespace" and defers to `platform-requirements.md` § Identifier and naming convention "for the exact per-platform forms, including the Apple-mandated App Group prefixes". Closes the 0248 regression.
 - FIX: `README.md:15` — same absolute claim relaxed to "derived from the `com.reluxworks.gramdrive` namespace". Summary register, so no enumeration replaces it.
