@@ -1,7 +1,7 @@
 # Platform Requirements
 
 Status: planning baseline
-Last updated: 2026-07-15
+Last updated: 2026-07-17
 
 ## Shared rules
 
@@ -9,6 +9,23 @@ Last updated: 2026-07-15
 - **PLAT-002 (V1):** Each adapter supports enumeration, stable identity, metadata refresh, content fetch, cancellation, restart recovery, and native offline/pin intent where available.
 - **PLAT-003 (V1):** Native UI is limited initially to authorization/account, provider registration, status, cache/offline settings, diagnostics, and removal.
 - **PLAT-004 (V1):** Platform packaging includes code signing, upgrades, migrations, and uninstallation cleanup in acceptance scope.
+
+### Identifier and naming convention (DEC-019 / POL-7)
+
+Every shipped bundle, package, App Group, sync-root, and provider-domain identifier is derived from the `com.reluxworks.gramdrive` namespace. App Groups additionally carry the platform-mandated prefix Apple requires — either `group.` or the team ID — ahead of that namespace. Every user-visible surface — drive/root display name, native UI, installer, and store listings — reads GramDrive. The `tgfs` repository codename never appears in a shipped identifier or user-visible string.
+
+Apple identifiers:
+
+| Identifier | Use | Registration |
+|---|---|---|
+| `com.reluxworks.gramdrive` | Containing application (macOS, iOS) | Explicit App ID, registered with App Groups capability |
+| `com.reluxworks.gramdrive.fileprovider` | File Provider extension | Explicit App ID, registered with App Groups capability |
+| `262RZ595FP.com.reluxworks.gramdrive` | App Group shared container — **the entitlement form v1 ships** (macOS 14 deployment target) | Team-prefixed; needs no portal registration and no provisioning profile under Developer ID signing |
+| `group.com.reluxworks.gramdrive` | App Group shared container — iOS and macOS 15+ | Registered manually in the portal; future, not used by v1 |
+
+DEC-017 / POL-5 fix the v1 support matrix at macOS 14+, arm64 only, so `262RZ595FP.com.reluxworks.gramdrive` is the App Group that v1 actually ships; `group.com.reluxworks.gramdrive` applies only once iOS or macOS 15+ enters scope. Source: `TASK-260716-1jswke`.
+
+Android uses the `com.reluxworks.gramdrive` application ID; Windows and Linux derive sync-root and service identifiers from the same prefix.
 
 ## macOS
 

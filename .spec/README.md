@@ -1,7 +1,7 @@
-# TGFS Specification Index
+# GramDrive Specification Index
 
 Status: planning baseline
-Last updated: 2026-07-15
+Last updated: 2026-07-17
 
 The `.spec/` directory is the source of truth for product and engineering requirements. Research explains why decisions were made; specifications define what future implementation must satisfy. Task-board elements must reference requirement IDs from these files where applicable.
 

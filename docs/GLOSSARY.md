@@ -7,6 +7,7 @@
 - **Drive source:** Provider-neutral backend used by the shared Rust core; local TDLib, remote HTTP, or deterministic fake.
 - **File Provider:** Apple framework that exposes remote storage through Finder or Files.
 - **FUSE:** Userspace filesystem mechanism used for the Linux mount.
+- **GramDrive:** Public product name (DEC-019/POL-7); identifier prefix `com.reluxworks.gramdrive.*`. Used on every user-visible surface, marketing, and store listing.
 - **Hydration:** Fetching and materializing some or all content for a placeholder.
 - **Materialized:** Content bytes are present locally and valid for a declared item version.
 - **NDJSON:** Newline-delimited JSON, one record per line; the lossless structured export format.
@@ -15,6 +16,7 @@
 - **Stable item ID:** Opaque identity that remains unchanged across title, path, and order changes.
 - **Takeout:** Telegram API session designed for user-initiated account data export.
 - **TDLib / tdjson:** Telegram's official client library and its C JSON interface.
+- **tgfs:** Internal repository name and codename only (`relux-works/tgfs`); never a user-visible product name. See GramDrive.
 - **Tombstone:** Local structured record that an observed item/message was deleted, when the selected retention policy preserves that fact.
 - **UniFFI:** Rust binding generator used to expose the shared core to Swift and Kotlin.
 - **Virtual appearance:** One provider path/view pointing to a canonical chat/item that may also appear elsewhere.

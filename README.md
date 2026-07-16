@@ -1,4 +1,4 @@
-# TGFS — Telegram File System
+# GramDrive
 
 Concept: expose a user's Telegram account as a file tree — **folder per chat** (named after the chat/user, in Telegram dialog order), containing all downloaded media plus the chat history exported as text. The primary product is a native drive resembling Dropbox/Google Drive:
 
@@ -12,7 +12,7 @@ Concept: expose a user's Telegram account as a file tree — **folder per chat**
 
 Start with the [specification index](.spec/README.md) and the [generated project plan](.planning/260715_045337_project.md). Product implementation is intentionally deferred until the plan is reviewed and approved.
 
-Naming (DEC-019): public product name is **GramDrive** (`com.reluxworks.gramdrive.*`); `tgfs` remains the internal repo/codename only — it collides with [TheodoreKrypton/tgfs](https://github.com/TheodoreKrypton/tgfs). Trademark/handle check happens before public release.
+Naming (DEC-019, POL-7): the public product name is **GramDrive**, and every shipped identifier is derived from the `com.reluxworks.gramdrive` namespace. `tgfs` remains the internal repository/codename only — it collides with [TheodoreKrypton/tgfs](https://github.com/TheodoreKrypton/tgfs) and must not appear in user-visible strings, marketing, or store listings. The repository is deliberately not renamed. Trademark/handle check happens before public release.
 
 ## Current direction (from research, 2026-07-15)
 
@@ -38,6 +38,7 @@ Naming (DEC-019): public product name is **GramDrive** (`com.reluxworks.gramdriv
 | `.research/260715-prior-art.md` | Exporter, archive, Telegram-FUSE, and WebDAV prior art |
 | `.research/260715-shared-core-feasibility.md` | Rust/UniFFI precedents, TDLib extension constraints, gomobile and grammers analysis |
 | `docs/OPEN_QUESTIONS.md` | Open product and architecture decisions |
+| `docs/TRACEABILITY.md` | Requirement coverage matrix: every PRD/DOM/SYNC/PLAT/SEC/NFR/DEC/POL ID mapped to board elements |
 
 ## Delivery decomposition
 
@@ -61,5 +62,12 @@ No project build tooling yet (research phase). Conventions:
 - `.spec/` — product and architecture source of truth.
 - `.research/` — permanent research archive.
 - `.task-board/` and `.planning/` — project decomposition and generated execution plans.
+- `.scripts/` — reusable repo utilities.
 - `.temp/` — ignored local agent/runtime artifacts only.
 - Research documents cite primary-source URLs inline; verify against them before relying on a claim.
+
+Available utilities:
+
+| Tool | Purpose | Run | Output |
+|---|---|---|---|
+| `.scripts/validate_traceability.py` | Validates `docs/TRACEABILITY.md` against `.spec/` and `.task-board/`: every requirement mapped exactly once, no orphan board elements, no stale requirement references on the board | `python3 .scripts/validate_traceability.py` (repo root; stdlib only) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |

@@ -1,11 +1,11 @@
 # Product Specification
 
 Status: planning baseline
-Last updated: 2026-07-15
+Last updated: 2026-07-17
 
 ## Product statement
 
-TGFS presents a user's accessible Telegram cloud chats as a native, read-only cloud drive. Chats are folders; media and documents are files; chat history is exposed as deterministic text and structured exports. The system file manager is the primary interface, with a minimal native companion for authorization, status, cache, diagnostics, and account removal.
+GramDrive presents a user's accessible Telegram cloud chats as a native, read-only cloud drive. Chats are folders; media and documents are files; chat history is exposed as deterministic text and structured exports. The system file manager is the primary interface, with a minimal native companion for authorization, status, cache, diagnostics, and account removal.
 
 The product should feel like Dropbox or Google Drive at the operating-system boundary, while preserving Telegram-specific identity, ordering, update, and content-policy constraints.
 
@@ -46,7 +46,7 @@ The user opens monthly Markdown or lossless NDJSON files generated from current 
 
 ### J5 — Keep content offline
 
-Where the OS exposes pin/offline intent, the user requests local availability. TGFS hydrates the requested content within quota and preserves it until unpinned or explicitly removed.
+Where the OS exposes pin/offline intent, the user requests local availability. GramDrive hydrates the requested content within quota and preserves it until unpinned or explicitly removed.
 
 ### J6 — Observe ongoing changes
 

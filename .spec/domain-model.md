@@ -1,7 +1,7 @@
 # Domain Model
 
 Status: planning baseline
-Last updated: 2026-07-15
+Last updated: 2026-07-17
 
 ## Invariants
 
@@ -106,4 +106,4 @@ Maps an item/version to materialized bytes and tracks size, access time, pin int
 
 ## Canonical ownership
 
-In local mode, TDLib/source state plus TGFS structured metadata are canonical; provider placeholders and generated files are projections. In remote mode, the service database/blob store are canonical for the normalized archive; client databases remain cache/provider state.
+In local mode, TDLib/source state plus GramDrive structured metadata are canonical; provider placeholders and generated files are projections. In remote mode, the service database/blob store are canonical for the normalized archive; client databases remain cache/provider state.

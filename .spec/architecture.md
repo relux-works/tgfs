@@ -73,6 +73,8 @@ Do not put OS placeholder objects, extension lifecycle, secure-store APIs, or UI
 
 ## Native layers
 
+Shipped identifiers are derived from the `com.reluxworks.gramdrive` namespace, and the drive presents as GramDrive (POL-7); see `platform-requirements.md` § Identifier and naming convention for the exact per-platform forms, including the Apple-mandated App Group prefixes.
+
 ### macOS
 
 Use `NSFileProviderReplicatedExtension` in Swift. Keep the extension thin even though no comparable documented 20 MB macOS cap was found. Run TDLib in a companion app/agent and share durable metadata through an App Group container or a narrowly scoped native service. Reuse the Apple provider-support Swift package with iOS where the APIs genuinely align.

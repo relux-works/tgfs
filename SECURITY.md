@@ -1,6 +1,6 @@
 # Security Policy
 
-TGFS is pre-implementation and has no released security-supported version yet.
+GramDrive (internal repository codename `tgfs`) is pre-implementation and has no released security-supported version yet.
 
 Do not open public issues containing Telegram credentials, session data, phone numbers, message content, file names, diagnostic archives, or other user data. Report suspected vulnerabilities privately to the repository owners through GitHub Security Advisories for `relux-works/tgfs`.
 

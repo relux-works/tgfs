@@ -19,6 +19,10 @@ Open decisions from the research phase. Details and trade-offs: `.research/26071
 
 8. **Takeout UX (remote tier only):** `TAKEOUT_INIT_DELAY_X` can postpone export and returns the required wait in seconds. How should onboarding explain and resume this security delay?
 
+## Specification consistency
+
+9. **product.md success gate vs. POL-5 (found by traceability audit, 2026-07-17):** `product.md` "Product success gates" declares V1 product-complete only when at least macOS **and Windows** pass the native gates, but DEC-017/POL-5 commit only macOS 14+ arm64 for v1 and defer Windows until it enters scope. Either relax the product-complete wording to the accepted support matrix, or record that "v1 release" (macOS) and "product-complete V1" (macOS+Windows) are deliberately different milestones. See `docs/TRACEABILITY.md` § Known tensions.
+
 ## Resolved (2026-07-17)
 
 Moved to `.spec/policies.md` / `.spec/decisions.md`:

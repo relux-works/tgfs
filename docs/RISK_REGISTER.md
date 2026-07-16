@@ -1,6 +1,6 @@
 # Risk Register
 
-Last updated: 2026-07-15
+Last updated: 2026-07-17
 
 | ID | Risk | Likelihood | Impact | Mitigation / decision gate |
 |---|---|---:|---:|---|
@@ -18,6 +18,6 @@ Last updated: 2026-07-15
 | R-012 | GPL/AGPL reference code is copied into a proprietary product. | Low | High | Reference-only rule, dependency/license scanning, legal review before reuse. |
 | R-013 | Provider/database migrations orphan stable IDs or placeholders. | Medium | High | Versioned identity scheme, migration fixtures, restart/upgrade tests, repair/reconciliation command. |
 | R-014 | Read-only intent is bypassed by OS/client behavior. | Medium | Medium | Do not advertise capabilities; stable errors; integration tests for create/write/rename/move/delete attempts. |
-| R-015 | Project name conflicts with existing `TheodoreKrypton/tgfs`. | High | Medium | Decide public product/repository naming before external launch; current private repo name is provisional. |
+| R-015 | Project name conflicts with existing `TheodoreKrypton/tgfs`. | High | Medium | Mitigated by DEC-019/POL-7: public name is GramDrive (`com.reluxworks.gramdrive.*`); `tgfs` is retained as the private repo/codename only and is never user-visible. Residual: formal trademark and handle/domain acquisition check before public release. |
 
 Risk owners are assigned in task-board during implementation planning. Critical/high risks must have explicit spike or control tasks before their dependent implementation can enter development.

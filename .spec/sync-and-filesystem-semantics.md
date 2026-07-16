@@ -1,7 +1,7 @@
 # Synchronization and Filesystem Semantics
 
 Status: planning baseline
-Last updated: 2026-07-15
+Last updated: 2026-07-17
 
 ## Source contract
 
@@ -66,7 +66,7 @@ Account/
 - **SYNC-050 (V1):** Cache accounting includes materialized blobs, partial transfers, generated documents, thumbnails, and required metadata separately.
 - **SYNC-051 (V1):** Eviction never removes explicitly pinned/offline content unless the user chooses an emergency policy that is clearly disclosed.
 - **SYNC-052 (V1):** LRU-like eviction operates only on eligible verified content and preserves source/item metadata needed to rehydrate.
-- **SYNC-053 (V1):** Provider/system eviction is reconciled into TGFS cache state.
+- **SYNC-053 (V1):** Provider/system eviction is reconciled into GramDrive cache state.
 - **SYNC-054 (V1):** Quota changes are durable and immediately produce an actionable plan/status rather than silent data loss.
 
 ## Read-only behavior
