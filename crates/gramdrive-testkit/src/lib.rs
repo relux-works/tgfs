@@ -22,7 +22,10 @@
 //! - [`RecordingSink`] — a `ContentSink` that verifies the delivery
 //!   contract while collecting bytes ([`sink`]);
 //! - [`exec`] — a single-threaded executor with no runtime behind it;
-//! - [`fixture`] — identity and item constructors for writing scripts.
+//! - [`fixture`] — identity and item constructors for writing scripts;
+//! - [`synthetic`] — the deterministic large-account fixture generator
+//!   (thousands of chats, 100k+ messages) shared by the state store's
+//!   schema evidence and later performance tasks.
 //!
 //! # Determinism is the whole product
 //!
@@ -91,6 +94,7 @@ pub mod fixture;
 pub mod record;
 pub mod script;
 pub mod sink;
+pub mod synthetic;
 
 pub use gramdrive_model as model;
 pub use gramdrive_source as source;

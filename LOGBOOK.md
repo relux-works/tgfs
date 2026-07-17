@@ -5,6 +5,25 @@
 
 ## 2026-07-17
 
+### 1613 — SQLite partial-index prover rejects IN-lists; the EXPLAIN gate caught it (TASK-260715-1ceq7h)
+- FINDING: `transfers_queue` partial index declared `WHERE state IN ('queued','running','suspended')` was **ignored** for `WHERE state = 'queued'` — plan fell to `SCAN transfers` + `USE TEMP B-TREE FOR ORDER BY`. SQLite's theorem prover accepts equality against an OR of equalities but not against an `IN` list.
+- FIX: predicate restated as `state = 'queued' OR state = 'running' OR state = 'suspended'` (`crates/gramdrive-state/src/schema/v1.sql`); plan now `SEARCH transfers USING INDEX transfers_queue`.
+- NOTE: found by the plan gate in `tests/query_plans.rs` — every required query's EXPLAIN must show an index and no temp b-tree, asserted against the loaded 110k-message fixture after ANALYZE. An index a query cannot prove is an index that does not exist; only an executable check notices.
+- SCOPE: `crates/gramdrive-state/src/schema/v1.sql`, `crates/gramdrive-state/tests/query_plans.rs`.
+
+### 1612 — rusqlite pinned at 0.39: libsqlite3-sys 0.38 needs a compiler newer than the toolchain pin (TASK-260715-1ceq7h)
+- ROOT CAUSE: rusqlite 0.40 → libsqlite3-sys 0.38.1, whose build script uses `cfg_select!` — unstable on the pinned Rust 1.91 (E0658). Not a license or policy issue; purely the toolchain pin.
+- FIX: `rusqlite = "0.39"` (libsqlite3-sys 0.37) with the reason in the workspace `Cargo.toml` comment. Bump together with `rust-toolchain.toml`.
+- FINDING: cargo-deny evaluates all targets, so libsqlite3-sys's wasm32 fallback (`sqlite-wasm-rs` → wasm-bindgen tree) enters the graph and its build scripts needed `[bans.build]` names despite never compiling for a GramDrive target — same precedent as `wit-bindgen`.
+- SCOPE: `Cargo.toml`, `deny.toml`, `crates/gramdrive-state/Cargo.toml`.
+
+### 1611 — Schema v1: append-only enforced by trigger with exactly one escape hatch (TASK-260715-1ceq7h)
+- MILESTONE: gramdrive-state schema v1 — 15 STRICT tables (accounts, chats, chat_list_entries, message_events+messages, attachments, blobs, items, transfers, cache_entries, pins, change_cursors, chat_sync_state, render_state, schema_history), WAL + per-connection FKs, `user_version` gate with named refusals (newer build / needs-migration). 30 state tests + 9 generator tests; `make check` 8/8.
+- DECISION: POL-3 append-only is a `BEFORE UPDATE` trigger, and its `WHEN` clause permits exactly one write shape — payload+payload_schema → NULL together (Mirror-mode purge keeps markers, drops content). DELETE stays legal (Audit purge tool, account cascade) but `messages.latest_event_seq` FK (no cascade) refuses to purge an event that is still current state. `AUTOINCREMENT` so purged sequence numbers never return — they are render watermarks.
+- DECISION: `items` holds canonical structural roots and appearance rows in one table; `canonical_item_id` is indexed identity **bytes, not an FK** — the canonical side lives in per-kind tables reached by decoding the ItemId, so a single FK target is unrepresentable. Tree structure is a real self-FK. One-appearance-per-(canonical,view) unique index needs `COALESCE(view_folder_id, 0)` — SQLite treats NULLs as distinct in unique indexes, so without the sentinel the constraint would be fiction.
+- DECISION: fixture generator lives in testkit (`synthetic`), emits model-vocabulary data only (no SQL, no state dep — dependency direction forbids it); state's tests map it to rows. Zipf-skewed 2048 chats / 110k messages, digest-pinned for drift detection; synthetic 31-day-month calendar so partitioning is integer arithmetic.
+- SCOPE: `crates/gramdrive-state/**`, `crates/gramdrive-testkit/src/synthetic.rs`.
+
 ### 1552 — SYNC-046 does not mean what the range cases were using it for (TASK-260715-3e8q4m)
 - FINDING: SYNC-046 verbatim is *"**Concurrent** requests for the same item/version coalesce where safe and do not corrupt range/accounting state"* (`.spec/sync-and-filesystem-semantics.md:62`). Six range-delivery cases were labelled SYNC-046 and **not one issued a concurrent call**. A range failure printed a requirement about concurrency.
 - ROOT CAUSE: `gramdrive-source/src/fetch.rs:39` cites SYNC-046 for the `FetchProgress` accounting fold, which is the "do not corrupt range/accounting state" half. Defensible for the *engine*; wrong as the clause a single-threaded range case pins. The clause those cases actually pin is **SYNC-041** ("Fetch accepts byte ranges even if a source internally downloads larger aligned chunks"), which was not in the `Clause` enum at all.

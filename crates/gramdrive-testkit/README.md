@@ -9,7 +9,8 @@ as a `dev-dependency` — it never ships in a product artifact.
 
 STORY-260715-255sa3 (drive-source-contract), EPIC-260715-1poogc
 (shared-rust-core). Populated by TASK-260715-3uft8j (deterministic fake
-source), TASK-260715-3e8q4m (conformance suite).
+source), TASK-260715-3e8q4m (conformance suite), TASK-260715-1ceq7h
+(synthetic large-account fixtures).
 
 ## Dependencies
 
@@ -190,6 +191,29 @@ range, a delivery of the right offsets with the wrong bytes, a miscategorized
 failure — and asserts the suite fails, on the case that owns that clause. A
 suite whose every case asserted `true` would pass the fake exactly as loudly;
 those tests are what say the cases have teeth.
+
+## The synthetic large account
+
+`synthetic::generate` deterministically expands a `SyntheticSpec` into a
+whole account of source facts in the model vocabulary — no SQL, no consumer
+knowledge. `SyntheticSpec::large_account()` is the acceptance fixture of
+TASK-260715-1ceq7h (2,048 chats, 110,000 messages, ~25k attachments,
+Zipf-skewed so a few chats are enormous and the tail is empty), used by
+gramdrive-state's EXPLAIN evidence and reused by later performance tasks so
+every "fast enough" is measured against the same account.
+
+```rust
+use gramdrive_testkit::synthetic::{self, SyntheticSpec};
+
+let account = synthetic::generate(&SyntheticSpec::large_account());
+assert!(account.message_total() >= 100_000);
+```
+
+Timestamps run on a synthetic calendar of uniform 31-day months from
+2024-01-01 (`synthetic::partition_of` gives the `(year, month)` partition as
+pure integer arithmetic). Same spec, same account, bit for bit — the unit
+tests pin totals and a structural digest, so a distribution change is a
+deliberate edit, not drift.
 
 ## Test command
 

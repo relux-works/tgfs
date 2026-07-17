@@ -8,6 +8,12 @@ publish.workspace = true
 
 [dependencies]
 gramdrive-model = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+# Synthetic large-account fixtures (TASK-260715-1ceq7h); dev-only per the
+# architecture rules — test support never ships in a product artifact.
+gramdrive-testkit = { workspace = true }
 
 [lints]
 # Shared lint set: Cargo.toml [workspace.lints].

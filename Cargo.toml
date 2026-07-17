@@ -34,6 +34,20 @@ gramdrive-testkit = { path = "crates/gramdrive-testkit" }
 uniffi = { version = "0.32" }
 tokio = { version = "1.52", default-features = false }
 
+# SQLite for the state store (gramdrive-state). `bundled` compiles the pinned
+# SQLite amalgamation into the crate instead of linking whatever libsqlite3
+# the build host carries: the schema relies on modern SQLite behavior (strict
+# CHECK evaluation, partial indexes, `unixepoch()`, JSON1), and a floating
+# system library would make "works on this Mac" the actual contract. The
+# amalgamation is public-domain C; rusqlite and libsqlite3-sys are MIT
+# (inside the POL-6 allow list). libsqlite3-sys builds it with a build
+# script — named in deny.toml [bans.build] like every other build script.
+#
+# 0.39, not 0.40: rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script
+# uses `cfg_select!` — unstable on the pinned 1.91 toolchain. Bump together
+# with the toolchain pin.
+rusqlite = { version = "0.39", features = ["bundled"] }
+
 # Unicode tables for the naming policy (SYNC-013). All three carry licenses
 # inside the POL-6 allow list (MIT OR Apache-2.0, and MIT for caseless), so
 # none needs a DEC-021-style exception. They are data, not logic: NFC,

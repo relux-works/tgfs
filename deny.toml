@@ -173,6 +173,18 @@ allow-build-scripts = [
     "num-traits",
     "zerocopy",
     "wit-bindgen",
+    # SQLite tree (rusqlite `bundled`, the state store — TASK-260715-1ceq7h).
+    # libsqlite3-sys's build script compiles the vendored public-domain
+    # SQLite amalgamation with cc; it generates no bindings and touches no
+    # network. The wasm names below are libsqlite3-sys's
+    # wasm32-unknown-unknown fallback (sqlite-wasm-rs and its wasm-bindgen
+    # tree, with rustversion's compiler probe) — in the graph for
+    # completeness, never compiled for a GramDrive target.
+    "libsqlite3-sys",
+    "sqlite-wasm-rs",
+    "wasm-bindgen",
+    "wasm-bindgen-shared",
+    "rustversion",
 ]
 
 # ---------------------------------------------------------------------------
