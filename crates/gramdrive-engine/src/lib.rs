@@ -1,10 +1,17 @@
 //! GramDrive transfer and cache engine — the orchestration layer of the core.
 //!
-//! This crate will own hydration, pin/offline state, resumable ranged
+//! This crate owns hydration, pin/offline state, resumable ranged
 //! downloads, integrity checks and cache promotion, quota accounting, and
 //! LRU eviction of unpinned content (STORY-260715-2hs8cf, POL-2). It drives
 //! any `DriveSource` through the provider-neutral contract and persists
 //! durable transfer state through `gramdrive-state`.
+//!
+//! Implemented so far: the durable transfer state machine ([`transfer`],
+//! TASK-260715-g4k3zm) — request/claim/progress/checkpoint and the
+//! terminal gates over the journal `gramdrive-state` persists. The fetch
+//! coordinator (TASK-260715-22fh09), integrity and atomic promotion
+//! (TASK-260715-3s6cpe), and quota/eviction (TASK-260715-11abx8) build on
+//! it.
 //!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - internal dependencies: `gramdrive-model`, `gramdrive-source`,
@@ -17,6 +24,8 @@
 pub use gramdrive_model as model;
 pub use gramdrive_source as source;
 pub use gramdrive_state as state;
+
+pub mod transfer;
 
 #[cfg(test)]
 mod tests {
