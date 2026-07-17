@@ -305,6 +305,7 @@ fn attachment_states_are_explicit_and_content_is_gated_on_availability() {
             size: Some(10),
             availability: Availability::Fetchable,
             content_hash: Some(ContentHash::Sha256([0x01; 32])),
+            media_name: Some("ok.jpg".to_owned()),
         },
         Attachment {
             index: AttachmentIndex(1),
@@ -314,6 +315,7 @@ fn attachment_states_are_explicit_and_content_is_gated_on_availability() {
             size: None,
             availability: Availability::Restricted,
             content_hash: None,
+            media_name: None,
         },
     ];
     let messages = vec![MessageHistory {

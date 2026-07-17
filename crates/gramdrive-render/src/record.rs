@@ -1,17 +1,20 @@
-//! The renderer's input contract: the structured message records the NDJSON
-//! renderer projects, plus the retention mode that governs the projection.
+//! The shared renderer input contract: the structured message records the
+//! renderers project, plus the retention mode that governs the projection.
 //!
 //! # Why this contract lives here
 //!
+//! Both renderers — the lossless [`crate::ndjson`] and the human-readable
+//! [`crate::markdown`] — are two projections of the *same* canonical records,
+//! so the record set lives at the crate root and each renderer re-exports it.
 //! `gramdrive-render` depends on `gramdrive-model` only (crate layering,
 //! `crates/README.md`): it cannot read `gramdrive-state`. Rendering is a pure
 //! function of canonical records (DOM-006), so the engine reads a chat's
 //! messages, events, and attachments from the state repositories up to a render
 //! watermark, builds the records below, and hands them to
-//! [`crate::ndjson::render_messages`]. The state layer stores each observed
-//! revision as an opaque payload blob (`message_events.payload`), never
-//! interpreted by SQL; this module is the interpreted, provider-neutral shape
-//! that payload decodes to for rendering.
+//! [`crate::ndjson::render_messages`] or [`crate::markdown::render_transcript`].
+//! The state layer stores each observed revision as an opaque payload blob
+//! (`message_events.payload`), never interpreted by SQL; this module is the
+//! interpreted, provider-neutral shape that payload decodes to for rendering.
 //!
 //! # Losslessness
 //!
@@ -264,11 +267,14 @@ pub enum ReactionKey {
 
 /// A downloadable attachment of a message.
 ///
-/// The renderer derives the attachment's stable item-id link from the message
-/// identity and [`Attachment::index`] (SYNC-032); the caller does not supply
-/// it. [`Attachment::content_hash`] is present only once the bytes are
+/// The NDJSON renderer derives the attachment's stable item-id link from the
+/// message identity and [`Attachment::index`] (SYNC-032); the caller does not
+/// supply it. [`Attachment::content_hash`] is present only once the bytes are
 /// downloaded and verified — absent means a dataless placeholder (POL-2) or an
 /// unavailable item (POL-4), disambiguated by [`Attachment::availability`].
+///
+/// [`Attachment::media_name`] carries the resolved on-disk file name for the
+/// human-readable Markdown link; see its field docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
     /// GramDrive ordinal within the message's attachments (DOM-021).
@@ -285,6 +291,19 @@ pub struct Attachment {
     pub availability: Availability,
     /// The content hash of the downloaded bytes, once materialized.
     pub content_hash: Option<ContentHash>,
+    /// The resolved display name of this attachment's file inside its year's
+    /// `media/` directory — the sanitized, collision-suffixed name the naming
+    /// policy assigned (SYNC-012, SYNC-013). `Some` when the attachment has a
+    /// file node in the virtual tree (the Markdown renderer links
+    /// `media/<media_name>`); `None` when no file exists to link — a source
+    /// with no downloadable object, or content the naming layer produced no
+    /// entry for.
+    ///
+    /// The renderer cannot derive this itself: collision suffixing depends on
+    /// the whole sibling set in the media directory (`resolve_siblings`), which
+    /// only the engine holds. The NDJSON renderer links by opaque identity
+    /// instead and ignores this field.
+    pub media_name: Option<String>,
 }
 
 /// The media kind of an [`Attachment`].

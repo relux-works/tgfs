@@ -507,6 +507,7 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                     size: Some(204_800),
                     availability: Availability::Fetchable,
                     content_hash: Some(digest(0xab)),
+                    media_name: Some("IMG_0001.jpg".to_owned()),
                 }];
                 body
             })],
@@ -528,6 +529,7 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                     size: Some(5_242_880),
                     availability: Availability::Fetchable,
                     content_hash: None,
+                    media_name: Some("video_0105.mp4".to_owned()),
                 }];
                 body
             })],
@@ -550,6 +552,7 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                     size: Some(1_024),
                     availability: Availability::Restricted,
                     content_hash: None,
+                    media_name: None,
                 }];
                 body
             })],
@@ -571,6 +574,7 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                         size: None,
                         availability: Availability::ViewOnce,
                         content_hash: None,
+                        media_name: None,
                     },
                     Attachment {
                         index: AttachmentIndex(1),
@@ -580,6 +584,7 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                         size: None,
                         availability: Availability::Unavailable,
                         content_hash: None,
+                        media_name: None,
                     },
                     Attachment {
                         index: AttachmentIndex(2),
@@ -591,6 +596,7 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                         size: None,
                         availability: Availability::Unavailable,
                         content_hash: None,
+                        media_name: None,
                     },
                 ];
                 body

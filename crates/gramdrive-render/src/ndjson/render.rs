@@ -15,13 +15,13 @@ use gramdrive_model::identity::{
 };
 
 use crate::json::Json;
-use crate::ndjson::record::{
-    Attachment, Entity, EntityKind, MediaKind, MessageHistory, Reaction, ReactionKey,
-    RetentionMode, Sender, ServiceAction,
-};
 use crate::ndjson::{
     MESSAGES_SCHEMA_FAMILY, MessagesInput, RENDERER_VERSION, SCHEMA_ID, SCHEMA_VERSION,
     content_version_token, document_id,
+};
+use crate::record::{
+    Attachment, Entity, EntityKind, MediaKind, MessageHistory, Reaction, ReactionKey,
+    RetentionMode, Sender, ServiceAction,
 };
 
 /// The disposition of a rendered message record.

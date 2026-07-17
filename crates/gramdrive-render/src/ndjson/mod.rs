@@ -42,10 +42,9 @@
 //! `schema_version` migrates deterministically, exactly as the durable
 //! identity and cursor formats evolve elsewhere in the core.
 
-mod record;
 mod render;
 
-pub use record::{
+pub use crate::record::{
     Attachment, Availability, Deletion, Entity, EntityKind, MediaKind, MessageBody, MessageHistory,
     Reaction, ReactionKey, RetentionMode, Revision, Sender, ServiceAction,
 };

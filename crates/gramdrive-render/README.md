@@ -93,6 +93,78 @@ inapplicable, so every line carries the same key set in the same order:
 - **Audit** — every revision (`superseded` then `present`), or, when a deletion
   was observed, the latest revision as a content-preserving `deleted` tombstone.
 
+## Monthly Markdown transcript (v1)
+
+Human-readable Markdown, one document per calendar month (`YYYY/MM.md`), from
+the same `MessageHistory` record set — `markdown::render_transcript` /
+`markdown::write_transcript` (SYNC-031). Byte-stable: rendering is a pure
+function of the records and the frozen versions, so a rerun over unchanged
+input rewrites nothing. The document is blocks separated by one blank line and
+closed by a single trailing newline.
+
+Versioning: `schema` = `gramdrive.transcript`, `schema_version` = `1`,
+`renderer_version` = `1`, schema family `1` (per-format lineage, independent of
+the NDJSON family). A format change is a version bump with a new golden fixture,
+never a mutation of v1.
+
+### Front matter
+
+A leading YAML block carries the same self-describing provenance the NDJSON
+header does (DOM-006); every value is renderer-controlled, so none is escaped:
+
+```yaml
+---
+schema: gramdrive.transcript
+schema_version: 1
+renderer_version: 1
+schema_family: 1
+document_id: gd…            # text form of the Markdown GeneratedDocKey
+account_id: 7
+namespace_version: 2
+chat_id: -1001234567890     # the title is never part of identity (DOM-023)
+partition: 2023-11          # chat | YYYY | YYYY-MM
+retention_mode: mirror      # mirror | audit (POL-3)
+timezone: UTC               # UTC | UTC±HH:MM[:SS] — the explicit render offset
+input_watermark_seq: 13
+content_version: gramdrive.transcript/s1/r1/w13
+---
+```
+
+### Body
+
+- `# Chat <id>` title and an italic subtitle (range · timezone · retention).
+- `## YYYY-MM-DD` per civil day (in the header's timezone); messages fall under
+  their send day, in input order.
+- Per message: a bold `**HH:MM:SS · <sender> · #<id>**` header (with `· edited …`
+  / `· deleted` markers), an optional italic relationship line
+  (reply/thread/topic/album), the text, a protected-content note (POL-4),
+  attachments, and reactions. Service messages render as an italic note.
+- Audit adds a `_Deleted …_` note and an `_Earlier revisions:_` list.
+
+### Timezone (SYNC-031)
+
+Every date and time is computed in one caller-supplied `UtcOffset` (fixed
+seconds east of UTC — no time-zone database, POL-6) and the offset is declared
+in the header. Like the retention mode, it is a render configuration held
+constant per account and is not part of `content_version_token`.
+
+### Injection safety (SYNC-031)
+
+Untrusted text, file names, titles, and reaction emoji are escaped so they
+cannot alter structure: Markdown block/inline syntax is backslash-escaped, `&`
+`<` `>` become HTML entities, C0 controls become U+FFFD, multi-line text is
+joined with hard breaks (one inert paragraph), and attachment links are
+percent-encoded.
+
+### Attachment links (SYNC-032)
+
+An attachment with a resolved on-disk name (`Attachment::media_name`) links to
+`media/<percent-encoded name>` — the sibling media directory of the month's
+year. Anything not downloaded is described with an explicit availability note
+(`not downloaded yet`, `restricted by Telegram`, `unavailable`, `view-once`)
+and no link. The engine supplies `media_name`; collision-resolved names are the
+naming policy's, not the renderer's.
+
 ## Test command
 
 ```sh
