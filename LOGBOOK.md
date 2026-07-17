@@ -5,6 +5,30 @@
 
 ## 2026-07-17
 
+### 1659 — Migration runner reads user_version outside its transaction: two processes both apply the same migration (TASK-260715-18l9xz)
+- FINDING: `migrate::run` reads `PRAGMA user_version` outside any transaction (`migrate.rs:200`) and `apply` never re-checks it inside the transaction it opens. `rusqlite`'s `conn.transaction()` is DEFERRED, so nothing serializes two processes that both read v1 and both decide to apply v2. Migrations run inside `StateStore::open`, and the crate's premise is that the app and the File Provider extension share the file (`lib.rs:6-9`) — first launch after an upgrade shipping a v2 is exactly when they race.
+- NOTE: reproduced at the SQLite level, mirroring `run`/`apply` statement-for-statement (`.temp/TASK-260715-18l9xz/concurrent_migration_probe.py`): A commits v2, B then fails with `duplicate column name`. B's `StateStore::open()` returns `Err(MigrationFailed)` against a healthy v2 database, with no retry.
+- NOTE: **no corruption**. The `schema_history` PRIMARY KEY on `version` means a double-apply can never silently succeed even if the migration SQL were idempotent, and the user_version-stamps-with-its-work invariant holds throughout. Impact is a failed open on the losing process, recoverable by reopening.
+- NOTE: latent — `MIGRATIONS` is empty (`SCHEMA_VERSION` is the baseline), so unreachable in the shipped build. It bites whoever writes the first real migration. Standard remedy is `TransactionBehavior::Immediate` + a version re-read inside the transaction, treating already-at-this-version as success; fail-fast vs. wait vs. recheck-and-skip is an undecided design choice, not a typo.
+- STATUS: pending — found in review, accepted as out of AC scope for this task. Recommend a follow-up under STORY-260715-16ik2x, sequenced before the first migration ships.
+- SCOPE: `crates/gramdrive-state/src/migrate.rs:195-233`, `crates/gramdrive-state/src/store.rs:49-52`.
+
+### 1658 — POL-3 append-only trigger blocks in-place payload migration; a future payload_schema bump must choose (TASK-260715-18l9xz)
+- FINDING: `message_events_append_only` permits exactly one UPDATE shape — payload and payload_schema both going to NULL (the Mirror purge). A `payload_schema` 1→2 migration therefore **cannot** rewrite payloads in place: the trigger aborts it. Discovered while picking a realistic chunked-migration test case.
+- NOTE: leaves three options for whoever bumps the payload format — (a) lazy read-time interpretation keyed on `payload_schema`, no migration at all; (b) DROP the trigger, rewrite, recreate — but a *chunked* rewrite leaves the log unprotected across chunk transactions; (c) append new-schema revision events rather than rewriting, which is what POL-3's model actually implies. Not decided here; no payload v2 exists yet.
+- NOTE: this is why the framework's test migration backfills `messages` (a projection, no trigger) instead of `message_events`. NFR-041's "serialized metadata" migration story routes through this constraint.
+- SCOPE: `crates/gramdrive-state/src/schema/v1.sql:147`, `crates/gramdrive-state/src/migrate.rs`.
+
+### 1657 — Migration journal must sit outside the numbered schema (TASK-260715-18l9xz)
+- DECISION: `migration_progress` + `repair_markers` live in `src/schema/journal.sql`, applied `IF NOT EXISTS` on every open at any version — not introduced by a migration.
+- NOTE: the reason is circular otherwise — a file written by a build older than the runner has no journal, and the runner needs the journal to run the migration that would create it. `schema_history` stays in `v1.sql` because it genuinely is part of v1.
+- NOTE: bootstrap runs only *after* the future-version check, so a file this build admits it cannot read is never written to. `tests/migrations.rs` asserts exactly that by checking no journal tables appear after a refused open.
+
+### 1656 — Runner stall guard catches only the unchanged-checkpoint case (TASK-260715-18l9xz)
+- FINDING: mutation-testing the runner (hardcoding `read_checkpoint` → None) produced an **infinite loop**, not a test failure: the chunk restarted from 0 each pass and returned a checkpoint differing from the `None` it was given, so `MigrationStalled` never fired.
+- NOTE: unreachable in real code (the runner reads the checkpoint it committed), but it marks the guard's true limit — a chunk returning a *fresh* useless checkpoint forever is indistinguishable from a long migration making progress. Any chunk bound the runner imposed would be a guess. Documented on `ChunkFn`; the per-migration fixture + interruption tests are where that bug is meant to die.
+- NOTE: three realistic mutations *are* caught (early version stamp → 5 tests, preamble re-run → 5, marker never cleared → 2). Suite has teeth.
+
 ### 1613 — SQLite partial-index prover rejects IN-lists; the EXPLAIN gate caught it (TASK-260715-1ceq7h)
 - FINDING: `transfers_queue` partial index declared `WHERE state IN ('queued','running','suspended')` was **ignored** for `WHERE state = 'queued'` — plan fell to `SCAN transfers` + `USE TEMP B-TREE FOR ORDER BY`. SQLite's theorem prover accepts equality against an OR of equalities but not against an `IN` list.
 - FIX: predicate restated as `state = 'queued' OR state = 'running' OR state = 'suspended'` (`crates/gramdrive-state/src/schema/v1.sql`); plan now `SEARCH transfers USING INDEX transfers_queue`.

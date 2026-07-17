@@ -14,6 +14,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use crate::error::StateError;
+use crate::repair::{self, RepairKind, RepairMarker};
 use crate::schema::ensure_schema;
 
 /// How long a connection waits on a locked database before failing.
@@ -34,11 +35,16 @@ pub struct StateStore {
 
 impl StateStore {
     /// Opens (creating if absent) the database at `path`, in WAL mode, with
-    /// the schema at [`crate::schema::SCHEMA_VERSION`].
+    /// the schema at [`crate::schema::SCHEMA_VERSION`] — creating it, or
+    /// migrating it forward, as the file requires.
+    ///
+    /// Migrations run here, and they are resumable: an open interrupted
+    /// mid-migration leaves a durable checkpoint, and the next open
+    /// continues from it rather than starting over (SYNC-072).
     ///
     /// Fails with a named category when the file is from a newer build
-    /// ([`StateError::UnsupportedSchemaVersion`]), needs a migration this
-    /// build cannot run ([`StateError::MigrationRequired`]), or refuses WAL
+    /// ([`StateError::UnsupportedSchemaVersion`]), when a migration fails
+    /// ([`StateError::MigrationFailed`]), or when the file refuses WAL
     /// ([`StateError::WalUnavailable`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let conn = Connection::open(path)?;
@@ -97,6 +103,31 @@ impl StateStore {
         Ok(self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    /// Every open repair marker, oldest first (SYNC-071, NFR-034).
+    ///
+    /// Empty is the normal answer. A non-empty list is durable work someone
+    /// owes this file — a projection to rebuild, or a migration that was
+    /// interrupted — and it belongs in health data (NFR-032) as much as in
+    /// reconciliation's queue.
+    pub fn repair_markers(&self) -> Result<Vec<RepairMarker>, StateError> {
+        repair::list(&self.conn)
+    }
+
+    /// Records that `detail` needs the repair named by `kind`.
+    ///
+    /// Idempotent by (kind, detail): raising an existing marker keeps the
+    /// original timestamp, so re-noticing a problem never makes it look new.
+    pub fn raise_repair_marker(&self, kind: RepairKind, detail: &str) -> Result<(), StateError> {
+        repair::raise(&self.conn, kind, detail)
+    }
+
+    /// Clears the marker for (kind, detail) — the repair is done.
+    ///
+    /// Clearing a marker that is not raised is not an error.
+    pub fn clear_repair_marker(&self, kind: RepairKind, detail: &str) -> Result<(), StateError> {
+        repair::clear(&self.conn, kind, detail)
     }
 }
 
