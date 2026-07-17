@@ -5,6 +5,20 @@
 
 ## 2026-07-17
 
+### 0655 — Identity v1 review accepted; max-key-size comment is wrong (TASK-260715-1qz1g5, review)
+- STATUS: review accepted → done. Independently re-ran `make check` (8/8) and `cargo test -p gramdrive-model` (31/31 green: 10 unit, 8 golden, 13 property). Type model matches DEC-008/DOM-001..024; golden pins, version gating, parser strictness, and namespace-separation properties all verified against the spec rows in `.spec/domain-model.md`.
+- FINDING: doc accuracy — `codec.rs:64` claims "largest v1 key (attachment appearance) is 40 bytes"; actual max is the **blob appearance at 49 bytes** (1+1+5 folder view+1 tag+8 account+1 hash tag+32 digest); even a canonical blob is 43. Same wrong figure in the results artifact. The enforceable contract is unaffected: `encoded_size_is_bounded` pins ≤64 bytes / ≤128 text chars, and no dependent carrier is fixed-width below that (Windows FILE_IDENTITY is 4 KiB). `Vec::with_capacity(48)` merely reallocs once for blob appearances. Fix the comment opportunistically; not worth a rework cycle.
+- NOTE: dependents should size buffers from the tested ≤64-byte bound, never from prose.
+
+### 0638 — Identity format v1 frozen: typed keys + opaque serialization in gramdrive-model (TASK-260715-1qz1g5)
+- MILESTONE: DEC-008/DOM-001..024 identity vocabulary landed — canonical keys (account, chat list, chat, message, attachment, generated doc, blob), appearance keys (view × canonical, non-nesting), opaque `ItemId` (binary + `gd`-prefixed lowercase base32 text). `crates/gramdrive-model/src/identity.rs`, `src/identity/codec.rs`.
+- DECISION: `AccountKey` excludes `NamespaceVersion`; Telegram-derived keys carry `AccountScope` (account + epoch), blob keys the bare account — content identity is orthogonal to the Telegram namespace epoch, so an epoch bump retires chats/messages/attachments/docs but not content-addressed blobs.
+- DECISION: encoding is a hand-rolled fixed-width prefix code, no serde — injectivity provable from layout, zero product-dep supply-chain surface. Text form is strict canonical base32 (one spelling per key; case-fold cannot alias).
+- DECISION: v1 pinned by golden fixtures (`tests/identity_golden.rs`); any encoding change must be a new version byte, never a v1 edit. Non-`0x01` version bytes fail as `UnsupportedVersion` by design.
+- FINDING: clippy's `allow-expect-in-tests` exempts only code inside `#[test]` fns — a helper fn in an integration test file still trips `expect_used`. Helpers must return `Result`.
+- NOTE: proptest (dev-dep, `default-features = false, features = ["std"]`) added three build-script names to `deny.toml` allowlist: `num-traits` (autocfg probe), `zerocopy` (via ppv-lite86/rand_chacha, cfg emitter), `wit-bindgen` (getrandom's WASI-only dep, never compiled for our targets). All dev-tree only; licenses gate unaffected.
+- STATUS: `make check` 8/8 green; 31 tests in gramdrive-model (13 property, 8 golden/error, 6 codec unit, 4 pre-existing).
+
 ### 0616 — `cargo clean -p` and artifact uplift silently fake a "rebuild" measurement (TASK-260715-3akqs8, review)
 - FINDING: measuring build reproducibility by hand has two traps that both return a *stale* digest from a command that exits 0 and looks like it built. Hit both while verifying 0552.
 - FINDING: `cargo clean -p <crate>` **without `--target <triple>`** does not clean the cross-target directory. A `clean -p` + `cargo rustc --target …` cycle finished in 0.36s and reported the pre-existing artifact's digest.

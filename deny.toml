@@ -139,8 +139,9 @@ deny = []
 [bans.build]
 # Build scripts execute arbitrary code at compile time on developer machines and
 # CI runners. Every entry below arrived with the UniFFI boundary
-# (TASK-260715-265gqq, as this comment predicted) and is a version/feature
-# probe or cfg emitter — none generates bindings or touches the network.
+# (TASK-260715-265gqq, as this comment predicted) or with the proptest dev
+# tree (TASK-260715-1qz1g5) and is a version/feature probe or cfg emitter —
+# none generates bindings or touches the network.
 # Entries are name-level, not version-pinned: the ban is about *which* crates
 # may run code at build time, and a routine patch bump must not flip this
 # gate. A new name still fails until it is added here on purpose.
@@ -163,6 +164,15 @@ allow-build-scripts = [
     "getrandom",
     "rustix",
     "libc",
+    # proptest dev tree (dev-dependency of gramdrive-model; never a product
+    # dependency, so none of this reaches a shipped artifact):
+    # num-traits probes rustc features via autocfg; zerocopy (under
+    # ppv-lite86/rand_chacha) emits version cfgs; wit-bindgen is getrandom's
+    # WASI-target dependency — in the graph for completeness, never compiled
+    # for a GramDrive target.
+    "num-traits",
+    "zerocopy",
+    "wit-bindgen",
 ]
 
 # ---------------------------------------------------------------------------

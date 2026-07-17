@@ -34,6 +34,12 @@ gramdrive-testkit = { path = "crates/gramdrive-testkit" }
 uniffi = { version = "0.32" }
 tokio = { version = "1.52", default-features = false }
 
+# Dev-dependency only (property tests). `std` without the default `fork`/
+# `timeout` features: forked test processes add child-process machinery
+# (rusty-fork, wait-timeout) the tests do not need, and every dependency is
+# supply-chain surface the deny gate then has to carry.
+proptest = { version = "1.8", default-features = false, features = ["std"] }
+
 # ---------------------------------------------------------------------------
 # Lints
 #

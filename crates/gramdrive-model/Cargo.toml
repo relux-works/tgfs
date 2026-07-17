@@ -9,3 +9,6 @@ publish.workspace = true
 [lints]
 # Shared lint set: Cargo.toml [workspace.lints].
 workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }

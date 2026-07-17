@@ -13,6 +13,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod identity;
+
 /// A half-open byte range `[start, end)` within a content object.
 ///
 /// Used by ranged content fetch and hydration. A range is never empty:
