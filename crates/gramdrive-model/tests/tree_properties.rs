@@ -26,6 +26,7 @@ fn schemas() -> DocSchemas {
         chat_json: SchemaFamily(1),
         messages_ndjson: SchemaFamily(2),
         month_markdown: SchemaFamily(3),
+        order_json: SchemaFamily(4),
     }
 }
 

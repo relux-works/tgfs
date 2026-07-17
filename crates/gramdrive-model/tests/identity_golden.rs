@@ -10,7 +10,7 @@ use gramdrive_model::identity::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
     CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
     FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MediaDirKey,
-    MessageId, MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
+    MessageId, MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -164,6 +164,30 @@ fn goldens() -> Vec<Golden> {
             })),
             bytes_hex: "0106000000000000002a00000001ffffff16e1c4ed2e01030001",
             text: "gdaedaaaaaaaaaaabkaaaaaap7777rnyoe5uxacayaae",
+        },
+        Golden {
+            name: "order_doc_main",
+            key: ItemKey::Canonical(CanonicalKey::OrderDoc(OrderDocKey {
+                list: ChatListKey {
+                    scope: SCOPE,
+                    kind: ChatListKind::Main,
+                },
+                schema_family: SchemaFamily(1),
+            })),
+            bytes_hex: "010b000000000000002a00000001010001",
+            text: "gdaefqaaaaaaaaaabkaaaaaaibaaaq",
+        },
+        Golden {
+            name: "order_doc_folder",
+            key: ItemKey::Canonical(CanonicalKey::OrderDoc(OrderDocKey {
+                list: ChatListKey {
+                    scope: SCOPE,
+                    kind: ChatListKind::Folder(FolderId(-7)),
+                },
+                schema_family: SchemaFamily(65535),
+            })),
+            bytes_hex: "010b000000000000002a0000000103fffffff9ffff",
+            text: "gdaefqaaaaaaaaaabkaaaaaaid777776p774",
         },
         Golden {
             name: "blob_sha256",

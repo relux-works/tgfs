@@ -114,6 +114,7 @@ fn resolve(siblings: &[(ItemId, String, NameKind)]) -> Vec<String> {
             id,
             raw,
             kind: *kind,
+            fixed: false,
         })
         .collect();
     gramdrive_model::naming::resolve_siblings(&inputs)

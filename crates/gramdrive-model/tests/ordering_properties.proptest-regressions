@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c38a5973e10d3a0f7df50fbbd131e156ce0ca44200ee21199c9d55885fe22e15 # shrinks to list = ChatListKey { scope: AccountScope { account: AccountKey { account_id: AccountId(0) }, namespace_version: NamespaceVersion(0) }, kind: Main }, records = [ChatOrderRecord { chat_id: ChatId(0), title: "", username: None, position: ChatPosition { order: 0, is_pinned: false } }, ChatOrderRecord { chat_id: ChatId(-1), title: "", username: None, position: ChatPosition { order: 0, is_pinned: false } }, ChatOrderRecord { chat_id: ChatId(-2), title: "", username: None, position: ChatPosition { order: 0, is_pinned: false } }, ChatOrderRecord { chat_id: ChatId(1), title: "", username: None, position: ChatPosition { order: -1, is_pinned: false } }], index = 0, order = -1

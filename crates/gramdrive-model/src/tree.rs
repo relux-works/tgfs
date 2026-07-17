@@ -6,6 +6,7 @@
 //! ```text
 //! Account/
 //!   Main/
+//!     order.json
 //!     Chat/
 //!       chat.json
 //!       messages.ndjson
@@ -44,8 +45,13 @@
 //! tree. Display names are raw presentation strings in the POL-1 stable form
 //! (`crate::naming::chat_folder_name`); sanitization and collision suffixing
 //! are the naming policy's job (`crate::naming`, TASK-260715-1ffbkg), applied
-//! by the consumer over a sibling set, and Telegram ordering metadata is the
-//! ordering projection's (TASK-260715-1jmsdp).
+//! by the consumer over a sibling set.
+//!
+//! Sibling order never encodes Telegram's dialog order, and no name ever
+//! carries a position (POL-1, DEC-013). Each list root publishes its exact
+//! order as data instead — the `order.json` child, whose bytes are
+//! `crate::ordering`'s job. A reorder rewrites that one document and changes
+//! nothing here.
 //!
 //! # Read-only capabilities (DEC-007, SYNC-060)
 //!
@@ -60,9 +66,10 @@ use crate::identity::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
     CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
     FolderCatalogKey, FolderId, GeneratedDocKey, ItemId, ItemKey, MediaDirKey, MessageId,
-    MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
+    MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
 };
 use crate::naming::chat_folder_name;
+use crate::ordering::ORDER_FILE_NAME;
 
 /// Display name of the Main chat-list root.
 const MAIN_NAME: &str = "Main";
@@ -164,6 +171,8 @@ pub struct DocSchemas {
     pub messages_ndjson: SchemaFamily,
     /// Family of the monthly `MM.md` Markdown documents.
     pub month_markdown: SchemaFamily,
+    /// Family of the per-list `order.json` ordering document (POL-1).
+    pub order_json: SchemaFamily,
 }
 
 /// What a provider may advertise for one item (SYNC-060, SYNC-061).
@@ -664,18 +673,29 @@ impl TreeProjection {
                     }))
                 })
                 .collect(),
-            ItemKey::Canonical(CanonicalKey::ChatList(list)) => self
-                .members
-                .get(&view_rank(list.kind))
-                .into_iter()
-                .flatten()
-                .map(|chat_id| {
-                    ItemKey::Appearance(AppearanceKey {
-                        view: list.kind,
-                        item: CanonicalKey::Chat(self.chat_key(*chat_id)),
-                    })
-                })
-                .collect(),
+            // order.json first, then the chats. Fixed children before derived
+            // ones is the same identity-order discipline as everywhere else:
+            // the document's position cannot depend on how many chats there
+            // are or what they are called.
+            ItemKey::Canonical(CanonicalKey::ChatList(list)) => {
+                std::iter::once(ItemKey::Canonical(CanonicalKey::OrderDoc(OrderDocKey {
+                    list: *list,
+                    schema_family: self.schemas.order_json,
+                })))
+                .chain(
+                    self.members
+                        .get(&view_rank(list.kind))
+                        .into_iter()
+                        .flatten()
+                        .map(|chat_id| {
+                            ItemKey::Appearance(AppearanceKey {
+                                view: list.kind,
+                                item: CanonicalKey::Chat(self.chat_key(*chat_id)),
+                            })
+                        }),
+                )
+                .collect()
+            }
             ItemKey::Appearance(AppearanceKey { view, item }) => {
                 self.appearance_child_keys(*view, item)
             }
@@ -805,6 +825,25 @@ impl TreeProjection {
                     NodeKind::ChatList,
                     name,
                 ))
+            }
+            // The ordering document of a list root that exists, at the schema
+            // family this projection publishes. A stale family is a document
+            // this tree does not have, not a document at a different name.
+            CanonicalKey::OrderDoc(doc)
+                if doc.list.scope == self.scope
+                    && doc.schema_family == self.schemas.order_json
+                    && self.view_exists(doc.list.kind) =>
+            {
+                Some(TreeNode {
+                    id: ItemKey::Canonical(*key).id(),
+                    parent: Some(ItemKey::Canonical(CanonicalKey::ChatList(doc.list)).id()),
+                    kind: NodeKind::GeneratedDoc,
+                    display_name: ORDER_FILE_NAME.to_string(),
+                    canonical: *key,
+                    capabilities: Capabilities::read_only_file(),
+                    size: None,
+                    content: None,
+                })
             }
             CanonicalKey::FolderCatalog(catalog) if catalog.scope == self.scope => {
                 Some(self.directory_node(

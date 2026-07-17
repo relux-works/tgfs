@@ -424,11 +424,13 @@ fn colliding_titles_are_resolved_apart_on_every_platform() {
                 id: &x,
                 raw: a,
                 kind: NameKind::Directory,
+                fixed: false,
             },
             SiblingName {
                 id: &y,
                 raw: b,
                 kind: NameKind::Directory,
+                fixed: false,
             },
         ])
         .into_iter()
@@ -475,11 +477,13 @@ fn greek_sigma_and_dotless_i_pairs_have_pinned_suffixes() {
                 id: &x,
                 raw: a,
                 kind: NameKind::Directory,
+                fixed: false,
             },
             SiblingName {
                 id: &y,
                 raw: b,
                 kind: NameKind::Directory,
+                fixed: false,
             },
         ])
         .into_iter()

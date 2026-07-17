@@ -19,7 +19,7 @@ use super::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
     CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
     FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemKey, MediaDirKey, MessageId,
-    MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
+    MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
 };
 
 const FORMAT_VERSION: u8 = 0x01;
@@ -37,6 +37,7 @@ const TAG_BLOB: u8 = 0x07;
 const TAG_FOLDER_CATALOG: u8 = 0x08;
 const TAG_YEAR_DIR: u8 = 0x09;
 const TAG_MEDIA_DIR: u8 = 0x0a;
+const TAG_ORDER_DOC: u8 = 0x0b;
 const TAG_APPEARANCE: u8 = 0x10;
 
 const LIST_MAIN: u8 = 0x01;
@@ -143,6 +144,15 @@ fn encode_canonical(out: &mut Vec<u8>, key: &CanonicalKey) {
                 DocFormat::Markdown => out.push(FORMAT_MARKDOWN),
                 DocFormat::Json => out.push(FORMAT_JSON),
             }
+            out.extend_from_slice(&schema_family.0.to_be_bytes());
+        }
+        CanonicalKey::OrderDoc(OrderDocKey {
+            list,
+            schema_family,
+        }) => {
+            out.push(TAG_ORDER_DOC);
+            encode_scope(out, &list.scope);
+            encode_list_kind(out, &list.kind);
             out.extend_from_slice(&schema_family.0.to_be_bytes());
         }
         CanonicalKey::Blob(BlobKey { account, hash }) => {
@@ -276,6 +286,14 @@ fn decode_canonical(
                 partition,
                 format,
                 schema_family,
+            }))
+        }
+        TAG_ORDER_DOC => {
+            let scope = decode_scope(reader)?;
+            let kind = decode_list_kind(reader)?;
+            Ok(CanonicalKey::OrderDoc(OrderDocKey {
+                list: ChatListKey { scope, kind },
+                schema_family: SchemaFamily(reader.u16()?),
             }))
         }
         TAG_BLOB => {

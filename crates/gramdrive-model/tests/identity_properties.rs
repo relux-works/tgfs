@@ -14,7 +14,7 @@ use gramdrive_model::identity::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
     CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
     FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MediaDirKey,
-    MessageId, MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
+    MessageId, MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
 };
 use proptest::prelude::*;
 
@@ -97,6 +97,12 @@ fn arb_canonical() -> impl Strategy<Value = CanonicalKey> {
                     schema_family: SchemaFamily(family),
                 })
             }),
+        (arb_scope(), arb_list_kind(), any::<u16>()).prop_map(|(scope, kind, family)| {
+            CanonicalKey::OrderDoc(OrderDocKey {
+                list: ChatListKey { scope, kind },
+                schema_family: SchemaFamily(family),
+            })
+        }),
         (arb_account(), any::<[u8; 32]>()).prop_map(|(account, digest)| {
             CanonicalKey::Blob(BlobKey {
                 account,

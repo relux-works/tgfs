@@ -580,6 +580,11 @@ pub struct SiblingName<'a> {
     pub raw: &'a str,
     /// How the sibling is projected.
     pub kind: NameKind,
+    /// Whether `raw` is a GramDrive-owned constant rather than a title from
+    /// the source — `order.json` at a chat-list root (POL-1), and nothing a
+    /// user can influence. Fixed names never take a collision suffix; a
+    /// colliding title yields to them instead. See [`resolve_siblings`].
+    pub fixed: bool,
 }
 
 /// Names a set of siblings so that no two collide (SYNC-012).
@@ -604,6 +609,24 @@ pub struct SiblingName<'a> {
 /// symmetric one at least never presents a `Bob` that is silently only one of
 /// two Bobs. Names still change when the *set* changes — collision resolution
 /// is set-relative by nature — but never when only the order changes.
+///
+/// # Fixed names are the one exception ([`SiblingName::fixed`], POL-1)
+///
+/// A sibling marked `fixed` keeps its name unconditionally, and titles that
+/// collide with it are the ones that yield. This does not reintroduce the
+/// churn the symmetry above avoids, because the two objections do not apply
+/// to a constant: it privileges nothing arbitrary (`order.json` is GramDrive's
+/// name, not one chat's claim on it), and it cannot be deleted, so no survivor
+/// is ever renamed by its disappearance. Suffixing it instead would be the
+/// real bug — `order.json` is the name POL-1 publishes at every list root, and
+/// a chat titled `order.json` must not be able to push the ordering metadata to
+/// `order.json (k3m9xq2)` or, worse, hand a provider two children with one
+/// name.
+///
+/// Fixed names must be distinct from each other; a set that collides fixed
+/// with fixed has no resolution and is returned with the duplicates intact
+/// (the caller is projecting two constants into one directory, which no
+/// GramDrive layout does).
 ///
 /// # Suffix derivation
 ///
@@ -655,7 +678,12 @@ pub fn resolve_siblings(siblings: &[SiblingName<'_>]) -> Vec<SafeName> {
     // that level distinct ids give distinct names. The cap is a backstop for
     // the precondition being violated, not part of the algorithm.
     for _ in 0..siblings.len().saturating_add(SUFFIX_WIDTHS.len()).min(64) {
-        let colliding = collisions(&names);
+        let colliding: Vec<usize> = collisions(&names)
+            .into_iter()
+            .filter(|index| !siblings[*index].fixed)
+            .collect();
+        // Empty means either nothing collides or every remaining collision is
+        // fixed-with-fixed, which no suffix can settle. Both are done.
         if colliding.is_empty() {
             break;
         }
@@ -704,10 +732,12 @@ fn collisions(names: &[String]) -> Vec<usize> {
 ///
 /// # What is assumed, and what is checked
 ///
-/// Composing gives distinctness under the *last* fold applied for free, and
-/// says nothing about the earlier ones: that a set distinct under this key is
-/// also distinct under `Platform::Windows.fold` is a fact about Unicode's
-/// tables, not a consequence of the composition. It is not assumed here — the
+/// Composing gives distinctness under the *first* fold applied for free, and
+/// says nothing about the later ones: with `ALL = [Apple, Windows, ..]` the key
+/// is `Windows(Apple(x))`, so `Apple(a) == Apple(b)` forces equal keys whatever
+/// the outer folds do — but that a set distinct under this key is also distinct
+/// under `Platform::Windows.fold` is a fact about Unicode's tables, not a
+/// consequence of the composition. It is not assumed here — the
 /// property suite folds resolved names by [`Platform::fold`], platform by
 /// platform, precisely so this key cannot grade its own homework.
 fn fold_key(name: &str) -> String {
@@ -1003,7 +1033,7 @@ mod tests {
 
     /// The assumption the whole collision check rests on: if *any* platform
     /// merges two names, [`fold_key`] merges them too. Composing the folds
-    /// does not give this — it gives it for the last fold applied and leaves
+    /// does not give this — it gives it for the first fold applied and leaves
     /// the rest to Unicode's tables — so it is pinned rather than argued.
     #[test]
     fn fold_key_merges_whatever_any_platform_merges() {

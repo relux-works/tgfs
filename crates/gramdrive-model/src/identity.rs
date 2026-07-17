@@ -282,6 +282,27 @@ pub struct GeneratedDocKey {
     pub schema_family: SchemaFamily,
 }
 
+/// Canonical identity of the `order.json` ordering-metadata document that
+/// sits at one chat-list root (POL-1, DEC-013).
+///
+/// Keyed by the list it describes, not by the order it records: a reorder
+/// rewrites the document's *bytes* and must never touch its identity, which
+/// is the whole point of DEC-013's stable-name projection. That is the same
+/// discipline [`GeneratedDocKey`] applies to titles, one level up — a chat
+/// list rather than a chat, so [`GeneratedDocKey`]'s chat-scoped shape cannot
+/// express it.
+///
+/// No [`DocFormat`]: a list root publishes exactly one ordering document and
+/// POL-1 fixes its name, so the format is not a degree of freedom identity
+/// needs to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrderDocKey {
+    /// The chat-list root whose order the document records.
+    pub list: ChatListKey,
+    /// Record-schema family (DOM-023).
+    pub schema_family: SchemaFamily,
+}
+
 /// Strong content hash naming a fully downloaded blob (DOM-021).
 ///
 /// An enum for algorithm agility: a future algorithm is a new variant with a
@@ -329,6 +350,8 @@ pub enum CanonicalKey {
     Attachment(AttachmentKey),
     /// A generated NDJSON/Markdown document.
     GeneratedDoc(GeneratedDocKey),
+    /// The ordering-metadata document of a chat-list root.
+    OrderDoc(OrderDocKey),
     /// A content-addressed blob.
     Blob(BlobKey),
 }

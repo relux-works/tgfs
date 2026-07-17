@@ -5,6 +5,36 @@
 
 ## 2026-07-17
 
+### 0930 — Review: ordering projection accepted; two non-blocking follow-ups (TASK-260715-1jmsdp)
+- VERDICT: review → **accepted** → `done`. `make check` 8/8 and `cargo test -p gramdrive-model` 118/118 re-run independently. AC pinned by tests (reorder changes metadata only; rename changes name only; property generalizes). Duplicate-detection fix verified independently — old `windows(2)` assumed sorted⟹adjacent but the sort is `(order, chat_id)` desc, so `[(c5,20),(c9,15),(c5,10)]` hides the second copy; set-based scan is correct, both regression tests genuine.
+- FOLLOW-UP [owner]: `.spec/sync-and-filesystem-semantics.md:32` SYNC-011 still reads "Numeric order prefixes are an optional presentation mode" — predates DEC-013. Code, `policies.md` POL-1 and `docs/TRACEABILITY.md:100` all read it the DEC-013 way; the spec sentence is the lone holdout. One-sentence owner edit; implementer correctly flagged rather than unilaterally rewriting an owner-governed spec. Did not gate acceptance.
+- FOLLOW-UP [hardening]: no cross-module test pins ordering↔tree consistency. `OrderEntry.id` and the tree's ChatList children build the same `AppearanceKey` independently, and order.json's `name` must match what a tree consumer derives via `resolve_siblings` with `fixed: true`. Holds by construction today and there is no production tree-naming consumer yet — but a future consumer forgetting `fixed: true` would make order.json name paths that do not exist, silently. Add the pin when the provider layer lands.
+
+### 0843 — order.json needed two structural extensions the ordering task exposed (TASK-260715-1jmsdp)
+- FINDING: POL-1 puts `order.json` at each **list** root, but `GeneratedDocKey` is chat-scoped by field type (`chat: ChatKey`) — a list-scoped generated document is **not representable**. Added `OrderDocKey { list: ChatListKey, schema_family }` + canonical tag `0x0b`, additive in the extension room the v1 range reserved (same move the tree builder made for `0x08`–`0x0a`). Pre-existing goldens unchanged, which is what pins it as additive.
+- FINDING: `order.json` at a list root shares a directory with user-titled chat folders, so a chat titled `order.json` collides with it. `resolve_siblings` is deliberately **symmetric** (every collision member suffixed), which would have suffixed the metadata to `order.json (k3m9xq2)` — or handed a provider two children with one name. Added `SiblingName::fixed`: constants never take a suffix, titles yield.
+- DECISION: the asymmetry is principled, not a special case. The two reasons symmetry exists (don't privilege an arbitrary member; don't rename the survivor when the other is deleted) **neither apply to a constant** — `order.json` is GramDrive's name, and it cannot be deleted. Documented on `resolve_siblings`.
+- SCOPE: `src/ordering.rs` (new), `src/identity.rs`, `src/identity/codec.rs`, `src/naming.rs`, `src/tree.rs`, README. `make check` 8/8, 118 tests.
+
+### 0843 — Duplicate chats slipped past an adjacency check because the sort key starts with `order` (TASK-260715-1jmsdp)
+- ROOT CAUSE: first implementation rejected duplicates via `records.windows(2).find(|w| w[0].chat_id == w[1].chat_id)` after sorting, reasoning "sorted ⟹ duplicates adjacent". False: the sort is `(order, chat_id)` **descending**, so `order` is the primary key. Two records for chat 5 (orders 20 and 10) are separated by any chat whose order falls between — e.g. `[(20,c5), (15,c9), (10,c5)]`.
+- FINDING: the 2-record fixture passed anyway — duplicates are trivially adjacent at n=2. The test agreed with the bug instead of catching it.
+- FINDING: consequence was not just a doubled `order.json` entry: the duplicate reaches `resolve_siblings`, violating its stated distinct-ids precondition (`naming.rs`), which resolves to **two identically-named folders**.
+- FIX: set-based scan after the sort (`ordering.rs:168`) — deterministic reported chat regardless of input order.
+- NOTE: both regression tests confirmed to fail against the reverted fix — `duplicate_chat_records_are_rejected_even_when_not_adjacent` (fixture) and `duplicate_chats_are_rejected_at_any_distance` (property, shrank to the 3-record interleave). Seed checked in per the `naming_properties` convention.
+- STATUS: resolved.
+
+### 0843 — order.json emits `order` as a string: int64 does not survive a JSON number (TASK-260715-1jmsdp)
+- DECISION: `chats[].order` is a **JSON string**, `chats[].chat_id` a **number**. `chatPosition.order` is int64 and a JSON number is an IEEE-754 double to most parsers (JavaScript, `jq`) — the top-of-range values Telegram gives **pinned** chats round silently, and two distinct pinned chats can compare equal after the round trip. `chat_id` is int53 by Telegram's own schema, where no such loss exists.
+- NOTE: `rank` (0-based, resolved) is the field readers should use; `order` is the raw server rank, kept for reconstruction. TDLib's own JSON interface serializes int64 as string for the same reason.
+- DECISION: `is_pinned` recorded but **not** a sort key — Telegram already encodes pinning in `order`, and sorting by it again would be a second, disagreeing implementation of the server's ranking. Kept because the pinned boundary is not recoverable from the sequence alone.
+
+### 0843 — Composition docs corrected: first fold is the free half, not last (TASK-260715-1ffbkg follow-up)
+- FIX: `naming.rs` `fold_key` rustdoc and `fold_key_merges_whatever_any_platform_merges` doc — `last` → `first`, per the 0821 review finding, folded into this task as the next one touching `naming.rs`.
+- NOTE: `fold_key = Windows(Apple(x))` for `ALL = [Apple, Windows, ..]`, so `Apple(a) == Apple(b)` forces equal keys for *any* outer folds — the first applied fold is free; the Windows guarantee is the Unicode fact. Comment-only; no test or behavior change.
+- STATUS: resolved (closes the 0821 `NOTE`).
+
+
 ### 0821 — Composed fold key verified hole-free; composition docs name the wrong half as "free" (TASK-260715-1ffbkg, review round 2)
 - STATUS: review → **accepted** → `done`. `make check` 8/8, 88/88 tests, re-run independently.
 - FINDING: the safety claim *"if any platform merges two names, `fold_key` merges them too"* verified **exhaustively**, not sampled — all 1,112,064 codepoints grouped by each `Platform::fold`, every group maps to one key: **0 holes on every platform, in both composition orders**. Probe: `.temp/TASK-260715-1ffbkg/foldprobe/`.

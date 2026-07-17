@@ -29,6 +29,7 @@ fn schemas() -> DocSchemas {
         chat_json: SchemaFamily(1),
         messages_ndjson: SchemaFamily(1),
         month_markdown: SchemaFamily(1),
+        order_json: SchemaFamily(1),
     }
 }
 
@@ -128,6 +129,7 @@ fn fixture_tree_matches_spec_layout() {
     let expected = [
         "Account/",
         "  Main/",
+        "    order.json",
         "    Chat/",
         "      chat.json",
         "      messages.ndjson",
@@ -136,6 +138,7 @@ fn fixture_tree_matches_spec_layout() {
         "        media/",
         "          photo.jpg",
         "  Archive/",
+        "    order.json",
         "  Telegram Folders/",
     ];
     assert_eq!(walk_lines(&tree, page(64)).unwrap(), expected);
@@ -155,7 +158,14 @@ fn page_size_one_yields_the_same_tree() {
 #[test]
 fn empty_account_has_fixed_roots() {
     let tree = build(Vec::new(), Vec::new()).unwrap();
-    let expected = ["Account/", "  Main/", "  Archive/", "  Telegram Folders/"];
+    let expected = [
+        "Account/",
+        "  Main/",
+        "    order.json",
+        "  Archive/",
+        "    order.json",
+        "  Telegram Folders/",
+    ];
     assert_eq!(walk_lines(&tree, page(64)).unwrap(), expected);
 }
 
@@ -194,6 +204,7 @@ fn media_and_month_partitions_are_independent() {
     let expected = [
         "Account/",
         "  Main/",
+        "    order.json",
         "    Chat/",
         "      chat.json",
         "      messages.ndjson",
@@ -203,6 +214,7 @@ fn media_and_month_partitions_are_independent() {
         "        media/",
         "          photo.jpg",
         "  Archive/",
+        "    order.json",
         "  Telegram Folders/",
     ];
     assert_eq!(walk_lines(&tree, page(64)).unwrap(), expected);
@@ -459,7 +471,8 @@ fn page_boundaries_chain_without_gaps_or_repeats() {
         .into_iter()
         .map(|node| node.id.text())
         .collect();
-    assert_eq!(full.len(), 5);
+    // The five chats, plus the list root's own order.json (POL-1).
+    assert_eq!(full.len(), 6);
 
     for size in 1..=3usize {
         let mut chunked = Vec::new();
@@ -588,5 +601,127 @@ fn input_violations_fail_loudly() {
             message: MessageId(500),
             index: AttachmentIndex(0),
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The ordering document at each list root (TASK-260715-1jmsdp; POL-1)
+// ---------------------------------------------------------------------------
+
+fn order_doc_key(kind: ChatListKind) -> CanonicalKey {
+    CanonicalKey::OrderDoc(gramdrive_model::identity::OrderDocKey {
+        list: gramdrive_model::identity::ChatListKey {
+            scope: scope(),
+            kind,
+        },
+        schema_family: schemas().order_json,
+    })
+}
+
+/// Every list root — Main, Archive, and each custom folder — publishes one
+/// `order.json`, and the folder catalog (which is not a list) does not.
+#[test]
+fn every_list_root_publishes_an_order_document() {
+    let mut chat = spec_chat();
+    chat.memberships = vec![ChatListKind::Main, ChatListKind::Folder(FolderId(7))];
+    let tree = build(
+        vec![FolderRecord {
+            folder_id: FolderId(7),
+            title: "Work".to_string(),
+        }],
+        vec![chat],
+    )
+    .unwrap();
+
+    for kind in [
+        ChatListKind::Main,
+        ChatListKind::Archive,
+        ChatListKind::Folder(FolderId(7)),
+    ] {
+        let list = ItemKey::Canonical(CanonicalKey::ChatList(
+            gramdrive_model::identity::ChatListKey {
+                scope: scope(),
+                kind,
+            },
+        ))
+        .id();
+        let first = tree
+            .children(&list, None, page(64))
+            .unwrap()
+            .nodes
+            .remove(0);
+        assert_eq!(first.display_name, "order.json", "list {kind:?}");
+        assert_eq!(first.kind, NodeKind::GeneratedDoc);
+        assert_eq!(first.parent.as_ref(), Some(&list));
+        // Read-only, like every v1 item (DEC-007).
+        assert!(!first.capabilities.write_content);
+        assert!(!first.capabilities.rename);
+        assert!(first.capabilities.read_content);
+        assert!(!first.capabilities.enumerate_children);
+    }
+
+    // The folder catalog groups views; it is not one, so it has no order.
+    let catalog = ItemKey::Canonical(CanonicalKey::FolderCatalog(
+        gramdrive_model::identity::FolderCatalogKey { scope: scope() },
+    ))
+    .id();
+    let names: Vec<String> = tree
+        .children(&catalog, None, page(64))
+        .unwrap()
+        .nodes
+        .into_iter()
+        .map(|node| node.display_name)
+        .collect();
+    assert_eq!(names, ["Work"]);
+}
+
+/// The ordering document resolves by identity, and its identity does not
+/// depend on the order it records — there is nothing in the key to change.
+#[test]
+fn the_order_document_resolves_and_is_canonical() {
+    let tree = build(Vec::new(), vec![spec_chat()]).unwrap();
+    let id = ItemKey::Canonical(order_doc_key(ChatListKind::Main)).id();
+    let node = tree.node(&id).expect("order.json resolves");
+    assert_eq!(node.canonical, order_doc_key(ChatListKind::Main));
+    assert_eq!(node.display_name, "order.json");
+    // Canonical, not an appearance: one document per list, not per view of a
+    // chat. Enumerating it as a child yields the same identity.
+    assert_eq!(node.id, id);
+}
+
+/// A document at a schema family this tree does not publish is not a node —
+/// the same discipline the chat documents apply (DOM-023).
+#[test]
+fn an_order_document_of_a_foreign_schema_family_is_not_a_node() {
+    let tree = build(Vec::new(), Vec::new()).unwrap();
+    let foreign = ItemKey::Canonical(CanonicalKey::OrderDoc(
+        gramdrive_model::identity::OrderDocKey {
+            list: gramdrive_model::identity::ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Main,
+            },
+            schema_family: SchemaFamily(999),
+        },
+    ))
+    .id();
+    assert!(tree.node(&foreign).is_none());
+}
+
+/// A document of a folder view that does not exist is not a node either.
+#[test]
+fn an_order_document_of_an_unknown_folder_is_not_a_node() {
+    let tree = build(Vec::new(), Vec::new()).unwrap();
+    let ghost = ItemKey::Canonical(order_doc_key(ChatListKind::Folder(FolderId(404)))).id();
+    assert!(tree.node(&ghost).is_none());
+}
+
+/// order.json is a file: it has no children, and asking for them says so.
+#[test]
+fn the_order_document_is_not_a_directory() {
+    let tree = build(Vec::new(), Vec::new()).unwrap();
+    let id = ItemKey::Canonical(order_doc_key(ChatListKind::Main)).id();
+    assert_eq!(
+        tree.children(&id, None, page(4)),
+        Err(ChildrenError::NotADirectory)
     );
 }

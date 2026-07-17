@@ -15,6 +15,7 @@
 
 pub mod identity;
 pub mod naming;
+pub mod ordering;
 pub mod tree;
 
 /// A half-open byte range `[start, end)` within a content object.

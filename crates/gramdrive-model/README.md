@@ -29,8 +29,8 @@ MIT, all inside the POL-6 allow list, so none needs a DEC-021-style named
 exception. None is platform-specific — they are the data each platform's own
 rules are written in — so layer 0 stays platform-neutral.
 
-Dev-only: `proptest` (identity, tree and naming property suites); it must
-never move to `[dependencies]` — test-support code does not ship
+Dev-only: `proptest` (identity, tree, naming and ordering property suites);
+it must never move to `[dependencies]` — test-support code does not ship
 (crates/README.md).
 
 ## Stable item identities (DEC-008, DOM-001..DOM-024)
@@ -41,7 +41,8 @@ TASK-260715-1qz1g5. The model:
 - **Canonical keys** (`CanonicalKey`) name source-derived records: account,
   chat list (Main/Archive/folder), the folder catalog, chat, chat-export
   year and media directories, message, attachment, generated document
-  (NDJSON/Markdown/JSON), and content-addressed blob. Telegram-derived keys
+  (NDJSON/Markdown/JSON), the per-list ordering document (`order.json`), and
+  content-addressed blob. Telegram-derived keys
   are scoped by `AccountScope` = account + `NamespaceVersion` (the epoch that
   retires an account's whole derived namespace at once, DOM-021).
 - **Appearance keys** (`AppearanceKey`) name one *virtual appearance* of a
@@ -75,17 +76,20 @@ message id: i64), attachment `0x05` (message fields, index: u32), generated
 document `0x06` (chat fields, partition, format, schema family: u16), blob
 `0x07` (account id: i64, hash), folder catalog `0x08` (scope), year
 directory `0x09` (chat fields, year: u16), media directory `0x0a` (chat
-fields, year: u16), appearance `0x10` (list kind, then the wrapped
-canonical key's tag and fields). Scope = account id (i64) + namespace
+fields, year: u16), order document `0x0b` (scope, list kind, schema family:
+u16), appearance `0x10` (list kind, then the wrapped canonical key's tag and
+fields). Scope = account id (i64) + namespace
 version (u32). List kind: Main `0x01`, Archive `0x02`, Folder `0x03` +
 folder id (i32). Partition: chat `0x01`, year `0x02` + u16, month `0x03` +
 u16 + u8. Format: NDJSON `0x01`, Markdown `0x02`, JSON `0x03`. Hash:
 SHA-256 `0x01` + 32 digest bytes.
 
 The directory kinds (`0x08`–`0x0a`) and the JSON format tag were added by
-the virtual tree builder (TASK-260715-3tjduq) in the extension room the v1
-canonical range reserved for it. The additions are purely additive: no
-pre-existing encoding changed, and the original golden fixtures pin that.
+the virtual tree builder (TASK-260715-3tjduq), and the order document
+(`0x0b`) by the ordering projection (TASK-260715-1jmsdp), in the extension
+room the v1 canonical range reserved for them. The additions are purely
+additive: no pre-existing encoding changed, and the original golden fixtures
+pin that.
 
 Every field is fixed-width once its tags are read, so the encoding is a
 prefix code: decoding is deterministic, no valid encoding is a prefix of
@@ -129,6 +133,7 @@ normalized source records into the default layout of
 ```text
 Account/                      canonical account key
   Main/                       canonical chat-list key
+    order.json                canonical order-document key (POL-1)
     Chat/                     appearance (view × canonical chat)
       chat.json               appearance over generated doc (JSON, whole chat)
       messages.ndjson         appearance over generated doc (NDJSON, whole chat)
@@ -137,8 +142,10 @@ Account/                      canonical account key
         media/                appearance over media-directory key
           <attachment files>  appearances over attachment keys
   Archive/
+    order.json
   Telegram Folders/           canonical folder-catalog key
-    <one dir per folder>      canonical chat-list keys (folder kind)
+    <one dir per folder>      canonical chat-list keys (folder kind, each
+                              with its own order.json)
 ```
 
 The model:
@@ -166,8 +173,11 @@ The model:
   constructors cannot express anything else.
 - Display names are raw presentation state in the POL-1 stable form
   (`naming::chat_folder_name`); sanitization and collision suffixing are
-  the `naming` module below, applied by the consumer over a sibling set,
-  and ordering metadata is TASK-260715-1jmsdp.
+  the `naming` module below, applied by the consumer over a sibling set.
+- **Sibling order is not Telegram's order, and no name carries a position**
+  (POL-1, DEC-013). Each list root publishes its exact order as an
+  `order.json` child instead, whose bytes are the `ordering` module's;
+  a reorder rewrites that one document and changes nothing in this tree.
 
 ## Cross-platform naming (SYNC-012, SYNC-013, PLAT-021, POL-1)
 
@@ -204,6 +214,13 @@ mode) and `resolve_siblings` makes a sibling set collision-free.
   on final names, so a title crafted to impersonate another chat's suffixed
   name simply joins the collision set. Escalation ends at the full `ItemId`
   text, which cannot collide.
+- **Fixed names are the one asymmetry** (`SiblingName::fixed`, POL-1). A
+  sibling whose name is GramDrive's own constant rather than a title —
+  `order.json` at a list root — keeps it, and colliding titles yield. The two
+  reasons suffixing is otherwise symmetric do not apply to a constant: it
+  privileges nothing arbitrary, and it cannot be deleted, so no survivor is
+  renamed by its disappearance. Suffixing it would move the name POL-1
+  publishes, or hand a provider two children called `order.json`.
 - **Collisions are folded through every platform, not through one.**
   `Platform::fold` models how each platform decides two names are one entry:
   Windows by NTFS's `$UpCase` (uppercase), Apple by full Unicode case
@@ -230,6 +247,89 @@ invariants over sampled hostile input and, in
 characters the platforms fold differently. The property and corpus suites
 fold by `Platform::fold`, never by the implementation's key — a test that
 folds the way the code folds passes by construction.
+
+## Ordering projection (POL-1, DEC-013, SYNC-011)
+
+The `ordering` module publishes Telegram's exact dialog order as data —
+TASK-260715-1jmsdp. Filesystems sort by name and Telegram does not, so POL-1
+keeps folder names stable and writes the order to `order.json` at each
+chat-list root (Main, Archive, and every custom folder), regenerated on
+reorder events.
+
+- **A reorder is a content change, never a rename.** When only positions
+  change, every `ItemId`, every folder name and every path is untouched; the
+  only thing that changes is the bytes of `order.json`. Nothing is keyed by
+  order, so nothing moves and no cached content is invalidated. A folder name
+  changes on exactly one input: the chat's own title or username changing.
+- **One mode, not two** (DEC-013). The numeric-prefix mode that SYNC-011 and
+  PRD-012 floated (`001 — Alex/`) is out of scope for v1, and is therefore
+  absent rather than present-and-disabled: a mode that ships switched off is
+  untested code that reads as a supported feature. Revisiting it post-v1
+  means a new decision row and a new projection mode, not re-enabling
+  something dormant.
+- **Ordering rule.** Chats sort by `(order, chat_id)` descending — Telegram's
+  own rule for `chatPosition`, and a total order because chat IDs are unique
+  within a list. Total is what makes the document a pure function of the
+  input set: shuffled records render byte-identical bytes, with no tie left
+  for input order to settle. `is_pinned` is recorded but is *not* a sort key;
+  Telegram already encodes pinning in `order`, and sorting by it again would
+  be a second, disagreeing implementation of the server's ranking.
+- **The document names real directories.** Entries carry the sanitized,
+  collision-suffixed name actually projected on disk, resolved over the list
+  root's whole sibling set — including `order.json` itself, which is why the
+  document cannot be shadowed by a chat titled `order.json`.
+- **Identity.** `OrderDocKey` = (chat list, schema family). Keyed by the list
+  it describes, not by the order it records, so a reorder cannot touch it.
+
+### `order.json` schema
+
+Deterministic by construction: fixed field order, no timestamps, no host
+state, no map iteration. Equal projections render byte-identical documents,
+so a sync that changed nothing rewrites nothing.
+
+```json
+{
+  "schema": "gramdrive.order",
+  "schema_family": 1,
+  "list": { "kind": "main" },
+  "chats": [
+    {
+      "rank": 0,
+      "id": "gdaeiacayaaaaaaaaaaavaaaaaaeaaaaaaaaaapuq",
+      "chat_id": 2002,
+      "name": "Alice — @alice",
+      "order": "9223372036854775807",
+      "pinned": true
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema` | Constant `gramdrive.order` — what this file is, for a reader who found it alone |
+| `schema_family` | DOM-023 schema lineage; matches the family in the document's `ItemId` |
+| `list` | `{"kind":"main"}`, `{"kind":"archive"}`, or `{"kind":"folder","folder_id":<i32>}` |
+| `chats[].rank` | 0-based position. **This is the order a reader should use** |
+| `chats[].id` | The chat appearance's `ItemId` text — joins the order to the enumerated tree |
+| `chats[].chat_id` | Telegram chat ID, a JSON number (int53 by Telegram's schema, so no precision loss) |
+| `chats[].name` | The folder name as projected on disk, sanitized and suffixed |
+| `chats[].order` | Telegram's raw rank, **a string** — see below |
+| `chats[].pinned` | Whether the chat is pinned in this list |
+
+`order` is a string because it is an int64 and a JSON number is an IEEE-754
+double to most parsers (JavaScript, `jq`): the top-of-range values Telegram
+gives pinned chats round silently, and two distinct pinned chats can compare
+equal after the round trip. `chat_id` is int53 by Telegram's own schema, where
+no such loss exists, and stays a number. Readers should not need `order` at
+all — `rank` is the resolved answer.
+
+Tests: `tests/ordering_fixture.rs` pins the schema and the acceptance
+criteria by example — a reorder changing metadata only, a rename changing the
+name only, and a chat failing to shadow `order.json`;
+`tests/ordering_properties.rs` proves them over sampled input, including
+titles built to break a JSON writer, and parses the rendered document with an
+independent reader rather than asserting it against a string the writer built.
 
 ## Test command
 

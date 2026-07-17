@@ -43,6 +43,7 @@ fn resolve(siblings: &[(&ItemId, &str, NameKind)]) -> Vec<String> {
             id,
             raw,
             kind: *kind,
+            fixed: false,
         })
         .collect();
     gramdrive_model::naming::resolve_siblings(&inputs)
@@ -299,4 +300,75 @@ fn appearances_of_one_chat_are_named_alike_in_every_view() {
         let names = resolve(&[(&record, "Alex — @alex", NameKind::Directory)]);
         assert_eq!(names[0], name.as_str());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed names (POL-1): GramDrive's own constants outrank titles
+// ---------------------------------------------------------------------------
+
+/// Resolves siblings where the first is fixed and the rest are titles.
+fn resolve_with_fixed(fixed: (&ItemId, &str), rest: &[(&ItemId, &str)]) -> Vec<String> {
+    let mut inputs = vec![SiblingName {
+        id: fixed.0,
+        raw: fixed.1,
+        kind: NameKind::File,
+        fixed: true,
+    }];
+    inputs.extend(rest.iter().map(|(id, raw)| SiblingName {
+        id,
+        raw,
+        kind: NameKind::Directory,
+        fixed: false,
+    }));
+    gramdrive_model::naming::resolve_siblings(&inputs)
+        .into_iter()
+        .map(SafeName::into_string)
+        .collect()
+}
+
+/// A fixed name keeps its spelling and the colliding title yields — the
+/// asymmetry POL-1 needs, and the one exception to symmetric suffixing.
+#[test]
+fn a_fixed_name_is_never_suffixed_and_the_title_yields() {
+    let (doc, chat) = (chat_id(1), chat_id(2));
+    let names = resolve_with_fixed((&doc, "order.json"), &[(&chat, "order.json")]);
+    assert_eq!(names[0], "order.json", "the constant must not move");
+    assert_ne!(names[1], "order.json");
+    assert!(names[1].starts_with("order.json ("), "{names:?}");
+}
+
+/// The fixed name is still resolved case-insensitively: a title that only a
+/// platform's fold merges with it must yield too.
+#[test]
+fn a_fixed_name_wins_against_case_variants() {
+    let (doc, chat) = (chat_id(1), chat_id(2));
+    let names = resolve_with_fixed((&doc, "order.json"), &[(&chat, "ORDER.JSON")]);
+    assert_eq!(names[0], "order.json");
+    assert_ne!(
+        Platform::Apple.fold(&names[1]),
+        Platform::Apple.fold("order.json"),
+        "{names:?}"
+    );
+}
+
+/// A fixed name costs nothing when nothing collides with it.
+#[test]
+fn a_fixed_name_leaves_unrelated_siblings_alone() {
+    let (doc, a, b) = (chat_id(1), chat_id(2), chat_id(3));
+    let names = resolve_with_fixed((&doc, "order.json"), &[(&a, "Alice"), (&b, "Bob")]);
+    assert_eq!(names, ["order.json", "Alice", "Bob"]);
+}
+
+/// Titles that collide with each other *and* with the fixed name all resolve:
+/// the constant stays put, both titles get distinct suffixes.
+#[test]
+fn titles_colliding_with_each_other_and_the_fixed_name_all_resolve() {
+    let (doc, a, b) = (chat_id(1), chat_id(2), chat_id(3));
+    let names = resolve_with_fixed(
+        (&doc, "order.json"),
+        &[(&a, "order.json"), (&b, "order.json")],
+    );
+    assert_eq!(names[0], "order.json");
+    let unique: std::collections::HashSet<&String> = names.iter().collect();
+    assert_eq!(unique.len(), 3, "every name must be distinct: {names:?}");
 }
