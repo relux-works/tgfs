@@ -15,8 +15,11 @@
 //! integrity verification with atomic content-addressed promotion
 //! ([`cache`], TASK-260715-3s6cpe), which layers over
 //! [`transfer::CompleteOutcome::Promoted`] to hash, verify, dedup, and
-//! publish finished bytes into the cache store. Quota accounting and
-//! eviction (TASK-260715-11abx8) build on them.
+//! publish finished bytes into the cache store; and cache accounting, quota
+//! enforcement, and LRU eviction ([`cache::Evictor`], TASK-260715-11abx8),
+//! which govern how much of that cache lives — pinned and Archive-Mode
+//! content quota-exempt, eviction of eligible unpinned content only, never
+//! racing an open read or a live transfer (POL-2, SYNC-050..054).
 //!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - internal dependencies: `gramdrive-model`, `gramdrive-source`,

@@ -163,6 +163,25 @@ pub struct CacheUsage {
     pub total_bytes: u64,
 }
 
+/// Device-wide materialized-cache totals, split by the facts the quota
+/// engine acts on (POL-2, SYNC-050/054). Every field sums `cache_entries`
+/// across every account, because the on-disk cache is one device budget even
+/// though blob identity is account-scoped (DOM-021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheTotals {
+    /// Every materialized byte, pinned or not.
+    pub total_bytes: u64,
+    /// Bytes an explicit pin or Archive-Mode coverage holds: quota-exempt,
+    /// but still counted and surfaced (POL-2).
+    pub pinned_bytes: u64,
+    /// Bytes no pin protects — the figure the quota is measured against.
+    pub unpinned_bytes: u64,
+    /// Bytes eviction can reclaim right now: unpinned *and* verified
+    /// (SYNC-052). A subset of `unpinned_bytes`; the rest awaits hashing or
+    /// repair and is never dropped as space.
+    pub evictable_bytes: u64,
+}
+
 /// One durable pin (POL-2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinRecord {
@@ -304,6 +323,117 @@ impl ReadTxn<'_> {
             });
         }
         Ok(usage)
+    }
+
+    /// Device-wide cache usage by category, summed across every account
+    /// (SYNC-050). The on-disk cache is one device budget, so the quota
+    /// engine needs the global figure the per-account [`ReadTxn::cache_usage`]
+    /// does not give.
+    pub fn cache_usage_by_kind(&self) -> Result<Vec<CacheUsage>, StateError> {
+        let mut statement = self
+            .conn()
+            .prepare_cached("SELECT kind, sum(size) FROM cache_entries GROUP BY kind")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut usage = Vec::new();
+        for row in rows {
+            let (kind, total) = row?;
+            usage.push(CacheUsage {
+                kind: CacheKind::parse(&kind)?,
+                total_bytes: size_from_column("cache_entries", total)?,
+            });
+        }
+        Ok(usage)
+    }
+
+    /// Device-wide materialized-cache totals split by pin and verification
+    /// (POL-2, SYNC-050/054) — the numbers a quota decision is made from in
+    /// one pass over `cache_entries`. `CASE`-form sums so the plan is one
+    /// aggregate scan, portable to any SQLite the toolchain pins.
+    pub fn cache_totals(&self) -> Result<CacheTotals, StateError> {
+        let (total, pinned, unpinned, evictable): (i64, i64, i64, i64) = self
+            .conn()
+            .prepare_cached(
+                "SELECT
+                     coalesce(sum(size), 0),
+                     coalesce(sum(CASE WHEN pinned = 1 THEN size ELSE 0 END), 0),
+                     coalesce(sum(CASE WHEN pinned = 0 THEN size ELSE 0 END), 0),
+                     coalesce(sum(CASE WHEN pinned = 0 AND verification = 'verified'
+                                       THEN size ELSE 0 END), 0)
+                 FROM cache_entries",
+            )?
+            .query_row([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+        Ok(CacheTotals {
+            total_bytes: size_from_column("cache_entries", total)?,
+            pinned_bytes: size_from_column("cache_entries", pinned)?,
+            unpinned_bytes: size_from_column("cache_entries", unpinned)?,
+            evictable_bytes: size_from_column("cache_entries", evictable)?,
+        })
+    }
+
+    /// One page of the eviction scan past a keyset cursor (POL-2,
+    /// SYNC-051/052): eligible rows only — unpinned, verified — in
+    /// `(last_access_at_ms, item_id)` order, so the quota engine can walk the
+    /// LRU frontier in bounded memory instead of loading the whole working
+    /// set. `after` is an exclusive lower bound; `None` starts at the oldest.
+    /// The tuple tiebreak on `item_id` makes pagination stable when several
+    /// entries share a last-access timestamp.
+    pub fn eviction_candidates_after(
+        &self,
+        after: Option<(i64, &ItemId)>,
+        limit: u32,
+    ) -> Result<Vec<EvictionCandidate>, StateError> {
+        let (has_cursor, cursor_access, cursor_item) = match after {
+            Some((access, item)) => (true, access, item.as_bytes().to_vec()),
+            None => (false, 0, Vec::new()),
+        };
+        let mut statement = self.conn().prepare_cached(
+            "SELECT item_id, size, last_access_at_ms FROM cache_entries
+             WHERE pinned = 0 AND verification = 'verified'
+               AND (?1 = 0
+                    OR last_access_at_ms > ?2
+                    OR (last_access_at_ms = ?2 AND item_id > ?3))
+             ORDER BY last_access_at_ms, item_id
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![has_cursor, cursor_access, cursor_item, i64::from(limit)],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (item, size, last_access_at_ms) = row?;
+            candidates.push(EvictionCandidate {
+                item: item_id_from_column("cache_entries", &item)?,
+                size: size_from_column("cache_entries", size)?,
+                last_access_at_ms,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Whether any cache entry still names this on-disk object by its
+    /// `materialization_ref` (SYNC-052 dedup). Content-addressed promotion
+    /// lets several entries — even across accounts — share one object, so
+    /// eviction must never delete the bytes while another entry still needs
+    /// them. Checked *after* a row is deleted to decide if its object became
+    /// an orphan the eviction may reclaim.
+    pub fn materialization_ref_referenced(&self, reference: &str) -> Result<bool, StateError> {
+        let found: Option<i64> = self
+            .conn()
+            .prepare_cached("SELECT 1 FROM cache_entries WHERE materialization_ref = ?1 LIMIT 1")?
+            .query_row(params![reference], |row| row.get(0))
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// One pin by item.

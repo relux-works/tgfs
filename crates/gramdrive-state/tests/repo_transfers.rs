@@ -339,3 +339,88 @@ fn promotion_rechecks_the_content_version_it_pinned() {
     assert_eq!(record.failure_category, None);
     tx.commit().expect("commit");
 }
+
+#[test]
+fn has_live_transfer_reflects_only_live_states() {
+    let mut store = store_with_docs(&[2026]);
+    let item = doc_id(2026);
+
+    let tx = store.write_txn().expect("write");
+    // No transfer yet.
+    assert!(!tx.read().has_live_transfer(&item).expect("live"));
+    // Queued is live.
+    let id = tx
+        .enqueue_transfer(&item, &content_version("v1"), &[range(0, 64)], 0, 1_000)
+        .expect("enqueue")
+        .transfer_id();
+    assert!(tx.read().has_live_transfer(&item).expect("live"));
+    // Running is live.
+    tx.claim_next_transfer(1_100).expect("claim").expect("some");
+    assert!(tx.read().has_live_transfer(&item).expect("live"));
+    // A terminal transfer is not live — eviction may proceed.
+    tx.record_transfer_progress(id, &[range(0, 64)], Some("stage-1"), 1_200)
+        .expect("progress");
+    tx.mark_transfer_done(id, 1_300).expect("done");
+    assert!(!tx.read().has_live_transfer(&item).expect("live"));
+    tx.commit().expect("commit");
+}
+
+#[test]
+fn staged_transfer_bytes_sums_live_completed_ranges_only() {
+    let mut store = store_with_docs(&[2024, 2025, 2026]);
+    let tx = store.write_txn().expect("write");
+    // Nothing staged yet.
+    assert_eq!(tx.read().staged_transfer_bytes().expect("staged"), 0);
+
+    // A running transfer with 48 staged bytes across two ranges.
+    let live = tx
+        .enqueue_transfer(
+            &doc_id(2024),
+            &content_version("v1"),
+            &[range(0, 64)],
+            0,
+            1_000,
+        )
+        .expect("enqueue")
+        .transfer_id();
+    tx.claim_next_transfer(1_100).expect("claim").expect("some");
+    tx.record_transfer_progress(live, &[range(0, 32), range(40, 56)], Some("stage-a"), 1_200)
+        .expect("progress");
+
+    // A suspended transfer with 10 staged bytes still counts (still live).
+    let suspended = tx
+        .enqueue_transfer(
+            &doc_id(2025),
+            &content_version("v1"),
+            &[range(0, 64)],
+            0,
+            1_300,
+        )
+        .expect("enqueue")
+        .transfer_id();
+    tx.claim_next_transfer(1_400).expect("claim").expect("some");
+    tx.record_transfer_progress(suspended, &[range(0, 10)], Some("stage-b"), 1_500)
+        .expect("progress");
+    tx.suspend_transfer(suspended, 1_600).expect("suspend");
+
+    // A terminal transfer's staged bytes are not counted — its staging is
+    // disposed, not cache.
+    let done = tx
+        .enqueue_transfer(
+            &doc_id(2026),
+            &content_version("v1"),
+            &[range(0, 64)],
+            0,
+            1_700,
+        )
+        .expect("enqueue")
+        .transfer_id();
+    tx.claim_next_transfer(1_800).expect("claim").expect("some");
+    tx.record_transfer_progress(done, &[range(0, 64)], Some("stage-c"), 1_900)
+        .expect("progress");
+    tx.mark_transfer_done(done, 2_000).expect("done");
+
+    // 48 (running) + 10 (suspended); the done transfer's 64 excluded.
+    assert_eq!(tx.read().staged_transfer_bytes().expect("staged"), 58);
+    tx.commit().expect("commit");
+}

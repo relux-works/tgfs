@@ -32,7 +32,7 @@ use gramdrive_model::version::ContentVersion;
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::error::StateError;
-use crate::repo::{ReadTxn, WriteTxn, item_id_from_column, ranges};
+use crate::repo::{ReadTxn, WriteTxn, item_id_from_column, ranges, size_from_column};
 
 /// Durable identity of one transfer journal row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -342,6 +342,44 @@ impl ReadTxn<'_> {
             .query_row(params![item.as_bytes(), version.as_str()], read_transfer)
             .optional()?;
         raw.map(finish_transfer).transpose()
+    }
+
+    /// Whether any live transfer (queued, running, or suspended) hydrates
+    /// this item at any version — the interlock the quota engine reads before
+    /// evicting so eviction never races an in-flight hydration (POL-2). The
+    /// item-scoped index answers it without scanning terminal rows.
+    pub fn has_live_transfer(&self, item: &ItemId) -> Result<bool, StateError> {
+        let found: Option<i64> = self
+            .conn()
+            .prepare_cached(
+                "SELECT 1 FROM transfers
+                 WHERE item_id = ?1
+                   AND (state = 'queued' OR state = 'running' OR state = 'suspended')
+                 LIMIT 1",
+            )?
+            .query_row(params![item.as_bytes()], |row| row.get(0))
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Total bytes staged by live transfers (SYNC-050): the sum of every
+    /// completed range across queued/running/suspended rows. These are the
+    /// partial-transfer bytes that occupy disk without being cache — the
+    /// quota engine surfaces them as their own accounting category, never as
+    /// evictable content (cancellation, not eviction, reclaims them). The
+    /// live-transfer partial index drives the scan; `json_each` fans the
+    /// stored `[[start,end],…]` range lists into their spans.
+    pub fn staged_transfer_bytes(&self) -> Result<u64, StateError> {
+        let staged: i64 = self
+            .conn()
+            .prepare_cached(
+                "SELECT coalesce(sum(json_extract(pair.value, '$[1]')
+                                     - json_extract(pair.value, '$[0]')), 0)
+                 FROM transfers t, json_each(t.completed_ranges) AS pair
+                 WHERE t.state = 'queued' OR t.state = 'running' OR t.state = 'suspended'",
+            )?
+            .query_row([], |row| row.get(0))?;
+        size_from_column("transfers", staged)
     }
 }
 

@@ -61,19 +61,46 @@
 //! item at this version is proof the work is already done, so a consumed
 //! staging object is never read a second time.
 //!
-//! # What it does not do
+//! # Quota, pinning, and eviction
 //!
-//! A partial-range transfer streamed its bytes to readers and is not a blob
-//! (domain-model § Blob): promotion reports [`Promotion::NotWholeContent`] and
-//! materializes nothing. Quota accounting, LRU eviction, and disk-full retry
-//! are the neighbouring task's (TASK-260715-11abx8, SYNC-050/054); this module
-//! folds any existing pin onto the row it writes so a pinned item is never
-//! momentarily evictable, and surfaces a host storage refusal as
-//! [`EngineError::Storage`](crate::transfer::EngineError::Storage) for that
-//! layer to act on, but decides no policy.
+//! Promotion writes the cache; [`quota`] governs how much of it may live and
+//! which bytes give way under pressure (TASK-260715-11abx8; POL-2,
+//! SYNC-050..054). A partial-range transfer streamed its bytes to readers and
+//! is not a blob (domain-model § Blob): promotion reports
+//! [`Promotion::NotWholeContent`] and materializes nothing; those staged bytes
+//! are accounted separately ([`CacheAccounting::partial_transfer_bytes`]) and
+//! reclaimed by cancellation, never eviction. Promotion folds any existing pin
+//! onto the row it writes so a pinned item is never momentarily evictable, and
+//! surfaces a host storage refusal as
+//! [`EngineError::Storage`](crate::transfer::EngineError::Storage); the
+//! [`Evictor`] is what turns that signal into reclaimed space.
+//!
+//! * [`Evictor`] — device cache accounting ([`CacheAccounting`], SYNC-050),
+//!   the actionable quota status ([`QuotaAssessment`], SYNC-054), and LRU
+//!   eviction of eligible unpinned content ([`Evictor::enforce`],
+//!   [`Evictor::reclaim`]; POL-2, SYNC-051/052). Eviction never races an open
+//!   read or a live transfer, and deletes an on-disk object only once no
+//!   surviving entry references it (dedup, SYNC-052); the object delete is
+//!   row-before-file, so a crash leaves a reconcilable orphan (SYNC-053).
+//! * [`pin`] / [`unpin`] — durable offline intent folded onto the materialized
+//!   row, with directional origin so a user pin and Archive-Mode coverage do
+//!   not clobber each other (POL-2, SYNC-051/062).
+//!
+//! System/provider eviction — bytes the OS purges out from under a live cache
+//! row — is reconciled by
+//! [`StateStore::reconcile`](gramdrive_state::StateStore::reconcile)
+//! (SYNC-053, TASK-260715-3s6cpe/22fh09); accounting here reads the durable
+//! rows and so assumes a reconciled store.
 
+mod pin;
 mod promote;
+mod quota;
 
+pub use pin::{PinOutcome, pin, unpin};
 pub use promote::{
     Materialization, Promoter, Promotion, PromotionConfig, PromotionHost, PromotionHostError,
+};
+pub use quota::{
+    CacheAccounting, DEFAULT_QUOTA_BYTES, EvictionPlan, EvictionReport, EvictionRequest, Evictor,
+    QuotaAssessment, QuotaPolicy,
 };

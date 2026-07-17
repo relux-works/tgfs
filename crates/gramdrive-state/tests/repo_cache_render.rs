@@ -19,8 +19,8 @@ use gramdrive_state::model::identity::{
 };
 use gramdrive_state::model::version::{ContentVersion, MetadataVersion};
 use gramdrive_state::repo::{
-    CacheEntryRecord, CacheKind, CacheVerification, FileFacts, ItemAvailability, ItemRecord,
-    MessageChange, PinOrigin, RenderOutput,
+    CacheEntryRecord, CacheKind, CacheTotals, CacheVerification, FileFacts, ItemAvailability,
+    ItemRecord, MessageChange, PinOrigin, RenderOutput,
 };
 use gramdrive_state::{StateError, StateStore};
 
@@ -211,6 +211,145 @@ fn accounting_touch_and_state_updates() {
     let by_kind: Vec<(CacheKind, u64)> = usage.iter().map(|u| (u.kind, u.total_bytes)).collect();
     assert!(by_kind.contains(&(CacheKind::GeneratedDoc, 100)));
     assert!(by_kind.contains(&(CacheKind::Thumbnail, 40)));
+}
+
+#[test]
+fn device_wide_totals_split_pins_and_verification() {
+    let mut store = store_with_docs(&[2024, 2025, 2026, 2027]);
+    let unpinned = doc_id(2024);
+    let pinned = doc_id(2025);
+    let unverified = doc_id(2026);
+    let thumb = doc_id(2027);
+
+    let tx = store.write_txn().expect("write");
+    tx.upsert_cache_entry(&entry(&unpinned, 100, 1_000))
+        .expect("entry");
+    let mut record = entry(&pinned, 200, 2_000);
+    record.pin = Some(PinOrigin::User);
+    tx.upsert_cache_entry(&record).expect("entry");
+    let mut record = entry(&unverified, 400, 3_000);
+    record.verification = CacheVerification::Unverified;
+    tx.upsert_cache_entry(&record).expect("entry");
+    let mut record = entry(&thumb, 40, 4_000);
+    record.kind = CacheKind::Thumbnail;
+    tx.upsert_cache_entry(&record).expect("entry");
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    // Device-wide totals split the facts the quota engine reads (SYNC-050/054).
+    assert_eq!(
+        read.cache_totals().expect("totals"),
+        CacheTotals {
+            total_bytes: 100 + 200 + 400 + 40,
+            pinned_bytes: 200,
+            unpinned_bytes: 100 + 400 + 40,
+            // Evictable excludes the pinned entry and the unverified one.
+            evictable_bytes: 100 + 40,
+        }
+    );
+
+    // Global usage by kind sums across accounts (SYNC-050).
+    let by_kind: Vec<(CacheKind, u64)> = read
+        .cache_usage_by_kind()
+        .expect("usage")
+        .iter()
+        .map(|u| (u.kind, u.total_bytes))
+        .collect();
+    assert!(by_kind.contains(&(CacheKind::GeneratedDoc, 100 + 200 + 400)));
+    assert!(by_kind.contains(&(CacheKind::Thumbnail, 40)));
+
+    // An empty cache totals to zero, never an error.
+    let mut empty = StateStore::open_in_memory().expect("open");
+    let read = empty.read_txn().expect("read");
+    assert_eq!(read.cache_totals().expect("totals"), CacheTotals::default());
+}
+
+#[test]
+fn eviction_candidates_page_by_keyset_cursor() {
+    let mut store = store_with_docs(&[2024, 2025, 2026, 2027]);
+    // Distinct access times so the LRU order is unambiguous.
+    let years = [2024, 2025, 2026, 2027];
+    let tx = store.write_txn().expect("write");
+    for (offset, year) in years.iter().enumerate() {
+        let access = 1_000 + offset as i64;
+        tx.upsert_cache_entry(&entry(&doc_id(*year), 10, access))
+            .expect("entry");
+    }
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    // First page of two, oldest first.
+    let first = read.eviction_candidates_after(None, 2).expect("page");
+    assert_eq!(
+        first.iter().map(|c| c.item.clone()).collect::<Vec<_>>(),
+        vec![doc_id(2024), doc_id(2025)]
+    );
+    // The next page continues strictly past the cursor.
+    let cursor = first.last().expect("last");
+    let second = read
+        .eviction_candidates_after(Some((cursor.last_access_at_ms, &cursor.item)), 2)
+        .expect("page");
+    assert_eq!(
+        second.iter().map(|c| c.item.clone()).collect::<Vec<_>>(),
+        vec![doc_id(2026), doc_id(2027)]
+    );
+    // Past the end is empty.
+    let last = second.last().expect("last");
+    assert!(
+        read.eviction_candidates_after(Some((last.last_access_at_ms, &last.item)), 2)
+            .expect("page")
+            .is_empty()
+    );
+}
+
+#[test]
+fn materialization_ref_reference_tracks_shared_objects() {
+    let mut store = store_with_docs(&[2024, 2025]);
+    let a = doc_id(2024);
+    let b = doc_id(2025);
+    // Two entries naming one content-addressed object (dedup, SYNC-052).
+    let tx = store.write_txn().expect("write");
+    let mut record = entry(&a, 100, 1_000);
+    record.materialization_ref = Some("object-shared".to_owned());
+    tx.upsert_cache_entry(&record).expect("entry");
+    let mut record = entry(&b, 100, 2_000);
+    record.materialization_ref = Some("object-shared".to_owned());
+    tx.upsert_cache_entry(&record).expect("entry");
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    assert!(
+        read.materialization_ref_referenced("object-shared")
+            .expect("ref")
+    );
+    assert!(
+        !read
+            .materialization_ref_referenced("object-absent")
+            .expect("ref")
+    );
+    drop(read);
+
+    // Evicting one referrer leaves the object still referenced by the other.
+    let tx = store.write_txn().expect("write");
+    assert!(tx.evict_cache_entry(&a).expect("evict"));
+    tx.commit().expect("commit");
+    let read = store.read_txn().expect("read");
+    assert!(
+        read.materialization_ref_referenced("object-shared")
+            .expect("ref")
+    );
+    drop(read);
+
+    // Evicting the last referrer orphans the object.
+    let tx = store.write_txn().expect("write");
+    assert!(tx.evict_cache_entry(&b).expect("evict"));
+    tx.commit().expect("commit");
+    let read = store.read_txn().expect("read");
+    assert!(
+        !read
+            .materialization_ref_referenced("object-shared")
+            .expect("ref")
+    );
 }
 
 #[test]

@@ -37,7 +37,20 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
   link, all in one transaction. File-before-row ordering makes every crash a
   reconcilable disagreement (orphan object or leaked staging), and the
   content-addressed handle gives idempotent promotion and per-account dedup
-  for free. Whole content only; quota and eviction are TASK-260715-11abx8.
+  for free. Whole content only.
+  The same module's `Evictor` (TASK-260715-11abx8; POL-2, SYNC-050..054) owns
+  cache accounting, quota enforcement, and LRU eviction: device-wide
+  accounting by category including partial transfers (`accounting`), the
+  actionable quota status a change produces (`assess`, SYNC-054), and eviction
+  of eligible unpinned-verified content only (`enforce`, `reclaim`). Pinned
+  and Archive-Mode content is quota-exempt but counted; eviction never races an
+  open read (host-supplied protected set) or a live transfer (durable
+  interlock), and deletes an on-disk object only once no surviving entry
+  references it (dedup), row-before-file so a crash leaves a reconcilable
+  orphan. `cache::pin` / `cache::unpin` fold durable offline intent onto the
+  materialized row with directional origin (a user pin is not downgraded by
+  Archive-Mode coverage). Quota *value* durability is the host's device
+  config; system/provider eviction is reconciled by `StateStore::reconcile`.
 
 ## Ownership
 

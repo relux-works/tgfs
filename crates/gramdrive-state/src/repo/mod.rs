@@ -60,8 +60,8 @@ pub use accounts::RetentionMode;
 pub use accounts::SourceKind;
 pub use attachments::{AttachmentAvailability, AttachmentFacts, AttachmentState, BlobRecord};
 pub use cache::{
-    CacheEntryRecord, CacheKind, CacheUsage, CacheVerification, EvictionCandidate, PinOrigin,
-    PinRecord,
+    CacheEntryRecord, CacheKind, CacheTotals, CacheUsage, CacheVerification, EvictionCandidate,
+    PinOrigin, PinRecord,
 };
 pub use changes::{
     AppliedChanges, ChatSyncRecord, MessageChange, MessageEventKind, MessageEventRecord,
