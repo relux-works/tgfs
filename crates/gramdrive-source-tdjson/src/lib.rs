@@ -28,6 +28,13 @@
 //!   the database-key lifecycle (creation, validated retrieval that fails
 //!   closed, rotation, logout deletion; TASK-260715-2odowl). Secrets are
 //!   redacted from every `Debug`/log form (TASK-260715-1hdnuy).
+//! - [`removal`] — [`AccountRemoval`], the crash-resumable account-removal
+//!   workflow (TASK-260715-wjaux5, SEC-004): the SEC-004 cleanup sequenced
+//!   behind a durable journal, distinguishing Telegram logout
+//!   ([`RemovalMode::RevokeSession`]) from local-only removal
+//!   ([`RemovalMode::LocalOnly`]), idempotent and fail-safe under concurrent
+//!   access. Owns the stages this crate can (session request, on-disk wipe,
+//!   keychain revocation, journal); the engine/state stages it directs.
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
 //!   and tests without the TDLib artifact.
@@ -50,6 +57,9 @@
 //! [`TdError`]: error::TdError
 //! [`MockTdJson`]: mock::MockTdJson
 //! [`AuthMachine`]: auth::AuthMachine
+//! [`AccountRemoval`]: removal::AccountRemoval
+//! [`RemovalMode::RevokeSession`]: removal::RemovalMode::RevokeSession
+//! [`RemovalMode::LocalOnly`]: removal::RemovalMode::LocalOnly
 
 // The only unsafe code is the FFI in `real`, which exists only when the env
 // gate compiles it in; every other build forbids unsafe outright.
@@ -61,6 +71,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod mock;
+pub mod removal;
 pub mod runtime;
 
 mod envelope;
@@ -81,6 +92,9 @@ pub use config::{
     SecretStore, StorageLayout, StoragePolicy, TdlibConfig, set_database_encryption_key_request,
 };
 pub use error::TdError;
+pub use removal::{
+    AccountRemoval, ExportPolicy, RemovalError, RemovalMode, RemovalRequest, RemovalStep,
+};
 pub use runtime::{
     PendingRequest, RuntimeConfig, RuntimeStats, TdClient, TdRuntime, UpdateRecvError, UpdateStream,
 };

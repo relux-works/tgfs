@@ -23,6 +23,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `api` | The two-trait seam: `TdSendApi` (thread-safe: create/send/execute) and `TdReceiveApi` (single-owner: receive takes `&mut self`) |
 | `auth` | `AuthMachine`: the deterministic sans-IO authorization state machine — typed core-facing states/inputs for the phone/code/2FA-password/QR paths, rejection classification with retry advice, unknown TDLib states failing safe as typed `Unsupported` |
 | `config` | `TdlibConfig` and the storage/memory policy: per-account `setTdlibParameters`/`setOption`/`addProxy` request builders, on-disk isolation with a clean logout wipe (`StorageLayout`), and the `SecretSource` keychain seam |
+| `removal` | `AccountRemoval`: the crash-resumable account-removal workflow (SEC-004) — the SEC-004 cleanup sequenced behind a durable journal, distinguishing Telegram logout (`RevokeSession` → `logOut`) from local-only removal (`LocalOnly` → `close`), idempotent per stage and fail-safe under concurrent access |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
@@ -139,6 +140,47 @@ Guarantees the scripted flows pin (`tests/auth_flow.rs`):
   removal's flow (TASK-260715-wjaux5, SEC-004).
 - **Credentials stay redacted.** The login code and 2FA password ride in
   `Secret` (SEC-020): plaintext reaches only the wire request to TDLib.
+
+## The account-removal workflow (`removal`)
+
+`AccountRemoval` (TASK-260715-wjaux5) sequences the SEC-004 cleanup for one
+account as a crash-resumable, idempotent workflow: quiesce transfers →
+terminate the session → wipe the on-disk database and cached exports →
+revoke the keychain key → purge the state rows. It is a driver loop — read
+`next_pending`, perform the stage's effect, durably `complete` it — behind a
+journal written outside the account's own subtree so the wipe cannot delete
+its own progress record; `finalize` removes the journal last, leaving no
+trace.
+
+Layering keeps this crate honest: two stages act on crates above it —
+cancelling transfers/unregistering provider state (`gramdrive-engine`) and
+purging state rows (`gramdrive-state`) — so `SignalQuiesce` and `PurgeState`
+are typed directives the composing caller executes, while the stages this
+crate owns (the session request, the on-disk wipe, keychain revocation, the
+journal) it runs directly.
+
+Guarantees the fixtures pin (`tests/account_removal.rs`):
+
+- **Telegram logout versus local-only removal is explicit.** `RevokeSession`
+  submits `logOut` (Telegram terminates this authorization server-side);
+  `LocalOnly` submits `close` (the server session is left intact, only local
+  state is torn down). Everything after the session step is identical.
+- **A full removal leaves no trace.** After the workflow finishes, a
+  recursive scan of the storage root finds nothing referencing the account —
+  subtree, exports, and journal all gone — while sibling accounts are
+  untouched (per-account isolation).
+- **Partial failure resumes.** Every stage is idempotent (a missing
+  directory, an absent key, an already-closed client are all success), so a
+  crash after an effect but before its record simply re-runs the effect on
+  resume; `AccountRemoval::pending` returns every in-progress removal to
+  finish on restart.
+- **Concurrent access fails safe.** `AccountRemoval::guard_open` refuses
+  (`RemovalError::InProgress`) while a removal is in flight, so a concurrent
+  open never observes a half-wiped account; a second `begin` adopts the
+  in-progress removal rather than racing it.
+- **Cached exports are retained or discarded by explicit choice.**
+  `ExportPolicy::Retain` omits the export-wipe stage entirely; `Discard`
+  removes the registered export directories with everything else.
 
 ## The env gate (`cfg(real_tdjson)`)
 
