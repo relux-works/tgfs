@@ -3,7 +3,28 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-07-18
+
+### 0012 — Review ACCEPTED: reproducible TDLib artifact (TASK-260715-rxjkpi → done)
+- DECISION: accepted. Read-only review; gates + artifact re-run independently, not trusted from the results doc.
+- FINDING: `make check` 8/8 reproduced (toolchain/format/lint/test/architecture/supply-chain/traceability/scripts); 20 new faked-subprocess self-tests pass in the repo gate `scripts` step.
+- FINDING: artifact proven end-to-end on my run — `shasum -c CHECKSUMS.sha256` OK (5/5); dylib sha256 on disk == `manifest.json` == `make tdlib-verify` digest (`1735ce83…`); `otool -D` = `@rpath/libtdjson.dylib`; `make tdlib-smoke` links `-ltdjson` and reads `TDLib version: 1.8.66` out of the live library.
+- FINDING: spec fit confirmed — POL-5/DEC-017 fix v1 at macOS 14+ arm64 (so macOS-only scope is spec-correct, not a forced fit); NFR-052 asks for commit-attributability + SBOM (satisfied); POL-6 explicitly permits BSL-1.0 (staged `LICENSE_1_0.txt` is genuine Boost 1.0). `link-smoke` absent from workspace metadata → libtdjson never leaks into `cargo build --workspace`.
+- NOTE: no defects. Build artifacts (`link-smoke/target`, `__pycache__`, `.temp/tdlib`) all gitignored; no workspace crate touched. Downstream static-OpenSSL/notarization (TASK-260715-3bhbkv) and wrapper consumption (TASK-260715-2ulon7) correctly out of scope.
+- STATUS: done.
+
 ## 2026-07-17
+
+### 2359 — Reproducible TDLib tdjson artifact lands (TASK-260715-rxjkpi → to-review)
+- MILESTONE: `.scripts/tdlib/build_tdlib.py` (`make tdlib`) fetches pinned TDLib, builds `libtdjson.dylib` + C headers, stages `manifest.json` + `CHECKSUMS.sha256`, proves it with a Rust link smoke. Built for real: TDLib **1.8.66**, dylib 23,661,456 B, macos-arm64. `make check` 8/8 (new self-tests included).
+- DECISION (pin a commit, not a tag): TDLib's last git tag `v1.8.0` is from 2022 while the lib is on 1.8.66; the ecosystem pins commits. Pinned `022d60202e446ad1287b9fb68e687c8a0760788b` (tdlib/td master, resolved 2026-07-17) in one constant `TDLIB_COMMIT`. Bumping = edit that + rebuild.
+- DECISION (build only the `tdjson` shared target): it links every TDLib sub-lib into itself and exports only the C JSON interface → single self-contained dylib; skips the CLI examples/static libs → short build, small tree. Public headers = 2 source (`td_json_client.h`, `td_log.h`) + cmake-generated `tdjson_export.h`.
+- DECISION (link-smoke crate is NOT in the gramdrive workspace): `.scripts/tdlib/link-smoke/` carries its own `[workspace]` table so `cargo build --workspace` / `make check` never link libtdjson — same isolation the reserved `gramdrive-source-tdjson` keeps. Gate stays green without the artifact, Xcode, or network; only the faked-subprocess self-test runs there.
+- FINDING (version read from the running library, per packaging philosophy): smoke calls `td_execute`/`td_create_client_id`/`td_send`/`td_receive`, reads `getOption "version"` (answered pre-auth, no api_id/network) → prints `TDLib version: 1.8.66`, which the pipeline records as `runtime_version`. Deprecated `td_json_client_create/destroy` are referenced (addresses printed) for link proof only — TDLib forbids mixing the two client interfaces in one process, so they are not called against the live modern scheduler.
+- FINDING (reproducibility scoped honestly, NFR-052): guarantee is *attributability* — pinned commit + recorded toolchain (cmake/clang/OpenSSL 3.6.3/zlib 1.2.12/gperf) + checksums + `otool -L` linkage (openssl@3, libz, libc++, libSystem). Byte-identical rebuild pursued same-machine (Release, `-ffile-prefix-map`, `ZERO_AR_DATE`, ld64 content-hashed LC_UUID); `make tdlib-verify` = 2 clean builds compared. Manifest `path_independent` is *derived* from `clean_build_tree` ∧ remap, not asserted. Cross-machine identical bytes NOT claimed.
+- SCOPE: new `.scripts/tdlib/{build_tdlib.py,README.md,link-smoke/}`, `.scripts/tests/test_build_tdlib.py` (20 tests, in `repo` gate), `Makefile` (+`tdlib`, `tdlib-smoke`, `tdlib-verify`). No gramdrive crate touched; zero new workspace deps. Output under gitignored `.temp/tdlib/`.
+- NOTE (downstream, not this task): dylib links OpenSSL/zlib dynamically (brew absolute install names). Self-contained/static-OpenSSL bundling + notarization/signing belong to the release-signing task (TASK-260715-3bhbkv). The tdjson wrapper (TASK-260715-2ulon7) consumes this artifact via `GRAMDRIVE_TDLIB_ARTIFACT_DIR` + rpath.
+- STATUS: to-review.
 
 ### 2359 — Review ACCEPTED: incremental render planner (TASK-260715-22l8zy → done; STORY-260715-1oq9jg → done)
 - VERDICT: accepted. Read-only review of the full change set (`render_plan/{mod,catalog,plan}.rs`, `tests/render_plan.rs`, hoisted `civil.rs`, engine/render wiring + READMEs). Gates re-run independently, not trusted from the results doc: `make check` 8/8, `cargo test -p gramdrive-engine --test render_plan` 11/11, `cargo test -p gramdrive-render` 14/14, clippy clean.

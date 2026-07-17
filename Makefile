@@ -11,7 +11,7 @@
 GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings \
-        package package-reproducible clean-gates
+        package package-reproducible tdlib tdlib-smoke tdlib-verify clean-gates
 
 # check — the pre-push gate: everything CI runs.
 check:
@@ -85,6 +85,37 @@ package:
 # the check behind it, and a check that does not vary the path cannot falsify it.
 package-reproducible:
 	python3 .scripts/packaging/build_core_artifacts.py --check-reproducible
+
+# --- TDLib artifact ----------------------------------------------------------
+# The pinned tdjson library GramDrive's local Telegram source links against.
+# Not a gate target and deliberately not a step of `check`: it needs a macOS
+# arm64 host with Xcode, cmake, gperf and OpenSSL, and a from-source C++ build,
+# and it produces an artifact rather than a pass/fail on the source. Same
+# reasoning as `package` above; CI runs it as its own job. Like `package`, it
+# invokes the script directly rather than through $(GATE) — the script writes a
+# stronger, purpose-built provenance record (manifest.json: pin, toolchain,
+# checksums; NFR-052), and routing it through the gate would add a second,
+# weaker record of the same run. The faked-subprocess self-tests DO run in the
+# `repo` gate suite, so `make check` covers the pipeline without Xcode or a
+# network. Pipeline and layout: .scripts/tdlib/README.md.
+
+# tdlib — fetch the pinned TDLib, build libtdjson.dylib + headers, stage the
+# manifest and checksums, and prove it with the Rust link smoke. Output:
+# .temp/tdlib/out/.
+tdlib:
+	python3 .scripts/tdlib/build_tdlib.py
+
+# tdlib-smoke — re-run only the Rust link smoke against an already-staged
+# artifact (links libtdjson, calls the C JSON interface, prints the version).
+tdlib-smoke:
+	GRAMDRIVE_TDLIB_ARTIFACT_DIR="$(CURDIR)/.temp/tdlib/out" \
+		cargo run --quiet --release --manifest-path .scripts/tdlib/link-smoke/Cargo.toml
+
+# tdlib-verify — build the library twice from a clean build tree and compare
+# bytes. The manifest's path_independent claim is only worth the check behind
+# it; same-machine reproducibility is what CI caching depends on.
+tdlib-verify:
+	python3 .scripts/tdlib/build_tdlib.py --verify
 
 # clean-gates — drop local gate provenance under .temp/acceptance/.
 clean-gates:

@@ -1,0 +1,24 @@
+# Link smoke test for the pinned TDLib tdjson artifact.
+#
+# This crate is DELIBERATELY NOT a member of the gramdrive workspace. It carries
+# its own empty [workspace] table so cargo treats it as a standalone root and
+# never attaches it to the parent at ../../.. -- linking libtdjson must not leak
+# into `cargo build --workspace` / `make check`, which run on machines that
+# never built the artifact (same isolation the reserved gramdrive-source-tdjson
+# crate keeps). It is built and run only by .scripts/tdlib/build_tdlib.py and the
+# `make tdlib-smoke` target, against a staged artifact.
+[workspace]
+
+[package]
+name = "tdlib-link-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tdlib-link-smoke"
+path = "src/main.rs"
+
+[profile.release]
+# Nothing here ships; keep the build fast.
+opt-level = 0

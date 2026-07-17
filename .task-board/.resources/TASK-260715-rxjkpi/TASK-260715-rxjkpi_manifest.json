@@ -1,0 +1,75 @@
+{
+  "artifacts": {
+    "files": {
+      "LICENSE_1_0.txt": {
+        "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+      },
+      "include/td/telegram/td_json_client.h": {
+        "sha256": "cdf6190b0264417c69c108d192d1f3381f3a1315ddb309798dbefc5036be1eb3"
+      },
+      "include/td/telegram/td_log.h": {
+        "sha256": "9406cfecb3bce67c12b24fee5d2b763c33493add92945709b2f4294061dfd91b"
+      },
+      "include/td/telegram/tdjson_export.h": {
+        "sha256": "684784987a4105e4bb3ec14cecce9d198668b7782336a060f47d132c13b61168"
+      },
+      "lib/libtdjson.dylib": {
+        "sha256": "1735ce834e68fac6c8d546d4808b58c41ca6b291625bf043239d28f9e9976eac"
+      }
+    },
+    "library": {
+      "bytes": 23661456,
+      "install_name": "@rpath/libtdjson.dylib",
+      "path": "lib/libtdjson.dylib",
+      "sha256": "1735ce834e68fac6c8d546d4808b58c41ca6b291625bf043239d28f9e9976eac"
+    },
+    "total_bytes": 23676700
+  },
+  "generated_for_source_date": "2026-07-17T23:39:54+04:00",
+  "gramdrive": {
+    "commit": "2df21848742afe5a7e8acb09603221dd2732b2fc",
+    "describe": "2df2184-dirty",
+    "worktree_clean": false
+  },
+  "license": {
+    "file": "LICENSE_1_0.txt",
+    "id": "BSL-1.0"
+  },
+  "linkage": [
+    "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+    "/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib",
+    "/usr/lib/libz.1.dylib",
+    "/usr/lib/libc++.1.dylib",
+    "/usr/lib/libSystem.B.dylib"
+  ],
+  "reproducibility": {
+    "build_type": "Release",
+    "clean_build_tree": false,
+    "deterministic_archives": true,
+    "path_independent": false,
+    "remapped_to": "/tdlib"
+  },
+  "schema": "tdlib-artifact/1",
+  "target": {
+    "arch": "arm64",
+    "label": "macos-arm64",
+    "macosx_deployment_target": "14.0"
+  },
+  "tdlib": {
+    "commit": "022d60202e446ad1287b9fb68e687c8a0760788b",
+    "repo": "https://github.com/tdlib/td.git",
+    "runtime_version": "1.8.66",
+    "source_version": "1.8.66"
+  },
+  "tool": "build_tdlib.py",
+  "toolchain": {
+    "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+    "cc": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "cmake": "cmake version 4.2.1",
+    "gperf": "GNU gperf 3.0.3",
+    "openssl": "OpenSSL 3.6.3 9 Jun 2026 (Library: OpenSSL 3.6.3 9 Jun 2026)",
+    "openssl_root": "/opt/homebrew/opt/openssl@3",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "zlib": "1.2.12"
+  }
+}
