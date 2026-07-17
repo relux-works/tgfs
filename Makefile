@@ -10,7 +10,8 @@
 
 GATE := python3 .scripts/acceptance/run_automated.py
 
-.PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings clean-gates
+.PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings \
+        package package-reproducible clean-gates
 
 # check — the pre-push gate: everything CI runs.
 check:
@@ -58,6 +59,32 @@ bindings:
 # kotlinc, java; see .scripts/smoke/run_bindings_smoke.py).
 smoke-bindings:
 	python3 .scripts/smoke/run_bindings_smoke.py
+
+# --- Artifact packaging ------------------------------------------------------
+# Not gate targets, and deliberately not steps of `check`: they need Xcode and a
+# release build, and they produce artifacts rather than a pass/fail on the
+# source. Same reasoning as smoke-bindings above; CI runs them as their own job.
+#
+# These invoke the packaging script directly rather than through $(GATE). The
+# gate entrypoint exists to give a check run attributable provenance, and the
+# packaging script already writes a stronger, purpose-built record of exactly
+# that kind — manifest.json with commit, toolchain versions, sizes and
+# checksums (NFR-052). Routing it through the gate would add a second, weaker
+# provenance record of the same run, which is the drift the one-entrypoint rule
+# is there to prevent.
+
+# package — build the artifacts native consumers ship against: the XCFramework,
+# the generated Swift bindings, the manifest and the checksums, then prove them
+# by resolving and running a real minimal Swift package against the result.
+# Output: .temp/packaging/ (pipeline and layout: .scripts/packaging/README.md).
+package:
+	python3 .scripts/packaging/build_core_artifacts.py
+
+# package-reproducible — build the shipped library at two different paths from
+# clean and compare bytes. The manifest's path_independent claim is only worth
+# the check behind it, and a check that does not vary the path cannot falsify it.
+package-reproducible:
+	python3 .scripts/packaging/build_core_artifacts.py --check-reproducible
 
 # clean-gates — drop local gate provenance under .temp/acceptance/.
 clean-gates:

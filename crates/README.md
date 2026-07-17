@@ -124,23 +124,26 @@ it deviates from a default:
 | `rustfmt.toml` | Formatting. Stable options only — a nightly option would need `cargo +nightly fmt`, defeating the pin |
 | `clippy.toml` | Clippy knobs with no manifest equivalent (test-only exemptions for `unwrap`/`expect`/`panic`) |
 | `Cargo.toml` `[workspace.lints]` | Lint **levels**. In the manifest rather than a CI flag, so an editor running clippy on save shows the same verdict as the gate. Each crate opts in with `[lints] workspace = true`; the architecture check fails a crate that forgets, because the failure is otherwise silent |
-| `Cargo.toml` `[profile.*]` | Build profiles. `overflow-checks` stays on in release (offset and quota arithmetic that wraps is a silent data error, NFR-012); `panic = "unwind"` is required — UniFFI turns panics into FFI errors via `catch_unwind`, and `abort` would crash the host app. `lto = "thin"` is set but **inert for `gramdrive-ffi`** — see below |
+| `Cargo.toml` `[profile.*]` | Build profiles. `overflow-checks` stays on in release (offset and quota arithmetic that wraps is a silent data error, NFR-012); `panic = "unwind"` is required — UniFFI turns panics into FFI errors via `catch_unwind`, and `abort` would crash the host app. `lto = "thin"` reaches the shipped `gramdrive-ffi` artifact only via packaging's crate-type override — see below |
 | `deny.toml` | Supply chain: POL-6 licenses, RustSec advisories, bans, sources |
 
 `python3 .scripts/check_toolchain.py` asserts the pin is actually in effect.
 rust-toolchain.toml only binds when rustup drives cargo; a distro rustc or a
 container with a baked-in toolchain ignores it and still prints "Finished".
 
-**Known gap — release LTO does not reach the shipped artifact.** Cargo omits
+**Release LTO reaches the shipped artifact only through packaging.** Cargo omits
 `-C lto` from any rustc invocation that also produces an rlib, since rustc
 cannot LTO an rlib output. `gramdrive-ffi` is `crate-type = ["lib", "staticlib",
-"cdylib"]` — the rlib serves the Windows CfAPI and Linux FUSE hosts — so its
-dylib and static library link **without** LTO, silently. `lto = "thin"` in
-`[profile.release]` therefore applies to nothing that ships today. Splitting the
-rlib into its own crate would fix it and is an architecture change (this
-document's crate table); which artifact actually ships is
-TASK-260715-3akqs8 (packaging). Until one of those resolves it, do not read
-`lto = "thin"` as a statement about the binary in a release.
+"cdylib"]` — the rlib serves the Windows CfAPI and Linux FUSE hosts — so a plain
+`cargo build --release` of it links **without** LTO, silently.
+
+Resolved by TASK-260715-3akqs8 without an architecture change: the packaging
+pipeline builds the shipped library with `cargo rustc --crate-type staticlib`,
+which emits only the type that ships and restores `-C lto=thin`
+(`.scripts/packaging/README.md`). Splitting the rlib into its own crate is
+therefore unnecessary. The consequence to keep in mind: `lto = "thin"` is a
+statement about `make package` output, not about an ad-hoc
+`cargo build --release`.
 
 Bumping Rust means changing `channel` in `rust-toolchain.toml` and
 `workspace.package.rust-version` in `Cargo.toml` together — the check fails if

@@ -98,17 +98,19 @@ debug-assertions = true
 # Cross-crate inlining across the seven crates at a fraction of "fat" LTO's
 # link time.
 #
-# CAVEAT — this currently does nothing for the artifact that ships. Cargo omits
-# `-C lto` when a single rustc invocation also produces an rlib, because rustc
-# cannot LTO an rlib output. gramdrive-ffi is `crate-type = ["lib", "staticlib",
-# "cdylib"]` (rlib for the Windows/Linux hosts, staticlib/cdylib for UniFFI), so
-# its dylib links without LTO and cargo says nothing about it. Verified by
-# building with and without "lib" in the set: `-C lto=thin` appears only without.
+# Cargo omits `-C lto` when a single rustc invocation also produces an rlib,
+# because rustc cannot LTO an rlib output. gramdrive-ffi is `crate-type =
+# ["lib", "staticlib", "cdylib"]` (rlib for the Windows/Linux hosts,
+# staticlib/cdylib for UniFFI), so a plain `cargo build` of it links without LTO
+# and cargo says nothing about it.
 #
-# The setting stays because it is right for every crate-type that does link, and
-# becomes live as soon as the shipped artifact's crate-type is settled — which
-# belongs to TASK-260715-3akqs8 (packaging), not here. Splitting the rlib out
-# into its own crate would work but is an architecture change (crates/README.md).
+# SETTLED (TASK-260715-3akqs8): the packaging pipeline builds the shipped
+# library with `cargo rustc --crate-type staticlib`, which emits only the type
+# that ships and restores the setting — verified: `-C lto=thin` appears in the
+# rustc invocation only with that override. So this is live for the artifact,
+# and inert for the debug/test builds that never ship. No architecture change
+# was needed: the crate keeps every crate-type its consumers need, and packaging
+# asks for the one it ships (.scripts/packaging/README.md).
 lto = "thin"
 codegen-units = 1
 

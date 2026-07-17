@@ -103,6 +103,29 @@ additionally needs `swiftc` (Xcode command line tools), `kotlinc`
 its two JVM runtime jars (JNA, kotlinx-coroutines) from Maven Central once,
 pinned by version and sha256 in the runner script.
 
+### Packaging the core for native consumers
+
+```sh
+make package               # build + verify the artifacts native hosts consume
+make package-reproducible  # build the shipped library at two paths, compare bytes
+```
+
+`make package` produces a self-contained SwiftPM package in `.temp/packaging/`:
+`GramDriveCore.xcframework` (macOS 14+ arm64 static library plus headers), the
+generated Swift bindings, a manifest, and checksums — then proves it by
+resolving and running a real minimal Swift package against the result. Needs
+Xcode (`xcodebuild`, `swift`); like the smoke it is not part of `make check`,
+because it needs a release build and produces artifacts rather than a verdict on
+the source.
+
+Per platform: **macOS** consumes the XCFramework; **Windows and Linux** consume
+the `gramdrive-ffi` crate directly as a Rust dependency and need no artifact at
+all (which is why the crate keeps its rlib crate-type); **Android** (`.so` +
+Kotlin) and **iOS** slices are deferred until those platforms enter scope
+(POL-5/DEC-017), not stubbed — a build path nothing runs is a build path that
+rots. Full rationale, the measured reproducibility and size numbers, and the
+crate-type and debug-info decisions: [`.scripts/packaging/README.md`](.scripts/packaging/README.md).
+
 Available utilities:
 
 | Tool | Purpose | Run | Output |
@@ -118,3 +141,4 @@ Available utilities:
 | `.scripts/tests/` | Self-tests for the gate scripts themselves — an untested runner is a gate with no gate | `python3 -m unittest discover -s .scripts/tests -t .scripts/tests`, or the `scripts` gate step | Standard unittest output |
 | `uniffi-bindgen` (workspace-local, `crates/gramdrive-ffi/src/bin/`) | Generates Swift + Kotlin bindings from the compiled library, version-locked to the linked `uniffi` crate; pipeline documented in `crates/gramdrive-ffi/README.md` | `make bindings`, or `cargo run -p gramdrive-ffi --features bindgen --bin uniffi-bindgen -- generate --library target/debug/libgramdrive_ffi.dylib --language swift --language kotlin --out-dir .temp/bindings` | Generated sources in `.temp/bindings/` (build artifacts, never committed) |
 | `.scripts/smoke/run_bindings_smoke.py` | End-to-end bindings smoke: builds the FFI library, generates bindings, compiles and runs the Swift and Kotlin smoke consumers (`.scripts/smoke/{swift,kotlin}/`) asserting async, progress, error, and cancellation round-trips | `make smoke-bindings`, or `python3 .scripts/smoke/run_bindings_smoke.py [--skip-swift] [--skip-kotlin]` (needs `swiftc`, `kotlinc`, `java`) | Exit 0 + `BINDINGS SMOKE PASSED`, or non-zero with the failing step's log; artifacts and per-step logs in `.temp/bindings-smoke/` |
+| `.scripts/packaging/build_core_artifacts.py` | Builds what native consumers ship against: release staticlib (LTO restored via a crate-type override), Swift bindings generated from that exact binary, XCFramework, manifest (contract version read from the built artifact, `git describe`, toolchain), checksums, and a deterministic zip; verifies it all by resolving and running a real minimal SwiftPM package (`.scripts/packaging/swift-consumer/`). Owns the shipped-target list | `make package`, `make package-reproducible`, or `python3 .scripts/packaging/build_core_artifacts.py [--skip-verify] [--check-reproducible]` (macOS; needs `xcodebuild`, `swift`) | Exit 0 + `PACKAGING PASSED`, or non-zero with the failing step's log; artifacts, `manifest.json`, `CHECKSUMS.sha256` and per-step logs in `.temp/packaging/` |

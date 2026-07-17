@@ -5,6 +5,87 @@
 
 ## 2026-07-17
 
+### 0616 — `cargo clean -p` and artifact uplift silently fake a "rebuild" measurement (TASK-260715-3akqs8, review)
+- FINDING: measuring build reproducibility by hand has two traps that both return a *stale* digest from a command that exits 0 and looks like it built. Hit both while verifying 0552.
+- FINDING: `cargo clean -p <crate>` **without `--target <triple>`** does not clean the cross-target directory. A `clean -p` + `cargo rustc --target …` cycle finished in 0.36s and reported the pre-existing artifact's digest.
+- FINDING: deleting the `.a` from `target/<triple>/release/` does not force a rebuild either. Cargo keeps the real artifact in `deps/` and hardlinks ("uplifts") it into `release/`, so the next build re-uplifts in 0.03s with no `Compiling` line.
+- NOTE: to genuinely recompile one crate inside an otherwise-populated target dir: `cargo clean -p <crate> --target <triple> --release`, then assert `Compiling <crate>` actually appears in cargo's stderr. Timing alone is the cheapest tell — an LTO staticlib build here is ~25s; anything under a second did not happen.
+- NOTE: this is why 0552's `cargo clean -p` framing understates the old check's weakness — a same-path `clean -p` + rebuild may not have rebuilt at all.
+- SCOPE: `.task-board/.resources/TASK-260715-3akqs8/TASK-260715-3akqs8_reviewer-measurements.py` (evidence).
+
+### 0615 — 0552 independently confirmed; a reused target dir is unstable, not just different (TASK-260715-3akqs8, review)
+- FINDING: **confirms 0552, refutes 0542.** Independent re-measurement driving the pipeline's own `build_env()`/`cargo_staticlib_argv()`: at the *exact main-checkout path* 0542 attributed `bab48d50…` to, a clean build produces `110b1b9a…` — identical to both staged paths and to the library inside the shipped XCFramework. The checkout path and the target-dir path are both measured non-variables.
+- FINDING: **new, strengthens 0553.** A polluted target dir does not yield a second *stable* value. Forced genuine rebuild (`Compiling` confirmed) in the repo's `target/` produced `a098d5f5…` — a **third** digest, neither `110b1b9a…` nor 0542/0552's `bab48d50…`; the pollution state had drifted in between. Reuse makes the bytes *unpredictable*; a clean target dir is stable at `110b1b9a…` everywhere.
+- NOTE: the two polluted digests share size 7,920,568 B, distinct from the clean build's 7,920,584 B — a coherent signature of the LTO delta.
+- NOTE: consequence — the dedicated wiped target dir (0553) is better justified than its own write-up claims. `.scripts/packaging/README.md` and `build_slices`'s docstring frame reuse as producing `bab48d50…`; "a reused target directory makes the bytes unpredictable" is truer and a stronger argument. No action taken (docs' conclusion unaffected).
+- FINDING: doc accuracy — `.scripts/packaging/README.md:144` cites zip `a3e976af…`; actual is `619a82df…` (stable across two full runs). The *property* (two runs identical) verified true. The value is inherently ephemeral: the zip contains the manifest, which embeds `git.describe` and `worktree_clean`, so any absolute zip sha there goes stale on the next commit. Recommend dropping the number rather than updating it.
+- STATUS: resolved — task accepted → `done`. `make check` 8/8, 113 script tests, `make package` + Swift consumer + `make smoke-bindings` all green.
+
+### 0552 — The reproducibility variable is target-dir reuse, not the checkout path (TASK-260715-3akqs8, rework)
+- FINDING: **corrects 0542 below.** The shipped (LTO) library *is* path-independent. Measured, clean builds of identical source: `110b1b9a…` at three different paths (`.temp/…/repro/a`, `.temp/…/repro/b-considerably-longer-path-name`, `/private/tmp/gramdrive-core-build`), across two different target-dir paths and two different `CARGO_HOME`s. Path, target path and `CARGO_HOME` are all measured non-variables.
+- ROOT CAUSE: the real variable is **prior state in the target directory**. Same path (main checkout), only target state varying: existing `target/` + `cargo clean -p` → `bab48d50…` (7,920,568 B); fresh target dir → `110b1b9a…` (7,920,584 B). The main checkout's `target/` carries 547 dep artifacts, an `incremental/` dir, and a stale rlib/dylib from earlier plain `cargo build` runs.
+- ANOMALY: 0542's experiment confounded two variables — its "main checkout" build reused the polluted `target/` while its "other path" build was a fresh checkout with a fresh target. The observed symptom was real and reproducible; the attribution to path was not. `110b1b9a…` is the clean-build value *everywhere*, including at the main checkout.
+- FINDING: 0542's LLVM analysis holds as far as the symptom goes — sole delta is `.llvm.<hash>` local-symbol suffixes (399 members, identical names, identical symbol count 3896, rustc's own mangled hashes byte-identical). But `--remap-path-prefix` not reaching LLVM module IDs is not what produced it here, since the path never moved the bytes.
+- NOTE: general lesson, stronger than 0542's — vary **one** axis at a time. A two-variable experiment cannot attribute a difference to either. Both 0542 and this entry measured the same true numbers and drew opposite conclusions from them.
+- NOTE: consequence — `cargo clean -p <crate>` is *not* a clean build. It drops the crate's own artifacts and leaves every dependency, which is exactly the state that moves the bytes.
+- SCOPE: `.temp/TASK-260715-3akqs8/repro-experiment.sh`, `.temp/TASK-260715-3akqs8/repro-q4.sh` (evidence).
+- STATUS: resolved — see 0553.
+
+### 0553 — Shipped library builds in a dedicated target dir, wiped per run (TASK-260715-3akqs8)
+- DECISION: keep the LTO override (0526) and keep `path_independent: true` — 0552 measured it true. The fix is to make it true *by construction*: the shipped staticlib is built with `CARGO_TARGET_DIR=.temp/packaging/target`, wiped before the build, so the artifact cannot inherit whatever a dev's `target/` accumulated.
+- DECISION: `path_independent` is no longer a hardcoded literal — it is computed from the procedure the run actually performed (`clean_target_dir and remapped_prefixes`), so a future `--reuse-target`-style change flips it to `false` instead of lying.
+- DECISION: packaging and `--check-reproducible` share one build procedure. A check whose procedure differs from the shipped build's does not cover the shipped artifact — the exact defect 0542 found in the old same-path check.
+- FIX: `--check-reproducible` now stages the build inputs to **two different paths** and builds each from clean, so the check varies the axis the claim is about.
+- NOTE: bindgen (`cargo run --features bindgen`) deliberately stays on the repo's default `target/` — it is a host tool, not shipped, and keeping it out of the packaging target dir is what keeps that dir single-purpose.
+- SCOPE: `.scripts/packaging/build_core_artifacts.py`, `.scripts/tests/test_build_core_artifacts.py`.
+
+### 0542 — ThinLTO defeats path-independent builds; `--remap-path-prefix` does not reach LLVM module IDs (TASK-260715-3akqs8, review)
+- NOTE: **superseded by 0552** — the finding below attributes to checkout path a difference that is caused by target-dir reuse. Numbers are correct; attribution is not. Kept for the record.
+- FINDING: **corrects 0530 below.** The shipped (LTO) library is *not* path-independent. Byte-identical source (`crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` diffed identical), only checkout path varying: `bab48d50…` at the main checkout vs `110b1b9a…` elsewhere. Deterministic, not flaky — rebuild from clean at the second path reproduced `110b1b9a…`.
+- ROOT CAUSE: `--remap-path-prefix` rewrites **debug info only**. ThinLTO derives its `.llvm.<hash>` local-symbol suffixes from the LLVM module identifier — the on-disk bitcode path — which is never remapped. Sole delta between the two archives: those suffixes (399 members, identical names; `strings` diff shows nothing else).
+- FINDING: the two "settled" decisions interact. The `--crate-type staticlib` override added in **0526** to restore `lto = "thin"` is precisely what broke the path-independence claimed in **0530**. Control: plain no-LTO build = `3a58076b…` at *both* paths. LTO on → path-dependent; LTO off → path-independent.
+- FINDING: `check_reproducible()` builds twice at the **same path**, so it observes determinism and time-independence (both real) but structurally cannot see path-independence — the one property `gramdrive-core-manifest.json` asserts (`path_independent: true`, hardcoded literal). That is why the false claim survived to review.
+- NOTE: time-independence is genuinely solid — an independent run at a different wall-clock reproduced the zip `fb36923d…` to the byte. Only the *path* axis is broken.
+- NOTE: general lesson — a reproducibility check must vary the axis it claims to control. Same-path-twice cannot falsify a cross-path claim.
+- SCOPE: `.scripts/packaging/build_core_artifacts.py:134` (`remap_rustflags`), `:765` (`check_reproducible`), `Cargo.toml` `[profile.release]`.
+- STATUS: pending — task routed to `to-dev`. Options: keep LTO and make `path_independent` a measured field; keep LTO and build from a canonical fixed path; or drop the LTO override. Whichever: `--check-reproducible` must build at two different paths.
+
+### 0533 — Artifact packaging landed: XCFramework + SwiftPM package, reproducible and self-reporting (TASK-260715-3akqs8)
+- MILESTONE: `make package` builds the artifact native hosts consume — `GramDriveCore.xcframework` (macos-arm64 staticlib + headers), Swift bindings generated from that exact binary, manifest, checksums, deterministic zip — and proves it by resolving and running a real minimal SwiftPM package (`.scripts/packaging/swift-consumer/`) that calls `probe_transfer`: 100 bytes, progress `[40, 80, 100]`.
+- DECISION: the manifest's contract version is read from the built binary **by running it** (verifier prints JSON, pipeline records it), never parsed from Rust source — a manifest cannot claim a contract the binary does not implement. Same principle as UniFFI library mode: the binary is the source of truth.
+- FINDING: `uniffi-bindgen --library` accepts the release **staticlib** directly, so one build is both the shipped artifact and the bindings source. No dylib-vs-staticlib skew possible.
+- DECISION: packaging is not a step of `make check` (needs Xcode + release build, produces artifacts not a verdict) and invokes the script directly rather than via the gate entrypoint — the script already writes a stronger purpose-built provenance record (manifest: commit, toolchain, sizes, checksums, NFR-052); routing it through the gate would add a second weaker record of the same run.
+- FINDING: the artifact directory name is load-bearing — SwiftPM derives a path dependency's package identity from the directory name, so it must be `GramDriveCore` for `.package(path: "../GramDriveCore")`. Pinned by a test.
+- SCOPE: `.scripts/packaging/{build_core_artifacts.py,README.md,swift-consumer/}`, `.scripts/tests/test_build_core_artifacts.py` (36 tests), `Makefile`, `README.md`.
+- STATUS: ready for review. `make check` 8/8, 87 script tests OK, `make smoke-bindings` unaffected.
+
+### 0530 — Reproducible builds needed two fixes: path remapping and killing our own build timestamp (TASK-260715-3akqs8)
+- FINDING: the same commit built at two paths produces **different** libraries. Measured: repo checkout `b6c393fe…` vs worktree `275d96ab…`. Cause: rustc embeds absolute source paths in debug info and `[profile.release] debug = "line-tables-only"` ships them. Same path twice was already bit-identical, so this only shows up if you actually build somewhere else — local vs CI.
+- FIX: `remap_rustflags()` remaps **both** the workspace and `CARGO_HOME` → `bab48d50…` from both checkouts. Both prefixes are required: dependency code compiles from the registry and lands in the archive, so remapping only the workspace leaves the build machine's home directory embedded and the difference returns on a machine whose home differs. std is already remapped upstream to `/rustc/<hash>`.
+- REGRESSION (self-inflicted, caught before handoff): the first pipeline stamped a wall-clock `built_at` into the manifest → manifest goes in the zip → two runs of one commit published different checksums while nothing about the software changed. Noticed only by running `make package` twice and watching the zip sha move.
+- FIX: artifact is stamped with its **source** date (`SOURCE_DATE_EPOCH`, else commit date); zip written with fixed timestamps and sorted entries. Two full `make package` runs from scratch now produce identical `fb36923d…`.
+- NOTE: a reproducibility claim is worth exactly the check behind it — `make package-reproducible` rebuilds from clean twice and compares. Verified the zip sha256 equals `swift package compute-checksum` output, so it is directly usable as an SPM `binaryTarget` checksum.
+- SCOPE: `.scripts/packaging/build_core_artifacts.py`.
+
+### 0526 — Release LTO fixed by a crate-type override; no architecture change needed (TASK-260715-3akqs8)
+- FIX: resolves the pending item from **0358** (2026-07-17). `cargo rustc -p gramdrive-ffi --release --crate-type staticlib` emits only the shipped type, so cargo no longer suppresses `-C lto` — verified empirically: `-C lto=thin` appears on the rustc line only with the override, absent with the crate's real three-type set.
+- DECISION: the suggested alternative — splitting the rlib into its own crate — is unnecessary and was avoided. The crate keeps every crate-type its consumers need (rlib for Windows/Linux hosts, staticlib for Apple, cdylib for JNA); packaging asks for the one it ships. `Cargo.toml` comment changed CAVEAT → SETTLED; `crates/README.md` "Known gap" rewritten.
+- NOTE: `lto = "thin"` is now a statement about `make package` output, **not** about an ad-hoc `cargo build --release` — that still links without LTO and always will.
+- SCOPE: `Cargo.toml`, `crates/README.md`, `.scripts/packaging/build_core_artifacts.py`.
+- STATUS: resolves 0358 (was: pending — flagged to packaging).
+
+### 0528 — Debug info ships unstripped: 5.2 MB that costs nothing where it matters (TASK-260715-3akqs8)
+- DECISION: the shipped staticlib is **not** stripped. Measured: `strip -S` takes it 7,920,568 B → 2,695,136 B, so debug info is ~5.2 MB, two thirds of the archive.
+- FINDING: that number is not the cost. The linker pulls only referenced objects out of a static archive and debug info lands in the consuming app's dSYM, not the executable users download; it compresses to near-nothing (whole artifact zips to 2.26 MB — **under** the stripped archive alone); and it is what lets the app's `dsymutil` resolve a crash inside the Rust core to a line instead of a column of addresses.
+- NOTE: settles the "stripping and dSYM handling belong to packaging" deferral in `[profile.release]`. Hosts wanting a smaller link can strip at their own link step — that choice belongs to whoever ships the app.
+- SCOPE: `Cargo.toml`, `.scripts/packaging/README.md`.
+
+### 0531 — Android/iOS deferred not stubbed; Windows/Linux get no artifact by design (TASK-260715-3akqs8)
+- DECISION: Windows and Linux consume the `gramdrive-ffi` **crate** directly as a Rust dependency — their CfAPI/FUSE hosts are Rust programs, no UniFFI, no bindings, no packaging step. That is why the crate keeps its rlib crate-type. Inventing an artifact for them would add a versioning seam where none is needed.
+- DECISION: Android deferred, not stubbed — needs NDK, per-ABI cross-build, AAR/jniLibs layout, JNA+coroutines runtime; none verifiable from a macOS-only support matrix (POL-5/DEC-017), and the Kotlin *contract* is already covered by the bindings smoke gate. A stub would be a build path nothing runs and nothing checks, which rots. iOS additionally gated by DEC-012.
+- NOTE: shipped-target list now lives in exactly one place — `SLICES` in `build_core_artifacts.py`. `rust-toolchain.toml` deferred that list to this task and now points at it; adding a platform means adding the triple there too (rustup takes cross-target std from that file). `-create-xcframework` already takes multiple `-library` pairs, which is why `SLICES` is a list.
+- NOTE: no new DEC row needed — POL-5/DEC-017 already determine the target list, and crate-type/debug-info are implementation decisions inside the existing architecture. Decision rows escalate to the owner (DEC-020/POL-8).
+
 ### 0503 — A new decision row needs a traceability matrix row in the same commit — DEC-021 shipped without one and left the gate red (TASK-260715-265gqq)
 - REGRESSION: commit fc3b594 added the DEC-021 row to `.spec/decisions.md` but no row in `docs/TRACEABILITY.md`; `.scripts/validate_traceability.py:168` requires every ID defined under `.spec/` to have a matrix row, so the `repo` suite failed with `missing matrix row for DEC-021` on an otherwise-green tree.
 - ROOT CAUSE: adding a decision is a two-file change and nothing in the decision update procedure (`.spec/decisions.md:34`) says so. The catching gate lives in the `repo` suite, not `core`, so a `make check-core` run after a spec edit looks clean.

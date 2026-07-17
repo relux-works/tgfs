@@ -19,5 +19,11 @@ profile = "minimal"
 
 # No `targets` entry on purpose. The reference host is macOS 14+ arm64 (POL-5)
 # and the core crates are platform-neutral, so the host target is what every
-# gate needs. Cross-target additions belong to artifact packaging
-# (TASK-260715-3akqs8), which owns the shipped-target list.
+# gate needs — and it is also the only target v1 ships (DEC-017), so a `targets`
+# entry here would restate the host and nothing more.
+#
+# The shipped-target list lives in exactly one place: `SLICES` in
+# .scripts/packaging/build_core_artifacts.py (TASK-260715-3akqs8). When a
+# platform enters scope and that list grows past the host, its triple has to be
+# added here too — a cross-target build needs its std, and rustup takes that
+# from this file.

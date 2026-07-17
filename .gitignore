@@ -11,6 +11,12 @@ build/
 dist/
 target/
 DerivedData/
+# SwiftPM. `.build/` is build output wherever it appears. Package.resolved is
+# ignored only for the packaging verifier: it resolves a single path dependency
+# on a freshly staged artifact, so a checked-in resolution would pin nothing and
+# go stale. A future shipped app package should commit its own.
+.build/
+.scripts/packaging/swift-consumer/Package.resolved
 
 # IDE and operating-system files
 .DS_Store
