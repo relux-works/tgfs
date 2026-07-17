@@ -168,6 +168,95 @@ pub(crate) fn insert_message(conn: &Connection, chat: i64, message: i64, latest_
     .expect("insert message");
 }
 
+// ---------------------------------------------------------------------------
+// Repository-layer helpers (TASK-260715-1opnb2): record constructors that go
+// through the typed API instead of raw SQL, and a file-backed database for
+// the WAL concurrency suites.
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use gramdrive_state::repo::{
+    AccountRecord, ChatRecord, ChatType, MessageRevision, RetentionMode, SourceKind,
+};
+
+/// A unique database path under the OS temp directory, cleaned on drop.
+/// Uniqueness comes from the process id and a counter — no clock, no
+/// randomness, so parallel test binaries cannot collide.
+pub(crate) struct TempDb {
+    pub(crate) path: PathBuf,
+}
+
+impl TempDb {
+    pub(crate) fn new() -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "gramdrive-repo-test-{}-{n}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        Self { path }
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = self.path.as_os_str().to_owned();
+            name.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(name));
+        }
+    }
+}
+
+/// The scaffold account as a typed record, matching [`scope`].
+pub(crate) fn account_record() -> AccountRecord {
+    AccountRecord {
+        account: scope().account,
+        source_kind: SourceKind::LocalTdlib,
+        display_name: "Test Account".to_owned(),
+        auth_state: "authorized".to_owned(),
+        namespace_version: scope().namespace_version,
+        retention_mode: RetentionMode::Mirror,
+        archive_mode: false,
+        secret_ref: None,
+        created_at_ms: 1_000,
+        updated_at_ms: 1_000,
+    }
+}
+
+/// A minimal typed chat record for [`chat_key`]`(chat)`.
+pub(crate) fn chat_record(chat: i64) -> ChatRecord {
+    ChatRecord {
+        key: chat_key(chat),
+        chat_type: ChatType::Private,
+        title: format!("Chat {chat}"),
+        username: None,
+        is_protected: false,
+        archive_mode: false,
+        metadata_version: gramdrive_state::model::version::MetadataVersion::new("m1")
+            .expect("valid version"),
+        left_at_ms: None,
+        deleted_at_ms: None,
+        last_update_at_ms: None,
+    }
+}
+
+/// A deterministic full message revision.
+pub(crate) fn revision(message: i64, sent_at_ms: i64) -> MessageRevision {
+    MessageRevision {
+        message_id: MessageId(message),
+        sender_id: Some(500),
+        sent_at_ms,
+        edited_at_ms: None,
+        observed_at_ms: sent_at_ms + 5,
+        payload_schema: SchemaFamily(1),
+        payload: format!("payload-{message}").into_bytes(),
+    }
+}
+
 /// Asserts a statement fails and that SQLite's complaint mentions `needle` —
 /// the constraint the schema is expected to enforce.
 pub(crate) fn expect_rejected(result: Result<usize, rusqlite::Error>, needle: &str) {

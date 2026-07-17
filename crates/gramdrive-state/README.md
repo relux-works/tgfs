@@ -87,6 +87,63 @@ migratable.
 3. Add an interruption test: interrupt it, reopen, resume, and assert the
    result is what an uninterrupted run produces.
 
+## Repositories
+
+`src/repo/` (TASK-260715-1opnb2) is the sanctioned surface other crates use:
+typed operations over the schema, speaking the `gramdrive-model` vocabulary
+plus record types — no SQL, no `rusqlite` type, and no stored encoding
+(enum strings, range JSON, cursor text) crosses the boundary. Everything
+runs inside an explicit transaction:
+
+- `StateStore::read_txn` — a WAL read snapshot: every query in it sees one
+  consistent database state and never blocks the other process's writer.
+- `StateStore::write_txn` — a short `BEGIN IMMEDIATE` write transaction:
+  the write lock is taken up front (no mid-transaction upgrade failures),
+  commit is explicit, and *drop is rollback* — which is the crate's
+  cancellation boundary: abandoning a transaction at any point leaves the
+  database exactly as the last commit left it.
+
+| Area | Operations | The invariant they carry |
+|---|---|---|
+| Accounts | upsert / read / `bump_namespace` | upsert never rewinds the namespace epoch — only `bump_namespace` moves it, forward (DOM-021) |
+| Chats and lists | `upsert_chat`, `replace_chat_list`, ordered `chat_list` | one list replaced whole per snapshot; read order is pinned-first, Telegram order descending (POL-1, DEC-013) |
+| Items | upsert / read / `children_page` / `child_by_name` / `appearances_of` / `tombstone_item` / `update_item_content` | identity columns (kind, scope, canonical link, view) derive from the `ItemId` itself, so the caller cannot write them inconsistently; content updates are compare-and-set on `ContentVersion` (DOM-003) |
+| Changes | `apply_message_changes`, event/message reads, sync windows | idempotent by Telegram identity (SYNC-021): exact replays, post-deletion revisions, and stale pre-edit revisions are skipped, so at-least-once delivery has exactly-once effect |
+| Cursors | `put_cursor` / `cursor` / `clear_cursor` | scope-checked both ways against the account's *current* epoch — a retired-epoch cursor is an explicit `CursorOutOfScope`, never a silent apply (SYNC-004); atomicity with state is the shared transaction (SYNC-022) |
+| Attachments and blobs | `upsert_attachment`, `record_blob`, `link_attachment_blob` | a locator refresh rewrites metadata only and can never detach verified bytes (SYNC-045); blob links require the blob row first |
+| Transfers | enqueue / claim / progress / suspend / resume / fail / cancel / done | coalescing per (item, version) (SYNC-046); two-phase cancel observed at work boundaries; `mark_transfer_done` re-checks the item's content version inside the promoting transaction (SYNC-042) |
+| Cache and pins | entry upsert / touch / verify / evict / usage, `pin_item` / `unpin_item` | eviction eligibility (unpinned + verified) is in the DELETE itself — an ineligible evict is a `false`, not a removal (SYNC-051/052) |
+| Render | `ensure_render_state`, `mark_render_dirty`, `dirty_render_items`, `publish_render` | watermarks only advance; a publication re-checks the event log in its own transaction and stays dirty if events arrived while rendering (SYNC-024) |
+
+SYNC-022's atomic checkpoint is compositional, not a special API: call
+`apply_message_changes`, `record_chat_sync`, and `put_cursor` under one
+`write_txn` and they commit or vanish together.
+
+## Multi-process safety
+
+On Apple platforms the app and the File Provider extension are separate
+processes over one database file (`.spec/architecture.md`); nothing
+in-memory is authoritative. What makes that safe:
+
+- **WAL + `synchronous=NORMAL`** on every file connection; a file that
+  refuses WAL refuses to open (`StateError::WalUnavailable`).
+- **Snapshot reads.** A `read_txn` pins one database state; the other
+  process's commits do not tear it, and it never blocks their writer.
+- **`BEGIN IMMEDIATE` writes + busy timeout.** Writers serialize on the
+  file lock; a contending writer waits (up to 5 s) instead of failing
+  mid-transaction, and decisions (queue claims, CAS checks, promotion
+  version checks) are made *inside* the write transaction, against the
+  committed truth — never against a stale in-memory picture.
+- **Short transactions.** Long work (hydration, rendering, backfill) is a
+  sequence of short transactions with re-checks at each boundary; the
+  durable `cancel_requested` flag and the render watermark re-check exist
+  precisely because another process may act between two of them.
+
+SQLite's locking is file-based, so `tests/repo_concurrency.rs` exercises
+the real primitives with two connections: a stable read snapshot across a
+foreign commit, two contending writers never double-claiming a transfer,
+and a reader that can never observe a cursor ahead of the state it seals.
+
 ## Evidence
 
 - `tests/schema_invariants.rs` — FKs, uniques, CHECKs, the append-only
@@ -107,6 +164,23 @@ migratable.
   journal-less file (one written before the runner existed) gets a journal,
   a file from the future is refused *without being written to*, and repair
   markers round-trip.
+- `tests/repo_changes.rs` — atomic cursor application through the failure
+  path (a rejected cursor rolls back the whole batch), idempotent replay
+  (exact, post-deletion, and stale-revision), scope rejections, sync
+  windows and the backfill backlog.
+- `tests/repo_snapshots.rs` — account epoch discipline, chat-list
+  replacement and order, item identity derivation, paged enumeration to
+  exhaustion, content-version compare-and-set, tombstone name reuse,
+  attachment refresh keeping its blob link.
+- `tests/repo_transfers.rs` — coalescing, claim order with backoff and
+  cancel flags, the full lifecycle with typed wrong-state answers, and the
+  SYNC-042 version re-check at promotion.
+- `tests/repo_cache_render.rs` — eviction eligibility in the DELETE,
+  accounting sums, pin origin semantics, watermark publication and the
+  render/append race.
+- `tests/repo_concurrency.rs` — two connections over one WAL file: stable
+  read snapshots, serialized writers with no double-claim, and cursor
+  never ahead of state under a concurrent reader.
 
 ## Test command
 

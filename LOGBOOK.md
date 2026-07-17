@@ -5,6 +5,38 @@
 
 ## 2026-07-17
 
+### 1755 — Review TASK-260715-1opnb2 accepted; pin_item origin overwrite is directionally unguarded
+- DECISION: repository layer accepted → done. AC evidence verified by reading the modules and the tests, `cargo test -p gramdrive-state` green in review rerun.
+- FINDING: `pin_item` upserts `origin = excluded.origin` unconditionally (`crates/gramdrive-state/src/repo/cache.rs:496`): an Archive-Mode re-pin over an existing User pin silently downgrades intent, and Archive-Mode teardown (`pins(Some(ArchiveMode))` → unpin) would then release the user's pin — the POL-2 outcome the docstring says cannot happen. Tested direction (ArchiveMode → User upgrade) holds; the reverse is unguarded in a layer whose stated philosophy is enforcing invariants in the layer.
+- NOTE: non-blocking — engine (STORY-260715-2hs8cf) owns pin orchestration and can check before archive-pinning; a directional upsert (user wins; explicit unpin+pin still downgrades) would close it at zero expressiveness cost. For the cache-quota-and-eviction task to pick up.
+- SCOPE: `crates/gramdrive-state/src/repo/cache.rs:490-503`, test `repo_cache_render.rs::pins_are_durable_intent_with_origin_semantics`.
+
+### 1754 — sanitize_is_idempotent proptest counterexample: name drifts on second pass (gramdrive-model)
+- REGRESSION: `make check` rerun during TASK-260715-1opnb2 review failed `gramdrive-model naming_properties::sanitize_is_idempotent` — a fresh random counterexample (57 successes, then failure), deterministic on seed replay. First pass leaves `.._` (dot run adjacent to characters replaced with `_`, e.g. `..` before `|`); second pass collapses it to `._`. Input class: zero-width joiners + combining marks + forbidden punctuation around dot runs. Violates POL-1 stable names: a name passing the policy twice (re-sync, rebuild) drifts.
+- NOTE: unrelated to the task under review (its diff touches `gramdrive-state` only); sanitizer is TASK-260715-1ffbkg (commit b8d9b2b). Filed as BUG-260717-3rr59f under STORY-260715-3qxar5; deterministic repro seed preserved in outcome resource TASK-260715-1opnb2_review.md (regressions file restored to handed-off state to keep the review read-only).
+- SCOPE: `crates/gramdrive-model/src/naming.rs:568`, `crates/gramdrive-model/tests/naming_properties.rs:171`.
+
+### 1748 — Repository layer derives item identity columns from the ItemId itself (TASK-260715-1opnb2)
+- DECISION: `upsert_item` derives kind, account scope, canonical link, and view columns by decoding the `ItemId` (`repo/items.rs:derive_identity`) instead of taking them in the record — a caller cannot write identity columns that disagree with the id. Account-root epoch is the one underivable column; it is read from the account row at upsert (DOM-021 keeps the epoch out of the root's id on purpose).
+- NOTE: `Message`/`Blob` keys and appearance-of-account are typed `InvalidArgument` at the repo layer — the schema `kind` CHECK would also refuse, but as an untyped SQL error.
+- SCOPE: `crates/gramdrive-state/src/repo/items.rs`.
+
+### 1747 — Stale-revision guard: replayed pre-edit history pages must not rewind the projection (TASK-260715-1opnb2)
+- DECISION: `apply_message_changes` skips a revision whose effective revision time (`edited_at_ms` else `sent_at_ms`) is older than the projected one (`repo/changes.rs`). Exact-replay idempotence alone is not enough: a history page fetched before an edit and replayed after the edit's change-feed application would otherwise append an `edited` event that rewinds current state to content Telegram no longer shows.
+- NOTE: relies on Telegram edit timestamps being per-message monotonic. Equal-time different-payload still applies as an edit (deliberate: no silent divergence).
+- NOTE: two more asymmetries in the same function, both POL-3: deletion of a never-observed message is a skip (never imply unobserved history); a revision after a witnessed deletion is a skip (tombstone wins).
+- SCOPE: `crates/gramdrive-state/src/repo/changes.rs`, tests `repo_changes.rs`.
+
+### 1746 — publish_render re-checks the event log inside the publishing transaction (TASK-260715-1opnb2)
+- DECISION: `publish_render` takes the source `ChatKey` and checks `EXISTS(events > watermark)` in its own write transaction; if events arrived while the renderer worked, the publication lands but `dirty` stays 1 (`repo/render.rs`). Closes the render/append race without locks: published bytes never silently claim to reflect events they predate (SYNC-024). Watermark regression (publish below stored watermark) is a typed refusal.
+- NOTE: alternative — trusting the caller to re-check — leaves the race open by default; making the repo own it means the safe path is the only path.
+- SCOPE: `crates/gramdrive-state/src/repo/render.rs`, test `repo_cache_render.rs::publication_never_regresses_and_never_hides_late_events`.
+
+### 1745 — WAL concurrency proven with two connections in one process (TASK-260715-1opnb2)
+- FINDING: SQLite locking is file-based, so two `StateStore` connections in one test process exercise the same primitives as app + FP extension in two processes: read snapshots stable across a foreign commit, `BEGIN IMMEDIATE` writers serialized through the busy handler with no double-claim of a transfer, and a concurrent reader never observing a cursor ahead of the state it seals (20 batches, invariant asserted per snapshot).
+- NOTE: `read_txn`/`write_txn` take `&mut self` — one connection, one transaction at a time, compile-enforced; concurrency is more connections, not shared ones. Statement cache bumped to 64 (`store.rs`) since the repo layer's distinct statements outnumber rusqlite's default 16.
+- SCOPE: `crates/gramdrive-state/tests/repo_concurrency.rs`, `src/repo/mod.rs`, `src/store.rs`.
+
 ### 1659 — Migration runner reads user_version outside its transaction: two processes both apply the same migration (TASK-260715-18l9xz)
 - FINDING: `migrate::run` reads `PRAGMA user_version` outside any transaction (`migrate.rs:200`) and `apply` never re-checks it inside the transaction it opens. `rusqlite`'s `conn.transaction()` is DEFERRED, so nothing serializes two processes that both read v1 and both decide to apply v2. Migrations run inside `StateStore::open`, and the crate's premise is that the app and the File Provider extension share the file (`lib.rs:6-9`) — first launch after an upgrade shipping a v2 is exactly when they race.
 - NOTE: reproduced at the SQLite level, mirroring `run`/`apply` statement-for-statement (`.temp/TASK-260715-18l9xz/concurrent_migration_probe.py`): A commits v2, B then fails with `duplicate column name`. B's `StateStore::open()` returns `Err(MigrationFailed)` against a healthy v2 database, with no retry.

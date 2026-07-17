@@ -1,12 +1,16 @@
 //! Failure vocabulary of the state store.
 
-/// Why the state store could not open, prepare, or query its database.
+use gramdrive_model::cursor::{CursorParseError, CursorScopeMismatch};
+
+/// Why the state store could not open, prepare, query, or update its
+/// database.
 ///
 /// Structured for the NFR-030 discipline: a category a caller can act on,
 /// never a panic. Everything SQLite-shaped stays in [`StateError::Sqlite`];
 /// the named variants are the conditions the store itself detects and a
 /// host must distinguish (a version-skewed file is user-visible "update the
-/// app", a busy database is "try again").
+/// app", a busy database is "try again", a version conflict is "re-read and
+/// decide").
 #[derive(Debug)]
 pub enum StateError {
     /// The underlying SQLite call failed.
@@ -78,6 +82,94 @@ pub enum StateError {
         /// The journal mode the database reported instead of `wal`.
         mode: String,
     },
+    /// A repository operation was called with an argument the typed layer
+    /// refuses before SQL ever sees it — an empty cursor stream, the folder-0
+    /// sentinel used as a real folder, content facts on a directory item.
+    ///
+    /// Kept distinct from [`StateError::Sqlite`] on purpose: a schema CHECK
+    /// firing means the typed layer failed at its one job of making invalid
+    /// rows unrepresentable; this variant is that job succeeding.
+    InvalidArgument {
+        /// What was wrong with the argument.
+        what: &'static str,
+    },
+    /// A repository operation required a row that does not exist — finishing
+    /// an unknown transfer, publishing render output for an item with no
+    /// render state.
+    ///
+    /// Deliberately not used by lookups: absence a caller can plan around is
+    /// an `Option::None`, absence that invalidates the operation is this.
+    RowNotFound {
+        /// The entity the operation required.
+        entity: &'static str,
+    },
+    /// A compare-and-set update found the stored version differs from the
+    /// version the caller based its work on (DOM-003, SYNC-042).
+    ///
+    /// The database is unchanged. The caller re-reads and decides: retry
+    /// against the current version, or discard work that is now stale —
+    /// bytes fetched for version A are never published as version B.
+    VersionConflict {
+        /// The entity whose version was checked.
+        entity: &'static str,
+        /// The version the caller expected to find; `None` means the caller
+        /// expected no version stored yet (a first publication).
+        expected: Option<String>,
+        /// The version actually stored; `None` when no version is stored.
+        found: Option<String>,
+    },
+    /// A render publication carried an input watermark below the one already
+    /// recorded (SYNC-024, SYNC-030).
+    ///
+    /// Watermarks only advance: published bytes claiming to reflect *less*
+    /// of the event log than the current bytes would silently un-render
+    /// observed history. The database is unchanged.
+    WatermarkRegression {
+        /// The watermark already recorded.
+        current: i64,
+        /// The lower watermark the publication carried.
+        proposed: i64,
+    },
+    /// A change cursor was presented against a scope it was not minted
+    /// under — the wrong account, or a namespace epoch that has since been
+    /// retired (SYNC-004, DOM-021).
+    ///
+    /// Rejected explicitly, never silently applied: the only correct
+    /// reaction is re-baselining under the current scope.
+    CursorOutOfScope {
+        /// The scope mismatch, as the model layer reports it.
+        source: CursorScopeMismatch,
+    },
+    /// A cursor stored in the database no longer parses — corruption, or a
+    /// cursor format from a newer build (SYNC-004).
+    CursorCorrupt {
+        /// Why the stored text failed to parse.
+        source: CursorParseError,
+    },
+    /// A stored row failed to round-trip through the typed layer — an enum
+    /// column carries text this build does not know, an identity blob does
+    /// not decode, a range list is not the format this crate writes.
+    ///
+    /// This is corruption or version skew, not a caller mistake; the row is
+    /// reported, never silently skipped or coerced.
+    CorruptRow {
+        /// The table the row lives in.
+        table: &'static str,
+        /// What failed to round-trip.
+        detail: String,
+    },
+    /// A repository operation found the row in a state the operation is not
+    /// valid from — completing a transfer that is already terminal, resuming
+    /// one that was never suspended.
+    ///
+    /// The database is unchanged; the caller re-reads and reconciles its
+    /// picture of the lifecycle with the durable one.
+    InvalidTransition {
+        /// The entity whose lifecycle refused the step.
+        entity: &'static str,
+        /// The state the row was actually in.
+        from: &'static str,
+    },
 }
 
 impl std::fmt::Display for StateError {
@@ -110,6 +202,34 @@ impl std::fmt::Display for StateError {
             Self::WalUnavailable { mode } => {
                 write!(f, "database refused WAL journal mode (got '{mode}')")
             }
+            Self::InvalidArgument { what } => write!(f, "invalid argument: {what}"),
+            Self::RowNotFound { entity } => write!(f, "{entity} not found"),
+            Self::VersionConflict {
+                entity,
+                expected,
+                found,
+            } => {
+                let expected = expected.as_deref().unwrap_or("(none)");
+                let found = found.as_deref().unwrap_or("(none)");
+                write!(
+                    f,
+                    "{entity} version conflict: expected '{expected}', found '{found}'"
+                )
+            }
+            Self::WatermarkRegression { current, proposed } => write!(
+                f,
+                "render watermark regression: proposed {proposed} is below current {current}"
+            ),
+            Self::CursorOutOfScope { source } => write!(f, "{source}"),
+            Self::CursorCorrupt { source } => {
+                write!(f, "stored change cursor failed to parse: {source}")
+            }
+            Self::CorruptRow { table, detail } => {
+                write!(f, "corrupt row in {table}: {detail}")
+            }
+            Self::InvalidTransition { entity, from } => {
+                write!(f, "invalid {entity} transition from state '{from}'")
+            }
         }
     }
 }
@@ -119,11 +239,19 @@ impl std::error::Error for StateError {
         match self {
             Self::Sqlite(error) => Some(error),
             Self::MigrationFailed { source, .. } => Some(source),
+            Self::CursorOutOfScope { source } => Some(source),
+            Self::CursorCorrupt { source } => Some(source),
             Self::UnsupportedSchemaVersion { .. }
             | Self::MigrationRequired { .. }
             | Self::MigrationStalled { .. }
             | Self::UnknownRepairKind { .. }
-            | Self::WalUnavailable { .. } => None,
+            | Self::WalUnavailable { .. }
+            | Self::InvalidArgument { .. }
+            | Self::RowNotFound { .. }
+            | Self::VersionConflict { .. }
+            | Self::WatermarkRegression { .. }
+            | Self::CorruptRow { .. }
+            | Self::InvalidTransition { .. } => None,
         }
     }
 }

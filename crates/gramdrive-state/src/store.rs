@@ -62,6 +62,11 @@ impl StateStore {
 
     fn configure(mut conn: Connection, journal: JournalRequirement) -> Result<Self, StateError> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // The repository layer (crate::repo) runs every statement through
+        // prepare_cached; its distinct statements outnumber rusqlite's
+        // default cache of 16, and evicting hot statements every transaction
+        // would make the cache a fiction.
+        conn.set_prepared_statement_cache_capacity(64);
         // Per-connection, off by default in SQLite for historical reasons;
         // every invariant in the schema assumes it is on.
         conn.pragma_update(None, "foreign_keys", true)?;

@@ -1,12 +1,12 @@
 //! GramDrive state store — durable local metadata in SQLite.
 //!
 //! This crate owns the versioned SQLite schema (TASK-260715-1ceq7h), its
-//! application and its forward-only migrations (TASK-260715-18l9xz), and
-//! will grow repositories (TASK-260715-1opnb2) and startup reconciliation
-//! (TASK-260715-21clwh) — STORY-260715-16ik2x. Transactions are short and
-//! state is durable: on Apple platforms the app and the File Provider
-//! extension are separate processes sharing this database in WAL mode, so no
-//! in-memory state is authoritative.
+//! application and its forward-only migrations (TASK-260715-18l9xz), the
+//! typed repositories over it (TASK-260715-1opnb2, [`repo`]), and will grow
+//! startup reconciliation (TASK-260715-21clwh) — STORY-260715-16ik2x.
+//! Transactions are short and state is durable: on Apple platforms the app
+//! and the File Provider extension are separate processes sharing this
+//! database in WAL mode, so no in-memory state is authoritative.
 //!
 //! # What the schema stores
 //!
@@ -32,12 +32,14 @@ pub use gramdrive_model as model;
 mod error;
 mod migrate;
 mod repair;
+pub mod repo;
 mod schema;
 mod store;
 
 pub use error::StateError;
 pub use migrate::{BASELINE_VERSION, ChunkFn, ChunkOutcome, Migration, MigrationStep};
 pub use repair::{RepairKind, RepairMarker};
+pub use repo::{ReadTxn, WriteTxn};
 pub use schema::SCHEMA_VERSION;
 pub use store::StateStore;
 
