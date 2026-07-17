@@ -4,9 +4,9 @@
 # its own empty [workspace] table so cargo treats it as a standalone root and
 # never attaches it to the parent at ../../.. -- linking libtdjson must not leak
 # into `cargo build --workspace` / `make check`, which run on machines that
-# never built the artifact (same isolation the reserved gramdrive-source-tdjson
-# crate keeps). It is built and run only by .scripts/tdlib/build_tdlib.py and the
-# `make tdlib-smoke` target, against a staged artifact.
+# never built the artifact (same isolation gramdrive-source-tdjson keeps via its
+# env-gated build.rs). It is built and run only by .scripts/tdlib/build_tdlib.py
+# and the `make tdlib-smoke` target, against a staged artifact.
 [workspace]
 
 [package]

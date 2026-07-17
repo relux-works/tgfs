@@ -11,7 +11,8 @@
 GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings \
-        package package-reproducible tdlib tdlib-smoke tdlib-verify clean-gates
+        package package-reproducible tdlib tdlib-smoke tdjson-smoke tdlib-verify \
+        clean-gates
 
 # check — the pre-push gate: everything CI runs.
 check:
@@ -110,6 +111,16 @@ tdlib:
 tdlib-smoke:
 	GRAMDRIVE_TDLIB_ARTIFACT_DIR="$(CURDIR)/.temp/tdlib/out" \
 		cargo run --quiet --release --manifest-path .scripts/tdlib/link-smoke/Cargo.toml
+
+# tdjson-smoke — run the gramdrive-source-tdjson wrapper's real-linkage smoke
+# against the staged artifact. The env variable is the gate: with it set, the
+# crate's build.rs enables cfg(real_tdjson), links libtdjson.dylib and bakes
+# in its rpath, and the otherwise-empty real_tdjson_smoke test binary runs
+# the actual runtime against the actual library. Without it (every `make
+# check`), the crate builds mock-only and this test compiles to nothing.
+tdjson-smoke:
+	GRAMDRIVE_TDLIB_ARTIFACT_DIR="$(CURDIR)/.temp/tdlib/out" \
+		cargo test -p gramdrive-source-tdjson --test real_tdjson_smoke
 
 # tdlib-verify — build the library twice from a clean build tree and compare
 # bytes. The manifest's path_independent claim is only worth the check behind

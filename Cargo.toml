@@ -48,6 +48,14 @@ tokio = { version = "1.52", default-features = false }
 # with the toolchain pin.
 rusqlite = { version = "0.39", features = ["bundled"] }
 
+# JSON for the tdjson wire format (gramdrive-source-tdjson): every request
+# and every received event of TDLib's C JSON interface is one JSON object.
+# MIT OR Apache-2.0 (inside the POL-6 allow list); already present in the
+# workspace graph as a build-dependency of uniffi's cargo-metadata feature,
+# and its build script (a limb-width probe) is already named in deny.toml
+# [bans.build].
+serde_json = { version = "1.0" }
+
 # Unicode tables for the naming policy (SYNC-013). All three carry licenses
 # inside the POL-6 allow list (MIT OR Apache-2.0, and MIT for caseless), so
 # none needs a DEC-021-style exception. They are data, not logic: NFC,

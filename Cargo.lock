@@ -363,6 +363,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gramdrive-source-tdjson"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "gramdrive-state"
 version = "0.1.0"
 dependencies = [

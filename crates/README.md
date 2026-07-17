@@ -34,6 +34,7 @@ neutrality violation invisible to the scan ships undetected.
 |---|---|---|---|
 | 0 | `gramdrive-model` | Domain vocabulary: identity, virtual tree, naming, versions, cursors, byte ranges | STORY-260715-3qxar5 (identity-and-namespace) |
 | 1 | `gramdrive-source` | Provider-neutral `DriveSource` contract (DEC-003) | STORY-260715-255sa3 (drive-source-contract) |
+| 1 | `gramdrive-source-tdjson` | Local TDLib source: safe tdjson runtime (lifecycle, correlation, update dispatch, shutdown); the `DriveSource` adapter follows in the owning story | STORY-260715-3elo6l (tdlib-runtime-integration) |
 | 1 | `gramdrive-state` | SQLite state store, schema migrations, reconciliation | STORY-260715-16ik2x (metadata-state-store) |
 | 1 | `gramdrive-render` | Deterministic NDJSON/Markdown renderers and render planning | STORY-260715-1oq9jg (deterministic-rendering) |
 | 2 | `gramdrive-engine` | Transfer/cache engine: hydration, quota, eviction, resumable downloads | STORY-260715-2hs8cf (transfer-and-cache-engine) |
@@ -50,6 +51,9 @@ neutrality violation invisible to the scan ships undetected.
                  gramdrive-model          (layer 0 — vocabulary)
 
   gramdrive-testkit -> {model, source}    (dev-dependency only for product crates)
+  gramdrive-source-tdjson -> {model, source}   (layer 1 — local TDLib source
+                                          implementation; nothing links it yet,
+                                          gramdrive-ffi may at composition time)
 ```
 
 ## Dependency direction rules
@@ -61,6 +65,7 @@ Dependencies point strictly downward. The authoritative allow list
 |---|---|
 | `gramdrive-model` | — |
 | `gramdrive-source` | `gramdrive-model` |
+| `gramdrive-source-tdjson` | `gramdrive-model`, `gramdrive-source` |
 | `gramdrive-state` | `gramdrive-model` |
 | `gramdrive-render` | `gramdrive-model` |
 | `gramdrive-engine` | `gramdrive-model`, `gramdrive-source`, `gramdrive-state`, `gramdrive-render` |
@@ -98,11 +103,17 @@ Additional rules:
   lifecycle, secure-store APIs, and UI types live in the native adapter
   layers (`.spec/architecture.md`).
 - **Source implementations are separate crates, not feature flags**
-  (DEC-003/DEC-005). Reserved names: `gramdrive-source-tdjson` (local TDLib
-  via tdjson, EPIC-260715-2ptb18) and `gramdrive-source-remote` (gotd/td
-  service client). Features leak transitively across a workspace; a separate
-  crate keeps TDLib linkage out of every build that does not ask for it, and
-  keeps the core honest about DEC-003 (no provider types in core).
+  (DEC-003/DEC-005). `gramdrive-source-tdjson` (local TDLib via tdjson,
+  EPIC-260715-2ptb18) is the first; `gramdrive-source-remote` (gotd/td
+  service client) stays reserved. Features leak transitively across a
+  workspace; a separate crate keeps TDLib linkage out of every build that
+  does not ask for it, and keeps the core honest about DEC-003 (no provider
+  types in core). Inside `gramdrive-source-tdjson` the real-vs-mock split is
+  an *environment* gate, not a feature: `build.rs` links `libtdjson.dylib`
+  and enables `cfg(real_tdjson)` only when `GRAMDRIVE_TDLIB_ARTIFACT_DIR`
+  is set (`make tdjson-smoke`), because the lint and test gates run
+  `--all-features` and a feature would drag the linkage into exactly the
+  runs that must stay artifact-free.
 - **Platform host crates (future Windows CfAPI / Linux FUSE hosts) join the
   workspace as new members** with their own policy rows; the platform ban
   list applies per-crate, not globally.
@@ -112,6 +123,9 @@ Additional rules:
   a core crate. The single current feature is `gramdrive-ffi/bindgen`,
   which gates the workspace-local `uniffi-bindgen` binary and is never
   enabled by a product build (`crates/gramdrive-ffi/README.md`).
+  `gramdrive-source-tdjson`'s real-linkage gate is deliberately an env
+  gate, not a feature (previous bullet), for the same reason this policy
+  exists: `--all-features` gate runs must never change what links.
 
 ## Toolchain and quality configuration
 

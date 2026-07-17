@@ -141,8 +141,10 @@ fails to link or load *here* rather than in the real tdjson wrapper
 `link-smoke/` carries its own empty `[workspace]` table so cargo treats it as a
 standalone root and never attaches it to the gramdrive workspace at `../../..`.
 Linking libtdjson must not leak into `cargo build --workspace` / `make check`,
-which run on machines that never built this artifact — the same isolation the
-reserved `gramdrive-source-tdjson` crate keeps. `make check` therefore stays
+which run on machines that never built this artifact — the same isolation
+`gramdrive-source-tdjson` keeps with its env-gated `build.rs` (linkage only
+when `GRAMDRIVE_TDLIB_ARTIFACT_DIR` is set; `make tdjson-smoke`). `make
+check` therefore stays
 green without the artifact, the network, or Xcode; the only thing the gate runs
 is the faked-subprocess self-test below.
 

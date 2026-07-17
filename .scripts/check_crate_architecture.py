@@ -58,6 +58,7 @@ from pathlib import Path
 CORE_CRATES = {
     "gramdrive-model",
     "gramdrive-source",
+    "gramdrive-source-tdjson",
     "gramdrive-state",
     "gramdrive-render",
     "gramdrive-engine",
@@ -69,6 +70,7 @@ CORE_CRATES = {
 ALLOWED_INTERNAL_DEPS = {
     "gramdrive-model": set(),
     "gramdrive-source": {"gramdrive-model"},
+    "gramdrive-source-tdjson": {"gramdrive-model", "gramdrive-source"},
     "gramdrive-state": {"gramdrive-model"},
     "gramdrive-render": {"gramdrive-model"},
     "gramdrive-engine": {
@@ -80,6 +82,7 @@ ALLOWED_INTERNAL_DEPS = {
     "gramdrive-ffi": {
         "gramdrive-model",
         "gramdrive-source",
+        "gramdrive-source-tdjson",
         "gramdrive-state",
         "gramdrive-render",
         "gramdrive-engine",

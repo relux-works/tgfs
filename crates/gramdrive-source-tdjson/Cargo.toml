@@ -1,0 +1,31 @@
+# Local TDLib source crate. Runtime semantics, the mock/real split and the
+# env-gated linkage: README.md in this directory.
+
+[package]
+name = "gramdrive-source-tdjson"
+description = "GramDrive local TDLib source: safe tdjson runtime — lifecycle, correlation, update dispatch, shutdown"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+# build.rs is an env gate, not a code generator: with
+# GRAMDRIVE_TDLIB_ARTIFACT_DIR unset it emits nothing but the cfg
+# declaration, and the crate builds mock-only with no TDLib linkage — which
+# is what lets `make check` stay green on machines that never built the
+# artifact. Deliberately an env gate rather than a cargo feature: the lint
+# and test gates run --all-features, so a `real-tdjson` feature would drag
+# the linkage into every gate run.
+build = "build.rs"
+
+[dependencies]
+# JSON is tdjson's wire format (TDLib's td_json_client interface); the
+# runtime parses every received event to correlate responses and route
+# updates, so the parsed Value is also what the caller gets. MIT/Apache-2.0
+# (POL-6); already in the workspace graph as a build dependency of uniffi's
+# cargo-metadata feature, and its build script is already named in
+# deny.toml [bans.build].
+serde_json = { workspace = true }
+
+[lints]
+# Shared lint set: Cargo.toml [workspace.lints].
+workspace = true
