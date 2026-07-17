@@ -24,7 +24,9 @@
 //! - [`config`] — [`TdlibConfig`] and the storage/memory policy: the
 //!   per-account `setTdlibParameters`/`setOption`/`addProxy` request
 //!   sequence, per-account on-disk isolation with a clean logout wipe, and
-//!   the [`SecretSource`] seam to platform secure storage. Secrets are
+//!   the [`SecretSource`]/[`SecretStore`] seam to platform secure storage —
+//!   the database-key lifecycle (creation, validated retrieval that fails
+//!   closed, rotation, logout deletion; TASK-260715-2odowl). Secrets are
 //!   redacted from every `Debug`/log form (TASK-260715-1hdnuy).
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
@@ -74,9 +76,9 @@ pub use auth::{
     RetryAdvice,
 };
 pub use config::{
-    AccountConfig, AccountStoragePaths, ApiCredentials, DatabaseKey, DeviceMetadata,
-    InMemorySecrets, MemoryOptions, Proxy, Secret, SecretError, SecretSource, StorageLayout,
-    StoragePolicy, TdlibConfig,
+    AccountConfig, AccountStoragePaths, ApiCredentials, DATABASE_KEY_LEN, DatabaseKey,
+    DeviceMetadata, InMemorySecrets, MemoryOptions, Proxy, Secret, SecretError, SecretSource,
+    SecretStore, StorageLayout, StoragePolicy, TdlibConfig, set_database_encryption_key_request,
 };
 pub use error::TdError;
 pub use runtime::{

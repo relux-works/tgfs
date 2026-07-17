@@ -10,9 +10,11 @@
 //!   (SEC-041's local-first analogue).
 //! - **Clean logout** — [`StorageLayout::wipe_account`] removes exactly one
 //!   account's subtree and nothing else, the on-disk half of the SEC-004
-//!   logout sequence. The keychain half (dropping the account's database
-//!   key and the product credentials) is the native adapter's part, done
-//!   through [`super::SecretSource`]'s backing store.
+//!   logout sequence. The keychain half — dropping the account's database
+//!   key — is [`super::SecretStore::delete_account`], done by the native
+//!   adapter over the OS keychain. The product `api_id`/`api_hash` are
+//!   shared across accounts and app-lifetime, so they are not dropped on a
+//!   per-account logout, only on a full app reset.
 
 use std::path::{Path, PathBuf};
 

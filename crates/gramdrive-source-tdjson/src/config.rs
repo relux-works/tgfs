@@ -21,6 +21,20 @@
 //!   redacts them; the plaintext reaches only the JSON request builders,
 //!   which put it on the wire to TDLib and nowhere else.
 //!
+//! # Key lifecycle
+//!
+//! The database encryption key has a lifecycle beyond retrieval — creation on
+//! first authorization, rotation, and deletion on logout — owned by the
+//! [`SecretStore`] seam and documented on that trait. Creation draws 256 bits
+//! of platform entropy ([`DatabaseKey::from_entropy`]); a key read back from
+//! storage is validated ([`DatabaseKey::from_stored`]) so a missing or
+//! malformed item fails closed with a typed [`SecretError`] rather than
+//! silently opening an unencrypted database; rotation submits
+//! [`set_database_encryption_key_request`] to the live client. The actual
+//! keychain binding is native-adapter code (DEC-002, `crates/README.md`
+//! platform ban): this crate ships only the seam and the artifact-free
+//! [`InMemorySecrets`].
+//!
 //! # Storage and memory policy (recorded evidence)
 //!
 //! GramDrive is a mirror: it must persist Telegram-derived state so a
@@ -41,7 +55,10 @@
 mod secret;
 mod storage;
 
-pub use secret::{ApiCredentials, DatabaseKey, InMemorySecrets, Secret, SecretError, SecretSource};
+pub use secret::{
+    ApiCredentials, DATABASE_KEY_LEN, DatabaseKey, InMemorySecrets, Secret, SecretError,
+    SecretSource, SecretStore,
+};
 pub use storage::{AccountStoragePaths, StorageLayout};
 
 use std::fmt;
@@ -442,6 +459,23 @@ fn set_option_int(name: &str, value: i64) -> Value {
     })
 }
 
+/// The `setDatabaseEncryptionKey` request that rotates a running client's
+/// database key to `new_key` — the rotation path (SEC-002/SEC-003).
+///
+/// Rotation is a live operation: the client is already initialized, so this
+/// stands apart from the [`TdlibConfig`] startup sequence rather than being a
+/// field of it. The caller persists `new_key` through
+/// [`SecretStore::put_database_key`] only after TDLib answers this request
+/// with `ok`; persisting first would strand the database under a key the
+/// keychain no longer holds. Like [`TdlibConfig::set_parameters_request`],
+/// the key rides base64-encoded and this request goes only to TDLib.
+pub fn set_database_encryption_key_request(new_key: &DatabaseKey) -> Value {
+    json!({
+        "@type": "setDatabaseEncryptionKey",
+        "new_encryption_key": new_key.base64(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +578,16 @@ mod tests {
         let sequence = config.startup_requests();
         assert_eq!(sequence.len(), 7);
         assert_eq!(sequence[6]["@type"], "addProxy");
+    }
+
+    #[test]
+    fn rotation_request_carries_only_the_new_key_base64() {
+        let new_key = DatabaseKey::from_bytes(b"foobar".to_vec());
+        let request = set_database_encryption_key_request(&new_key);
+        assert_eq!(request["@type"], "setDatabaseEncryptionKey");
+        // base64("foobar"), the same encoding setTdlibParameters uses.
+        assert_eq!(request["new_encryption_key"], "Zm9vYmFy");
+        // No other field carries key material.
+        assert_eq!(request.as_object().unwrap().len(), 2);
     }
 }
