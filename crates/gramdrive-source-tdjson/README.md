@@ -20,6 +20,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | Module | Owns |
 |---|---|
 | `api` | The two-trait seam: `TdSendApi` (thread-safe: create/send/execute) and `TdReceiveApi` (single-owner: receive takes `&mut self`) |
+| `config` | `TdlibConfig` and the storage/memory policy: per-account `setTdlibParameters`/`setOption`/`addProxy` request builders, on-disk isolation with a clean logout wipe (`StorageLayout`), and the `SecretSource` keychain seam |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
@@ -73,6 +74,38 @@ call. Miri cannot execute FFI, so the full ownership justification lives in
 `src/real.rs` module docs, and the same runtime logic runs under the mock
 in every gate.
 
+## Configuration and storage policy (`config`)
+
+`AccountConfig::mirror(account, &layout)` builds the secret-free plan for an
+account — its isolated storage paths, device/app metadata (SEC-030), the
+`StoragePolicy` (file + chat-info + message databases on, secret chats off —
+the mirror needs TDLib's local database as its history source), and the
+`MemoryOptions` that minimize footprint (TDLib's own storage optimizer off
+because GramDrive owns the cache quota and LRU per POL-2; prompt message
+unload; no persistent network-statistics DB; no notification groups).
+
+`plan.resolve(&secrets)` attaches the `api_id`/`api_hash` and the per-account
+database encryption key from a `SecretSource` — the seam to platform secure
+storage (macOS Keychain service `gramdrive-telegram`; the native adapter
+implements the trait, no keychain code lives in this core crate). The
+resulting `TdlibConfig::startup_requests()` is the ordered
+`setTdlibParameters` → `setOption`s → optional `addProxy` sequence the
+authorization flow submits.
+
+Guarantees the fixtures pin (`tests/config.rs`):
+
+- **Secrets never log.** `api_id`, `api_hash`, the database key, and proxy
+  credentials are redacted from every `Debug`/log form; the plaintext
+  reaches only the wire request to TDLib (SEC-020/SEC-023).
+- **Isolation.** Distinct accounts map to disjoint on-disk subtrees, so one
+  account's TDLib database can never touch another's.
+- **Survives upgrade.** A version bump changes `application_version` only;
+  every field that decides which encrypted database TDLib opens is
+  byte-identical, so the upgrade reopens the same store.
+- **Clean logout.** `StorageLayout::wipe_account` removes exactly one
+  account's subtree, idempotently — the on-disk half of the SEC-004 logout
+  sequence (the keychain half is the native adapter's).
+
 ## The env gate (`cfg(real_tdjson)`)
 
 Default builds — every `make check`, on machines that never built the
@@ -90,9 +123,13 @@ policy).
 
 ## Dependencies
 
-Internal: none yet (`gramdrive-model`, `gramdrive-source` are the allowed
-set for the coming adapter). External: `serde_json` — JSON is tdjson's wire
-format. Platform-specific code: forbidden. See `crates/README.md`.
+Internal: `gramdrive-model` — the `config` layer keys per-account storage
+isolation and secret lookup on `AccountId` (DOM-020/DOM-021);
+`gramdrive-source` remains reserved for the coming `DriveSource` adapter.
+External: `serde_json` — JSON is tdjson's wire format and the config
+request type. Platform-specific code: forbidden — the keychain lives behind
+the `SecretSource` seam, implemented in the native adapter. See
+`crates/README.md`.
 
 ## Test command
 

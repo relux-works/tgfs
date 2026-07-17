@@ -16,6 +16,11 @@
 //!   deterministic drain.
 //! - [`error`] — [`TdError`], the typed conversion of tdjson
 //!   `{"@type":"error"}` objects plus the runtime's own failure states.
+//! - [`config`] — [`TdlibConfig`] and the storage/memory policy: the
+//!   per-account `setTdlibParameters`/`setOption`/`addProxy` request
+//!   sequence, per-account on-disk isolation with a clean logout wipe, and
+//!   the [`SecretSource`] seam to platform secure storage. Secrets are
+//!   redacted from every `Debug`/log form (TASK-260715-1hdnuy).
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
 //!   and tests without the TDLib artifact.
@@ -43,6 +48,7 @@
 #![cfg_attr(real_tdjson, deny(unsafe_code))]
 
 pub mod api;
+pub mod config;
 pub mod error;
 pub mod mock;
 pub mod runtime;
@@ -55,6 +61,11 @@ mod slot;
 #[allow(unsafe_code)]
 pub mod real;
 
+pub use config::{
+    AccountConfig, AccountStoragePaths, ApiCredentials, DatabaseKey, DeviceMetadata,
+    InMemorySecrets, MemoryOptions, Proxy, Secret, SecretError, SecretSource, StorageLayout,
+    StoragePolicy, TdlibConfig,
+};
 pub use error::TdError;
 pub use runtime::{
     PendingRequest, RuntimeConfig, RuntimeStats, TdClient, TdRuntime, UpdateRecvError, UpdateStream,

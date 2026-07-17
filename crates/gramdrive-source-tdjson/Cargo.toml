@@ -18,12 +18,20 @@ publish.workspace = true
 build = "build.rs"
 
 [dependencies]
+# Domain vocabulary. The configuration layer keys per-account storage
+# isolation and secret lookup on `gramdrive_model::identity::AccountId`
+# (DOM-020/DOM-021) rather than inventing a parallel account id. Layer-0,
+# no internal dependencies of its own; the direction gramdrive-source-tdjson
+# -> gramdrive-model is on the architecture allow list (crates/README.md).
+gramdrive-model = { workspace = true }
+
 # JSON is tdjson's wire format (TDLib's td_json_client interface); the
 # runtime parses every received event to correlate responses and route
-# updates, so the parsed Value is also what the caller gets. MIT/Apache-2.0
-# (POL-6); already in the workspace graph as a build dependency of uniffi's
-# cargo-metadata feature, and its build script is already named in
-# deny.toml [bans.build].
+# updates, so the parsed Value is also what the caller gets. The config
+# layer builds `setTdlibParameters`/`setOption`/`addProxy` requests as the
+# same `Value`. MIT/Apache-2.0 (POL-6); already in the workspace graph as a
+# build dependency of uniffi's cargo-metadata feature, and its build script
+# is already named in deny.toml [bans.build].
 serde_json = { workspace = true }
 
 [lints]
