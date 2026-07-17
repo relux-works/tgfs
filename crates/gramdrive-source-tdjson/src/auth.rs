@@ -74,7 +74,7 @@
 use serde_json::{Value, json};
 
 use crate::config::{Secret, TdlibConfig};
-use crate::error::TdError;
+use crate::error::{TdError, trailing_integer};
 
 /// The core-facing authorization state, translated from TDLib's
 /// `authorizationState*` vocabulary. Carries everything a UI needs to
@@ -597,15 +597,6 @@ impl AuthMachine {
     }
 }
 
-/// The trailing decimal integer of `message`, if it ends with one — how
-/// both flood-wait message shapes ("Too Many Requests: retry after 17",
-/// "FLOOD_WAIT_17") state their delay.
-fn trailing_integer(message: &str) -> Option<u64> {
-    let trimmed = message.trim_end();
-    let digits = trimmed.len() - trimmed.bytes().rev().take_while(u8::is_ascii_digit).count();
-    trimmed.get(digits..)?.parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use gramdrive_model::identity::AccountId;
@@ -994,20 +985,6 @@ mod tests {
         for (rejection, expected) in cases {
             assert_eq!(rejection.advice(), expected, "{rejection}");
         }
-    }
-
-    #[test]
-    fn trailing_integer_parses_both_flood_message_shapes() {
-        assert_eq!(
-            trailing_integer("Too Many Requests: retry after 17"),
-            Some(17)
-        );
-        assert_eq!(trailing_integer("FLOOD_WAIT_120"), Some(120));
-        assert_eq!(trailing_integer("FLOOD_WAIT_3 "), Some(3));
-        assert_eq!(trailing_integer("Too Many Requests"), None);
-        assert_eq!(trailing_integer(""), None);
-        // A huge trailing number must not panic, just fail to parse.
-        assert_eq!(trailing_integer("wait 99999999999999999999999999"), None);
     }
 
     #[test]

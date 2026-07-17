@@ -24,6 +24,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `auth` | `AuthMachine`: the deterministic sans-IO authorization state machine — typed core-facing states/inputs for the phone/code/2FA-password/QR paths, rejection classification with retry advice, unknown TDLib states failing safe as typed `Unsupported` |
 | `config` | `TdlibConfig` and the storage/memory policy: per-account `setTdlibParameters`/`setOption`/`addProxy` request builders, on-disk isolation with a clean logout wipe (`StorageLayout`), and the `SecretSource` keychain seam |
 | `removal` | `AccountRemoval`: the crash-resumable account-removal workflow (SEC-004) — the SEC-004 cleanup sequenced behind a durable journal, distinguishing Telegram logout (`RevokeSession` → `logOut`) from local-only removal (`LocalOnly` → `close`), idempotent per stage and fail-safe under concurrent access |
+| `snapshot` | `SnapshotMachine`: the deterministic sans-IO initial chat-list snapshot (TASK-260715-30amrq) — `loadChats` pagination per list, the `getChats` order witness, lazy `getChat` detail resolution, flood-wait backoff advice, resumable per-list commits carrying Telegram's exact ordering metadata |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
@@ -182,6 +183,51 @@ Guarantees the fixtures pin (`tests/account_removal.rs`):
   `ExportPolicy::Retain` omits the export-wipe stage entirely; `Discard`
   removes the registered export directories with everything else.
 
+## The initial chat-list snapshot (`snapshot`)
+
+`SnapshotMachine` (TASK-260715-30amrq) turns TDLib's chat-list loading
+protocol into deterministic, resumable, per-list commits — the metadata
+baseline everything else (history crawl, live updates, folder sync) builds
+on. Sans-IO like the auth machine: the caller submits the requests
+`next_step` names, pumps the client's updates into `on_update`, feeds
+response outcomes to `on_response`, and persists each `ListCommit`
+atomically — canonical chat rows, ordered membership, and the commit's
+resume token in one state transaction (SYNC-022), with
+`SNAPSHOT_CURSOR_STREAM` as the cursor convention.
+
+Guarantees the suites pin (`tests/chat_snapshot.rs`, unit tests in
+`src/snapshot.rs`):
+
+- **Metadata only (SYNC-020).** The entire request surface is `loadChats`
+  (pagination; the end-of-list `404` is the terminator, not a failure),
+  `getChats` (the exact-order witness), and lazy `getChat` for chats the
+  witness names that updates did not announce. No history, no media, no
+  per-chat user/supergroup fan-out — usernames ride the
+  `updateUser`/`updateSupergroup` objects TDLib pushes during the load.
+- **Exact ordering metadata (DEC-013/POL-1).** Every list entry carries
+  Telegram's opaque int64 `order` (parsed from tdjson's string wire shape,
+  exact at int64 range) and the pinned flag; entries are emitted
+  pinned-first, order descending, id descending — byte-for-byte the order
+  the state layer's `chat_list` read reproduces.
+- **No duplicates, no gaps (SYNC-003).** A duplicate id in the order
+  witness and a listed chat that even lazy resolution cannot place are
+  typed contract failures; a chat that demonstrably left the list mid-load
+  (explicit order-0 position) is excluded and counted, never resurrected
+  and never a false gap. Secret chats (POL-4) and unknown chat types are
+  excluded and counted, fail-safe.
+- **Resume without rework it cannot avoid (SYNC-004/SYNC-022).** Progress
+  is list-granular because `loadChats` has no offset — TDLib's local
+  database is the page cache, so an interrupted list re-enumerates locally
+  rather than re-downloading. A resumed machine skips committed lists
+  entirely; re-running a list is idempotent (upserts plus atomic membership
+  replace), so interruption at any point yields neither duplicates nor
+  gaps. Resume tokens are versioned and rejected explicitly when
+  unreadable, never treated as an empty history.
+- **Flood wait is advice, not failure (SYNC-044).** Codes 429/`FLOOD_WAIT`
+  (with Telegram's stated delay parsed out) and 500 arm one typed
+  `Backoff` step and re-issue the identical request; everything else is a
+  typed terminal error whose recovery path is the durable token.
+
 ## The env gate (`cfg(real_tdjson)`)
 
 Default builds — every `make check`, on machines that never built the
@@ -200,12 +246,15 @@ policy).
 ## Dependencies
 
 Internal: `gramdrive-model` — the `config` layer keys per-account storage
-isolation and secret lookup on `AccountId` (DOM-020/DOM-021);
+isolation and secret lookup on `AccountId` (DOM-020/DOM-021), and the
+`snapshot` layer speaks `ChatListKind` for the lists it enumerates;
 `gramdrive-source` remains reserved for the coming `DriveSource` adapter.
 External: `serde_json` — JSON is tdjson's wire format and the config
-request type. Platform-specific code: forbidden — the keychain lives behind
-the `SecretSource` seam, implemented in the native adapter. See
-`crates/README.md`.
+request type. Dev-only: `gramdrive-state` — the snapshot integration suite
+applies commits through the real typed repositories; product code never
+links it from here (the composing caller owns that wiring). Platform-
+specific code: forbidden — the keychain lives behind the `SecretSource`
+seam, implemented in the native adapter. See `crates/README.md`.
 
 ## Test command
 

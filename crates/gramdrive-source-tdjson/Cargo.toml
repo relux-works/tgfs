@@ -34,6 +34,16 @@ gramdrive-model = { workspace = true }
 # is already named in deny.toml [bans.build].
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# The snapshot integration suite (tests/chat_snapshot.rs) proves the whole
+# TASK-260715-30amrq loop end-to-end: the sans-IO snapshot machine's
+# per-list commits are applied through the typed state repositories
+# (upsert_chat / replace_chat_list / put_cursor in one transaction,
+# SYNC-022) against a real in-memory store. Dev-only: the architecture
+# direction table binds [dependencies]; product code never links state from
+# here — the composing caller (engine/ffi) owns that wiring.
+gramdrive-state = { workspace = true }
+
 [lints]
 # Shared lint set: Cargo.toml [workspace.lints].
 workspace = true

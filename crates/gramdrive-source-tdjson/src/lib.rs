@@ -35,6 +35,13 @@
 //!   ([`RemovalMode::LocalOnly`]), idempotent and fail-safe under concurrent
 //!   access. Owns the stages this crate can (session request, on-disk wipe,
 //!   keychain revocation, journal); the engine/state stages it directs.
+//! - [`snapshot`] — [`SnapshotMachine`], the deterministic sans-IO initial
+//!   chat-list snapshot (TASK-260715-30amrq): `loadChats` pagination per
+//!   list, the `getChats` order witness, lazy `getChat` detail resolution,
+//!   flood-wait backoff advice, and resumable per-list commits carrying
+//!   Telegram's exact ordering metadata — never a history or media request
+//!   (SYNC-020). The composing caller persists each commit through the
+//!   state repositories together with its resume token (SYNC-022).
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
 //!   and tests without the TDLib artifact.
@@ -57,6 +64,7 @@
 //! [`TdError`]: error::TdError
 //! [`MockTdJson`]: mock::MockTdJson
 //! [`AuthMachine`]: auth::AuthMachine
+//! [`SnapshotMachine`]: snapshot::SnapshotMachine
 //! [`AccountRemoval`]: removal::AccountRemoval
 //! [`RemovalMode::RevokeSession`]: removal::RemovalMode::RevokeSession
 //! [`RemovalMode::LocalOnly`]: removal::RemovalMode::LocalOnly
@@ -73,6 +81,7 @@ pub mod error;
 pub mod mock;
 pub mod removal;
 pub mod runtime;
+pub mod snapshot;
 
 mod envelope;
 mod queue;
@@ -97,4 +106,8 @@ pub use removal::{
 };
 pub use runtime::{
     PendingRequest, RuntimeConfig, RuntimeStats, TdClient, TdRuntime, UpdateRecvError, UpdateStream,
+};
+pub use snapshot::{
+    ChatSnapshot, ListCommit, ListEntrySnapshot, SNAPSHOT_CURSOR_STREAM, SnapshotBackoff,
+    SnapshotChatKind, SnapshotError, SnapshotMachine, SnapshotPlan, SnapshotRequest, SnapshotStep,
 };
