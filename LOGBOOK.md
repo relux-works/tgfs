@@ -5,6 +5,41 @@
 
 ## 2026-07-17
 
+### 1552 — SYNC-046 does not mean what the range cases were using it for (TASK-260715-3e8q4m)
+- FINDING: SYNC-046 verbatim is *"**Concurrent** requests for the same item/version coalesce where safe and do not corrupt range/accounting state"* (`.spec/sync-and-filesystem-semantics.md:62`). Six range-delivery cases were labelled SYNC-046 and **not one issued a concurrent call**. A range failure printed a requirement about concurrency.
+- ROOT CAUSE: `gramdrive-source/src/fetch.rs:39` cites SYNC-046 for the `FetchProgress` accounting fold, which is the "do not corrupt range/accounting state" half. Defensible for the *engine*; wrong as the clause a single-threaded range case pins. The clause those cases actually pin is **SYNC-041** ("Fetch accepts byte ranges even if a source internally downloads larger aligned chunks"), which was not in the `Clause` enum at all.
+- FIX: added `Clause::Sync041`, re-labelled the six range cases. SYNC-046 now pins one real case — `fetch.concurrent-fetches-do-not-corrupt-each-other`, two overlapping fetches of the same item/version in flight at once via a hand-rolled `both()` join (`support.rs`; no async dep by design).
+- FINDING: `source.rs:25-30` makes concurrency an explicit source obligation ("concurrent calls never corrupt each other's answers") and nothing tested it before this.
+- NOTE: the mislabel was self-inflicted and invisible while everything was green — `clauses_upheld()` was crediting SYNC-046 against a clause that had never run. Verbatim `statement()` text is what surfaced it; a paraphrase would have agreed with the code forever.
+- SCOPE: `crates/gramdrive-testkit/src/conformance/{report.rs,support.rs,cases/fetch.rs}`.
+
+### 1551 — Six conformance cases removed: vacuous or over-strict (TASK-260715-3e8q4m)
+- FINDING: a conformance suite has two failure modes worse than a missing case — a case that **cannot fail**, and a case that **fails a correct backend**. Adversarial review (wrapper backends honoring the contract but differing from the fake) proved four of the latter and one of the former. All were written by me and all looked reasonable.
+- DECISION: removed *"a directory advertises no write"* (SYNC-060). `SourceItem::capabilities()` (`item.rs:172-187`) hardcodes writes to `false` on **every** branch → no impl can produce a writable set → unfalsifiable. Same tautology as asserting `retry_advice()` on an already-matched variant. SYNC-060 also says *"not advertised **through native providers**"* — a File Provider obligation, not `DriveSource`'s — so the clause left the suite entirely.
+- DECISION: removed *"a generous page completes in one page"*. `page.rs:118` says a source *"may return fewer, never more"*, and `next: None` **means** complete rather than obliging a source to know it without another round trip. `source.rs:203` — the contract's own stub — violates the case.
+- DECISION: removed *"a thumbnail of an absent item is NotFound"*. `source.rs:97-99` blesses `Ok(None)` as *"a normal answer, not an error"* and mandates a failure only for restricted content. The case was inventing a rule.
+- DECISION: removed `!is_complete()` on an abandoned fetch — a source may deliver a small range in one chunk and suspend before resolving. The module's own doc had warned against counting bytes, eight lines above the line that counted bytes.
+- FIX: flood-wait backoff 1500ms → whole seconds; Telegram `FLOOD_WAIT_n` is integer seconds, so a tdjson harness could not have staged the old value.
+- NOTE: the surviving rule — **assert the category the backend chose, never the classification derived from it**. Sole exception `RateLimited::retry_after`, which is a number the backend must carry across the boundary intact and nothing else would notice.
+- SCOPE: `crates/gramdrive-testkit/src/conformance/cases/{shape,enumeration,cancellation,failures}.rs`.
+
+### 1550 — Conformance suite: generic harness seam, skips are not passes (TASK-260715-3e8q4m)
+- MILESTONE: `gramdrive_testkit::conformance` — 38 cases / 13 clauses, `run<H: SourceHarness>(&H) -> Report`. Fake passes 38/38, 0 skipped. `make check` 8/8.
+- DECISION: generic over `H`, **not** a trait object. `block_on` is generic in the future's output because how futures are driven is the backend's business — the fake needs no runtime, tdjson needs tokio. Dyn-compatibility would have forced an executor choice into the suite.
+- DECISION: arming (`Perturbation`, pre-live: unreachable, expired reference, rate limit, auth revoked, slow, mid-fetch race) split from mutating (`Mutation`, live: child appears/removed, content changes). Backends implement them in different layers. The mutation **plan is declared up front** so a harness can prepare — `SourceScript` is immutable, so `FakeHarness` compiles the plan into change batches at build time and `Control::advance` is `FakeSource::advance`. Plan order *is* revision order.
+- DECISION: `Capability` gating with `Skipped` ≠ `Passed`. A backend that cannot stage a version race has not proved it survives one; crediting it would make the suite most flattering to the backends supporting least. `clauses_upheld()` credits only clauses that ran; the skip list prints under the pass count.
+- DECISION: cases return `Failure`, never assert. Forced by the workspace `panic` denial (this is `src/`, not a test) and independently right: a run reports every broken clause instead of stopping at the first, in the contract's vocabulary rather than this crate's. `assert_conforms` is the only panic and its caller is a test.
+- FINDING: `Clause::statement()` is **verbatim** `.spec/` text. A paraphrase is where a suite quietly acquires opinions the specification does not hold — and it hid a real mislabel until replaced (see 1552).
+- FINDING: the fake's `advance()` mid-enumeration always rejects the continuation, so `does_not_splice_when_the_listing_moves` only ever exercises the reject branch. The keep-serving-the-snapshot branch is equally contract-legal and stays untested until a backend takes it.
+- SCOPE: `crates/gramdrive-testkit/src/conformance/**`, `tests/conformance.rs`, READMEs.
+
+### 1549 — Saboteur sources are what make the suite worth running (TASK-260715-3e8q4m)
+- FINDING: the fake passing 38/38 proves ~nothing on its own — a suite whose every case asserted `true` passes exactly as loudly. `tests/conformance.rs` therefore wraps the fake in `Saboteur`, a source that breaks **one** clause on purpose, and asserts the suite fails *on the case owning that clause*.
+- SCOPE: caught — duplicated child (SYNC-003), snapshot shifting per page (SYNC-003), any cursor served regardless of scope (SYNC-004 ×2), delivery one byte past the range (SYNC-041), right offsets + wrong bytes (SYNC-041 **and** SYNC-046), every failure reported as `Unavailable` (SYNC-044 ×2 — auth and expired reference).
+- FINDING: "right offsets, wrong bytes" is invisible to `FetchProgress` — it accounts offsets and lengths and never looks at a byte. Only the byte comparison catches it, which is exactly the shape a concurrency bug takes (two fetches served from one buffer). Proves the concurrency case's assertion can actually fail.
+- NOTE: an "austere" harness supporting nothing is also tested — it gets skips, stays `is_conformant()` (a skip breaks no clause), and is **not** credited with the clauses it never ran. That test is the guard on the skip-vs-pass distinction.
+- SCOPE: `crates/gramdrive-testkit/tests/conformance.rs`.
+
 ### 1459 — Outcome::Failed now carries its delivered count; no delivered() accessor (TASK-260715-3uft8j)
 - DECISION: `Outcome::Failed(SourceError)` → `Outcome::Failed { error, delivered }` (`record.rs`). Review flagged this as a decision, not rework; taken **now** rather than after the conformance suite (TASK-260715-3e8q4m) builds on the type.
 - ROOT CAUSE of the flag: AC says "assert requests, cancellation **and side effects**", but a version race or sink-stop that moved bytes reported them only via the sink, never via `interactions()`. `a_race_records_the_bytes_it_delivered` was asserting the *sink* under a name promising the *record* — the test name was evidence of the type gap, not of a sloppy test.

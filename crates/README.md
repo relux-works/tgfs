@@ -38,7 +38,7 @@ neutrality violation invisible to the scan ships undetected.
 | 1 | `gramdrive-render` | Deterministic NDJSON/Markdown renderers and render planning | STORY-260715-1oq9jg (deterministic-rendering) |
 | 2 | `gramdrive-engine` | Transfer/cache engine: hydration, quota, eviction, resumable downloads | STORY-260715-2hs8cf (transfer-and-cache-engine) |
 | 3 | `gramdrive-ffi` | UniFFI boundary; the only crate native consumers link | STORY-260715-2p879f (workspace-and-bindings) |
-| — | `gramdrive-testkit` | Deterministic fake source, fixtures, conformance helpers | STORY-260715-255sa3 (drive-source-contract) |
+| — | `gramdrive-testkit` | Deterministic fake source, fixtures, the one `DriveSource` conformance suite (SYNC-002) | STORY-260715-255sa3 (drive-source-contract) |
 
 ```text
                  gramdrive-ffi            (layer 3 — FFI boundary)

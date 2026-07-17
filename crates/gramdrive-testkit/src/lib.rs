@@ -1,12 +1,15 @@
 //! GramDrive test support — deterministic fixtures shared across the core.
 //!
 //! This crate owns the deterministic fake `DriveSource`
-//! (TASK-260715-3uft8j), and will own the source conformance suite
-//! (TASK-260715-3e8q4m) and shared fixture trees, including the
+//! (TASK-260715-3uft8j) and the one source conformance suite
+//! (TASK-260715-3e8q4m), and will own shared fixture trees, including the
 //! cross-platform filename fixtures required by PLAT-021.
 //!
 //! # What is here
 //!
+//! - [`conformance`] — the backend-agnostic suite every `DriveSource`
+//!   implementation must pass (SYNC-002, NFR-002), and the fake's harness
+//!   for it;
 //! - [`SourceScript`] / [`ScriptBuilder`] — a whole backend written down:
 //!   a base tree, the bytes behind each file, the change batches that move
 //!   it forward, and the faults that interrupt any of it ([`script`]);
@@ -80,6 +83,7 @@
 mod rng;
 mod tree;
 
+pub mod conformance;
 pub mod exec;
 pub mod fake;
 pub mod fault;

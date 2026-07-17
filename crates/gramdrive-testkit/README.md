@@ -114,6 +114,83 @@ under contention" or "does this meet a latency budget" (NFR-020..022). Those
 need a real backend and a real runtime. What it answers is every question
 with a contractual answer, identically on every run.
 
+## The conformance suite
+
+One suite, run against every `DriveSource` implementation (SYNC-002,
+NFR-002). The point of DEC-003's provider-neutral boundary is that the engine
+holds a local TDLib source, a remote source, or a fake behind one `dyn
+DriveSource` and does not care which — a promise worth exactly as much as the
+shared test that checks it.
+
+```rust
+use gramdrive_testkit::conformance::{self, FakeHarness};
+
+let report = conformance::run(&FakeHarness::new());
+assert!(report.is_conformant(), "{report}");
+```
+
+### Running it against your backend
+
+Implement `SourceHarness`: name the backend, declare which `Capability`s you
+can stage, drive a future, and build `WORLD` on demand. Then call
+`conformance::assert_conforms(&harness)` from a `#[test]`. The suite never
+constructs your source, never reaches past the trait, and never learns your
+page-token format; everything it knows about your world it learns from the
+`Landmarks` you hand back. `conformance::FakeHarness` is the worked example —
+about 250 lines, and the whole of what a backend owes the suite.
+
+| Type | Purpose |
+|---|---|
+| `SourceHarness` | The seam: `name`, `supports`, `block_on`, `stage`. Generic, not a trait object — `block_on` is generic in its output because how futures are driven is the backend's business |
+| `WORLD` / `WorldSpec` | The one world every case is staged against. Fixed, not configurable: a fixture that varies per backend gives results that cannot be compared across backends |
+| `Landmarks` | Where the harness put each part of the world — identities only; the suite reads the rest through the contract |
+| `Perturbation` / `Setup::arm` | Interference armed *before* the source goes live: a call that fails, throttles, takes its time, or loses a race |
+| `Mutation` / `Setup::plan` / `Control` | Changes applied *while* it is live: a child appears or leaves, content moves on. Declared up front so a harness can prepare — the fake compiles the plan into change batches at build time |
+| `Capability` | What a harness can stage. What it declines is **skipped**, never passed |
+| `Report` / `Clause` / `CaseOutcome` | The verdict: per case, the clause it pins, the claim it makes, and what the source did instead |
+
+### Two properties worth knowing
+
+**Skipped is not passed.** No backend stages everything — a `tdjson` source
+against a live account cannot conjure a flood wait on cue. `supports` lets a
+harness decline, and the case is reported `Skipped`, printed in a list under
+the pass count. `Report::is_conformant` means "broke nothing it was asked
+about", which is not "correct", and `clauses_upheld` credits only clauses that
+actually ran. Counting a skip as a pass would make the suite most flattering
+to the backends that support least.
+
+**A case asserts only what the contract mandates.** A conformance suite that
+fails correct backends is worse than none, so each case pins the clause and
+stops. It is why there is no case for "a page larger than the listing needs no
+continuation" (`PageRequest` says a source may return fewer items than asked,
+and `next: None` *means* complete rather than being an obligation to know it
+early), none for "a thumbnail of an absent item is `NotFound`" (`Ok(None)` is
+a normal answer per the trait's own docs), and none for "a directory advertises
+no write" (`capabilities()` derives writes to `false` on every branch, so no
+implementation can fail it — a tautology wearing a backend's name). Cases that
+cannot fail cost the same to run and buy nothing but a longer pass count.
+
+**A failure names a clause, not a call stack.** Cases return `Failure` rather
+than panicking, so a run reports every broken clause instead of stopping at
+the first, and each one arrives with the requirement's verbatim `.spec/` text
+and what the source did in contract terms:
+
+```text
+FAILED enumeration.covers-every-child-exactly-once [SYNC-003]
+  clause:   Enumeration is paginated and repeatable for a declared snapshot/version;
+            duplicate or missing children across pages are contract failures.
+  claim:    paging through a listing serves every child once — no duplicate, no hole
+  observed: child chat:100/year:2000 was served twice across 3 pages
+```
+
+`tests/conformance.rs` holds the suite to that claim from the other side: it
+runs it against sources built to break one clause each — a duplicated child, a
+drifting snapshot, a cursor served regardless of scope, a delivery past its
+range, a delivery of the right offsets with the wrong bytes, a miscategorized
+failure — and asserts the suite fails, on the case that owns that clause. A
+suite whose every case asserted `true` would pass the fake exactly as loudly;
+those tests are what say the cases have teeth.
+
 ## Test command
 
 ```sh
