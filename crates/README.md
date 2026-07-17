@@ -106,9 +106,12 @@ Additional rules:
 - **Platform host crates (future Windows CfAPI / Linux FUSE hosts) join the
   workspace as new members** with their own policy rows; the platform ban
   list applies per-crate, not globally.
-- Workspace crates currently declare **no cargo features**. A crate that
-  introduces one must document it in its README; features must never toggle
-  provider or platform code into a core crate.
+- Workspace crates declare **no cargo features** except documented
+  tooling-only ones: a crate that introduces a feature must document it in
+  its README, and features must never toggle provider or platform code into
+  a core crate. The single current feature is `gramdrive-ffi/bindgen`,
+  which gates the workspace-local `uniffi-bindgen` binary and is never
+  enabled by a product build (`crates/gramdrive-ffi/README.md`).
 
 ## Toolchain and quality configuration
 
@@ -190,7 +193,21 @@ Inner-loop commands, which are not gates:
 | `make build` | Build every crate (reference host: macOS 14+ arm64, POL-5) |
 | `make test` | Run all crate tests without provenance |
 | `cargo test -p <crate>` | Run one crate's tests (also in each crate README) |
+| `make bindings` | Generate Swift + Kotlin bindings into `.temp/bindings` (library mode; `crates/gramdrive-ffi/README.md`) |
+| `make smoke-bindings` | Compile and run the Swift and Kotlin smoke consumers against freshly generated bindings (`.scripts/smoke/`) |
 
-UniFFI generation is owned by TASK-260715-265gqq; artifact packaging, including
-the shipped-target list and dSYM/stripping decisions, by TASK-260715-3akqs8; CI
-jobs and the blind cross-build gate by TASK-260715-3faqmr.
+The UniFFI contract, generation pipeline, threading/async model, and
+interface versioning policy live in `crates/gramdrive-ffi/README.md`
+(TASK-260715-265gqq). Artifact packaging, including the shipped-target list
+and dSYM/stripping decisions, is TASK-260715-3akqs8; CI jobs and the blind
+cross-build gate are TASK-260715-3faqmr.
+
+**Licensing — two named POL-6 exceptions, gate green.** The uniffi crates are
+MPL-2.0 and `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`; both
+licenses sit outside the POL-6 allow list and are owner-accepted named
+exceptions per **DEC-021** (2026-07-17). `deny.toml` enforces them as
+per-crate `[licenses.exceptions]` rather than blanket `allow` entries, so the
+grant reaches only the crates named there — any further license, or any
+further crate carrying these two, fails the gate until a new decision row
+covers it. All four `cargo deny` checks (licenses, advisories, bans, sources)
+pass.

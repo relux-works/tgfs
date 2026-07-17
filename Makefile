@@ -10,7 +10,7 @@
 
 GATE := python3 .scripts/acceptance/run_automated.py
 
-.PHONY: check check-core check-repo gates fmt build test clean-gates
+.PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings clean-gates
 
 # check — the pre-push gate: everything CI runs.
 check:
@@ -44,6 +44,20 @@ build:
 # test — run the workspace tests directly (fast inner loop, no provenance).
 test:
 	cargo test --workspace
+
+# bindings — generate Swift + Kotlin bindings from the built library
+# (library mode; pipeline documented in crates/gramdrive-ffi/README.md).
+bindings:
+	cargo build -p gramdrive-ffi
+	cargo run -p gramdrive-ffi --features bindgen --bin uniffi-bindgen -- \
+		generate --library target/debug/libgramdrive_ffi.dylib \
+		--language swift --language kotlin --out-dir .temp/bindings
+
+# smoke-bindings — build, generate, then compile and run the Swift and
+# Kotlin smoke consumers against the generated bindings (needs swiftc,
+# kotlinc, java; see .scripts/smoke/run_bindings_smoke.py).
+smoke-bindings:
+	python3 .scripts/smoke/run_bindings_smoke.py
 
 # clean-gates — drop local gate provenance under .temp/acceptance/.
 clean-gates:

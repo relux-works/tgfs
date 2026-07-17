@@ -24,6 +24,16 @@ gramdrive-engine = { path = "crates/gramdrive-engine" }
 gramdrive-ffi = { path = "crates/gramdrive-ffi" }
 gramdrive-testkit = { path = "crates/gramdrive-testkit" }
 
+# External dependencies. Versions live here so every crate that pulls one in
+# agrees on the requirement; per-crate manifests add only features.
+#
+# uniffi is MPL-2.0 — outside the POL-6 allow list, and allowed as an
+# owner-accepted named exception (DEC-021). deny.toml grants it per-crate via
+# [licenses.exceptions], so the grant reaches only the uniffi* crates named
+# there; a new one fails the gate until it is added on purpose.
+uniffi = { version = "0.32" }
+tokio = { version = "1.52", default-features = false }
+
 # ---------------------------------------------------------------------------
 # Lints
 #

@@ -5,6 +5,45 @@
 
 ## 2026-07-17
 
+### 0503 — A new decision row needs a traceability matrix row in the same commit — DEC-021 shipped without one and left the gate red (TASK-260715-265gqq)
+- REGRESSION: commit fc3b594 added the DEC-021 row to `.spec/decisions.md` but no row in `docs/TRACEABILITY.md`; `.scripts/validate_traceability.py:168` requires every ID defined under `.spec/` to have a matrix row, so the `repo` suite failed with `missing matrix row for DEC-021` on an otherwise-green tree.
+- ROOT CAUSE: adding a decision is a two-file change and nothing in the decision update procedure (`.spec/decisions.md:34`) says so. The catching gate lives in the `repo` suite, not `core`, so a `make check-core` run after a spec edit looks clean.
+- FIX: added the DEC-021 matrix row (`docs/TRACEABILITY.md`, elements TASK-260715-265gqq + TASK-260715-152wjq) and cited DEC-021 in the POL-6 row note. `make check` → 8/8.
+- NOTE: DEC-021 gets no POL row of its own — it is a named exception inside POL-6; noted inline so the next reader does not "fix" the absence.
+- SCOPE: `docs/TRACEABILITY.md`.
+- STATUS: resolved.
+
+### 0502 — DEC-021 enforced as per-crate deny.toml exceptions, not a blanket allow — supply-chain gate green (TASK-260715-265gqq)
+- DECISION: implemented the DEC-021 grant as `[licenses.exceptions]` entries naming the 8 `uniffi*` crates (MPL-2.0) and `unicode-ident` (Unicode-3.0), rather than adding the two licenses to `[licenses] allow` as the unblock note directed. DEC-021 grants them to *named* crates; a blanket allow would let any future dependency carry MPL-2.0 in silently — the outcome the decision row exists to prevent, and contrary to deny.toml's own stated premise that "the gate is what makes it a fact rather than an intention". Deviation flagged in the task results for review.
+- FINDING: `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0` — the MIT half resolves against the existing allow list, so only the `Unicode-3.0` term needs the exception. cargo-deny `exceptions` are additive to `allow`, not a replacement for it.
+- FINDING: cargo-deny `exceptions` take a crate name/version spec, not a glob — `uniffi*` is not expressible; the 8 names are listed explicitly. Left unversioned to match the `[bans.build]` convention: a patch bump must not flip the gate, but a new `uniffi_*` crate on a version bump fails until added on purpose.
+- FIX: `deny.toml` `[licenses] exceptions`; `.spec/policies.md` POL-6 corrected — it described enforcement as "allow entries in deny.toml", which is no longer what the config does. DEC-021's decision row itself untouched (DEC-020: human-only).
+- SCOPE: `deny.toml`, `.spec/policies.md`.
+- STATUS: resolved — `cargo deny check` green; `make check` 8/8; both binding smokes still pass.
+
+### 0444 — UniFFI license reality: MPL-2.0 blocks the supply-chain gate, owner decision drafted (TASK-260715-265gqq)
+- FINDING: every `uniffi*` crate (0.32.0) is MPL-2.0 and `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0` — both outside the POL-6 allow list, so `cargo deny check licenses` fails by design. `deny.toml` and POL-6 require an owner-approved decision row before extending the allow list; DEC-020 makes that human-only.
+- DECISION: implemented the UniFFI boundary anyway (UniFFI is the accepted bridge per DEC-001/architecture.md) and left the license gate honestly red; drafted the decision row + options in `docs/OPEN_QUESTIONS.md` item 10. Recommended: accept MPL-2.0 (file-scoped weak copyleft, no modifications planned) + Unicode-3.0 (compile-time only).
+- FIX: `deny.toml [bans.build]` allow list populated with the 13 build-script crates the uniffi/tokio trees bring (all version/feature probes) — exactly the edit the config's own comment predicted for this task. advisories/bans/sources all pass; licenses is the only red.
+- SCOPE: `deny.toml`, `docs/OPEN_QUESTIONS.md`, `crates/README.md`, `Cargo.toml`.
+- STATUS: blocked on owner licensing decision; everything else in the task is done and verified.
+
+### 0443 — uniffi 0.32 Swift bindings do not propagate Task cancellation → cancellation made an explicit contract token (TASK-260715-265gqq)
+- FINDING: generated Swift `uniffiRustCallAsync` polls via `withUnsafeContinuation` with no `withTaskCancellationHandler`; cancelling the Swift `Task` never reaches Rust, and the generated `CALL_CANCELLED` handler is literally `fatalError("Cancellation not supported yet")` (verified in generated `GramDriveCore.swift`). Kotlin cancels the coroutine and frees the Rust future (drops in-flight work) but also never calls `rust_future_cancel`.
+- DECISION: cancellation is explicit and in-band — exported `CancellationToken` object (tokio `watch`-backed), long-running ops take it as an argument and fail with `DriveError::Cancelled` at the next cancellation point. Matches how the platform provider APIs actually deliver cancellation (`NSProgress` handlers, Android `CancellationSignal`) and is verified round-trip in both smoke consumers. Re-evaluate on every uniffi upgrade; token contract stays regardless.
+- FINDING: an error variant field named `message` produces uncompilable Kotlin bindings — collides with `kotlin.Exception.message` (overload resolution ambiguity in generated `FfiConverter`). Boundary rule recorded in `api.rs` + crate README: diagnostic field is `detail`, never `message`.
+- FINDING: Kotlin smoke gotcha — a failed `async` child cancels its parent scope even when `await()` is caught; expected-failure assertions must `runCatching` inside the async block.
+- SCOPE: `crates/gramdrive-ffi/src/api.rs`, `.scripts/smoke/{swift,kotlin}/`, `crates/gramdrive-ffi/README.md` § Cancellation.
+- STATUS: resolved; both smokes green (`BINDINGS SMOKE PASSED`).
+
+### 0442 — UniFFI boundary landed: proc-macro contract, library-mode pipeline, Swift+Kotlin smoke green (TASK-260715-265gqq)
+- MILESTONE: `gramdrive-ffi` now exposes the provider-neutral contract — `ContractVersion`/`contract_version()`, `DriveError` (9 stable categories per NFR-030), `TransferProgress` + foreign `ProgressListener`, `CancellationToken`, `DriveCore` (validated constructor + `probe_transfer` conformance probe). Proc-macros over UDL (compiler-checked single source of truth); namespace `gramdrive`, Swift module `GramDriveCore`, Kotlin package `com.reluxworks.gramdrive.core` per POL-7 (`uniffi.toml`).
+- DECISION: tokio drives the core (`async_runtime = "tokio"`); exported futures are polled by the foreign binding, must never block; callbacks arrive on background threads by contract. Full threading/async model + interface versioning policy: `crates/gramdrive-ffi/README.md`.
+- DECISION: bindgen is a workspace-local bin behind the tooling-only `bindgen` feature (`required-features`), version-locked to the linked uniffi — no external uniffi-bindgen skew possible. Pipeline: `make bindings`; end-to-end proof: `make smoke-bindings` → `.scripts/smoke/run_bindings_smoke.py` (Swift consumer links the staticlib, Kotlin/JVM consumer loads the cdylib via JNA with sha256-pinned jars).
+- NOTE: installed `kotlin` via brew for the Kotlin smoke (documented in root README prerequisites); jars pinned: jna-5.17.0, kotlinx-coroutines-core-jvm-1.10.2.
+- SCOPE: `crates/gramdrive-ffi/*` (api.rs, bin/uniffi_bindgen.rs, uniffi.toml, Cargo.toml, README), workspace `Cargo.toml`, `Makefile`, `.scripts/smoke/*`, root `README.md`.
+- STATUS: 13 Rust tests + both smoke consumers green; core gates 5/6 (supply-chain red on the licensing decision above).
+
 ### 0358 — Release LTO is silently inert for the shipped FFI artifact (TASK-260715-2cn768)
 - FINDING: `[profile.release] lto = "thin"` never reaches `gramdrive-ffi`. Cargo omits `-C lto` from any rustc invocation that also emits an rlib (rustc cannot LTO an rlib output), and `gramdrive-ffi` is `crate-type = ["lib", "staticlib", "cdylib"]` — so `libgramdrive_ffi.dylib`/`.a` link without LTO. No warning from cargo; the build says "Finished".
 - FINDING: verified empirically, not inferred — with `crate-type = ["cdylib"]` alone, `cargo build -p gramdrive-ffi --release -v` shows `-C lto=thin`; with the real three-type set it is absent. Other profile flags DO apply: `-C codegen-units=1`, `-C overflow-checks=on`, `-C debuginfo=line-tables-only` confirmed on the rustc line.

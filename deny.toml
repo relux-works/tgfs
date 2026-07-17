@@ -33,8 +33,8 @@ all-features = true
 # The product is proprietary; every third-party dependency must carry a
 # permissive license. The allow list is exactly the POL-6 set (BSD expressed as
 # its 2- and 3-clause SPDX forms). Any other license — including permissive ones
-# outside this set (e.g. Unicode-3.0) — fails the gate and requires an explicit
-# owner-approved decision row in .spec/decisions.md before being added here.
+# outside this set — fails the gate and requires an explicit owner-approved
+# decision row in .spec/decisions.md before being added here.
 #
 # GPL/AGPL/LGPL-static sources (tdesktop, tdl, MadelineProto) are reference-only
 # under POL-6. They are absent from this list on purpose: the gate is what makes
@@ -56,6 +56,43 @@ allow = [
 private = { ignore = true }
 # Allow-list entries may be unused while the dependency tree is small.
 unused-allowed-license = "allow"
+
+# POL-6 named exceptions (DEC-021, owner-accepted 2026-07-17).
+#
+# Two licenses outside the POL-6 permissive set are allowed, and only for the
+# crates named here:
+#
+#   MPL-2.0      the uniffi crate family — the accepted FFI bridge (DEC-001).
+#                Weak copyleft scoped to the covered *files*, not to the work
+#                that links them, so it does not reach our proprietary code.
+#                The obligation is conditional: modifying a covered file means
+#                publishing that file. We use these crates unmodified.
+#   Unicode-3.0  unicode-ident — proc-macro infrastructure under syn/quote.
+#                Compile-time only; never linked into a shipped artifact.
+#                Its expression is `(MIT OR Apache-2.0) AND Unicode-3.0`, so the
+#                MIT half resolves against `allow` above and only the Unicode-3.0
+#                term needs the exception.
+#
+# `exceptions` rather than `allow` entries on purpose: DEC-021 grants these
+# licenses to *named crates*, not to the dependency tree at large. A blanket
+# allow would let any future crate carry MPL-2.0 in silently, which is the
+# outcome the decision row exists to prevent.
+#
+# Names are unversioned, matching [bans.build] below: the grant is about *which*
+# crates may carry these licenses, and a patch bump must not flip the gate. A
+# new uniffi_* crate appearing on a version bump fails here until it is added on
+# purpose — that review is the feature.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "uniffi" },
+    { allow = ["MPL-2.0"], crate = "uniffi_bindgen" },
+    { allow = ["MPL-2.0"], crate = "uniffi_core" },
+    { allow = ["MPL-2.0"], crate = "uniffi_internal_macros" },
+    { allow = ["MPL-2.0"], crate = "uniffi_macros" },
+    { allow = ["MPL-2.0"], crate = "uniffi_meta" },
+    { allow = ["MPL-2.0"], crate = "uniffi_pipeline" },
+    { allow = ["MPL-2.0"], crate = "uniffi_udl" },
+    { allow = ["Unicode-3.0"], crate = "unicode-ident" },
+]
 
 # ---------------------------------------------------------------------------
 # Advisories — known vulnerabilities and unmaintained crates
@@ -101,10 +138,32 @@ deny = []
 
 [bans.build]
 # Build scripts execute arbitrary code at compile time on developer machines and
-# CI runners. Nothing in the tree needs one today; the first crate that does is
-# a decision worth making on purpose rather than discovering in a build log.
-# (UniFFI's scaffolding — TASK-260715-265gqq — is the likely first entry here.)
-allow-build-scripts = []
+# CI runners. Every entry below arrived with the UniFFI boundary
+# (TASK-260715-265gqq, as this comment predicted) and is a version/feature
+# probe or cfg emitter — none generates bindings or touches the network.
+# Entries are name-level, not version-pinned: the ban is about *which* crates
+# may run code at build time, and a routine patch bump must not flip this
+# gate. A new name still fails until it is added here on purpose.
+allow-build-scripts = [
+    # Proc-macro infrastructure under uniffi_macros/serde_derive/syn.
+    # Compile-time only; never linked into a shipped artifact.
+    "proc-macro2",
+    "quote",
+    "camino",
+    "fs-err",
+    # uniffi runtime tree: anyhow directly; serde/serde_core/serde_json/
+    # thiserror/zmij via cargo_metadata (uniffi's default `cargo-metadata`
+    # feature); getrandom/rustix/libc via tempfile (uniffi_pipeline).
+    "anyhow",
+    "serde",
+    "serde_core",
+    "serde_json",
+    "thiserror",
+    "zmij",
+    "getrandom",
+    "rustix",
+    "libc",
+]
 
 # ---------------------------------------------------------------------------
 # Sources — where code may come from

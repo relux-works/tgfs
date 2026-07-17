@@ -97,6 +97,12 @@ toolchain automatically), `cargo-deny` (`brew install cargo-deny`), and Python
 missing or is the wrong version, rather than letting an unpinned compiler
 quietly produce a different verdict.
 
+The bindings smoke (`make smoke-bindings`, not part of `make check`)
+additionally needs `swiftc` (Xcode command line tools), `kotlinc`
+(`brew install kotlin`), and Java 17+ (`brew install openjdk`); it downloads
+its two JVM runtime jars (JNA, kotlinx-coroutines) from Maven Central once,
+pinned by version and sha256 in the runner script.
+
 Available utilities:
 
 | Tool | Purpose | Run | Output |
@@ -110,3 +116,5 @@ Available utilities:
 | `cargo-deny` (installed via `brew install cargo-deny`) | Supply-chain gate, config in `deny.toml`: POL-6 licenses (permissive-only), RustSec advisories, bans, and sources (crates.io only) | `cargo deny check` (repo root), or one check: `cargo deny check licenses` | `advisories ok, bans ok, licenses ok, sources ok`, or non-zero exit with the offending dependency tree |
 | `.scripts/validate_traceability.py` | Validates `docs/TRACEABILITY.md` against `.spec/` and `.task-board/`: every requirement mapped exactly once, no orphan board elements, no stale requirement references on the board | `python3 .scripts/validate_traceability.py` (repo root; stdlib only) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
 | `.scripts/tests/` | Self-tests for the gate scripts themselves — an untested runner is a gate with no gate | `python3 -m unittest discover -s .scripts/tests -t .scripts/tests`, or the `scripts` gate step | Standard unittest output |
+| `uniffi-bindgen` (workspace-local, `crates/gramdrive-ffi/src/bin/`) | Generates Swift + Kotlin bindings from the compiled library, version-locked to the linked `uniffi` crate; pipeline documented in `crates/gramdrive-ffi/README.md` | `make bindings`, or `cargo run -p gramdrive-ffi --features bindgen --bin uniffi-bindgen -- generate --library target/debug/libgramdrive_ffi.dylib --language swift --language kotlin --out-dir .temp/bindings` | Generated sources in `.temp/bindings/` (build artifacts, never committed) |
+| `.scripts/smoke/run_bindings_smoke.py` | End-to-end bindings smoke: builds the FFI library, generates bindings, compiles and runs the Swift and Kotlin smoke consumers (`.scripts/smoke/{swift,kotlin}/`) asserting async, progress, error, and cancellation round-trips | `make smoke-bindings`, or `python3 .scripts/smoke/run_bindings_smoke.py [--skip-swift] [--skip-kotlin]` (needs `swiftc`, `kotlinc`, `java`) | Exit 0 + `BINDINGS SMOKE PASSED`, or non-zero with the failing step's log; artifacts and per-step logs in `.temp/bindings-smoke/` |

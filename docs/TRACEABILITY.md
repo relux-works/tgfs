@@ -261,10 +261,11 @@ Multiple board elements on one row are justified in Notes (typical split: engine
 | DEC-018 | Accepted | active | TASK-260715-2weglw, TASK-260715-152wjq | Decision record (done) + SBOM/license scanning enforcement (POL-6). |
 | DEC-019 | Accepted | active | TASK-260715-7pdgft, TASK-260717-3dvved | Decision record (done) + GramDrive name application across specs/docs/identifiers (POL-7). |
 | DEC-020 | Accepted | active | TASK-260715-3rhlh6, TASK-260715-1nxcst | Decision record (done) + the release-readiness review that operates the single human gate (POL-8). |
+| DEC-021 | Accepted | active | TASK-260715-265gqq, TASK-260715-152wjq | Named MPL-2.0 (uniffi*) / Unicode-3.0 (unicode-ident) exceptions enforced as per-crate `[licenses.exceptions]` entries in deny.toml at the UniFFI boundary + license scanning in core CI (narrows POL-6/DEC-018). |
 
 ### POL — product policies
 
-POL rows are the detailed form of DEC-013..DEC-020; they map to the same enforcing elements plus policy-specific implementation tasks.
+POL rows are the detailed form of DEC-013..DEC-020; they map to the same enforcing elements plus policy-specific implementation tasks. DEC-021 has no POL row of its own — it is a named exception inside POL-6.
 
 | Requirement | Tier | Disposition | Board elements | Notes |
 |---|---|---|---|---|
@@ -273,7 +274,7 @@ POL rows are the detailed form of DEC-013..DEC-020; they map to the same enforci
 | POL-3 | Accepted | active | TASK-260715-37nhe5, TASK-260715-287x8t | Mirror/Audit retention mapping + decision record (details of DEC-015). |
 | POL-4 | Accepted | active | TASK-260715-23arcu, TASK-260715-3nl3mu | Protected/view-once capability enforcement incl. restriction-aware thumbnails (details of DEC-016; decision record TASK-260715-3prhsi). |
 | POL-5 | Accepted | active | TASK-260715-3ox001, TASK-260715-3pwu1o | macOS 14+ arm64 support matrix + CI jobs pinned to it (details of DEC-017). |
-| POL-6 | Accepted | active | TASK-260715-152wjq, TASK-260715-3faqmr | License/SBOM enforcement in dependency controls and core CI (details of DEC-018; decision record TASK-260715-2weglw). |
+| POL-6 | Accepted | active | TASK-260715-152wjq, TASK-260715-3faqmr | License/SBOM enforcement in dependency controls and core CI (details of DEC-018; named exceptions per DEC-021; decision record TASK-260715-2weglw). |
 | POL-7 | Accepted | active | TASK-260717-3dvved, TASK-260715-7pdgft | GramDrive application task + decision record (details of DEC-019). |
 | POL-8 | Accepted | active | TASK-260715-1nxcst, TASK-260715-3rhlh6 | Release-gate review operation + approval-boundary definition (details of DEC-020). |
 

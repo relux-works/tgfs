@@ -1,0 +1,9 @@
+# Bindings-generation config, read by uniffi-bindgen in library mode.
+# Names follow POL-7: shipped identifiers derive from the GramDrive product
+# namespace (com.reluxworks.gramdrive.*), never the tgfs codename.
+
+[bindings.kotlin]
+package_name = "com.reluxworks.gramdrive.core"
+
+[bindings.swift]
+module_name = "GramDriveCore"

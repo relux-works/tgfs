@@ -1,12 +1,13 @@
 //! GramDrive FFI boundary — the only crate native consumers link.
 //!
-//! This crate will own the UniFFI-exposed API surface: provider-neutral
+//! The UniFFI-exposed contract lives in [`api`]: provider-neutral
 //! asynchronous operations, records, errors, cancellation, and progress for
-//! Swift (File Provider hosts) and Kotlin (DocumentsProvider). The UniFFI
-//! wiring, UDL/proc-macro choice, and generation pipeline are defined by
-//! TASK-260715-265gqq; artifact packaging by TASK-260715-3akqs8. Windows and
-//! Linux hosts bypass the generated bindings and use this crate as a plain
-//! Rust dependency.
+//! Swift (File Provider hosts) and Kotlin (DocumentsProvider). Binding
+//! style, generation pipeline, threading/async model, callback dispatch
+//! rules, and the versioning policy are documented in this crate's
+//! README.md. Artifact packaging is owned by TASK-260715-3akqs8. Windows
+//! and Linux hosts bypass the generated bindings and use this crate as a
+//! plain Rust dependency.
 //!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - internal dependencies: any core crate (this is the top of the graph);
@@ -16,6 +17,13 @@
 //! - no platform-specific dependencies or `cfg(target_os/windows/unix)` code.
 
 #![deny(unsafe_code)]
+
+// Emits the `extern "C"` scaffolding the generated Swift/Kotlin bindings
+// call into, under the `gramdrive` namespace (POL-7: shipped identifiers
+// carry the product name, not the codename).
+uniffi::setup_scaffolding!("gramdrive");
+
+pub mod api;
 
 pub use gramdrive_engine as engine;
 pub use gramdrive_model as model;

@@ -1,3 +1,6 @@
+# UniFFI boundary crate. Binding style, threading/async model, callback
+# dispatch rules and versioning policy: README.md in this directory.
+
 [package]
 name = "gramdrive-ffi"
 description = "GramDrive UniFFI boundary: Swift/Kotlin bindings over the drive core"
@@ -11,9 +14,33 @@ publish.workspace = true
 # staticlib/cdylib for the UniFFI-generated Swift and Kotlin bindings.
 crate-type = ["lib", "staticlib", "cdylib"]
 
+[[bin]]
+# Bindings generator, pinned to the exact uniffi version the library was
+# compiled with — a version-skewed external uniffi-bindgen produces bindings
+# whose contract-version check fails at load time. Gated behind the `bindgen`
+# feature so the CLI machinery (clap et al.) never enters a product build:
+# `cargo run -p gramdrive-ffi --features bindgen --bin uniffi-bindgen -- ...`.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# Tooling-only feature (documented in README.md per crates/README.md policy):
+# enables the uniffi-bindgen binary above. Toggles no provider or platform
+# code and is never enabled by a product build.
+bindgen = ["uniffi/cli"]
+
 [dependencies]
 gramdrive-engine = { workspace = true }
 gramdrive-model = { workspace = true }
+# `tokio` feature: exported async fns are wrapped so tokio-backed primitives
+# (timers, I/O) work regardless of which thread polls the future. The
+# threading model is documented in README.md.
+uniffi = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 
 [lints]
 # Shared lint set: Cargo.toml [workspace.lints].

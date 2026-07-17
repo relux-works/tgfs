@@ -1,25 +1,158 @@
 # gramdrive-ffi
 
-The FFI boundary — the only crate native consumers link. Will expose the
-UniFFI API surface (async operations, records, errors, cancellation,
-progress) for Swift and Kotlin; Windows/Linux hosts consume it as a plain
-Rust dependency. Builds as `rlib` + `staticlib` + `cdylib`. Provider-neutral
-by contract: no Telegram or OS-native types cross this boundary.
+The FFI boundary — the only crate native consumers link. Exposes the UniFFI
+contract in `src/api.rs` (provider-neutral async operations, records,
+errors, cancellation, progress) for Swift and Kotlin; Windows/Linux hosts
+consume the crate as a plain Rust dependency instead. Builds as `rlib` +
+`staticlib` + `cdylib`. Provider-neutral by contract (DEC-003): no Telegram
+or OS-native types cross this boundary — paths are strings, times are
+integer milliseconds.
 
 ## Ownership
 
 STORY-260715-2p879f (workspace-and-bindings), EPIC-260715-1poogc
-(shared-rust-core). UniFFI wiring: TASK-260715-265gqq; artifact packaging:
-TASK-260715-3akqs8.
+(shared-rust-core). UniFFI contract and generation pipeline:
+TASK-260715-265gqq; artifact packaging (XCFramework, Android libraries,
+shipped-target list): TASK-260715-3akqs8.
+
+## Binding style: proc-macros, not UDL
+
+The contract is declared with UniFFI proc-macros (`#[uniffi::export]`,
+`#[derive(uniffi::Record)]`, `#[derive(uniffi::Error)]`,
+`uniffi::setup_scaffolding!`) rather than a `.udl` file. One source of truth
+in Rust: the compiler checks the exported surface against the real types on
+every build, where a UDL file drifts silently until bindgen runs. The
+scaffolding is emitted under the `gramdrive` namespace (POL-7), so generated
+identifiers carry the product name, never the `tgfs` codename.
+
+## Generation pipeline
+
+Bindings are generated in *library mode* from the compiled dylib — the
+binary is the source of truth, not any IDL — by a workspace-local
+`uniffi-bindgen` that is version-locked to the `uniffi` crate the library
+links (a skewed external generator produces bindings that fail the runtime
+contract check):
+
+```sh
+cargo build -p gramdrive-ffi
+cargo run -p gramdrive-ffi --features bindgen --bin uniffi-bindgen -- \
+  generate --library target/debug/libgramdrive_ffi.dylib \
+  --language swift --language kotlin --out-dir .temp/bindings
+```
+
+or `make bindings`. Output: `GramDriveCore.swift` + `GramDriveCoreFFI.h` +
+`GramDriveCoreFFI.modulemap` (Swift), and
+`com/reluxworks/gramdrive/core/gramdrive.kt` (Kotlin; needs JNA and
+kotlinx-coroutines on the classpath). Naming is pinned in `uniffi.toml`.
+Generated bindings are build artifacts: they are never committed, and they
+are only valid against the exact library build they were generated from —
+UniFFI embeds per-API checksums and a contract-version probe that fail fast
+at load time on any mismatch. Packaging generated sources into shippable
+artifacts belongs to TASK-260715-3akqs8.
+
+The executable proof of the whole pipeline is the bindings smoke gate
+(`python3 .scripts/smoke/run_bindings_smoke.py`, or `make smoke-bindings`):
+it generates bindings, compiles a real Swift consumer and a real Kotlin/JVM
+consumer against them, runs both, and asserts async success, progress
+callbacks, structured-error round-trips, and cancellation round-trips.
+
+## Threading and async model
+
+- **Exported `async fn`s use UniFFI's poll protocol.** The foreign binding
+  drives the future: the Rust future body executes on whichever
+  binding-managed thread performs the poll (a Swift cooperative-pool thread,
+  a Kotlin dispatcher thread), and wake-ups are delivered through a
+  callback. There is no dedicated "FFI thread".
+- **tokio is the core's runtime.** Exported async methods are declared with
+  `async_runtime = "tokio"`, which wraps each future so tokio primitives
+  (timers, future I/O) work regardless of the polling thread; tokio's
+  reactor runs on its own background threads. The engine
+  (STORY-260715-2hs8cf) inherits this decision: internal long-running work
+  is tokio tasks, and the FFI layer awaits them.
+- **Exported futures must never block a thread.** A blocking call inside an
+  exported future stalls a binding thread pool and violates the provider
+  deadline rule (NFR-025). Blocking work goes onto tokio (`spawn_blocking`)
+  and is awaited.
+- **Callback dispatch** (`ProgressListener` and future callback traits):
+  calls arrive synchronously on a background thread owned by the operation —
+  by contract never a platform main thread, so hosts must hop to their own
+  queue/dispatcher for UI work. Implementations must be thread-safe, return
+  quickly without blocking, and never throw; a foreign exception cannot
+  cross the boundary meaningfully and is treated as a host programming
+  error.
+- **Panics unwind into binding errors.** UniFFI catches unwinds and raises a
+  generic binding-level exception on the foreign side; `[profile.release]
+  panic = "unwind"` in the workspace manifest is load-bearing for this and
+  documented there. Hosts treat such exceptions as `Internal`.
+
+## Cancellation
+
+Cancellation is explicit and in-band: long-running operations take a
+`CancellationToken` argument; `token.cancel()` (any thread, any time,
+idempotent) makes the operation fail with `DriveError::Cancelled` at its
+next cancellation point. This is the contract because the platform provider
+APIs deliver cancellation as handles/callbacks (`NSProgress` cancellation
+handlers, Android `CancellationSignal` — both map 1:1 onto a token), and
+because binding-runtime task cancellation is not dependable across
+languages, measured against uniffi 0.32 generated code:
+
+- **Swift**: cancelling the surrounding `Task` does **not** propagate — the
+  generated poll loop is not cancellation-aware, and the generated handler
+  for a Rust-side `CALL_CANCELLED` status is a `fatalError("Cancellation
+  not supported yet")` placeholder. Without a token, an abandoned operation
+  runs to completion.
+- **Kotlin**: cancelling the coroutine throws `CancellationException` at the
+  suspension point and frees the Rust future, which drops the in-flight
+  operation (no further callbacks). That is a binding behavior we verify in
+  the smoke test as a bonus, not the contract mechanism.
+
+Re-evaluate the Swift limitation on every uniffi upgrade; the token contract
+stays either way.
+
+## Error contract
+
+`DriveError` categories are stable and contractual (NFR-030); the `detail`
+string is diagnostic only. Adding a variant is additive (minor bump; native
+`switch`/`when` statements keep a default arm); removing or renaming one is
+breaking (major bump). Boundary rule learned the hard way: **never name a
+field `message`** — it collides with `kotlin.Exception.message` and the
+generated Kotlin bindings do not compile (uniffi 0.32).
+
+## Versioning policy
+
+- **The contract is versioned independently of crates and artifacts**:
+  `api::CONTRACT_VERSION`, exposed to consumers as `contract_version()`.
+  Semver over the exported surface: breaking = major, additive = minor,
+  behavior-preserving fix = patch. Native hosts assert the major at startup.
+- **Bindings are not compatible across builds.** UniFFI's embedded API
+  checksums make a bindings/library mismatch fail at load time, so generated
+  sources always ship from the same build that produced the binary
+  (TASK-260715-3akqs8 owns that packaging path).
+- **The `uniffi` dependency version is part of the toolchain contract**: the
+  workspace-local `uniffi-bindgen` exists so generator and runtime can never
+  skew.
+
+## Features
+
+`bindgen` — tooling-only (documented per `crates/README.md` feature policy):
+enables the `uniffi-bindgen` binary and its CLI dependencies. Never enabled
+by a product build; toggles no provider or platform code.
 
 ## Dependencies
 
 Internal: `gramdrive-engine`, `gramdrive-model` (any core crate allowed;
-nothing may depend on this crate). Platform-specific code: forbidden.
-See `crates/README.md`.
+nothing may depend on this crate). External: `uniffi` (runtime + macros),
+`tokio` (`macros`, `sync`, `time`). Platform-specific code: forbidden. See
+`crates/README.md`.
+
+**License gate status**: the uniffi crates are MPL-2.0, which is outside the
+POL-6 allow list and an owner-accepted named exception per **DEC-021**
+(2026-07-17, `.spec/decisions.md`). `deny.toml` grants it to the named
+`uniffi*` crates via `[licenses.exceptions]`; the supply-chain gate is green.
 
 ## Test command
 
 ```sh
 cargo test -p gramdrive-ffi
+python3 .scripts/smoke/run_bindings_smoke.py   # end-to-end Swift + Kotlin smoke
 ```
