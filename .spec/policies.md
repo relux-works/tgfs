@@ -56,6 +56,7 @@ The product is **proprietary / closed-source**.
 - Dependencies: permissive licenses only (MIT, Apache-2.0, BSD, BSL-1.0, Zlib, ISC).
 - GPL/AGPL/LGPL-static code (tdesktop, tdl, MadelineProto, official Telegram clients) is **reference-only** — never linked, vendored, or translated verbatim.
 - CI license scanning (SBOM) enforces this; any exception requires an explicit owner-approved decision row.
+- Accepted named exceptions (DEC-021, owner-approved 2026-07-17): **MPL-2.0** for the `uniffi*` crate family (file-scoped weak copyleft; unmodified use in a proprietary product; modifications to covered files, if ever made, must be published) and **Unicode-3.0** for `unicode-ident` (compile-time proc-macro infrastructure only). Enforced as allow entries in `deny.toml`; any further license requires a new decision row.
 
 ## POL-7. Public name (DEC-019)
 

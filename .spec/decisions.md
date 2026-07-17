@@ -27,6 +27,7 @@ This compact log records decisions that constrain decomposition. Detailed eviden
 | **DEC-018** | Accepted | Product is proprietary; permissive-license dependencies only; GPL/AGPL strictly reference-only, enforced via SBOM scanning in CI. | Keeps monetization options open; open-sourcing later remains possible. Details: POL-6. |
 | **DEC-019** | Accepted | Public name: **GramDrive** (`com.reluxworks.gramdrive.*`); repo/codename may stay tgfs. | tgfs and tgfiles both collide with existing projects/services; GramDrive verified collision-free 2026-07-17; trademark/handle check before public release. Details: POL-7. |
 | **DEC-020** | Accepted | Single human approval gate: public release. Decision-row changes and new ToS-risk behaviors always escalate to the owner. | Maximizes agent-loop autonomy while keeping account-safety and release control human-owned. Details: POL-8. |
+| **DEC-021** | Accepted | Allow MPL-2.0 (uniffi crate family) and Unicode-3.0 (unicode-ident, compile-time only) as named POL-6 exceptions; enforcement stays in deny.toml. | UniFFI is the accepted bridge (DEC-001); MPL-2.0 is file-scoped weak copyleft compatible with a proprietary product; no plans to modify the covered files. Owner-accepted 2026-07-17. Details: POL-6. |
 
 ## Decision update procedure
 

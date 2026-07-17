@@ -35,3 +35,4 @@ Moved to `.spec/policies.md` / `.spec/decisions.md`:
 - Product licensing → **DEC-018** (proprietary, permissive deps only).
 - Public name → **DEC-019** (GramDrive, `com.reluxworks.gramdrive.*`).
 - Human approval gates → **DEC-020** (single gate: public release).
+- License exception for UniFFI (MPL-2.0) and unicode-ident (Unicode-3.0) → **DEC-021** (named POL-6 exceptions, owner-accepted 2026-07-17).
