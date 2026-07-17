@@ -8,10 +8,12 @@
 //!
 //! Implemented so far: the durable transfer state machine ([`transfer`],
 //! TASK-260715-g4k3zm) — request/claim/progress/checkpoint and the
-//! terminal gates over the journal `gramdrive-state` persists. The fetch
-//! coordinator (TASK-260715-22fh09), integrity and atomic promotion
-//! (TASK-260715-3s6cpe), and quota/eviction (TASK-260715-11abx8) build on
-//! it.
+//! terminal gates over the journal `gramdrive-state` persists — and the
+//! ranged fetch coordinator ([`fetch`], TASK-260715-22fh09), which drives
+//! a `DriveSource` through those claims: reader coalescing, aligned
+//! chunking, bounded parallelism, locator refresh, and streaming to reader
+//! sinks. Integrity and atomic promotion (TASK-260715-3s6cpe) and
+//! quota/eviction (TASK-260715-11abx8) build on them.
 //!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - internal dependencies: `gramdrive-model`, `gramdrive-source`,
@@ -25,6 +27,7 @@ pub use gramdrive_model as model;
 pub use gramdrive_source as source;
 pub use gramdrive_state as state;
 
+pub mod fetch;
 pub mod transfer;
 
 #[cfg(test)]

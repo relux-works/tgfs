@@ -17,6 +17,16 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
   a bounded retry budget with parking for precondition-blocked faults,
   and two-phase cancellation. Crash-resume composes with
   `StateStore::reconcile`: reconcile first, then claim.
+- `fetch` — the ranged fetch coordinator (TASK-260715-22fh09;
+  SYNC-041/043/044/045/046). `FetchCoordinator` drives a `DriveSource`
+  through the machine's claims: readers coalesce onto live transfers and
+  stream from staged bytes, sub-fetches align to a chunk grid with bounded
+  fanout per item, stale locators refresh in-attempt with identity
+  unchanged, every other failure classifies through the machine's retry
+  taxonomy, and cancellation is prompt both by dropped future and by
+  durable two-phase cancel. Runtime-agnostic and clock-free: the host
+  supplies a `Clock` and a `StagingHost`, and tests drive it on the
+  testkit's deterministic executor.
 
 ## Ownership
 

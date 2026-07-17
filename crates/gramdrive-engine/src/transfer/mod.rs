@@ -101,7 +101,7 @@
 //! cache at no further cost, while honoring the flag would discard them.
 
 mod error;
-mod ranges;
+pub(crate) mod ranges;
 mod retry;
 
 pub use error::EngineError;
@@ -758,7 +758,7 @@ impl TransferMachine {
 }
 
 /// The item projection's answer to "does the pin still hold".
-enum ItemStanding {
+pub(crate) enum ItemStanding {
     /// The pinned version is what the projection serves.
     Pinned {
         /// The item's logical size, when known.
@@ -772,7 +772,7 @@ enum ItemStanding {
     },
 }
 
-fn item_standing(
+pub(crate) fn item_standing(
     read: &ReadTxn<'_>,
     item: &ItemId,
     pinned: &ContentVersion,

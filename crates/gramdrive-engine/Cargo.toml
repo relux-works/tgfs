@@ -11,6 +11,12 @@ gramdrive-model = { workspace = true }
 gramdrive-source = { workspace = true }
 gramdrive-state = { workspace = true }
 
+[dev-dependencies]
+# Deterministic fake source, executor, and recording sink for the fetch
+# coordinator's tests. Dev-only by architecture rule (crates/README.md):
+# test support never ships in a product artifact.
+gramdrive-testkit = { workspace = true }
+
 [lints]
 # Shared lint set: Cargo.toml [workspace.lints].
 workspace = true
