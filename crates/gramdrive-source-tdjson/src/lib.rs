@@ -10,6 +10,11 @@
 //!   implementations copy every C string into an owned `String` before
 //!   returning, and the receive half takes `&mut self` so the one-receiver
 //!   rule of `td_receive` is enforced by ownership, not discipline.
+//! - [`auth`] — [`AuthMachine`], the deterministic sans-IO authorization
+//!   state machine (TASK-260715-51n6jb): TDLib authorization updates and
+//!   user inputs become core-facing typed states, requests, and rejection
+//!   classifications; unknown TDLib states fail safe as typed
+//!   `Unsupported`, never a panic.
 //! - [`runtime`] — [`TdRuntime`]: the single receive-loop owner, request-id
 //!   correlation over `@extra`, per-client bounded update queues, typed
 //!   error conversion, cancellation, and coordinated shutdown with a
@@ -31,8 +36,9 @@
 //!
 //! The `DriveSource` adapter that maps this runtime onto the
 //! provider-neutral contract (DEC-003) is deliberately absent here: it
-//! lands with the follow-up tasks of this story (configuration,
-//! authorization, enumeration). This layer's contract is only that tdjson's
+//! lands with the enumeration follow-ups of the owning stories, composing
+//! the configuration ([`config`]) and authorization ([`auth`]) layers that
+//! are already here. This layer's contract is only that tdjson's
 //! asynchrony — one global receive stream multiplexing every client's
 //! responses and updates — becomes safe, correlated, cancellable Rust.
 //!
@@ -41,6 +47,7 @@
 //! [`TdRuntime`]: runtime::TdRuntime
 //! [`TdError`]: error::TdError
 //! [`MockTdJson`]: mock::MockTdJson
+//! [`AuthMachine`]: auth::AuthMachine
 
 // The only unsafe code is the FFI in `real`, which exists only when the env
 // gate compiles it in; every other build forbids unsafe outright.
@@ -48,6 +55,7 @@
 #![cfg_attr(real_tdjson, deny(unsafe_code))]
 
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod mock;
@@ -61,6 +69,10 @@ mod slot;
 #[allow(unsafe_code)]
 pub mod real;
 
+pub use auth::{
+    AuthError, AuthInput, AuthMachine, AuthRejection, AuthState, AuthStep, CodeInfo, PasswordInfo,
+    RetryAdvice,
+};
 pub use config::{
     AccountConfig, AccountStoragePaths, ApiCredentials, DatabaseKey, DeviceMetadata,
     InMemorySecrets, MemoryOptions, Proxy, Secret, SecretError, SecretSource, StorageLayout,

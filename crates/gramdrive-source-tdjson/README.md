@@ -6,9 +6,10 @@ tdjson's asynchrony — one process-global receive stream multiplexing every
 client's responses and updates — into safe, correlated, cancellable Rust:
 client lifecycle, `@extra` request correlation, ordered bounded update
 dispatch, typed error conversion, and coordinated shutdown with a
-deterministic drain. The `DriveSource` adapter over this runtime (DEC-003)
-lands with the follow-up tasks of the owning story (configuration,
-authorization, enumeration).
+deterministic drain. On top of it sit the configuration layer (`config`,
+TASK-260715-1hdnuy) and the authorization state machine (`auth`,
+TASK-260715-51n6jb); the `DriveSource` adapter over this runtime (DEC-003)
+lands with the enumeration follow-ups of the owning stories.
 
 ## Ownership
 
@@ -20,6 +21,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | Module | Owns |
 |---|---|
 | `api` | The two-trait seam: `TdSendApi` (thread-safe: create/send/execute) and `TdReceiveApi` (single-owner: receive takes `&mut self`) |
+| `auth` | `AuthMachine`: the deterministic sans-IO authorization state machine — typed core-facing states/inputs for the phone/code/2FA-password/QR paths, rejection classification with retry advice, unknown TDLib states failing safe as typed `Unsupported` |
 | `config` | `TdlibConfig` and the storage/memory policy: per-account `setTdlibParameters`/`setOption`/`addProxy` request builders, on-disk isolation with a clean logout wipe (`StorageLayout`), and the `SecretSource` keychain seam |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
@@ -105,6 +107,38 @@ Guarantees the fixtures pin (`tests/config.rs`):
 - **Clean logout.** `StorageLayout::wipe_account` removes exactly one
   account's subtree, idempotently — the on-disk half of the SEC-004 logout
   sequence (the keychain half is the native adapter's).
+
+## The authorization state machine (`auth`)
+
+`AuthMachine` (TASK-260715-51n6jb) turns TDLib's `updateAuthorizationState`
+events and user actions into a deterministic, core-facing flow. It is
+sans-IO: the caller — the coming `DriveSource` adapter, or a native shell
+through the FFI boundary — pumps the client's `UpdateStream` into
+`on_update`, submits the requests each step returns (the machine answers
+`waitTdlibParameters` with `TdlibConfig::startup_requests()` itself), turns
+user actions into requests through `on_input`, and classifies a failed
+submission with `AuthRejection::classify`, which pairs every rejection with
+typed `RetryAdvice`.
+
+Guarantees the scripted flows pin (`tests/auth_flow.rs`):
+
+- **TDLib's reported state is the single source of truth.** Inputs never
+  move the typed state; a rejected code or password leaves the flow exactly
+  where TDLib says it is, so retries need no special path and an
+  interrupted sign-in resumes from whatever state TDLib reports first.
+- **First-class paths.** Phone → code → optional 2FA password, and QR
+  confirmation → optional 2FA password, as typed states carrying the
+  display material (code info, password hint, QR link) and typed inputs
+  (submit/resend/cancel).
+- **Unknown states fail safe.** Email gates, registration, and any state a
+  future TDLib adds become the typed `Unsupported` state: every input but
+  `Cancel` fails with a typed error, nothing panics, and cancel still
+  closes the client.
+- **Cancel is local.** `Cancel` maps to `close` — abandoning the flow;
+  server-side logout, revocation, and the storage wipe are account
+  removal's flow (TASK-260715-wjaux5, SEC-004).
+- **Credentials stay redacted.** The login code and 2FA password ride in
+  `Secret` (SEC-020): plaintext reaches only the wire request to TDLib.
 
 ## The env gate (`cfg(real_tdjson)`)
 

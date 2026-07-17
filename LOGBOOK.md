@@ -5,6 +5,31 @@
 
 ## 2026-07-18
 
+### 0138 — ANOMALY: task-board `m --dry-run` applies set_notes for real
+- ANOMALY: during the TASK-260715-51n6jb review, several `task-board m 'set_notes(...)' --dry-run` invocations appended to the task's notes for real; others on the same session honored the flag (returned `{"dry_run":true}`). No pattern isolated (not text length ≤800, not specific characters — same payload failed to parse twice with `expected ')' at end of input`, then parsed verbatim minutes later).
+- FIX (workaround): notes restored via `set_notes(..., set=true)` full replace; junk lines removed. Treat `m --dry-run` as unreliable for `set_notes` until the task-board CLI is fixed.
+- SCOPE: task-board CLI (project-management skill tooling), not this repo's code.
+- STATUS: monitoring; upstream fix belongs to the task-board source repo.
+
+### 0131 — Review ACCEPTED: authorization state machine (TASK-260715-51n6jb → done)
+- DECISION: accepted. Read-only review; gates + tests reproduced independently, not trusted from the results doc.
+- FINDING: `make check` 8/8 reproduced green (incl. clippy `-D warnings`, full workspace test); `cargo test -p gramdrive-source-tdjson` = 38 lib unit + 8 `auth_flow` integration + 25 other integration, all green. Provenance: `.temp/acceptance/local-all`, review logs in `.temp/TASK-260715-51n6jb/`.
+- FINDING: all AC scenarios verified against the actual tests — success (phone→code→password with exact wire-conversation assertion + zero absorbed-event stats; QR with link rotation + password gate), wrong-code retry, expired code→resend→fresh info→success, invalid password retry, network loss mid-flow (connection update ignored, 500→`Network`/`RetrySameInput`, same input retried), cancellation mid-flow (in-flight request abandoned, close→Closing→Closed, further input typed error, runtime ends client), unknown state fail-safe (`WaitEmailAddress` → typed `Unsupported`, cancel escapes). Unit side pins the input-validity state table, full classification + advice tables, malformed-update typed errors with state unchanged, resume mid-flow, Debug redaction of code/password.
+- FINDING: architecture fit verified — sans-IO machine over the existing runtime seam, no new deps, `Secret::expose()` stays `pub(crate)` (SEC-020 holds: plaintext only via the crate-private request builder), no TDLib JSON outward (raw `@type` only as diagnostic detail), `@extra` minting left to the runtime (asserted), README + `lib.rs` module docs consistent with code.
+- NOTE (non-blocking, no rework): `WaitQrConfirmation` accepts only `Cancel` — real TDLib also permits `setAuthenticationPhoneNumber` there as a QR→phone fallback; v1 escape is cancel+restart, consistent with documented scope, first-class fallback = future extension of the validity table. `trailing_integer` is byte-indexed but `get()` guards char boundaries — no panic path, overflow-safe (both tested). Implementer's logbook entry below stamped 0134, slightly ahead of wall clock at review time (0129) — cosmetic.
+- STATUS: done.
+
+### 0134 — Authorization state machine lands (TASK-260715-51n6jb → to-review)
+- MILESTONE: new `auth` module in `gramdrive-source-tdjson` — `AuthMachine`, deterministic sans-IO authorization flow: typed `AuthState`/`AuthInput`/`AuthRejection`/`RetryAdvice`/`AuthError`, phone→code→optional-2FA and QR→optional-2FA paths. `make check` 8/8; 13 new unit tests + 8 scripted integration flows (`tests/auth_flow.rs`) over real `TdRuntime` + mock, all deterministic (no sleeps/timing).
+- DECISION (sans-IO, updates are the only state mover): machine holds no client, does no I/O; typed state advances ONLY on `updateAuthorizationState` — inputs validate against current state and yield exactly one request (or typed error), TDLib confirms progress. Consequence: retries need no special path (rejected code/password leaves state where TDLib says), and interrupted sign-in resumes from whatever state TDLib reports first. This is what makes every AC scenario a scripted deterministic test.
+- DECISION (unknown states fail safe, product scope): v1 = existing personal account sign-in. Email gates (`WaitEmailAddress`/`WaitEmailCode`), registration, and any future TDLib state → typed `AuthState::Unsupported{td_type}`; all inputs but `Cancel` → typed `AuthError::UnsupportedState`; no panic, no wedge. First-class email support = new task extending the enums.
+- DECISION (Cancel = local `close`, not logout): runtime already treats `authorizationStateClosed` as end-of-client. Server-side logout/revocation + storage wipe stay in account removal (TASK-260715-wjaux5, SEC-004). Clean ownership boundary, no premature logOut semantics.
+- DECISION (rejection classification contract): matches Telegram's contractual uppercase identifiers (`PHONE_CODE_INVALID/EXPIRED`, `PASSWORD_HASH_INVALID`, …); TDLib code 500 read as transient Network → RetrySameInput (misread internal error costs one failed retry, never a wrong transition); flood-wait seconds parsed from both message shapes. `TdError::Shutdown/ClientClosed` → `SessionEnded`.
+- DECISION (secrets): login code + 2FA password ride in existing `Secret` (redacted Debug, plaintext only via crate-private builder onto the wire — SEC-020). Phone number deliberately NOT wrapped: TDLib echoes it in clear in `code_info` and UI renders it; wrapping would feign protection.
+- DECISION (machine owns the config answer): on `waitTdlibParameters` machine emits `TdlibConfig::startup_requests()` itself — plumbing the user never sees; the reason `AuthMachine` holds `TdlibConfig`.
+- SCOPE: `crates/gramdrive-source-tdjson/src/auth.rs` (new), `tests/auth_flow.rs` (new), `src/lib.rs` (+module, re-exports), crate `README.md` (auth section + module table).
+- STATUS: to-review.
+
 ### 0108 — Review ACCEPTED: TDLib configuration + storage policy (TASK-260715-1hdnuy → done)
 - DECISION: accepted. Read-only review; all gates + tests reproduced independently, not trusted from the results doc.
 - FINDING: `make check` 8/8 reproduced green; `gramdrive-source-tdjson` config = 13 lib unit tests + 4 integration fixtures (`tests/config.rs`) green, full workspace test green.
