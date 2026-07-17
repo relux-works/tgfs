@@ -1,0 +1,22 @@
+# clippy tunables for the GramDrive workspace.
+#
+# The lint *levels* live in Cargo.toml `[workspace.lints]`, not here: levels set
+# in the manifest are compiled into every invocation (cargo, rust-analyzer, an
+# editor's on-save clippy), so a developer's IDE shows the same verdict the gate
+# does. This file only holds the knobs that have no manifest equivalent.
+#
+# Run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+#      (part of `--suite core`)
+
+# `unwrap_used` / `expect_used` / `panic` are denied in Cargo.toml because a
+# panic in the core is either a crash in a File Provider extension or a lost
+# structured error (NFR-030). Test code is the exception: a test that cannot
+# unwrap its own fixture has to grow error plumbing that proves nothing, and a
+# panicking test is just a failing test.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# `msrv` is intentionally not set here. Clippy reads it from
+# `workspace.package.rust-version` in Cargo.toml, and duplicating it would give
+# the repo two sources of truth that drift apart silently.

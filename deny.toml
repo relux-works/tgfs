@@ -1,18 +1,45 @@
-# cargo-deny configuration — license gate required by POL-6 (DEC-018).
+# cargo-deny configuration — the workspace supply-chain gate (NFR-050).
 #
-# The product is proprietary; every third-party dependency must carry a
-# permissive license. The allow list below is exactly the POL-6 set
-# (BSD expressed as its 2- and 3-clause SPDX forms). Any other license —
-# including permissive ones outside this set (e.g. Unicode-3.0) — fails the
-# gate and requires an explicit owner-approved decision row in
-# .spec/decisions.md before being added here.
+# Four checks, all part of `.scripts/acceptance/run_automated.py --suite core`:
 #
-# Run: cargo deny check licenses
+#   licenses    POL-6 (DEC-018): permissive-licensed dependencies only.
+#   advisories  Known vulnerabilities and unmaintained crates (RustSec).
+#   bans        Duplicate and wildcard dependencies.
+#   sources     Where code is allowed to come from.
+#
+# Run: cargo deny check                       (all four)
+#      cargo deny check licenses              (one)
+#
+# cargo-deny is the only tool here rather than cargo-audit + cargo-deny: both
+# read the same RustSec database, and `cargo deny check advisories` covers what
+# `cargo audit` reports. One tool means one config file, one version to pin,
+# and one place a rule can hide. Minimum version 0.18 — the `[advisories]`
+# schema below (no `vulnerability`/`unsound`/`notice` keys) is rejected by
+# older releases; `.scripts/check_toolchain.py` enforces the floor.
+#
+# Determinism note: licenses, bans and sources are hermetic — same commit, same
+# verdict, forever. `advisories` is deliberately not: it is evaluated against a
+# database that changes, so a commit that passes today can fail tomorrow when a
+# CVE lands. That is the point of the check, not a flaw in it.
 
 [graph]
 # Evaluate every feature combination a consumer could enable, so a
 # platform- or feature-gated dependency cannot smuggle in a license.
 all-features = true
+
+# ---------------------------------------------------------------------------
+# Licenses — POL-6 (DEC-018)
+#
+# The product is proprietary; every third-party dependency must carry a
+# permissive license. The allow list is exactly the POL-6 set (BSD expressed as
+# its 2- and 3-clause SPDX forms). Any other license — including permissive ones
+# outside this set (e.g. Unicode-3.0) — fails the gate and requires an explicit
+# owner-approved decision row in .spec/decisions.md before being added here.
+#
+# GPL/AGPL/LGPL-static sources (tdesktop, tdl, MadelineProto) are reference-only
+# under POL-6. They are absent from this list on purpose: the gate is what makes
+# "never linked or vendored" a fact rather than an intention.
+# ---------------------------------------------------------------------------
 
 [licenses]
 allow = [
@@ -29,3 +56,67 @@ allow = [
 private = { ignore = true }
 # Allow-list entries may be unused while the dependency tree is small.
 unused-allowed-license = "allow"
+
+# ---------------------------------------------------------------------------
+# Advisories — known vulnerabilities and unmaintained crates
+#
+# Vulnerabilities are always an error in cargo-deny 0.18+ and have no severity
+# threshold to relax, which matches the release gate in
+# .spec/quality-and-release.md: no unresolved critical/high security findings.
+#
+# An advisory that genuinely does not apply is silenced by adding its RRUSTSEC ID
+# to `ignore` below WITH a comment stating why it cannot reach us — never by
+# lowering a level. An empty `ignore` list is the healthy state.
+# ---------------------------------------------------------------------------
+
+[advisories]
+# A yanked dependency is a supply-chain signal, not a nuisance: the author
+# pulled that exact version for a reason.
+yanked = "deny"
+# Unmaintained crates matter where we chose them. A transitive unmaintained
+# crate deep in someone else's tree is a warning we cannot act on directly, so
+# it is not a build-stopper — "workspace" scopes the error to our own choices.
+unmaintained = "workspace"
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Bans — dependency-tree shape
+# ---------------------------------------------------------------------------
+
+[bans]
+# Two versions of the same crate is normal in a young tree and usually a
+# transitive constraint we cannot fix by editing our own manifest. Warn so it
+# stays visible and gets pruned deliberately; do not fail a build on it.
+multiple-versions = "warn"
+# A wildcard version is not a dependency, it is a promise to break later.
+wildcards = "deny"
+# ...except between our own crates. `{ workspace = true }` on a path dependency
+# carries no version requirement, so cargo-deny reads all seven internal edges
+# as wildcards. They are not: the seven crates version and ship as one unit, and
+# the edges are constrained by .scripts/check_crate_architecture.py instead.
+# This exemption applies only to path dependencies of private (publish = false)
+# crates, so it cannot silently excuse a wildcard on a registry dependency.
+allow-wildcard-paths = true
+deny = []
+
+[bans.build]
+# Build scripts execute arbitrary code at compile time on developer machines and
+# CI runners. Nothing in the tree needs one today; the first crate that does is
+# a decision worth making on purpose rather than discovering in a build log.
+# (UniFFI's scaffolding — TASK-260715-265gqq — is the likely first entry here.)
+allow-build-scripts = []
+
+# ---------------------------------------------------------------------------
+# Sources — where code may come from
+#
+# crates.io only. A git dependency bypasses the registry's immutability: a
+# force-pushed tag changes what a pinned revision resolves to, and no license
+# or advisory metadata is guaranteed. Adding a git source is an architecture
+# decision, so the gate demands it be written down here first.
+# ---------------------------------------------------------------------------
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -14,3 +14,7 @@ crate-type = ["lib", "staticlib", "cdylib"]
 [dependencies]
 gramdrive-engine = { workspace = true }
 gramdrive-model = { workspace = true }
+
+[lints]
+# Shared lint set: Cargo.toml [workspace.lints].
+workspace = true

@@ -9,3 +9,7 @@ publish.workspace = true
 [dependencies]
 gramdrive-model = { workspace = true }
 gramdrive-source = { workspace = true }
+
+[lints]
+# Shared lint set: Cargo.toml [workspace.lints].
+workspace = true

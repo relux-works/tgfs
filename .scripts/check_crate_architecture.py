@@ -24,6 +24,10 @@ Checks, all fatal (exit code 1):
      per-platform with no cfg and no dependency to give them away.
  10. Every crate directory has a README.md with '## Ownership' and
      '## Test command' sections.
+ 11. Every crate opts into the shared lint set with `[lints] workspace = true`.
+     A crate that omits it still compiles and still passes the lint gate — it
+     is simply exempt from every lint in [workspace.lints], silently. That is
+     the failure mode this check exists for: a green gate that checked nothing.
 
 Scan tradeoffs for checks 8 and 9 — deliberately fail-closed, since a false
 positive costs one rename and a miss costs the platform-neutrality guarantee:
@@ -44,6 +48,7 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -255,9 +260,21 @@ def check(repo_root: Path) -> list[str]:
     if graph:
         errors.append(f"dependency cycle among: {sorted(graph)}")
 
-    # 8/9. Platform predicates in sources; 10. README sections.
+    # 8/9. Platform predicates in sources; 10. README sections; 11. lints opt-in.
     for name in sorted(set(members) & CORE_CRATES):
-        crate_dir = Path(members[name]["manifest_path"]).parent
+        manifest_path = Path(members[name]["manifest_path"])
+        crate_dir = manifest_path.parent
+
+        # 11. Shared lint set opt-in. cargo metadata does not report the
+        # [lints] table, so read the manifest directly.
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("lints", {}).get("workspace") is not True:
+            errors.append(
+                f"{name}: Cargo.toml lacks '[lints] workspace = true' — the "
+                f"crate is silently exempt from the shared lint set in "
+                f"[workspace.lints]"
+            )
+
         if name in PLATFORM_NEUTRAL_CRATES:
             for src in sorted((crate_dir / "src").rglob("*.rs")):
                 code = strip_line_comments(src.read_text(encoding="utf-8"))

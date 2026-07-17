@@ -5,6 +5,31 @@
 
 ## 2026-07-17
 
+### 0358 — Release LTO is silently inert for the shipped FFI artifact (TASK-260715-2cn768)
+- FINDING: `[profile.release] lto = "thin"` never reaches `gramdrive-ffi`. Cargo omits `-C lto` from any rustc invocation that also emits an rlib (rustc cannot LTO an rlib output), and `gramdrive-ffi` is `crate-type = ["lib", "staticlib", "cdylib"]` — so `libgramdrive_ffi.dylib`/`.a` link without LTO. No warning from cargo; the build says "Finished".
+- FINDING: verified empirically, not inferred — with `crate-type = ["cdylib"]` alone, `cargo build -p gramdrive-ffi --release -v` shows `-C lto=thin`; with the real three-type set it is absent. Other profile flags DO apply: `-C codegen-units=1`, `-C overflow-checks=on`, `-C debuginfo=line-tables-only` confirmed on the rustc line.
+- DECISION: kept `lto = "thin"` with the caveat written into `Cargo.toml:~105` and `crates/README.md` rather than deleting it — it is correct for every crate-type that links and goes live once the shipped artifact's crate-type is settled. Not silently kept: both docs now say it applies to nothing that ships today.
+- NOTE: fix belongs to TASK-260715-3akqs8 (packaging owns the shipped artifact) or an architecture change splitting the rlib into its own crate. Do not read `lto = "thin"` as a claim about a release binary until then.
+- SCOPE: `Cargo.toml`, `crates/README.md`.
+- STATUS: pending — flagged to packaging, not resolved here.
+
+### 0357 — Cross-target builds are not TASK-260715-2cn768's to do (TASK-260715-2cn768)
+- FINDING: `crates/README.md:18` claimed cross-target builds — the check that would catch platform leakage the static scan misses — were owned by this task. They are not achievable here: POL-5 fixes v1 at exactly one target (macOS 14+ arm64), so there is no second target to build against.
+- DECISION: corrected the doc rather than inventing a probe target. Building core crates for, say, `x86_64-unknown-linux-gnu` purely as a neutrality probe would gate on a platform POL-5 places out of scope, and `rustup target add` on every dev machine + CI is a real cost for a check that is trivially green against today's stub crates.
+- NOTE: gap closes from two directions — a platform host crate (Windows CfAPI / Linux FUSE) brings its target with it, or TASK-260715-3faqmr's barycenter blind cross-build job. Both now named in `crates/README.md`; until then a neutrality violation invisible to the regex scan ships undetected, and that is stated rather than implied away.
+- SCOPE: `crates/README.md`.
+- STATUS: reassigned, documented as a live limitation.
+
+### 0356 — Quality gates unified behind one entrypoint (TASK-260715-2cn768)
+- DECISION: every gate runs through `.scripts/acceptance/run_automated.py --suite <x> --run-id <id>` (barycenter pattern); `Makefile` and CI are shorthand for it, never a second copy of the commands. Suites: `core` (toolchain, format, lint, test, architecture, supply-chain), `repo` (traceability, scripts), `all`. Any step name also works as `--suite` for a one-step run. Provenance per run → `.temp/acceptance/<run-id>/` (`summary.json` + per-step log). All 8 steps green.
+- DECISION: cargo-deny alone, no cargo-audit — same RustSec DB, so one tool = one config = one place a rule can hide. `cargo deny check` covers licenses (POL-6) + advisories + bans + sources. Licenses/bans/sources are hermetic; advisories are DB-dependent by design, so a passing commit can fail tomorrow.
+- DECISION: lint *levels* live in `Cargo.toml [workspace.lints]`, not a CI flag, so an editor running clippy on save agrees with the gate. `-D warnings` in the gate covers the warn-by-default remainder. Denied: `unwrap_used`/`expect_used`/`panic` (a panic crosses UniFFI as a crashed extension or a lost error category, NFR-030) and `print_stdout`/`print_stderr`/`dbg_macro` (a library in someone else's process has no console, NFR-032); tests exempted via `clippy.toml`.
+- FINDING: `[lints] workspace = true` is per-crate opt-in — a crate that omits it is silently exempt from the whole set and the gate still passes green. Added as check #11 in `check_crate_architecture.py`; verified it fires by removing the stanza from `gramdrive-render`.
+- FINDING: `group_imports`/`imports_granularity` are nightly-only; on the pinned stable toolchain rustfmt warns and ignores them. Dropped from `rustfmt.toml` — reaching them needs `cargo +nightly fmt`, which defeats the pin. Import grouping stays unenforced convention.
+- FINDING: `rust-toolchain.toml` only binds when rustup drives cargo — a distro rustc or a baked-in container toolchain ignores it and still prints "Finished". Hence `.scripts/check_toolchain.py`: asserts rustc/cargo match the pin, components are runnable, MSRV ≤ pin, cargo-deny ≥ 0.18 (deny.toml's `[advisories]` schema).
+- SCOPE: new `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml`, `.scripts/check_toolchain.py`, `.scripts/acceptance/run_automated.py`, `.scripts/tests/` (47 tests); edited `Cargo.toml`, `deny.toml`, `Makefile`, `crates/*/Cargo.toml`, `check_crate_architecture.py`, both READMEs.
+- STATUS: ready for review.
+
 ### 0342 — Review #2: arch-check rework accepted, task done (TASK-260715-3o8wpt)
 - DECISION: rework accepted → done. All gates independently re-run on the real tree (build / test 14 suites 10 passed / fmt / clippy / deny / arch-check / `make check`), board harness re-run reproduces its log 1:1, and 10/10 reviewer probes beyond the harness behaved as claimed — incl. target-gated dev/build deps, plain-triple `[target.x86_64-pc-windows-msvc.dependencies]` (no cfg syntax at all), renamed target-gated dep, banned dep in dev section. Scope honored: only the check script + `crates/README.md` changed (mtime-verified), no probe leftovers in `crates/`.
 - FINDING: `target_arch`/`target_env` predicates (e.g. `cfg(target_env = "msvc")`) are outside `PLATFORM_PREDICATE_RE` — consistent with the documented scope and review #1's required set, so not a defect; becomes worth adding only if arch/env-gating turns into a real leakage vector.

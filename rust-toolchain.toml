@@ -1,0 +1,23 @@
+# Pinned Rust toolchain for the GramDrive workspace.
+#
+# rustup reads this file for every cargo invocation in the repo, so local and
+# CI runs compile with the same compiler, the same rustfmt style, and the same
+# clippy lint set. An exact version — not "stable" — is the point: a floating
+# channel silently changes the lint set and the formatting output between runs.
+#
+# `python3 .scripts/check_toolchain.py` verifies that the active compiler
+# actually matches this pin (rustup is not guaranteed to be the driver).
+#
+# Bumping the pin: raise `channel` here and `workspace.package.rust-version` in
+# Cargo.toml together, then run `.scripts/acceptance/run_automated.py --suite
+# core` — a new toolchain usually brings new clippy lints and formatting.
+
+[toolchain]
+channel = "1.91.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
+
+# No `targets` entry on purpose. The reference host is macOS 14+ arm64 (POL-5)
+# and the core crates are platform-neutral, so the host target is what every
+# gate needs. Cross-target additions belong to artifact packaging
+# (TASK-260715-3akqs8), which owns the shipped-target list.

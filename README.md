@@ -68,12 +68,45 @@ Conventions:
 - `.temp/` — ignored local agent/runtime artifacts only.
 - Research documents cite primary-source URLs inline; verify against them before relying on a claim.
 
+### Running the checks
+
+Every automated gate runs through **one entrypoint**, and CI invokes the same
+script with the same suite names — a gate that exists only inside a CI config
+cannot be run before pushing, and drifts the first time either side is edited.
+
+```sh
+make check        # everything CI runs: the core suite plus the repo suite
+make check-core   # Rust core only: toolchain, format, lint, test, architecture, supply chain
+make gates        # print every suite and the exact command behind each step
+make fmt          # apply rustfmt (the gate only checks formatting)
+```
+
+`make check` is shorthand for
+`python3 .scripts/acceptance/run_automated.py --suite all --run-id local-all`.
+Every step runs even after one fails, because the useful output of a gate run is
+the full list of what is broken. Each run writes provenance to
+`.temp/acceptance/<run-id>/` — `summary.json` (commit, worktree state, tool
+versions, per-step exit codes and durations) plus one log per step. CI uploads
+that directory as an artifact and passes `--require-clean`, which refuses to run
+against a dirty worktree so the recorded commit describes what was actually
+tested (NFR-052).
+
+Prerequisites: `rustup` (it reads `rust-toolchain.toml` and installs the pinned
+toolchain automatically), `cargo-deny` (`brew install cargo-deny`), and Python
+3.11+. The `toolchain` step fails with an explicit message if any of them is
+missing or is the wrong version, rather than letting an unpinned compiler
+quietly produce a different verdict.
+
 Available utilities:
 
 | Tool | Purpose | Run | Output |
 |---|---|---|---|
-| `cargo` (Rust 1.91+, edition 2024) | Build and test the shared core workspace | `cargo build --workspace` / `cargo test --workspace` (repo root); per-crate commands in each `crates/*/README.md` | Binaries/test results under `target/` (gitignored) |
-| `.scripts/check_crate_architecture.py` | Enforces `crates/README.md`: dependency direction, no cycles, no platform leakage in core crates, testkit dev-only, per-crate README sections | `python3 .scripts/check_crate_architecture.py` (repo root; stdlib only, needs `cargo` on PATH) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
-| `cargo-deny` (installed via `brew install cargo-deny`) | POL-6 license gate: permissive-only dependency licenses, config in `deny.toml` | `cargo deny check licenses` (repo root) | `licenses ok`, or non-zero exit with the offending dependency tree |
-| `make` | Aggregated repo checks | `make check` (arch + licenses + traceability + build + test); individual targets in `Makefile` | Fails on first broken gate |
+| `.scripts/acceptance/run_automated.py` | The single gate entrypoint: runs a named suite, records provenance. Used identically by `make` and by CI | `python3 .scripts/acceptance/run_automated.py --suite core --run-id local-core`; `--list` prints suites and steps | Exit 0 pass / 1 failed step / 2 could not start; `.temp/acceptance/<run-id>/` with `summary.json` + per-step logs |
+| `make` | Shorthand for the entrypoint plus the non-gate inner loop (`fmt`, `build`, `test`) | `make check`, `make check-core`, `make check-repo`, `make gates` | Delegates to the entrypoint; never re-defines a gate command |
+| `cargo` (pinned to Rust 1.91.0 by `rust-toolchain.toml`, edition 2024) | Build and test the shared core workspace | `cargo build --workspace` / `cargo test --workspace` (repo root); per-crate commands in each `crates/*/README.md` | Binaries/test results under `target/` (gitignored) |
+| `rustfmt` + `clippy` (pinned components) | Formatting and lints. Config: `rustfmt.toml`, `clippy.toml`, and `[workspace.lints]` in `Cargo.toml` — levels live in the manifest so editors agree with the gate | `cargo fmt --all` to fix; the `format` and `lint` gate steps to check | Exit non-zero on a formatting diff or any warning (`-D warnings`) |
+| `.scripts/check_toolchain.py` | Asserts the pinned toolchain is actually in effect — `rust-toolchain.toml` only binds when rustup drives cargo — and that `cargo-deny` meets the minimum version | `python3 .scripts/check_toolchain.py` (repo root; stdlib only) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
+| `.scripts/check_crate_architecture.py` | Enforces `crates/README.md`: dependency direction, no cycles, no platform leakage in core crates, testkit dev-only, per-crate README sections, shared lint-set opt-in | `python3 .scripts/check_crate_architecture.py` (repo root; stdlib only, needs `cargo` on PATH) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
+| `cargo-deny` (installed via `brew install cargo-deny`) | Supply-chain gate, config in `deny.toml`: POL-6 licenses (permissive-only), RustSec advisories, bans, and sources (crates.io only) | `cargo deny check` (repo root), or one check: `cargo deny check licenses` | `advisories ok, bans ok, licenses ok, sources ok`, or non-zero exit with the offending dependency tree |
 | `.scripts/validate_traceability.py` | Validates `docs/TRACEABILITY.md` against `.spec/` and `.task-board/`: every requirement mapped exactly once, no orphan board elements, no stale requirement references on the board | `python3 .scripts/validate_traceability.py` (repo root; stdlib only) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
+| `.scripts/tests/` | Self-tests for the gate scripts themselves — an untested runner is a gate with no gate | `python3 -m unittest discover -s .scripts/tests -t .scripts/tests`, or the `scripts` gate step | Standard unittest output |

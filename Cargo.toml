@@ -2,7 +2,8 @@
 #
 # Architecture, dependency-direction rules, and feature policy: crates/README.md.
 # Layering is enforced by `python3 .scripts/check_crate_architecture.py`.
-# License gate (POL-6): deny.toml, run with `cargo deny check licenses`.
+# Supply-chain gate (POL-6): deny.toml, run with `cargo deny check`.
+# Toolchain pin: rust-toolchain.toml. Every gate: `.scripts/acceptance/run_automated.py`.
 
 [workspace]
 resolver = "3"
@@ -22,3 +23,103 @@ gramdrive-render = { path = "crates/gramdrive-render" }
 gramdrive-engine = { path = "crates/gramdrive-engine" }
 gramdrive-ffi = { path = "crates/gramdrive-ffi" }
 gramdrive-testkit = { path = "crates/gramdrive-testkit" }
+
+# ---------------------------------------------------------------------------
+# Lints
+#
+# Levels live here rather than in a CI flag so that every consumer of the
+# manifest — cargo, rust-analyzer, an editor running clippy on save — agrees
+# with the gate. Each crate opts in with `[lints] workspace = true`; a crate
+# that omits it silently loses the whole set, which is why
+# .scripts/check_crate_architecture.py fails a crate that forgets the opt-in.
+#
+# `-D warnings` in the lint gate covers everything warn-by-default on top of
+# what is enumerated here. The enumerated lints are the ones that are *not*
+# on by default and that map to a stated project requirement.
+# ---------------------------------------------------------------------------
+
+[workspace.lints.rust]
+# Public API of the core is consumed through generated Swift/Kotlin bindings,
+# where a doc comment is the only documentation a native caller ever sees.
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+# `pub` on an item nothing re-exports means the module tree lies about the
+# crate's surface; the FFI boundary (DEC-003) depends on that surface being
+# exactly what it claims.
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# Correctness, suspicious, style, complexity and perf: hard errors, not advice.
+all = { level = "deny", priority = -1 }
+
+# A panic in the core is not a local failure. Across the UniFFI boundary it is
+# an aborted File Provider extension or a lost error category (NFR-030), and
+# NFR-025/NFR-033 require callbacks to fail with a category rather than die.
+# Tests are exempt via clippy.toml.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# The core is a library linked into someone else's process: it has no console.
+# Diagnostics belong in structured errors and health data (NFR-030, NFR-032),
+# and a stray print in a File Provider extension goes nowhere a user can read.
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+
+# ---------------------------------------------------------------------------
+# Build profiles
+# ---------------------------------------------------------------------------
+
+[profile.dev]
+# Cargo defaults are right for the debug loop; overriding them would only
+# trade compile time for runtime the debug loop does not need.
+
+[profile.test]
+# Inherits `dev`. Stated explicitly because the core's arithmetic is offsets,
+# quota accounting and cursors: silent wrapping there produces a wrong byte
+# range rather than a crash, and NFR-010/NFR-012 depend on catching that in a
+# test rather than in a user's Finder.
+overflow-checks = true
+debug-assertions = true
+
+[profile.release]
+# Cross-crate inlining across the seven crates at a fraction of "fat" LTO's
+# link time.
+#
+# CAVEAT — this currently does nothing for the artifact that ships. Cargo omits
+# `-C lto` when a single rustc invocation also produces an rlib, because rustc
+# cannot LTO an rlib output. gramdrive-ffi is `crate-type = ["lib", "staticlib",
+# "cdylib"]` (rlib for the Windows/Linux hosts, staticlib/cdylib for UniFFI), so
+# its dylib links without LTO and cargo says nothing about it. Verified by
+# building with and without "lib" in the set: `-C lto=thin` appears only without.
+#
+# The setting stays because it is right for every crate-type that does link, and
+# becomes live as soon as the shipped artifact's crate-type is settled — which
+# belongs to TASK-260715-3akqs8 (packaging), not here. Splitting the rlib out
+# into its own crate would work but is an architecture change (crates/README.md).
+lto = "thin"
+codegen-units = 1
+
+# Integer overflow traps in shipped builds too. This is a deliberate trade of
+# a few percent throughput against the NFR-012 guarantee that partial or wrong
+# content is never published: a wrapped offset in hydration or eviction is a
+# silent data error, and the performance budgets (NFR-020..NFR-022) are
+# provisional and I/O-bound, not arithmetic-bound. Revisit only with measured
+# evidence that this is what costs a budget.
+overflow-checks = true
+
+# Panics must unwind. UniFFI converts a panic into an FFI error via
+# `catch_unwind`; `panic = "abort"` would turn a recoverable binding error
+# into a crash of the host app or extension. TASK-260715-265gqq depends on this.
+panic = "unwind"
+
+# Enough to symbolicate a crash report from the shipped dylib without carrying
+# full DWARF. Stripping and dSYM handling belong to artifact packaging
+# (TASK-260715-3akqs8), which owns what actually ships.
+debug = "line-tables-only"
+
+[profile.bench]
+# Inherits `release`, including overflow-checks — a benchmark of code that is
+# not the shipped code measures nothing.

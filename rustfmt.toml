@@ -1,0 +1,25 @@
+# rustfmt configuration for the GramDrive workspace.
+#
+# Run: cargo fmt --all           (format)
+#      cargo fmt --all --check   (gate; part of `--suite core`)
+#
+# Only stable options are set. Nightly-only options are excluded even though
+# rustfmt merely warns about them on stable rather than failing: an option that
+# silently does nothing is worse than no option, because the formatting then
+# depends on who ran it. Every deviation from rustfmt defaults has to earn its
+# line — defaults are what every Rust reader already expects.
+#
+# Deliberately absent: `group_imports` and `imports_granularity`. Both are
+# nightly-only, and reaching them would mean running `cargo +nightly fmt`,
+# which defeats the toolchain pin in rust-toolchain.toml. Import grouping stays
+# an unenforced convention until those options stabilize.
+
+# Format against the Rust 2024 style edition, matching workspace.package.edition.
+# `cargo fmt` infers this from the manifest, but a bare `rustfmt` invocation
+# (editors, pre-commit hooks) does not — stating it keeps the output identical
+# whichever way rustfmt is driven.
+style_edition = "2024"
+
+# LF endings regardless of platform or git core.autocrlf setting, so a future
+# Windows CfAPI host cannot produce a diff that differs only by newline.
+newline_style = "Unix"

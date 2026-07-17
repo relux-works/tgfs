@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "run_id": "verify-final",
+  "suite": "all",
+  "commit": "8244a6d15d30bd839be5535fd450f347b684c7fa",
+  "worktree_clean": false,
+  "require_clean": false,
+  "tools": {
+    "python": "3.14.4",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+    "cargo-deny": "cargo-deny 0.20.2",
+    "git": "git version 2.50.1 (Apple Git-155)"
+  },
+  "started_at": "2026-07-16T23:58:38.435439+00:00",
+  "steps": [
+    {
+      "name": "toolchain",
+      "purpose": "active toolchain matches rust-toolchain.toml",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        ".scripts/check_toolchain.py"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.383,
+      "log": "toolchain.log",
+      "status": "passed"
+    },
+    {
+      "name": "format",
+      "purpose": "rustfmt.toml formatting",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.132,
+      "log": "format.log",
+      "status": "passed"
+    },
+    {
+      "name": "lint",
+      "purpose": "clippy lint set from [workspace.lints], warnings are errors",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.133,
+      "log": "lint.log",
+      "status": "passed"
+    },
+    {
+      "name": "test",
+      "purpose": "unit and integration tests across the workspace",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--all-features"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.216,
+      "log": "test.log",
+      "status": "passed"
+    },
+    {
+      "name": "architecture",
+      "purpose": "crate layering, dependency direction, platform neutrality",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        ".scripts/check_crate_architecture.py"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.094,
+      "log": "architecture.log",
+      "status": "passed"
+    },
+    {
+      "name": "supply-chain",
+      "purpose": "POL-6 licenses, RustSec advisories, bans, sources",
+      "command": [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.964,
+      "log": "supply-chain.log",
+      "status": "passed"
+    },
+    {
+      "name": "traceability",
+      "purpose": "docs/TRACEABILITY.md against .spec/ and .task-board/",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        ".scripts/validate_traceability.py"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.068,
+      "log": "traceability.log",
+      "status": "passed"
+    },
+    {
+      "name": "scripts",
+      "purpose": "self-tests for the scripts in .scripts/",
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        ".scripts/tests",
+        "-t",
+        ".scripts/tests"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.095,
+      "log": "scripts.log",
+      "status": "passed"
+    }
+  ],
+  "result": "passed",
+  "finished_at": "2026-07-16T23:58:40.668832+00:00"
+}
