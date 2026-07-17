@@ -2,8 +2,15 @@
 
 Domain vocabulary of the GramDrive core: item identity, the virtual
 `chat -> folder -> files` tree, naming/sanitization policy, versions, change
-cursors, and byte ranges. Layer 0 — every other crate depends on it; it
-depends on nothing inside the workspace.
+cursors, byte ranges, and the SHA-256 content hash that names blobs. Layer 0 —
+every other crate depends on it; it depends on nothing inside the workspace.
+
+The `hash` module is a self-contained, streaming SHA-256 (FIPS 180-4),
+vendored rather than pulled from a crate to keep this platform-neutral layer
+free of a hashing crate's build scripts and transitive tree (POL-6,
+`deny.toml` `[bans.build]`). It is pinned to the FIPS 180-4 and NIST
+known-answer vectors and hashes already-public content for identity and
+integrity only — not secrets — so it makes no constant-time claim.
 
 ## Ownership
 

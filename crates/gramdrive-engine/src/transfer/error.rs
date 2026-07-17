@@ -14,6 +14,15 @@ use gramdrive_state::StateError;
 pub enum EngineError {
     /// The state store refused or failed the underlying operation.
     State(StateError),
+    /// The host's local storage refused a cache-materialization step (the
+    /// atomic promote of a staged object, TASK-260715-3s6cpe). The bytes are
+    /// still staged — the rename is all-or-nothing — so the caller may retry;
+    /// resolving persistent exhaustion is the quota/eviction layer's job
+    /// (TASK-260715-11abx8, SYNC-050/054).
+    Storage {
+        /// The host's own description of the failure.
+        detail: String,
+    },
     /// The item cannot be hydrated at all — a directory, a tombstoned row,
     /// POL-4 restricted or unavailable content, or a file with no content
     /// version to pin (SYNC-042 requires the pin before the first byte).
@@ -57,6 +66,7 @@ impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::State(error) => write!(f, "state store: {error}"),
+            Self::Storage { detail } => write!(f, "local storage: {detail}"),
             Self::NotHydratable { reason } => write!(f, "item is not hydratable: {reason}"),
             Self::RangeBeyondExtent { end, extent } => write!(
                 f,
@@ -82,7 +92,8 @@ impl std::error::Error for EngineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::State(error) => Some(error),
-            Self::NotHydratable { .. }
+            Self::Storage { .. }
+            | Self::NotHydratable { .. }
             | Self::RangeBeyondExtent { .. }
             | Self::IncompleteContent { .. }
             | Self::UnknownExtent

@@ -27,6 +27,17 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
   durable two-phase cancel. Runtime-agnostic and clock-free: the host
   supplies a `Clock` and a `StagingHost`, and tests drive it on the
   testkit's deterministic executor.
+- `cache` — integrity verification and atomic promotion (TASK-260715-3s6cpe;
+  SYNC-042, SYNC-050..053). `Promoter` layers over the machine's
+  `CompleteOutcome::Promoted`: it hashes the whole staged object with a
+  vendored SHA-256 (`gramdrive-model::hash`) and fails closed on truncated or
+  unreadable bytes, re-checks the version pin, then promotes the object into
+  content-addressed cache through the host `PromotionHost` port and records
+  the blob, the `verified` cache entry, and — for an attachment — the blob
+  link, all in one transaction. File-before-row ordering makes every crash a
+  reconcilable disagreement (orphan object or leaked staging), and the
+  content-addressed handle gives idempotent promotion and per-account dedup
+  for free. Whole content only; quota and eviction are TASK-260715-11abx8.
 
 ## Ownership
 

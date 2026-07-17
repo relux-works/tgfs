@@ -2,8 +2,9 @@
 //!
 //! This crate owns provider-neutral domain types: item identity, the virtual
 //! `chat -> folder -> files` tree, naming/sanitization policy, versions,
-//! change cursors, and byte ranges. Every other core crate depends on this
-//! one; this crate depends on nothing inside the workspace.
+//! change cursors, byte ranges, and the SHA-256 content hash ([`hash`]) that
+//! names blobs. Every other core crate depends on this one; this crate depends
+//! on nothing inside the workspace.
 //!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - no internal dependencies;
@@ -16,6 +17,7 @@
 mod base32;
 
 pub mod cursor;
+pub mod hash;
 pub mod identity;
 pub mod naming;
 pub mod ordering;
