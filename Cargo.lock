@@ -322,6 +322,7 @@ name = "gramdrive-engine"
 version = "0.1.0"
 dependencies = [
  "gramdrive-model",
+ "gramdrive-render",
  "gramdrive-source",
  "gramdrive-state",
  "gramdrive-testkit",

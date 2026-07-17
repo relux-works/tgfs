@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 gramdrive-model = { workspace = true }
+gramdrive-render = { workspace = true }
 gramdrive-source = { workspace = true }
 gramdrive-state = { workspace = true }
 

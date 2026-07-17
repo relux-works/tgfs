@@ -21,20 +21,29 @@
 //! content quota-exempt, eviction of eligible unpinned content only, never
 //! racing an open read or a live transfer (POL-2, SYNC-050..054).
 //!
+//! The incremental render planner ([`render_plan`], TASK-260715-22l8zy)
+//! computes, from a batch of normalized changes and the renderer/schema
+//! versions, which generated documents are stale and a plan to regenerate
+//! exactly those against the current event watermark — the marking and planning
+//! that sit in front of `gramdrive-render`'s pure renderers and
+//! `gramdrive-state`'s atomic publication.
+//!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - internal dependencies: `gramdrive-model`, `gramdrive-source`,
-//!   `gramdrive-state`, and `gramdrive-render` (allowed, not yet used);
+//!   `gramdrive-state`, and `gramdrive-render`;
 //! - no platform-specific dependencies or `cfg(target_os/windows/unix)` code;
 //! - no direct provider (TDLib/gotd) types — only the source contract.
 
 #![deny(unsafe_code)]
 
 pub use gramdrive_model as model;
+pub use gramdrive_render as render;
 pub use gramdrive_source as source;
 pub use gramdrive_state as state;
 
 pub mod cache;
 pub mod fetch;
+pub mod render_plan;
 pub mod transfer;
 
 #[cfg(test)]
@@ -47,5 +56,7 @@ mod tests {
         assert_eq!(via_source, range);
         let via_state = crate::state::model::ByteRange::new(0, 4).expect("valid range");
         assert_eq!(via_state, range);
+        let via_render = crate::render::model::ByteRange::new(0, 4).expect("valid range");
+        assert_eq!(via_render, range);
     }
 }

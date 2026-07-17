@@ -52,17 +52,35 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
   Archive-Mode coverage). Quota *value* durability is the host's device
   config; system/provider eviction is reconciled by `StateStore::reconcile`.
 
+- `render_plan` — the incremental render planner (TASK-260715-22l8zy;
+  SYNC-024, SYNC-030..033, DOM-006, DOM-023). From the send instants of a
+  normalized-change batch and the frozen renderer/schema versions, it computes
+  which generated documents went stale: the whole-chat `messages.ndjson`
+  (always) and the transcript of each touched calendar month (only), keyed by a
+  `catalog` of document classes that read their identities, versions, and
+  content-version tokens straight from `gramdrive-render`. Months come from the
+  renderer's own `civil` calendar, so a message never plans into a month the
+  renderer would not group it under. `dirty_affected` records the stale set on
+  the durable dirty worklist in the change's own transaction (SYNC-022);
+  `plan_for_changes` and `plan_worklist` turn stale documents into `RenderJob`s
+  against the chat's current event watermark, skipping anything already current
+  (idempotent re-planning). The planner never renders or publishes — atomic,
+  resumable publication is `gramdrive-state`'s `publish_render` watermark
+  protocol, so an interrupted regeneration leaves the previous version readable
+  and the work on the worklist (SYNC-033).
+
 ## Ownership
 
-STORY-260715-2hs8cf (transfer-and-cache-engine), EPIC-260715-1poogc
-(shared-rust-core). Populated by TASK-260715-22fh09 (ranged fetch
-coordinator), TASK-260715-g4k3zm (durable transfer state), TASK-260715-3s6cpe
-(integrity/promotion), TASK-260715-11abx8 (quota/eviction).
+STORY-260715-2hs8cf (transfer-and-cache-engine) and STORY-260715-1oq9jg
+(deterministic-rendering), EPIC-260715-1poogc (shared-rust-core). Populated by
+TASK-260715-22fh09 (ranged fetch coordinator), TASK-260715-g4k3zm (durable
+transfer state), TASK-260715-3s6cpe (integrity/promotion), TASK-260715-11abx8
+(quota/eviction), TASK-260715-22l8zy (incremental render planner).
 
 ## Dependencies
 
-Internal: `gramdrive-model`, `gramdrive-source`, `gramdrive-state`
-(`gramdrive-render` allowed, not yet used). Platform-specific code:
+Internal: `gramdrive-model`, `gramdrive-source`, `gramdrive-state`, and
+`gramdrive-render` (used by `render_plan`). Platform-specific code:
 forbidden. See `crates/README.md`.
 
 ## Test command

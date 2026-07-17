@@ -1,13 +1,13 @@
 //! Deterministic, dependency-free text helpers for the Markdown renderer:
-//! injection-safe escaping, media-link percent-encoding, and civil-time
-//! formatting.
+//! injection-safe escaping and media-link percent-encoding.
 //!
 //! Every function here is a pure transform of its input — no locale, no clock,
 //! no allocator-order dependence — so equal inputs yield byte-identical output
-//! (SYNC-031). The escaper and the civil-time conversion are hand-rolled for
-//! the same reason the JSON writer is (`crate::json`): each is one small, fully
-//! specified rule, and a dependency would be more supply-chain surface (POL-6)
-//! than code.
+//! (SYNC-031). The escaper is hand-rolled for the same reason the JSON writer
+//! is (`crate::json`): it is one small, fully specified rule, and a dependency
+//! would be more supply-chain surface (POL-6) than code. Civil-time conversion
+//! moved to the shared [`crate::civil`] module, which the render planner reuses
+//! so it never disagrees with the day grouping about a calendar boundary.
 
 /// The Unicode replacement character, substituted for raw C0 controls that a
 /// Markdown reader would otherwise swallow or mis-render.
@@ -145,82 +145,6 @@ pub(super) fn percent_encode_component(name: &str, out: &mut String) {
     }
 }
 
-/// A civil date and wall-clock time, already resolved into a fixed UTC offset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Civil {
-    /// Proleptic Gregorian year.
-    pub year: i64,
-    /// Month, 1–12.
-    pub month: u32,
-    /// Day of month, 1–31.
-    pub day: u32,
-    /// Hour, 0–23.
-    pub hour: u32,
-    /// Minute, 0–59.
-    pub minute: u32,
-    /// Second, 0–59.
-    pub second: u32,
-}
-
-impl Civil {
-    /// Converts a millisecond instant to civil time in a fixed offset (seconds
-    /// east of UTC). Uses floor division throughout, so a pre-1970 instant
-    /// resolves correctly rather than truncating toward zero.
-    pub(super) fn from_millis(instant_ms: i64, offset_seconds: i32) -> Self {
-        let local_ms = instant_ms + i64::from(offset_seconds) * 1000;
-        let total_seconds = local_ms.div_euclid(1000);
-        let days = total_seconds.div_euclid(86_400);
-        let second_of_day = total_seconds.rem_euclid(86_400);
-        let (year, month, day) = civil_from_days(days);
-        Self {
-            year,
-            month,
-            day,
-            hour: (second_of_day / 3_600) as u32,
-            minute: ((second_of_day % 3_600) / 60) as u32,
-            second: (second_of_day % 60) as u32,
-        }
-    }
-
-    /// `YYYY-MM-DD`.
-    pub(super) fn date(&self) -> String {
-        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
-    }
-
-    /// `HH:MM:SS`.
-    pub(super) fn time(&self) -> String {
-        format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
-    }
-
-    /// `YYYY-MM-DD HH:MM:SS`.
-    pub(super) fn date_time(&self) -> String {
-        format!("{} {}", self.date(), self.time())
-    }
-}
-
-/// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`.
-///
-/// Howard Hinnant's `civil_from_days` (public domain, `chrono`-compatible),
-/// which is exact for the full `i64` day range and needs no lookup table.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097; // [0, 146096]
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
-    let month_position = (5 * day_of_year + 2) / 153; // [0, 11]
-    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if month_position < 10 {
-        month_position + 3
-    } else {
-        month_position - 9
-    } as u32; // [1, 12]
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month, day)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,37 +217,5 @@ mod tests {
         out.clear();
         percent_encode_component("файл.pdf", &mut out);
         assert_eq!(out, "%D1%84%D0%B0%D0%B9%D0%BB.pdf");
-    }
-
-    #[test]
-    fn civil_time_matches_known_instants() {
-        // 1_700_000_000_000 ms = 2023-11-14T22:13:20Z (a fixed reference).
-        let utc = Civil::from_millis(1_700_000_000_000, 0);
-        assert_eq!(utc.date(), "2023-11-14");
-        assert_eq!(utc.time(), "22:13:20");
-
-        // The Unix epoch itself.
-        let epoch = Civil::from_millis(0, 0);
-        assert_eq!(epoch.date_time(), "1970-01-01 00:00:00");
-    }
-
-    #[test]
-    fn civil_time_applies_offset_and_crosses_the_day_boundary() {
-        // +03:00 pushes 22:13:20Z into the next civil day.
-        let plus3 = Civil::from_millis(1_700_000_000_000, 3 * 3_600);
-        assert_eq!(plus3.date(), "2023-11-15");
-        assert_eq!(plus3.time(), "01:13:20");
-
-        // A negative offset can pull an instant back across midnight.
-        let minus5 = Civil::from_millis(1_700_000_000_000, -5 * 3_600);
-        assert_eq!(minus5.date(), "2023-11-14");
-        assert_eq!(minus5.time(), "17:13:20");
-    }
-
-    #[test]
-    fn civil_time_is_correct_before_the_epoch() {
-        // -1 ms is the last second of 1969 under floor division.
-        let before = Civil::from_millis(-1, 0);
-        assert_eq!(before.date_time(), "1969-12-31 23:59:59");
     }
 }

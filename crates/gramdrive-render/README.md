@@ -1,15 +1,19 @@
 # gramdrive-render
 
-Deterministic projections of chat history: lossless `messages.ndjson`,
-human-readable Markdown, and the incremental render planner. Pure functions
-of canonical records — identical input yields byte-identical output; no I/O
-policy lives here.
+Deterministic projections of chat history: lossless `messages.ndjson` and
+human-readable Markdown, plus the shared `civil` calendar the incremental
+render planner reuses. Pure functions of canonical records — identical input
+yields byte-identical output; no I/O policy lives here.
 
 ## Ownership
 
 STORY-260715-1oq9jg (deterministic-rendering), EPIC-260715-1poogc
 (shared-rust-core). Populated by TASK-260715-2tq5sk (NDJSON),
-TASK-260715-hmmiay (Markdown), TASK-260715-22l8zy (incremental planner).
+TASK-260715-hmmiay (Markdown), and TASK-260715-22l8zy (incremental planner —
+whose orchestration lives in `gramdrive-engine::render_plan`; this crate
+provides the `civil` calendar and the document identities/versions it plans
+against, so the planner never disagrees with a renderer about a month
+boundary).
 
 ## Dependencies
 

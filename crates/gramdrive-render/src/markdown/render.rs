@@ -12,7 +12,8 @@ use std::fmt;
 
 use gramdrive_model::identity::DocPartition;
 
-use crate::markdown::text::{self, Civil};
+use crate::civil::Civil;
+use crate::markdown::text;
 use crate::markdown::{
     MONTH_MARKDOWN_SCHEMA_FAMILY, MarkdownInput, RENDERER_VERSION, SCHEMA_ID, SCHEMA_VERSION,
     content_version_token, document_id,
