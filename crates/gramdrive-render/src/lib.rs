@@ -1,11 +1,11 @@
 //! GramDrive renderers — deterministic NDJSON and Markdown projections of
 //! chat history.
 //!
-//! This crate will own the lossless `messages.ndjson` renderer, the
-//! human-readable Markdown renderer, and the incremental render planner
-//! (STORY-260715-1oq9jg). Rendering is a pure function of canonical records:
-//! the same input always produces byte-identical output, so generated files
-//! are reproducible views, never a second source of truth.
+//! This crate owns the lossless `messages.ndjson` renderer ([`ndjson`]), and
+//! will grow the human-readable Markdown renderer and the incremental render
+//! planner (STORY-260715-1oq9jg). Rendering is a pure function of canonical
+//! records: the same input always produces byte-identical output, so generated
+//! files are reproducible views, never a second source of truth (DOM-006).
 //!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - internal dependencies: `gramdrive-model` only;
@@ -15,6 +15,10 @@
 #![forbid(unsafe_code)]
 
 pub use gramdrive_model as model;
+
+mod json;
+
+pub mod ndjson;
 
 #[cfg(test)]
 mod tests {
