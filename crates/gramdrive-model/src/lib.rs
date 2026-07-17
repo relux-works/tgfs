@@ -13,10 +13,14 @@
 
 #![forbid(unsafe_code)]
 
+mod base32;
+
+pub mod cursor;
 pub mod identity;
 pub mod naming;
 pub mod ordering;
 pub mod tree;
+pub mod version;
 
 /// A half-open byte range `[start, end)` within a content object.
 ///

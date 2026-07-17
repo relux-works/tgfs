@@ -418,64 +418,28 @@ impl<'a> Reader<'a> {
 // third-party crate's flag matrix. Lowercase because identities appear in
 // logs and URLs where case-folding environments are common; strict parsing
 // keeps text -> bytes one-to-one anyway.
+//
+// The codec itself lives in `crate::base32` since the change cursor adopted
+// the same text form under its own prefix (TASK-260715-1j4ij3); this module
+// keeps the identity prefix and maps the neutral errors onto `IdParseError`.
+// The golden and property suites pin that this indirection changed nothing.
+
+use crate::base32::{self, TextDecodeError};
 
 const TEXT_PREFIX: &str = "gd";
-const ALPHABET: [u8; 32] = *b"abcdefghijklmnopqrstuvwxyz234567";
 
 pub(super) fn encode_text(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(TEXT_PREFIX.len() + bytes.len().div_ceil(5) * 8);
-    out.push_str(TEXT_PREFIX);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for &byte in bytes {
-        acc = (acc << 8) | u32::from(byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            out.push(char::from(ALPHABET[((acc >> bits) & 0x1f) as usize]));
-        }
-        // Keep only the unconsumed low bits so `acc` stays within 12 bits
-        // and `acc << 8` above can never overflow (checks are on in release).
-        acc &= (1 << bits) - 1;
-    }
-    if bits > 0 {
-        out.push(char::from(ALPHABET[((acc << (5 - bits)) & 0x1f) as usize]));
-    }
-    out
+    base32::encode(TEXT_PREFIX, bytes)
 }
 
 pub(super) fn decode_text(text: &str) -> Result<Vec<u8>, IdParseError> {
-    let payload = text
-        .strip_prefix(TEXT_PREFIX)
-        .ok_or(IdParseError::MissingPrefix)?;
-    let mut out = Vec::with_capacity(payload.len() * 5 / 8);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for (index, &byte) in payload.as_bytes().iter().enumerate() {
-        let value = match byte {
-            b'a'..=b'z' => byte - b'a',
-            b'2'..=b'7' => byte - b'2' + 26,
-            _ => {
-                return Err(IdParseError::InvalidCharacter {
-                    position: TEXT_PREFIX.len() + index,
-                });
-            }
-        };
-        acc = (acc << 5) | u32::from(value);
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
-            acc &= (1 << bits) - 1;
+    base32::decode(TEXT_PREFIX, text).map_err(|error| match error {
+        TextDecodeError::MissingPrefix => IdParseError::MissingPrefix,
+        TextDecodeError::InvalidCharacter { position } => {
+            IdParseError::InvalidCharacter { position }
         }
-    }
-    // A canonical unpadded encoding leaves fewer than 5 leftover bits (5+
-    // means a character count no byte string produces) and those bits are
-    // zero (RFC 4648 pads the final quantum with zeros).
-    if bits >= 5 || acc != 0 {
-        return Err(IdParseError::NonCanonicalText);
-    }
-    Ok(out)
+        TextDecodeError::NonCanonical => IdParseError::NonCanonicalText,
+    })
 }
 
 #[cfg(test)]

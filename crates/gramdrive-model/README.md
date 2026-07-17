@@ -10,7 +10,9 @@ depends on nothing inside the workspace.
 STORY-260715-3qxar5 (identity-and-namespace), EPIC-260715-1poogc
 (shared-rust-core). Populated by TASK-260715-1qz1g5 (stable item identities),
 TASK-260715-3tjduq (virtual tree builder), TASK-260715-1ffbkg (cross-platform
-naming), TASK-260715-1jmsdp (ordering projection).
+naming), TASK-260715-1jmsdp (ordering projection), and TASK-260715-1j4ij3
+(versions and change cursors, for the drive-source contract —
+STORY-260715-255sa3).
 
 ## Dependencies
 
@@ -123,6 +125,46 @@ pairs directly. Residual collision surface lives in the inputs:
   retires.
 - **Display-name collisions** are not identity collisions; deterministic
   suffixing is naming policy (SYNC-012, TASK-260715-1ffbkg).
+
+## Versions and change cursors (DOM-003, DOM-004, SYNC-004)
+
+The `version` and `cursor` modules own the durable sync vocabulary —
+TASK-260715-1j4ij3. They live in this crate rather than `gramdrive-source`
+because the state store persists both and may depend only on layer 0.
+
+- **`MetadataVersion` / `ContentVersion`** are opaque, provider-chosen
+  tokens compared for equality only (DOM-003 allows monotonic *or*
+  content-derived versions, so cross-token ordering is meaningless and
+  `Ord` is deliberately absent). Two distinct types, not one: a metadata
+  version where a content version belongs is the mistake that publishes
+  stale bytes under a fresh stamp, so the type system refuses it.
+  Validation: non-empty, ≤ 256 bytes, no control characters. The durable
+  form is the token text itself.
+- **`ChangeCursor`** anchors one position in a source's change feed. It
+  carries the `AccountScope` it was minted under plus an opaque provider
+  payload (≤ 4096 bytes); `require_scope` rejects account/namespace
+  mismatches explicitly (SYNC-004), and decoding rejects unknown format
+  versions distinctly from corruption.
+
+### Cursor serialization format v1
+
+Binary layout (integers big-endian, two's complement): byte 0 format
+version (`0x01`); bytes 1..9 account id (i64); bytes 9..13 namespace
+version (u32); bytes 13.. the provider payload (the remainder — exactly one
+variable-length field, at the tail, so the encoding is injective). Text
+form: `"gdc-"` + unpadded lowercase base32 of the binary form — the same
+strict codec as identity text (shared `base32` module), so each cursor has
+exactly one valid spelling. The prefixes cannot alias: cursor text fails
+`ItemId` parsing at the `-`, identity text fails cursor parsing at the
+missing prefix.
+
+v1 is frozen by golden fixtures (`tests/cursor_golden.rs`), same policy as
+identity: a change that breaks them is wrong; evolution is a new format
+version byte decoded alongside v1. The format carries no checksum on
+purpose — the payload is opaque provider state; corruption *detection* is
+not a cursor guarantee, scope and schema rejection are
+(`tests/cursor_properties.rs` proves round-trip, injectivity, canonicality,
+and totality of parsing).
 
 ## Virtual tree builder (SYNC-010..012, PRD-010..013, DEC-007)
 
