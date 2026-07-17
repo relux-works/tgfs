@@ -9,8 +9,8 @@
 use gramdrive_model::identity::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
     CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
-    FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MessageId, MessageKey,
-    NamespaceVersion, SchemaFamily,
+    FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MediaDirKey,
+    MessageId, MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -124,6 +124,46 @@ fn goldens() -> Vec<Golden> {
             })),
             bytes_hex: "0106000000000000002a00000001ffffff16e1c4ed2e0102ffff",
             text: "gdaedaaaaaaaaaaabkaaaaaap7777rnyoe5uxacax774",
+        },
+        Golden {
+            name: "folder_catalog",
+            key: ItemKey::Canonical(CanonicalKey::FolderCatalog(FolderCatalogKey {
+                scope: SCOPE,
+            })),
+            bytes_hex: "0108000000000000002a00000001",
+            text: "gdaeeaaaaaaaaaaabkaaaaaai",
+        },
+        Golden {
+            name: "year_dir",
+            key: ItemKey::Canonical(CanonicalKey::YearDir(YearDirKey {
+                chat: CHAT,
+                year: 2026,
+            })),
+            bytes_hex: "0109000000000000002a00000001ffffff16e1c4ed2e07ea",
+            text: "gdaeeqaaaaaaaaaabkaaaaaap7777rnyoe5uxap2q",
+        },
+        Golden {
+            name: "media_dir_appearance_in_main",
+            key: ItemKey::Appearance(AppearanceKey {
+                view: ChatListKind::Main,
+                item: CanonicalKey::MediaDir(MediaDirKey {
+                    chat: CHAT,
+                    year: 2026,
+                }),
+            }),
+            bytes_hex: "0110010a000000000000002a00000001ffffff16e1c4ed2e07ea",
+            text: "gdaeiaccqaaaaaaaaaaavaaaaaah7777yw4hco2lqh5i",
+        },
+        Golden {
+            name: "generated_doc_chat_json",
+            key: ItemKey::Canonical(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+                chat: CHAT,
+                partition: DocPartition::Chat,
+                format: DocFormat::Json,
+                schema_family: SchemaFamily(1),
+            })),
+            bytes_hex: "0106000000000000002a00000001ffffff16e1c4ed2e01030001",
+            text: "gdaedaaaaaaaaaaabkaaaaaap7777rnyoe5uxacayaae",
         },
         Golden {
             name: "blob_sha256",

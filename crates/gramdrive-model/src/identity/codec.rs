@@ -18,15 +18,15 @@
 use super::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
     CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
-    FolderId, GeneratedDocKey, IdParseError, ItemKey, MessageId, MessageKey, NamespaceVersion,
-    SchemaFamily,
+    FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemKey, MediaDirKey, MessageId,
+    MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
 };
 
 const FORMAT_VERSION: u8 = 0x01;
 
 // Item kind tags. 0x10 for appearance leaves the canonical range room to
-// grow (the virtual tree builder will add directory kinds) while keeping the
-// two spaces visually distinct in a hex dump.
+// grow while keeping the two spaces visually distinct in a hex dump; the
+// virtual tree builder's directory kinds occupy 0x08..0x0a.
 const TAG_ACCOUNT: u8 = 0x01;
 const TAG_CHAT_LIST: u8 = 0x02;
 const TAG_CHAT: u8 = 0x03;
@@ -34,6 +34,9 @@ const TAG_MESSAGE: u8 = 0x04;
 const TAG_ATTACHMENT: u8 = 0x05;
 const TAG_GENERATED_DOC: u8 = 0x06;
 const TAG_BLOB: u8 = 0x07;
+const TAG_FOLDER_CATALOG: u8 = 0x08;
+const TAG_YEAR_DIR: u8 = 0x09;
+const TAG_MEDIA_DIR: u8 = 0x0a;
 const TAG_APPEARANCE: u8 = 0x10;
 
 const LIST_MAIN: u8 = 0x01;
@@ -46,6 +49,7 @@ const PARTITION_MONTH: u8 = 0x03;
 
 const FORMAT_NDJSON: u8 = 0x01;
 const FORMAT_MARKDOWN: u8 = 0x02;
+const FORMAT_JSON: u8 = 0x03;
 
 const HASH_SHA256: u8 = 0x01;
 
@@ -61,8 +65,9 @@ const FIELD_HASH: &str = "content hash algorithm";
 // ---------------------------------------------------------------------------
 
 pub(super) fn encode_key(key: &ItemKey) -> Vec<u8> {
-    // Largest v1 key (attachment appearance) is 40 bytes.
-    let mut out = Vec::with_capacity(48);
+    // Largest v1 key (blob appearance) is 49 bytes; consumers must size
+    // buffers from the tested <=64-byte bound, never from this comment.
+    let mut out = Vec::with_capacity(64);
     out.push(FORMAT_VERSION);
     match key {
         ItemKey::Canonical(canonical) => encode_canonical(&mut out, canonical),
@@ -86,9 +91,23 @@ fn encode_canonical(out: &mut Vec<u8>, key: &CanonicalKey) {
             encode_scope(out, scope);
             encode_list_kind(out, kind);
         }
+        CanonicalKey::FolderCatalog(FolderCatalogKey { scope }) => {
+            out.push(TAG_FOLDER_CATALOG);
+            encode_scope(out, scope);
+        }
         CanonicalKey::Chat(chat) => {
             out.push(TAG_CHAT);
             encode_chat(out, chat);
+        }
+        CanonicalKey::YearDir(YearDirKey { chat, year }) => {
+            out.push(TAG_YEAR_DIR);
+            encode_chat(out, chat);
+            out.extend_from_slice(&year.to_be_bytes());
+        }
+        CanonicalKey::MediaDir(MediaDirKey { chat, year }) => {
+            out.push(TAG_MEDIA_DIR);
+            encode_chat(out, chat);
+            out.extend_from_slice(&year.to_be_bytes());
         }
         CanonicalKey::Message(message) => {
             out.push(TAG_MESSAGE);
@@ -122,6 +141,7 @@ fn encode_canonical(out: &mut Vec<u8>, key: &CanonicalKey) {
             match format {
                 DocFormat::Ndjson => out.push(FORMAT_NDJSON),
                 DocFormat::Markdown => out.push(FORMAT_MARKDOWN),
+                DocFormat::Json => out.push(FORMAT_JSON),
             }
             out.extend_from_slice(&schema_family.0.to_be_bytes());
         }
@@ -203,7 +223,18 @@ fn decode_canonical(
             let kind = decode_list_kind(reader)?;
             Ok(CanonicalKey::ChatList(ChatListKey { scope, kind }))
         }
+        TAG_FOLDER_CATALOG => Ok(CanonicalKey::FolderCatalog(FolderCatalogKey {
+            scope: decode_scope(reader)?,
+        })),
         TAG_CHAT => Ok(CanonicalKey::Chat(decode_chat(reader)?)),
+        TAG_YEAR_DIR => Ok(CanonicalKey::YearDir(YearDirKey {
+            chat: decode_chat(reader)?,
+            year: reader.u16()?,
+        })),
+        TAG_MEDIA_DIR => Ok(CanonicalKey::MediaDir(MediaDirKey {
+            chat: decode_chat(reader)?,
+            year: reader.u16()?,
+        })),
         TAG_MESSAGE => Ok(CanonicalKey::Message(decode_message(reader)?)),
         TAG_ATTACHMENT => {
             let message = decode_message(reader)?;
@@ -231,6 +262,7 @@ fn decode_canonical(
             let format = match reader.u8()? {
                 FORMAT_NDJSON => DocFormat::Ndjson,
                 FORMAT_MARKDOWN => DocFormat::Markdown,
+                FORMAT_JSON => DocFormat::Json,
                 tag => {
                     return Err(IdParseError::UnknownTag {
                         tag,

@@ -24,8 +24,9 @@ The `identity` module owns the typed keys and their opaque serialization —
 TASK-260715-1qz1g5. The model:
 
 - **Canonical keys** (`CanonicalKey`) name source-derived records: account,
-  chat list (Main/Archive/folder), chat, message, attachment, generated
-  NDJSON/Markdown document, and content-addressed blob. Telegram-derived keys
+  chat list (Main/Archive/folder), the folder catalog, chat, chat-export
+  year and media directories, message, attachment, generated document
+  (NDJSON/Markdown/JSON), and content-addressed blob. Telegram-derived keys
   are scoped by `AccountScope` = account + `NamespaceVersion` (the epoch that
   retires an account's whole derived namespace at once, DOM-021).
 - **Appearance keys** (`AppearanceKey`) name one *virtual appearance* of a
@@ -57,12 +58,19 @@ Item kind tags: account `0x01` (account id: i64), chat list `0x02` (scope,
 list kind), chat `0x03` (scope, chat id: i64), message `0x04` (chat fields,
 message id: i64), attachment `0x05` (message fields, index: u32), generated
 document `0x06` (chat fields, partition, format, schema family: u16), blob
-`0x07` (account id: i64, hash), appearance `0x10` (list kind, then the
-wrapped canonical key's tag and fields). Scope = account id (i64) +
-namespace version (u32). List kind: Main `0x01`, Archive `0x02`, Folder
-`0x03` + folder id (i32). Partition: chat `0x01`, year `0x02` + u16, month
-`0x03` + u16 + u8. Format: NDJSON `0x01`, Markdown `0x02`. Hash: SHA-256
-`0x01` + 32 digest bytes.
+`0x07` (account id: i64, hash), folder catalog `0x08` (scope), year
+directory `0x09` (chat fields, year: u16), media directory `0x0a` (chat
+fields, year: u16), appearance `0x10` (list kind, then the wrapped
+canonical key's tag and fields). Scope = account id (i64) + namespace
+version (u32). List kind: Main `0x01`, Archive `0x02`, Folder `0x03` +
+folder id (i32). Partition: chat `0x01`, year `0x02` + u16, month `0x03` +
+u16 + u8. Format: NDJSON `0x01`, Markdown `0x02`, JSON `0x03`. Hash:
+SHA-256 `0x01` + 32 digest bytes.
+
+The directory kinds (`0x08`–`0x0a`) and the JSON format tag were added by
+the virtual tree builder (TASK-260715-3tjduq) in the extension room the v1
+canonical range reserved for it. The additions are purely additive: no
+pre-existing encoding changed, and the original golden fixtures pin that.
 
 Every field is fixed-width once its tags are read, so the encoding is a
 prefix code: decoding is deterministic, no valid encoding is a prefix of
@@ -96,6 +104,54 @@ pairs directly. Residual collision surface lives in the inputs:
   retires.
 - **Display-name collisions** are not identity collisions; deterministic
   suffixing is naming policy (SYNC-012, TASK-260715-1ffbkg).
+
+## Virtual tree builder (SYNC-010..012, PRD-010..013, DEC-007)
+
+The `tree` module owns `TreeProjection` — TASK-260715-3tjduq. It projects
+normalized source records into the default layout of
+`.spec/sync-and-filesystem-semantics.md`:
+
+```text
+Account/                      canonical account key
+  Main/                       canonical chat-list key
+    Chat/                     appearance (view × canonical chat)
+      chat.json               appearance over generated doc (JSON, whole chat)
+      messages.ndjson         appearance over generated doc (NDJSON, whole chat)
+      2026/                   appearance over year-directory key
+        07.md                 appearance over generated doc (Markdown, month)
+        media/                appearance over media-directory key
+          <attachment files>  appearances over attachment keys
+  Archive/
+  Telegram Folders/           canonical folder-catalog key
+    <one dir per folder>      canonical chat-list keys (folder kind)
+```
+
+The model:
+
+- **One record, many appearances (PRD-013).** A projection stores exactly
+  one canonical record per chat; views hold references. Everything below a
+  view root is an appearance identity — the view wrapped around the
+  unchanged canonical key — so no canonical record or blob identity is
+  ever duplicated. Which `(view, item)` combinations resolve is this
+  module's discipline: chats and their subtrees appear through views;
+  accounts, chat lists, the catalog, messages, and blobs never do.
+- **Lazy, paged enumeration (SYNC-003).** `children` mints only the
+  requested page of the requested parent. Page boundaries are the last
+  returned child's `ItemId`; within one projection pages are repeatable
+  with no duplicates or gaps, and a boundary from another snapshot fails
+  loudly rather than skipping children.
+- **Determinism.** Sibling order derives from stable identity (fixed
+  roots, folder IDs, chat IDs, years, months, message/attachment
+  ordinals), never input order — the property suite
+  (`tests/tree_properties.rs`) shuffles every input collection and
+  requires identical output; `tests/tree_fixture.rs` pins the spec's
+  layout example literally.
+- **Read-only capabilities (DEC-007, SYNC-060).** Every node carries
+  capability metadata whose write side is constant `false`; v1
+  constructors cannot express anything else.
+- Display names are raw presentation state (POL-1 stable chat names:
+  `<Display Name> — @<username>`); sanitization and collision suffixing
+  are TASK-260715-1ffbkg, ordering metadata is TASK-260715-1jmsdp.
 
 ## Test command
 

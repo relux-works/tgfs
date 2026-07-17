@@ -13,8 +13,8 @@
 use gramdrive_model::identity::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
     CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
-    FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MessageId, MessageKey,
-    NamespaceVersion, SchemaFamily,
+    FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MediaDirKey,
+    MessageId, MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
 };
 use proptest::prelude::*;
 
@@ -66,7 +66,12 @@ fn arb_canonical() -> impl Strategy<Value = CanonicalKey> {
         arb_account().prop_map(CanonicalKey::Account),
         (arb_scope(), arb_list_kind())
             .prop_map(|(scope, kind)| CanonicalKey::ChatList(ChatListKey { scope, kind })),
+        arb_scope().prop_map(|scope| CanonicalKey::FolderCatalog(FolderCatalogKey { scope })),
         arb_chat().prop_map(CanonicalKey::Chat),
+        (arb_chat(), any::<u16>())
+            .prop_map(|(chat, year)| CanonicalKey::YearDir(YearDirKey { chat, year })),
+        (arb_chat(), any::<u16>())
+            .prop_map(|(chat, year)| CanonicalKey::MediaDir(MediaDirKey { chat, year })),
         arb_message().prop_map(CanonicalKey::Message),
         (arb_message(), any::<u32>()).prop_map(|(message, index)| {
             CanonicalKey::Attachment(AttachmentKey {
@@ -77,7 +82,11 @@ fn arb_canonical() -> impl Strategy<Value = CanonicalKey> {
         (
             arb_chat(),
             arb_partition(),
-            prop_oneof![Just(DocFormat::Ndjson), Just(DocFormat::Markdown)],
+            prop_oneof![
+                Just(DocFormat::Ndjson),
+                Just(DocFormat::Markdown),
+                Just(DocFormat::Json)
+            ],
             any::<u16>()
         )
             .prop_map(|(chat, partition, format, family)| {

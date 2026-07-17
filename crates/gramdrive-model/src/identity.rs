@@ -9,8 +9,9 @@
 //! # Canonical vs appearance identity (DOM-002, DOM-022)
 //!
 //! [`CanonicalKey`] identifies a source-derived record: an account, a chat
-//! list, a chat, a message, an attachment, a generated document, or a blob.
-//! Canonical identity never changes when presentation changes.
+//! list, the folder catalog, a chat, a chat-export year or media directory,
+//! a message, an attachment, a generated document, or a blob. Canonical
+//! identity never changes when presentation changes.
 //!
 //! [`AppearanceKey`] identifies one *virtual appearance* of a canonical item:
 //! the same canonical chat shown in Main, in Archive, and in a custom folder
@@ -135,6 +136,18 @@ pub struct ChatListKey {
     pub kind: ChatListKind,
 }
 
+/// Canonical identity of the fixed directory that groups every custom
+/// Telegram-folder view of an account — "Telegram Folders" in the default
+/// layout (`.spec/sync-and-filesystem-semantics.md`, tree layout).
+///
+/// Scoped like [`ChatListKey`]: the catalog is chat-list-level structure, so
+/// a namespace bump retires it together with the folder views it groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FolderCatalogKey {
+    /// Owning account and namespace epoch.
+    pub scope: AccountScope,
+}
+
 /// Telegram chat/peer identifier — int53, may be negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChatId(pub i64);
@@ -149,6 +162,31 @@ pub struct ChatKey {
     pub scope: AccountScope,
     /// Telegram chat ID within that scope.
     pub chat_id: ChatId,
+}
+
+/// Canonical identity of one calendar-year directory of a chat's export
+/// (`Chat/2026/` in the default layout).
+///
+/// The year is part of identity, not presentation: `2026/` names the same
+/// directory for as long as the chat has content in that year, whatever the
+/// chat is called. Which years exist is the virtual tree builder's
+/// discipline, derived from observed message months.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct YearDirKey {
+    /// The chat the export belongs to.
+    pub chat: ChatKey,
+    /// Calendar year of the directory.
+    pub year: u16,
+}
+
+/// Canonical identity of the media directory of one chat-export year
+/// (`Chat/2026/media/` in the default layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MediaDirKey {
+    /// The chat the export belongs to.
+    pub chat: ChatKey,
+    /// Calendar year the directory collects media for.
+    pub year: u16,
 }
 
 /// Telegram message identifier — int53 within its chat.
@@ -192,6 +230,8 @@ pub enum DocFormat {
     Ndjson,
     /// Rendered Markdown transcript.
     Markdown,
+    /// JSON chat metadata document (`chat.json`).
+    Json,
 }
 
 /// Record-schema family of a generated document (DOM-023).
@@ -275,8 +315,14 @@ pub enum CanonicalKey {
     Account(AccountKey),
     /// A chat-list view root (Main, Archive, or a custom folder).
     ChatList(ChatListKey),
+    /// The fixed directory grouping the custom-folder views of an account.
+    FolderCatalog(FolderCatalogKey),
     /// A chat.
     Chat(ChatKey),
+    /// A calendar-year directory of a chat's export.
+    YearDir(YearDirKey),
+    /// The media directory of one chat-export year.
+    MediaDir(MediaDirKey),
     /// A message.
     Message(MessageKey),
     /// A downloadable attachment.
