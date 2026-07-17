@@ -170,6 +170,17 @@ pub enum StateError {
         /// The state the row was actually in.
         from: &'static str,
     },
+    /// The host's local storage could not be inventoried, so reconciliation
+    /// has nothing to compare the database against (SYNC-070).
+    ///
+    /// Fatal to the pass rather than a finding: a survey against a *partial*
+    /// inventory would read every unlisted object as an orphan and delete
+    /// live cache. A storage failure on one individual object is the
+    /// survivable case, and that one is reported as an unresolved finding.
+    LocalStorage {
+        /// The host's description of the failure.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for StateError {
@@ -230,6 +241,9 @@ impl std::fmt::Display for StateError {
             Self::InvalidTransition { entity, from } => {
                 write!(f, "invalid {entity} transition from state '{from}'")
             }
+            Self::LocalStorage { detail } => {
+                write!(f, "local storage could not be inventoried: {detail}")
+            }
         }
     }
 }
@@ -251,7 +265,8 @@ impl std::error::Error for StateError {
             | Self::VersionConflict { .. }
             | Self::WatermarkRegression { .. }
             | Self::CorruptRow { .. }
-            | Self::InvalidTransition { .. } => None,
+            | Self::InvalidTransition { .. }
+            | Self::LocalStorage { .. } => None,
         }
     }
 }

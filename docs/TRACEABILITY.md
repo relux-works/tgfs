@@ -227,7 +227,7 @@ Multiple board elements on one row are justified in Notes (typical split: engine
 | NFR-031 | V1 | active | TASK-260715-g4k3zm | Transfer/sync progress survives restart where source supports resume. |
 | NFR-032 | V1 | active | TASK-260715-162fdj | Health payload: cursor, last success, transfers, cache pressure, registration, redacted failures. |
 | NFR-033 | V1 | active | TASK-260715-22fh09, TASK-260715-162fdj | Bounded retries in fetch coordination + observability of retry/flood-wait state. |
-| NFR-034 | V1 | active | TASK-260715-1nuhxj, TASK-260715-1zqwbz | Repair operation + corruption/missing-file fixture coverage. |
+| NFR-034 | V1 | active | TASK-260715-21clwh, TASK-260715-1nuhxj, TASK-260715-1zqwbz | Core reconciliation pass with its corruption/missing/extra fixtures + user-triggered repair operation + acceptance fixture coverage. |
 | NFR-040 | V1 | active | TASK-260715-3ox001 | Minimum OS/architecture matrix recorded (POL-5/DEC-017) before implementation. |
 | NFR-041 | V1 | active | TASK-260715-18l9xz, TASK-260715-1qz1g5 | SQLite/serialized/export schema migration tests + provider identity version compatibility. |
 | NFR-042 | V1 | active | TASK-260715-1j4ij3 | Additive-tolerant, major-version-rejecting contract types. |

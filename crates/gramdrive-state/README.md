@@ -119,6 +119,55 @@ SYNC-022's atomic checkpoint is compositional, not a special API: call
 `apply_message_changes`, `record_chat_sync`, and `put_cursor` under one
 `write_txn` and they commit or vanish together.
 
+## Reconciliation
+
+`src/reconcile.rs` (TASK-260715-21clwh) is the pass that makes the database
+and the bytes on disk agree again after a process died between them
+(SYNC-070). `StateStore::reconcile` repairs; `StateStore::plan_reconcile`
+runs the same survey and only reports — the dry run TASK-260715-1nuhxj
+presents before committing to anything. Both are idempotent: a second pass
+over a reconciled file finds nothing.
+
+It cannot touch Telegram, structurally rather than by discipline — the
+architecture forbids this crate depending on `gramdrive-source`, and the
+entrypoints take a `LocalStorage` and nothing else (SYNC-071).
+
+**The `LocalStorage` port.** This crate never chooses paths, so it cannot
+walk a cache directory; the host implements the port and this crate joins
+the two inventories against the opaque handles already in the schema
+(`cache_entries.materialization_ref`, `transfers.temp_ref`). A listing that
+fails is fatal to the pass (`StateError::LocalStorage`) — a survey against a
+partial inventory would read every unlisted object as an orphan and delete
+live cache. A failure on one individual object is survivable and becomes an
+unresolved finding.
+
+**The precondition: no engine is running against the file.** Every check
+reads a database/disk disagreement as damage, and a live engine is a
+permanent legitimate source of exactly those — it is always between two
+steps of something (bytes staged, range not yet recorded; object written,
+row not yet committed). So this requires what `fsck` requires: nothing else
+may be touching what it repairs. It is a caller contract, the same shape as
+"the host chooses where the file lives". The containing app runs it at
+startup before claiming anything (TDLib, and so the engine, cannot live in
+the extension — `.spec/architecture.md`); the extension never runs it, since
+it claims and materializes nothing; a user-triggered repair quiesces the
+engine first.
+
+That precondition is what makes a `running` transfer legible. The row is
+otherwise ambiguous — a dead claim and a live one look identical, and this
+crate has no liveness primitive to tell them apart. With it, no claim can be
+live, so every `running` row is a dead one.
+
+| Finding | Evidence | Repair |
+|---|---|---|
+| `InterruptedTransfer` | a `running` row (so: a dead claim) | requeued **keeping** `completed_ranges`/`temp_ref` — a resume, not a restart; `retry_count` untouched, because a crash is not a failed attempt |
+| `LeakedStaging` | a staging object no live transfer claims | object deleted, stale `temp_ref` cleared off the terminal row |
+| `MissingCacheObject` | `materialization_ref` absent from the inventory (SYNC-053) | the `cache_entries` row is dropped — it claims bytes that do not exist. **The `pins` row is not**: POL-2 intent is independent of materialization, so the engine re-hydrates it. A generated document also goes back on the dirty worklist |
+| `OrphanCacheObject` | an object no row claims | deleted; the database is the authority on what is cached, so an unclaimed object can never be served |
+| `UnlocatableCacheEntry` | entry with no handle | reported only — an entry we cannot check is not one we may delete |
+| `ProjectionRebuildPending` | a `rebuild_projection` marker | reported only, marker left raised: rebuilding `items` needs the engine-side projection builder, and the work is still owed |
+| `MigrationInterrupted` | a `migration_interrupted` marker | reported only — `open` is what resumes a migration, before any of this runs |
+
 ## Multi-process safety
 
 On Apple platforms the app and the File Provider extension are separate
@@ -181,6 +230,17 @@ and a reader that can never observe a cursor ahead of the state it seals.
 - `tests/repo_concurrency.rs` — two connections over one WAL file: stable
   read snapshots, serialized writers with no double-claim, and cursor
   never ahead of state under a concurrent reader.
+- `tests/reconcile.rs` — the NFR-034 fixtures: *missing* (a row for bytes
+  that are gone), *extra* (bytes no row claims), and *corruption* (in-flight
+  state that outlived its process), each asserted to converge, to converge
+  idempotently, and never at the cost of a pin. The crash test is not a
+  simulation: it re-executes the test binary, lets the child `abort()` with a
+  transfer claimed and a transaction open, and reconciles the file the dead
+  process actually left — committed progress intact, uncommitted work gone.
+  Verified by mutation: requeueing without the staged ranges, protecting
+  every `temp_ref` instead of only the claimed ones, deleting a requeued
+  transfer's staging area, or dropping the pin with the entry each fail this
+  suite.
 
 ## Test command
 
