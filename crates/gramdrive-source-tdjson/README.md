@@ -25,6 +25,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `config` | `TdlibConfig` and the storage/memory policy: per-account `setTdlibParameters`/`setOption`/`addProxy` request builders, on-disk isolation with a clean logout wipe (`StorageLayout`), and the `SecretSource` keychain seam |
 | `removal` | `AccountRemoval`: the crash-resumable account-removal workflow (SEC-004) — the SEC-004 cleanup sequenced behind a durable journal, distinguishing Telegram logout (`RevokeSession` → `logOut`) from local-only removal (`LocalOnly` → `close`), idempotent per stage and fail-safe under concurrent access |
 | `snapshot` | `SnapshotMachine`: the deterministic sans-IO initial chat-list snapshot (TASK-260715-30amrq) — `loadChats` pagination per list, the `getChats` order witness, lazy `getChat` detail resolution, flood-wait backoff advice, resumable per-list commits carrying Telegram's exact ordering metadata |
+| `updates` | `UpdateMachine`: the deterministic sans-IO live chat-metadata/list update mapper (TASK-260715-1c8fea) — TDLib's push updates (title/photo/position/removed-from-list/protected-content, plus the user/supergroup username feed) folded into the same normalized change stream, with POL-1 invalidation classification (reorder → `order.json`, rename → folder rename), idempotent under duplicate and out-of-order delivery, and gap reporting for unknown chats |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
@@ -228,6 +229,47 @@ Guarantees the suites pin (`tests/chat_snapshot.rs`, unit tests in
   `Backoff` step and re-issue the identical request; everything else is a
   typed terminal error whose recovery path is the durable token.
 
+## Live chat-metadata/list updates (`updates`)
+
+`UpdateMachine` (TASK-260715-1c8fea) keeps the snapshot baseline current from
+TDLib's live push stream. It is a pure sans-IO reducer — no requests, no
+client: feed every update to `on_update`, drain the accumulated normalized
+changes with `take_batch`, and apply the `UpdateBatch` to state in one
+transaction (canonical `chats` first for the `chat_list_entries → chats`
+foreign key, memberships after). Membership deltas use the incremental
+`upsert_chat_list_entry` / `remove_chat_list_entry` repo methods, so one chat's
+move never rewrites the rest of a list.
+
+Guarantees the suites pin (`tests/chat_updates.rs`, unit tests in
+`src/updates.rs`):
+
+- **The same normalized vocabulary as the snapshot.** `updateNewChat`,
+  `updateChatTitle`, `updateChatPhoto`, `updateChatPosition`,
+  `updateChatRemovedFromList`, `updateChatHasProtectedContent`, and the
+  `updateUser`/`updateSupergroup` username feed fold into `ChatMetadata`
+  upserts and `MembershipChange` deltas — one projection, kept current, never a
+  second disagreeing one (SYNC-026).
+- **Provider invalidation split (POL-1).** A reorder (position/pin change) is a
+  content change: `Invalidation::ListOrdering` (regenerate `order.json`) and
+  nothing else — it never rewrites the chat's canonical row, so identity is
+  stable. A rename (title/username change of a known chat) emits
+  `Invalidation::FolderName`. First sight, avatar, and protected-content
+  changes emit `Invalidation::Metadata` (the metadata version advances; no
+  folder or list order does).
+- **Converge under duplicates, out-of-order, and restart.** Every field is
+  applied last-write-wins; a value equal to the known one produces no output,
+  so a duplicated or replayed update is a no-op. With a content-derived
+  `metadata_version`, a restart fed TDLib's re-pushed burst rewrites nothing —
+  the SYNC-003 enumeration anchor stays put.
+- **Gaps, not forgeries (SYNC-003/023).** An update naming a chat with no known
+  metadata cannot forge a canonical row (and the foreign key would reject its
+  membership), so the value is dropped and the chat reported in
+  `UpdateBatch::unresolved`; the caller resolves it with `getChat` (fed back as
+  `updateNewChat`, carrying current title/avatar/positions) or re-baselines.
+  There is deliberately no live resume token — the stream has no offset, and
+  durability is idempotent convergence plus snapshot re-baselining. Secret and
+  unknown chat types are excluded and never mistaken for gaps (POL-4/DEC-016).
+
 ## The env gate (`cfg(real_tdjson)`)
 
 Default builds — every `make check`, on machines that never built the
@@ -247,14 +289,14 @@ policy).
 
 Internal: `gramdrive-model` — the `config` layer keys per-account storage
 isolation and secret lookup on `AccountId` (DOM-020/DOM-021), and the
-`snapshot` layer speaks `ChatListKind` for the lists it enumerates;
-`gramdrive-source` remains reserved for the coming `DriveSource` adapter.
-External: `serde_json` — JSON is tdjson's wire format and the config
-request type. Dev-only: `gramdrive-state` — the snapshot integration suite
-applies commits through the real typed repositories; product code never
-links it from here (the composing caller owns that wiring). Platform-
-specific code: forbidden — the keychain lives behind the `SecretSource`
-seam, implemented in the native adapter. See `crates/README.md`.
+`snapshot` and `updates` layers speak `ChatListKind` for the lists they
+enumerate and keep current; `gramdrive-source` remains reserved for the coming
+`DriveSource` adapter. External: `serde_json` — JSON is tdjson's wire format
+and the config request type. Dev-only: `gramdrive-state` — the snapshot and
+update integration suites apply commits through the real typed repositories;
+product code never links it from here (the composing caller owns that wiring).
+Platform-specific code: forbidden — the keychain lives behind the
+`SecretSource` seam, implemented in the native adapter. See `crates/README.md`.
 
 ## Test command
 

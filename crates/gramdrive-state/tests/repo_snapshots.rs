@@ -263,6 +263,132 @@ fn chat_lists_replace_atomically_and_read_in_presentation_order() {
     }
 }
 
+#[test]
+fn chat_list_entries_apply_incrementally_and_idempotently() {
+    let mut store = store();
+    let main = ChatListKey {
+        scope: scope(),
+        kind: ChatListKind::Main,
+    };
+
+    // Baseline of three members via the whole-list replace.
+    let tx = store.write_txn().expect("write");
+    for chat in [1, 2, 3] {
+        tx.upsert_chat(&chat_record(chat)).expect("chat");
+    }
+    tx.replace_chat_list(
+        &main,
+        &[
+            ChatListEntry {
+                chat_id: ChatId(1),
+                sort_order: 100,
+                pinned: false,
+            },
+            ChatListEntry {
+                chat_id: ChatId(2),
+                sort_order: 200,
+                pinned: false,
+            },
+            ChatListEntry {
+                chat_id: ChatId(3),
+                sort_order: 300,
+                pinned: false,
+            },
+        ],
+    )
+    .expect("replace");
+    tx.commit().expect("commit");
+
+    // One chat reorders (and pins): the incremental upsert touches only its
+    // row, leaving the other two exactly where they were.
+    let tx = store.write_txn().expect("write");
+    tx.upsert_chat_list_entry(
+        &main,
+        &ChatListEntry {
+            chat_id: ChatId(1),
+            sort_order: 999,
+            pinned: true,
+        },
+    )
+    .expect("reorder");
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    let order: Vec<(i64, i64, bool)> = read
+        .chat_list(&main)
+        .expect("list")
+        .iter()
+        .map(|entry| (entry.chat_id.0, entry.sort_order, entry.pinned))
+        .collect();
+    // Pinned first, then Telegram order descending (POL-1).
+    assert_eq!(
+        order,
+        vec![(1, 999, true), (3, 300, false), (2, 200, false)]
+    );
+    drop(read);
+
+    // Re-applying the same position is idempotent — no duplicate, same order.
+    let tx = store.write_txn().expect("write");
+    tx.upsert_chat_list_entry(
+        &main,
+        &ChatListEntry {
+            chat_id: ChatId(1),
+            sort_order: 999,
+            pinned: true,
+        },
+    )
+    .expect("idempotent reorder");
+    tx.commit().expect("commit");
+    let read = store.read_txn().expect("read");
+    assert_eq!(
+        read.chat_list(&main).expect("list").len(),
+        3,
+        "no duplicate row"
+    );
+    drop(read);
+
+    // One chat leaves the list; the removal reports it existed, a repeat does
+    // not, and no other member is disturbed.
+    let tx = store.write_txn().expect("write");
+    assert!(
+        tx.remove_chat_list_entry(&main, ChatId(2)).expect("remove"),
+        "the membership existed"
+    );
+    assert!(
+        !tx.remove_chat_list_entry(&main, ChatId(2))
+            .expect("remove again"),
+        "a replayed removal is a no-op"
+    );
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    let remaining: Vec<i64> = read
+        .chat_list(&main)
+        .expect("list")
+        .iter()
+        .map(|entry| entry.chat_id.0)
+        .collect();
+    assert_eq!(remaining, vec![1, 3]);
+    // The chat's canonical row survives leaving the list (SYNC-026).
+    assert!(read.chat(&common::chat_key(2)).expect("chat").is_some());
+    drop(read);
+
+    // A membership for an unknown chat is refused by the foreign key.
+    let tx = store.write_txn().expect("write");
+    let result = tx.upsert_chat_list_entry(
+        &main,
+        &ChatListEntry {
+            chat_id: ChatId(999),
+            sort_order: 1,
+            pinned: false,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "no membership without a canonical chat row"
+    );
+}
+
 /// The item tree every item test builds: root, main list, chat, doc.
 fn build_tree(store: &mut StateStore) -> (ItemId, ItemId, ItemId, ItemId) {
     let root_id = common::account_root_id();

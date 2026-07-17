@@ -291,4 +291,70 @@ impl WriteTxn<'_> {
         }
         Ok(())
     }
+
+    /// Inserts or updates one chat's membership row in one list, leaving every
+    /// other member of the list untouched — the incremental counterpart of
+    /// [`WriteTxn::replace_chat_list`] for live `updateChatPosition` deltas
+    /// (SYNC-026). Idempotent: re-applying the same `(sort_order, pinned)`
+    /// rewrites the row to itself. The member chat must already have its
+    /// canonical row ([`WriteTxn::upsert_chat`]); the `chat_list_entries →
+    /// chats` foreign key rejects a membership for an unknown chat.
+    ///
+    /// Order metadata (POL-1's `order.json` and the app's canonical order)
+    /// stays consistent because both read `chat_list` sorted by
+    /// `pinned DESC, sort_order DESC` — the position lives in the row, never
+    /// in insertion order.
+    pub fn upsert_chat_list_entry(
+        &self,
+        list: &ChatListKey,
+        entry: &ChatListEntry,
+    ) -> Result<(), StateError> {
+        let (account_id, namespace) = scope_columns(&list.scope);
+        let (list_kind, folder_id) = list_columns(list.kind)?;
+        self.conn()
+            .prepare_cached(
+                "INSERT INTO chat_list_entries (account_id, namespace_version, list_kind,
+                                                folder_id, chat_id, sort_order, pinned)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (account_id, namespace_version, list_kind, folder_id, chat_id)
+                 DO UPDATE SET sort_order = excluded.sort_order, pinned = excluded.pinned",
+            )?
+            .execute(params![
+                account_id,
+                namespace,
+                list_kind,
+                folder_id,
+                entry.chat_id.0,
+                entry.sort_order,
+                entry.pinned,
+            ])?;
+        Ok(())
+    }
+
+    /// Removes one chat's membership from one list — the chat left the list
+    /// (an `updateChatPosition` order 0, or `updateChatRemovedFromList`),
+    /// without disturbing the rest of the list or the chat's canonical record
+    /// (SYNC-026: leaving a list drops an appearance, never the chat).
+    ///
+    /// Returns whether a membership row existed: idempotent, so a replayed or
+    /// duplicate removal reports `false` rather than failing.
+    pub fn remove_chat_list_entry(
+        &self,
+        list: &ChatListKey,
+        chat_id: ChatId,
+    ) -> Result<bool, StateError> {
+        let (account_id, namespace) = scope_columns(&list.scope);
+        let (list_kind, folder_id) = list_columns(list.kind)?;
+        let affected = self
+            .conn()
+            .prepare_cached(
+                "DELETE FROM chat_list_entries
+                 WHERE account_id = ?1 AND namespace_version = ?2
+                   AND list_kind = ?3 AND folder_id = ?4 AND chat_id = ?5",
+            )?
+            .execute(params![
+                account_id, namespace, list_kind, folder_id, chat_id.0,
+            ])?;
+        Ok(affected > 0)
+    }
 }

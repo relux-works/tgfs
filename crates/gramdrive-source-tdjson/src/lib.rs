@@ -42,6 +42,15 @@
 //!   Telegram's exact ordering metadata — never a history or media request
 //!   (SYNC-020). The composing caller persists each commit through the
 //!   state repositories together with its resume token (SYNC-022).
+//! - [`updates`] — [`UpdateMachine`], the deterministic sans-IO live
+//!   chat-metadata/list update mapper (TASK-260715-1c8fea): TDLib's push
+//!   updates (`updateChatTitle`/`updateChatPhoto`/`updateChatPosition`/
+//!   `updateChatRemovedFromList`/`updateChatHasProtectedContent`, and the
+//!   `updateUser`/`updateSupergroup` username feed) fold into the same
+//!   provider-neutral normalized change stream the snapshot commits in, with
+//!   POL-1 invalidation classification (reorder regenerates `order.json`, a
+//!   rename renames the folder), idempotent under duplicate and out-of-order
+//!   delivery, and gap reporting for unknown chats (SYNC-023).
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
 //!   and tests without the TDLib artifact.
@@ -65,6 +74,7 @@
 //! [`MockTdJson`]: mock::MockTdJson
 //! [`AuthMachine`]: auth::AuthMachine
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
+//! [`UpdateMachine`]: updates::UpdateMachine
 //! [`AccountRemoval`]: removal::AccountRemoval
 //! [`RemovalMode::RevokeSession`]: removal::RemovalMode::RevokeSession
 //! [`RemovalMode::LocalOnly`]: removal::RemovalMode::LocalOnly
@@ -82,10 +92,12 @@ pub mod mock;
 pub mod removal;
 pub mod runtime;
 pub mod snapshot;
+pub mod updates;
 
 mod envelope;
 mod queue;
 mod slot;
+mod wire;
 
 #[cfg(real_tdjson)]
 #[allow(unsafe_code)]
@@ -111,3 +123,4 @@ pub use snapshot::{
     ChatSnapshot, ListCommit, ListEntrySnapshot, SNAPSHOT_CURSOR_STREAM, SnapshotBackoff,
     SnapshotChatKind, SnapshotError, SnapshotMachine, SnapshotPlan, SnapshotRequest, SnapshotStep,
 };
+pub use updates::{ChatMetadata, Invalidation, MembershipChange, UpdateBatch, UpdateMachine};
