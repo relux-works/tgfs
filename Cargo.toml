@@ -34,6 +34,27 @@ gramdrive-testkit = { path = "crates/gramdrive-testkit" }
 uniffi = { version = "0.32" }
 tokio = { version = "1.52", default-features = false }
 
+# Unicode tables for the naming policy (SYNC-013). All three carry licenses
+# inside the POL-6 allow list (MIT OR Apache-2.0, and MIT for caseless), so
+# none needs a DEC-021-style exception. They are data, not logic: NFC,
+# grapheme-cluster boundaries and the case-folding map are UCD tables that
+# cannot be hand-written correctly, and getting them wrong means a name that a
+# filesystem silently rewrites, a truncation that splits an emoji, or two
+# chats that collapse into one folder.
+#
+# `default-features = false` where it is offered — the default features pull in
+# std-only conveniences the policy does not use. caseless offers no such knob
+# and re-enables unicode-normalization's defaults transitively; harmless, since
+# the model crate is std anyway, and noted so the next reader does not read the
+# flag above as a guarantee.
+unicode-normalization = { version = "0.1", default-features = false }
+unicode-segmentation = { version = "1.13", default-features = false }
+# CaseFolding.txt, which the naming policy needs and the other two do not
+# carry: APFS folds sibling names by full Unicode case folding, and no
+# combination of to_lowercase/to_uppercase reproduces it (`ẞ` folds to `ss`,
+# which neither mapping reaches). See Platform::fold.
+caseless = { version = "0.2" }
+
 # Dev-dependency only (property tests). `std` without the default `fork`/
 # `timeout` features: forked test processes add child-process machinery
 # (rusty-fork, wait-timeout) the tests do not need, and every dependency is

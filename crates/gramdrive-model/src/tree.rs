@@ -41,10 +41,11 @@
 //! Sibling order is derived from stable identity — fixed roots, then folder
 //! IDs, chat IDs, years, months, and message/attachment ordinals — never
 //! from input or discovery order, so shuffled input yields a byte-identical
-//! tree. Display names are raw presentation strings (POL-1 stable chat
-//! names); sanitization and collision suffixing are the naming policy's job
-//! (TASK-260715-1ffbkg), and Telegram ordering metadata is the ordering
-//! projection's (TASK-260715-1jmsdp).
+//! tree. Display names are raw presentation strings in the POL-1 stable form
+//! (`crate::naming::chat_folder_name`); sanitization and collision suffixing
+//! are the naming policy's job (`crate::naming`, TASK-260715-1ffbkg), applied
+//! by the consumer over a sibling set, and Telegram ordering metadata is the
+//! ordering projection's (TASK-260715-1jmsdp).
 //!
 //! # Read-only capabilities (DEC-007, SYNC-060)
 //!
@@ -61,6 +62,7 @@ use crate::identity::{
     FolderCatalogKey, FolderId, GeneratedDocKey, ItemId, ItemKey, MediaDirKey, MessageId,
     MessageKey, NamespaceVersion, SchemaFamily, YearDirKey,
 };
+use crate::naming::chat_folder_name;
 
 /// Display name of the Main chat-list root.
 const MAIN_NAME: &str = "Main";
@@ -833,7 +835,7 @@ impl TreeProjection {
                         }))
                         .id(),
                         NodeKind::Chat,
-                        chat_display_name(&state.title, state.username.as_deref()),
+                        chat_folder_name(&state.title, state.username.as_deref()),
                     ),
                 )
             }
@@ -996,15 +998,6 @@ impl TreeProjection {
             size: None,
             content: None,
         }
-    }
-}
-
-/// POL-1 stable chat folder name: `<Display Name> — @<username>`, or the
-/// display name alone when the chat has no username.
-fn chat_display_name(title: &str, username: Option<&str>) -> String {
-    match username {
-        Some(username) => format!("{title} — @{username}"),
-        None => title.to_string(),
     }
 }
 

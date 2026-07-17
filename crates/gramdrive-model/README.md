@@ -15,8 +15,23 @@ naming), TASK-260715-1jmsdp (ordering projection).
 ## Dependencies
 
 Internal: none. Platform-specific code: forbidden. See `crates/README.md`.
-Dev-only: `proptest` (identity property suite); it must never move to
-`[dependencies]` — test-support code does not ship (crates/README.md).
+
+External: `unicode-normalization`, `unicode-segmentation` and `caseless` —
+Unicode character data for the naming policy (NFC, grapheme-cluster
+boundaries, full case folding). Tables, not logic: they cannot be
+hand-written correctly, and a wrong answer is a name the filesystem silently
+rewrites, a truncation that splits an emoji, or two chats that collapse into
+one folder. `caseless` carries the CaseFolding data the other two do not:
+APFS folds sibling names by full Unicode case folding, which no combination
+of `to_lowercase`/`to_uppercase` reproduces (`ẞ` folds to `ss`, which neither
+mapping reaches) — see `Platform::fold`. Licenses are MIT OR Apache-2.0 and
+MIT, all inside the POL-6 allow list, so none needs a DEC-021-style named
+exception. None is platform-specific — they are the data each platform's own
+rules are written in — so layer 0 stays platform-neutral.
+
+Dev-only: `proptest` (identity, tree and naming property suites); it must
+never move to `[dependencies]` — test-support code does not ship
+(crates/README.md).
 
 ## Stable item identities (DEC-008, DOM-001..DOM-024)
 
@@ -149,9 +164,72 @@ The model:
 - **Read-only capabilities (DEC-007, SYNC-060).** Every node carries
   capability metadata whose write side is constant `false`; v1
   constructors cannot express anything else.
-- Display names are raw presentation state (POL-1 stable chat names:
-  `<Display Name> — @<username>`); sanitization and collision suffixing
-  are TASK-260715-1ffbkg, ordering metadata is TASK-260715-1jmsdp.
+- Display names are raw presentation state in the POL-1 stable form
+  (`naming::chat_folder_name`); sanitization and collision suffixing are
+  the `naming` module below, applied by the consumer over a sibling set,
+  and ordering metadata is TASK-260715-1jmsdp.
+
+## Cross-platform naming (SYNC-012, SYNC-013, PLAT-021, POL-1)
+
+The `naming` module projects untrusted Telegram titles onto filesystem
+names — TASK-260715-1ffbkg. `sanitize` is total (no input has a failure
+mode) and `resolve_siblings` makes a sibling set collision-free.
+
+- **One name for the strictest target.** Not one name per platform: the
+  same archive is read through the macOS, Windows, Android and Linux
+  adapters, and a per-platform name would make one chat a different path
+  per device and break `chat.json` links (SYNC-032). The policy is the
+  union of all four platforms' rules; `Platform::check` models each
+  platform faithfully so the corpus can assert one output satisfies all
+  of them (PLAT-021).
+- **The pipeline** (order is load-bearing, see the module docs): remove
+  invisible characters (controls, bidi overrides, ZWSP/BOM — but never
+  ZWJ/ZWNJ, which carry meaning); substitute the Windows forbidden set
+  `< > : " / \ | ? *` with `_`; normalize to NFC *after* the removals, since
+  deleting a control from between a base and its combining mark can leave a
+  sequence that composes; trim leading whitespace and trailing dots/spaces
+  (Windows drops them silently); fall back to `Unnamed` if nothing is left;
+  truncate to 255 bytes / 255 UTF-16 units at grapheme-cluster boundaries;
+  escape Windows device names on the stem before the first dot
+  (`CON.txt` -> `CON_.txt`).
+- **Traversal is impossible by construction.** Separators are substituted
+  before any structure is derived, and `.`/`..` trim to nothing and become
+  the fallback. A property test asserts it over sampled hostile input, not
+  a case list.
+- **Collision suffixes derive from stable identity, never discovery order**
+  (SYNC-012). `Bob (k3m9xq2)` — base32 of a mixed digest of the `ItemId`
+  bytes, not a prefix of the id (sibling ids share long prefixes and would
+  give identical suffixes). A counter would renumber folders on every
+  re-sync. Every member of a collision set is suffixed, and the check runs
+  on final names, so a title crafted to impersonate another chat's suffixed
+  name simply joins the collision set. Escalation ends at the full `ItemId`
+  text, which cannot collide.
+- **Collisions are folded through every platform, not through one.**
+  `Platform::fold` models how each platform decides two names are one entry:
+  Windows by NTFS's `$UpCase` (uppercase), Apple by full Unicode case
+  folding, Android/Linux by bytes. Neither case-insensitive fold contains the
+  other — `ı`/`i` collide only on Windows, Kelvin `K`/`K` only on Apple, and
+  `ẞ`/`ß` only on Apple — so the collision key composes all four. No stock
+  mapping is a substitute: `to_lowercase` misses every Windows-only pair
+  (and shipped that bug), `to_uppercase` every Apple-only one, and the round
+  trip still misses `ẞ`/`ß`.
+- **Whole-path budgets are the adapters' (PLAT-022).** This module budgets
+  one component; the core does not know where a sync root is mounted, and
+  meeting a 260-char `MAX_PATH` by component truncation would mangle names
+  on the three platforms with no such limit. Windows long-path support is
+  the CfAPI host's declared capability (PLAT-WIN-004).
+
+Tests: `tests/naming_fixture.rs` is the shared corpus — one expected output
+per input asserted against all four platforms, plus a fold corpus of *pairs*
+with the platforms that merge each (a one-name-per-row table cannot catch a
+wrong fold: every row passes while two rows name one folder);
+`tests/naming_collisions.rs` pins the suffix goldens and the
+order-independence of resolution; `tests/naming_properties.rs` proves the
+invariants over sampled hostile input and, in
+`case_variant_siblings_never_collide`, over an alphabet of nothing but
+characters the platforms fold differently. The property and corpus suites
+fold by `Platform::fold`, never by the implementation's key — a test that
+folds the way the code folds passes by construction.
 
 ## Test command
 

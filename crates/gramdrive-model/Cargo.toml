@@ -10,5 +10,15 @@ publish.workspace = true
 # Shared lint set: Cargo.toml [workspace.lints].
 workspace = true
 
+[dependencies]
+# UCD tables the naming policy cannot hand-write: NFC normalization,
+# grapheme-cluster boundaries, and full case folding (SYNC-013). Versions and
+# rationale: workspace Cargo.toml. None is platform-specific — they are the
+# data each platform's *own* rules are written in — so layer 0 stays
+# platform-neutral.
+unicode-normalization = { workspace = true }
+unicode-segmentation = { workspace = true }
+caseless = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }

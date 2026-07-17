@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod identity;
+pub mod naming;
 pub mod tree;
 
 /// A half-open byte range `[start, end)` within a content object.
