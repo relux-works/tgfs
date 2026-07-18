@@ -51,6 +51,14 @@
 //!   POL-1 invalidation classification (reorder regenerates `order.json`, a
 //!   rename renames the folder), idempotent under duplicate and out-of-order
 //!   delivery, and gap reporting for unknown chats (SYNC-023).
+//! - [`folders`] — [`FolderCatalogMachine`], the deterministic sans-IO folder
+//!   (chat filter) catalog reducer (TASK-260715-54nopz): TDLib's
+//!   `updateChatFolders` folds into a normalized folder create/rename/delete/
+//!   reorder change stream with POL-1 invalidation classification, and yields
+//!   the ordered folder set the snapshot enumerates. Folder membership stays
+//!   the chat machines' `chat_list_entries` appearances, so a chat in several
+//!   folders is one canonical record with one appearance per folder and a
+//!   folder deletion removes only those appearances (SYNC-026, DOM-022).
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
 //!   and tests without the TDLib artifact.
@@ -75,6 +83,7 @@
 //! [`AuthMachine`]: auth::AuthMachine
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
 //! [`UpdateMachine`]: updates::UpdateMachine
+//! [`FolderCatalogMachine`]: folders::FolderCatalogMachine
 //! [`AccountRemoval`]: removal::AccountRemoval
 //! [`RemovalMode::RevokeSession`]: removal::RemovalMode::RevokeSession
 //! [`RemovalMode::LocalOnly`]: removal::RemovalMode::LocalOnly
@@ -88,6 +97,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod folders;
 pub mod mock;
 pub mod removal;
 pub mod runtime;
@@ -113,6 +123,7 @@ pub use config::{
     SecretStore, StorageLayout, StoragePolicy, TdlibConfig, set_database_encryption_key_request,
 };
 pub use error::TdError;
+pub use folders::{FolderCatalogBatch, FolderCatalogMachine, FolderDefinition, FolderInvalidation};
 pub use removal::{
     AccountRemoval, ExportPolicy, RemovalError, RemovalMode, RemovalRequest, RemovalStep,
 };

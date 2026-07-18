@@ -26,6 +26,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `removal` | `AccountRemoval`: the crash-resumable account-removal workflow (SEC-004) — the SEC-004 cleanup sequenced behind a durable journal, distinguishing Telegram logout (`RevokeSession` → `logOut`) from local-only removal (`LocalOnly` → `close`), idempotent per stage and fail-safe under concurrent access |
 | `snapshot` | `SnapshotMachine`: the deterministic sans-IO initial chat-list snapshot (TASK-260715-30amrq) — `loadChats` pagination per list, the `getChats` order witness, lazy `getChat` detail resolution, flood-wait backoff advice, resumable per-list commits carrying Telegram's exact ordering metadata |
 | `updates` | `UpdateMachine`: the deterministic sans-IO live chat-metadata/list update mapper (TASK-260715-1c8fea) — TDLib's push updates (title/photo/position/removed-from-list/protected-content, plus the user/supergroup username feed) folded into the same normalized change stream, with POL-1 invalidation classification (reorder → `order.json`, rename → folder rename), idempotent under duplicate and out-of-order delivery, and gap reporting for unknown chats |
+| `folders` | `FolderCatalogMachine`: the deterministic sans-IO folder (chat filter) catalog reducer (TASK-260715-54nopz) — `updateChatFolders` folded into a normalized folder create/rename/delete/reorder change stream with POL-1 invalidation classification, yielding the ordered folder set the snapshot enumerates; folder membership stays the chat machines' appearances, so a folder deletion removes only appearances |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
@@ -270,6 +271,44 @@ Guarantees the suites pin (`tests/chat_updates.rs`, unit tests in
   durability is idempotent convergence plus snapshot re-baselining. Secret and
   unknown chat types are excluded and never mistaken for gaps (POL-4/DEC-016).
 
+## The folder (chat filter) catalog (`folders`)
+
+`FolderCatalogMachine` (TASK-260715-54nopz) discovers the custom Telegram
+folders that populate the "Telegram Folders/" catalog. It is a pure sans-IO
+full-state reducer over one update — `updateChatFolders`, pushed on connect and
+on every catalog change, always carrying the complete ordered folder list. Feed
+each to `on_update`, drain the net change with `take_batch`, and apply the
+`FolderCatalogBatch`. `folders()` yields the ordered folder-id set a composing
+caller feeds into a `SnapshotPlan` (the snapshot machine snapshots the folders
+it is given and left discovery here).
+
+A folder is two separate facts: its *definition* (id, title, tab position) lives
+here, while its *membership* is ordinary `chatListFolder` positions the snapshot
+and update machines already fold into `chat_list_entries`. So a chat in several
+folders is one canonical `chats` row with one appearance per list (DOM-022), and
+deleting a folder clears only that folder's memberships — the caller applies
+each `FolderCatalogBatch::removed` with an empty `replace_chat_list`, leaving the
+canonical chats and every other list untouched (SYNC-026).
+
+Guarantees the suites pin (`tests/folder_catalog.rs`, unit tests in
+`src/folders.rs`):
+
+- **Normalized create/rename/delete/reorder.** The batch is the diff between the
+  last-observed catalog and the last-drained one, so a duplicate or replayed
+  `updateChatFolders` is a no-op and a restart re-push converges without churn.
+- **Provider invalidation split (POL-1/SYNC-011).** A rename (title change)
+  emits `FolderInvalidation::Renamed`; a folder that only shifted tab position
+  never does — a reorder is content, so it emits a single
+  `FolderInvalidation::CatalogOrdering`. Creations and deletions emit `Created`
+  and `Removed`; any set/order change adds one `CatalogOrdering`.
+- **Membership is appearances, not canonical data.** The end-to-end suite drives
+  both machines into a real store and reads back one canonical record with N
+  appearances, a folder deletion that removes appearances only, and incremental
+  folder create/rename/reorder that never disturbs a chat row.
+- **Version-tolerant title parse.** The folder title is read across TDLib name
+  shapes (`name.text.text`, `name.text`, bare `name`, legacy `title`); a folder
+  entry without an id fails safe (skipped, never guessed).
+
 ## The env gate (`cfg(real_tdjson)`)
 
 Default builds — every `make check`, on machines that never built the
@@ -289,11 +328,12 @@ policy).
 
 Internal: `gramdrive-model` — the `config` layer keys per-account storage
 isolation and secret lookup on `AccountId` (DOM-020/DOM-021), and the
-`snapshot` and `updates` layers speak `ChatListKind` for the lists they
-enumerate and keep current; `gramdrive-source` remains reserved for the coming
-`DriveSource` adapter. External: `serde_json` — JSON is tdjson's wire format
-and the config request type. Dev-only: `gramdrive-state` — the snapshot and
-update integration suites apply commits through the real typed repositories;
+`snapshot`, `updates`, and `folders` layers speak `ChatListKind`/`FolderId` for
+the lists and folders they enumerate and keep current; `gramdrive-source`
+remains reserved for the coming `DriveSource` adapter. External: `serde_json` —
+JSON is tdjson's wire format and the config request type. Dev-only:
+`gramdrive-state` — the snapshot, update, and folder-catalog integration suites
+apply commits through the real typed repositories;
 product code never links it from here (the composing caller owns that wiring).
 Platform-specific code: forbidden — the keychain lives behind the
 `SecretSource` seam, implemented in the native adapter. See `crates/README.md`.
