@@ -69,13 +69,39 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
   protocol, so an interrupted regeneration leaves the previous version readable
   and the work on the worklist (SYNC-033).
 
+- `backfill` — the metadata-first local backfill scheduler
+  (TASK-260715-mua1ng; POL-2/DEC-014, SYNC-020/021, SEC-031, NFR-033,
+  NFR-031, SYNC-070).
+  The provider-neutral *policy* the source's sans-IO history machines were
+  built to be driven by: it reads no TDLib type, only the durable projection
+  and the source failure taxonomy. `BackfillScheduler::plan_next` yields one
+  history action per call, ordered by visible-item priority — a chat on
+  screen, then a chat opened into, then the least-recently-synced tail of
+  `backfill_backlog` — and never a media action: media is not mirrored
+  eagerly (SYNC-020). Foreground work runs even on a metered/power-saving
+  device; only background metadata yields to those constraints. An
+  account-global pacer (`pace`) spaces requests and honors Telegram flood
+  waits against a durable deadline that survives restart, so a crash resumes
+  neither paused work nor a violated flood wait (NFR-031, SYNC-070); the flood-wait
+  attempt budget reuses the source machine's own per-request `attempt`.
+  `media_policy` is the separate Archive-Mode eager-media gate — suspended
+  while any history remains (metadata-first), on low/critical disk (POL-2
+  disk warning), on a metered/offline link, while power-saving, or with
+  Archive Mode off — and quota-exempt by construction: it never consults the
+  cache quota, only physical disk. Durable pause/pacing live in
+  `gramdrive-state`'s `backfill_control` row; `observe` reports the pause,
+  the pending gate deadline, and the bounded backlog. Clock-free (`now_ms`
+  threaded) and stateless, so scripted tests replay every decision exactly.
+
 ## Ownership
 
 STORY-260715-2hs8cf (transfer-and-cache-engine) and STORY-260715-1oq9jg
 (deterministic-rendering), EPIC-260715-1poogc (shared-rust-core). Populated by
 TASK-260715-22fh09 (ranged fetch coordinator), TASK-260715-g4k3zm (durable
 transfer state), TASK-260715-3s6cpe (integrity/promotion), TASK-260715-11abx8
-(quota/eviction), TASK-260715-22l8zy (incremental render planner).
+(quota/eviction), TASK-260715-22l8zy (incremental render planner), and
+TASK-260715-mua1ng (metadata-first local backfill scheduler,
+STORY-260715-3l5jxq under EPIC-260715-2ptb18).
 
 ## Dependencies
 

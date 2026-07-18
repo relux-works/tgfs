@@ -152,6 +152,13 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
               ORDER BY last_sync_at_ms LIMIT 32",
     },
     RequiredQuery {
+        name: "backfill_control_lookup",
+        serves: "the scheduler's durable pause/pacing state for one scope (POL-8, NFR-033)",
+        sql: "SELECT paused, next_request_at_ms, flood_wait_until_ms, updated_at_ms
+              FROM backfill_control
+              WHERE account_id = ?1 AND namespace_version = ?2",
+    },
+    RequiredQuery {
         name: "dirty_render_docs",
         serves: "the re-render worklist (SYNC-024)",
         sql: "SELECT item_id FROM render_state WHERE dirty = 1",

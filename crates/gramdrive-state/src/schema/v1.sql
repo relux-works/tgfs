@@ -504,6 +504,38 @@ CREATE INDEX chat_sync_state_backlog
     WHERE history_complete = 0;
 
 -- ---------------------------------------------------------------------------
+-- backfill_control — durable per-scope backfill scheduler state
+-- (TASK-260715-mua1ng; POL-2/DEC-014, NFR-031, SYNC-070, SEC-031, NFR-033).
+-- The engine's metadata-first backfill scheduler keeps no state in memory: the
+-- pause a user set and the flood-wait a Telegram 429 mandated must both survive
+-- a process restart (NFR-031, SYNC-070), or a crash would resume paused work or
+-- re-hammer an account still under a flood wait (a ban risk; NFR-033: a flood
+-- wait is never a tight retry loop). One row per scope.
+--   paused              — user pause switch (task AC user-pausable;
+--                         SYNC-043/SYNC-005 durable resumable state).
+--   next_request_at_ms  — account-global request spacer: the earliest wall
+--                         clock at which the next provider request may issue
+--                         (SEC-031 request-concurrency bound over time).
+--   flood_wait_until_ms — a honored Telegram flood-wait deadline; no request
+--                         issues before it (NFR-033: flood waits are never a
+--                         tight retry loop). Distinct from the spacer so a
+--                         flood wait is observable on its own.
+-- The scheduler's own flood-wait attempt budget uses the source machine's
+-- per-request attempt count (passed in), so no durable fault counter lives
+-- here. Namespace_version is carried (not just account_id) because a bump
+-- retires the backlog it paces; the row is scope-keyed like chat_sync_state.
+-- ---------------------------------------------------------------------------
+CREATE TABLE backfill_control (
+    account_id          INTEGER NOT NULL REFERENCES accounts (account_id) ON DELETE CASCADE,
+    namespace_version   INTEGER NOT NULL CHECK (namespace_version >= 0),
+    paused              INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+    next_request_at_ms  INTEGER,
+    flood_wait_until_ms INTEGER,
+    updated_at_ms       INTEGER NOT NULL,
+    PRIMARY KEY (account_id, namespace_version)
+) STRICT, WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
 -- render_state — per generated document (domain-model § Generated document;
 -- SYNC-024, SYNC-030..033): which renderer/schema produced the published
 -- bytes, from inputs up to which event watermark, and whether the document

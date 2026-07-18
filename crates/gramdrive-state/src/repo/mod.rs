@@ -46,6 +46,7 @@ use gramdrive_model::identity::AccountScope;
 
 mod accounts;
 mod attachments;
+mod backfill;
 mod cache;
 mod changes;
 mod chats;
@@ -60,6 +61,7 @@ pub use accounts::RetentionChange;
 pub use accounts::RetentionMode;
 pub use accounts::SourceKind;
 pub use attachments::{AttachmentAvailability, AttachmentFacts, AttachmentState, BlobRecord};
+pub use backfill::BackfillControlRecord;
 pub use cache::{
     CacheEntryRecord, CacheKind, CacheTotals, CacheUsage, CacheVerification, EvictionCandidate,
     PinOrigin, PinRecord,

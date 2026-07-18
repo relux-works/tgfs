@@ -39,6 +39,7 @@ every connection; file databases run in WAL with `synchronous=NORMAL`.
 | Hydration | `transfers` | Durable transfer journal pinned to a content version (SYNC-042), JSON-validated ranges, the SYNC-044 failure taxonomy, a partial index over live states for the queue head |
 | Cache | `cache_entries`, `pins` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; `pins` is durable offline intent independent of materialization |
 | Sync positions | `change_cursors`, `chat_sync_state` | One durable feed position per (account, stream) — scope verification stays with `ChangeCursor::require_scope` (SYNC-004); per-chat resumable history windows (SYNC-021) |
+| Backfill control | `backfill_control` | The engine backfill scheduler's durable per-scope pause switch, request spacer, and honored flood-wait deadline — a restart resumes neither paused work nor a violated flood wait (SYNC-043/SYNC-005 pause, SEC-031 spacer, NFR-033 flood, NFR-031/SYNC-070 restart durability) |
 | Rendering | `render_state` | Renderer/schema versions, the event-sequence input watermark, and a dirty worklist behind a covering partial index (SYNC-024, SYNC-030..033) |
 | Versioning | `schema_history` + `user_version` | The pragma answers "what is current"; the table answers "how did we get here" for the migration runner (SYNC-072) |
 
@@ -217,6 +218,8 @@ and a reader that can never observe a cursor ahead of the state it seals.
   path (a rejected cursor rolls back the whole batch), idempotent replay
   (exact, post-deletion, and stale-revision), scope rejections, sync
   windows and the backfill backlog.
+- `tests/repo_backfill.rs` — the backfill scheduler's durable control row:
+  absent-reads-`None`, full-field round-trip, single-row upsert per scope.
 - `tests/repo_snapshots.rs` — account epoch discipline, chat-list
   replacement and order, item identity derivation, paged enumeration to
   exhaustion, content-version compare-and-set, tombstone name reuse,

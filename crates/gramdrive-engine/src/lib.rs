@@ -28,6 +28,14 @@
 //! that sit in front of `gramdrive-render`'s pure renderers and
 //! `gramdrive-state`'s atomic publication.
 //!
+//! The metadata-first backfill scheduler ([`backfill`], TASK-260715-mua1ng)
+//! is the provider-neutral policy that composes the source's sans-IO history
+//! machines: it orders history work by visible-item priority, paces provider
+//! requests against a durable flood-wait budget, gates background metadata
+//! and eager Archive-Mode media on device power/network/disk conditions, and
+//! stays durable, bounded, observable, and user-pausable — never mirroring
+//! media eagerly by default (POL-2, SYNC-020/021).
+//!
 //! Boundary rules (enforced by `.scripts/check_crate_architecture.py`):
 //! - internal dependencies: `gramdrive-model`, `gramdrive-source`,
 //!   `gramdrive-state`, and `gramdrive-render`;
@@ -41,6 +49,7 @@ pub use gramdrive_render as render;
 pub use gramdrive_source as source;
 pub use gramdrive_state as state;
 
+pub mod backfill;
 pub mod cache;
 pub mod fetch;
 pub mod render_plan;
