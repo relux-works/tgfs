@@ -100,6 +100,18 @@
 //!   The [`FetchCatalog`] seam supplies the per-item facts the state layer
 //!   owns; the conformance run for ranged reads lives in
 //!   `tests/fetch_conformance.rs`.
+//! - [`thumbnail`] — [`ThumbnailMachine`] and [`TdThumbnailer`], the eager
+//!   preview adapter (TASK-260715-3nl3mu): the `DriveSource::thumbnail` side
+//!   of this source. Serves POL-2's always-eager, small thumbnails from the
+//!   previews the normalizer already captured — a downloadable TDLib
+//!   thumbnail *file* (distinct from full-content hydration) or the inline
+//!   minithumbnail decoded in-crate — with a POL-4 gate that refuses a
+//!   restricted or view-once attachment before any request, a byte cap so a
+//!   preview can never become a full-media download, and the same per-file
+//!   serialization and prompt cancellation the ranged fetch uses. The
+//!   [`ThumbnailCatalog`] seam supplies the per-item facts, built from an
+//!   [`AttachmentDescriptor`] via [`ThumbnailTarget::from_descriptor`]; the
+//!   adapter suite lives in `tests/thumbnail_source.rs`.
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
 //!   and tests without the TDLib artifact.
@@ -129,6 +141,11 @@
 //! [`DownloadMachine`]: download::DownloadMachine
 //! [`TdDownloader`]: download::TdDownloader
 //! [`FetchCatalog`]: download::FetchCatalog
+//! [`ThumbnailMachine`]: thumbnail::ThumbnailMachine
+//! [`TdThumbnailer`]: thumbnail::TdThumbnailer
+//! [`ThumbnailCatalog`]: thumbnail::ThumbnailCatalog
+//! [`ThumbnailTarget::from_descriptor`]: thumbnail::ThumbnailTarget::from_descriptor
+//! [`AttachmentDescriptor`]: message::AttachmentDescriptor
 //! [`CrawlMachine`]: history::CrawlMachine
 //! [`LiveMachine`]: live::LiveMachine
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
@@ -157,6 +174,7 @@ pub mod mock;
 pub mod removal;
 pub mod runtime;
 pub mod snapshot;
+pub mod thumbnail;
 pub mod updates;
 
 mod envelope;
@@ -209,5 +227,9 @@ pub use runtime::{
 pub use snapshot::{
     ChatSnapshot, ListCommit, ListEntrySnapshot, SNAPSHOT_CURSOR_STREAM, SnapshotBackoff,
     SnapshotChatKind, SnapshotError, SnapshotMachine, SnapshotPlan, SnapshotRequest, SnapshotStep,
+};
+pub use thumbnail::{
+    TdThumbnailer, ThumbnailCatalog, ThumbnailConfig, ThumbnailMachine, ThumbnailStep,
+    ThumbnailTarget,
 };
 pub use updates::{ChatMetadata, Invalidation, MembershipChange, UpdateBatch, UpdateMachine};

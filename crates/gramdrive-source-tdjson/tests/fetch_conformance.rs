@@ -1,9 +1,10 @@
-//! The conformance run for the tdjson source's ranged reads
-//! (TASK-260715-1onbmf): the one `DriveSource` suite (SYNC-002), with every
-//! fetch flowing through the real download adapter — catalog gates,
-//! `downloadFile` over the real runtime and the mock tdjson, local reads
-//! from a real temporary file — and enumeration served by the testkit's
-//! deterministic fake, whose own conformance the testkit already proves.
+//! The conformance run for the tdjson source's ranged reads and thumbnails
+//! (TASK-260715-1onbmf, TASK-260715-3nl3mu): the one `DriveSource` suite
+//! (SYNC-002), with every fetch flowing through the real download adapter —
+//! catalog gates, `downloadFile` over the real runtime and the mock tdjson,
+//! local reads from a real temporary file — every thumbnail through the real
+//! thumbnail adapter, and enumeration served by the testkit's deterministic
+//! fake, whose own conformance the testkit already proves.
 //!
 //! # What this run certifies, and what it does not
 //!
@@ -11,11 +12,14 @@
 //! exercises `gramdrive_source_tdjson::download` for real: the bytes the
 //! suite compares came out of a file on disk through the adapter's read
 //! path, the stale-reference case runs the actual `getMessage` refresh, and
-//! the version race trips the adapter's per-slice re-verification. The
-//! enumeration, cursor, and thumbnail clauses certify the embedded fake —
-//! they run here so the suite runs whole (it has no partial mode), not as
-//! evidence about tdjson enumeration, which lands with its own adapter
-//! task. The harness name says as much in every report.
+//! the version race trips the adapter's per-slice re-verification. The POL-4
+//! "every door" case (shape.rs) runs `gramdrive_source_tdjson::thumbnail` for
+//! real too: the restricted landmark's thumbnail is refused by the real
+//! adapter's POL-4 gate, before any request. The enumeration and cursor
+//! clauses certify the embedded fake — they run here so the suite runs whole
+//! (it has no partial mode), not as evidence about tdjson enumeration, which
+//! lands with its own adapter task. The harness name says as much in every
+//! report.
 //!
 //! # How TDLib is played
 //!
@@ -59,7 +63,7 @@ use gramdrive_source_tdjson::message::AttachmentAvailability;
 use gramdrive_source_tdjson::mock::{MockTdJson, SentRequest};
 use gramdrive_source_tdjson::{
     CatalogEntry, DownloadConfig, DownloadPriority, FetchCatalog, FileTarget, TdDownloader,
-    TdRuntime,
+    TdRuntime, TdThumbnailer, ThumbnailCatalog, ThumbnailConfig, ThumbnailTarget,
 };
 use gramdrive_testkit::FakeSource;
 use gramdrive_testkit::conformance::{
@@ -85,13 +89,14 @@ const READ_CHUNK_BYTES: u64 = 8;
 // The source under test: real fetch, fake everything else
 // ---------------------------------------------------------------------------
 
-/// The staged source: `fetch` goes through the real download adapter over
-/// the mock tdjson; every other operation is the embedded testkit fake
-/// (module docs). The runtime rides along so its receive loop lives as
-/// long as the source.
+/// The staged source: `fetch` goes through the real download adapter and
+/// `thumbnail` through the real thumbnail adapter, both over the mock tdjson;
+/// every other operation is the embedded testkit fake (module docs). The
+/// runtime rides along so its receive loop lives as long as the source.
 struct RangedTdjsonSource {
     fake: Arc<FakeSource>,
     downloader: TdDownloader,
+    thumbnailer: TdThumbnailer,
     _runtime: TdRuntime,
 }
 
@@ -125,7 +130,33 @@ impl DriveSource for RangedTdjsonSource {
     }
 
     fn thumbnail(&self, item: ItemId, spec: ThumbnailSpec) -> SourceFuture<'_, Option<Thumbnail>> {
-        self.fake.thumbnail(item, spec)
+        self.thumbnailer.thumbnail(item, spec)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The thumbnail catalog: the restricted landmark refuses through POL-4
+// ---------------------------------------------------------------------------
+
+/// The preview facts for the conformance run. The suite calls `thumbnail`
+/// only on the restricted landmark (the POL-4 "every door" case, shape.rs),
+/// which the real adapter refuses with `Restricted` and zero requests; every
+/// other item has no thumbnail (`Ok(None)`), so no preview download is ever
+/// staged and the responder never sees one.
+struct ConformanceThumbnailCatalog {
+    restricted: Option<ItemId>,
+}
+
+impl ThumbnailCatalog for ConformanceThumbnailCatalog {
+    fn resolve(&self, item: &ItemId) -> Option<ThumbnailTarget> {
+        if self.restricted.as_ref() == Some(item) {
+            return Some(ThumbnailTarget {
+                availability: AttachmentAvailability::Restricted,
+                downloadable: None,
+                inline: None,
+            });
+        }
+        None
     }
 }
 
@@ -515,7 +546,11 @@ impl SourceHarness for TdjsonFetchHarness {
             read_chunk_bytes: NonZeroU64::new(READ_CHUNK_BYTES)
                 .ok_or_else(|| HarnessError::new("read cap must be non-zero"))?,
         };
-        let downloader = TdDownloader::new(client, Arc::clone(&catalog) as _, config);
+        let downloader = TdDownloader::new(client.clone(), Arc::clone(&catalog) as _, config);
+        let thumbnail_catalog = Arc::new(ConformanceThumbnailCatalog {
+            restricted: landmarks.restricted_file.clone(),
+        });
+        let thumbnailer = TdThumbnailer::new(client, thumbnail_catalog, ThumbnailConfig::default());
 
         let control = WiredControl {
             fake: fake_staged.control,
@@ -538,6 +573,7 @@ impl SourceHarness for TdjsonFetchHarness {
             source: Arc::new(RangedTdjsonSource {
                 fake: fake_staged.source,
                 downloader,
+                thumbnailer,
                 _runtime: runtime,
             }),
             landmarks,

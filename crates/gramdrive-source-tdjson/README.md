@@ -9,8 +9,9 @@ dispatch, typed error conversion, and coordinated shutdown with a
 deterministic drain. On top of it sit the configuration layer (`config`,
 TASK-260715-1hdnuy) and the authorization state machine (`auth`,
 TASK-260715-51n6jb). Of the `DriveSource` adapter over this runtime
-(DEC-003), the ranged-read side is here (`download`, TASK-260715-1onbmf);
-the enumeration side lands with the follow-ups of the owning stories.
+(DEC-003), the ranged-read side is here (`download`, TASK-260715-1onbmf) and
+the eager-preview side (`thumbnail`, TASK-260715-3nl3mu); the enumeration
+side lands with the follow-ups of the owning stories.
 
 ## Ownership
 
@@ -31,6 +32,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `updates` | `UpdateMachine`: the deterministic sans-IO live chat-metadata/list update mapper (TASK-260715-1c8fea) — TDLib's push updates (title/photo/position/removed-from-list/protected-content, plus the user/supergroup username feed) folded into the same normalized change stream, with POL-1 invalidation classification (reorder → `order.json`, rename → folder rename), idempotent under duplicate and out-of-order delivery, and gap reporting for unknown chats |
 | `folders` | `FolderCatalogMachine`: the deterministic sans-IO folder (chat filter) catalog reducer (TASK-260715-54nopz) — `updateChatFolders` folded into a normalized folder create/rename/delete/reorder change stream with POL-1 invalidation classification, yielding the ordered folder set the snapshot enumerates; folder membership stays the chat machines' appearances, so a folder deletion removes only appearances |
 | `download` | `DownloadMachine` + `TdDownloader`: the ranged download adapter (TASK-260715-1onbmf) — the `DriveSource::fetch` side of this source. POL-4/version-pin/extent gates before any network call, synchronous ranged `downloadFile` with priority passthrough (1..=32), bounded local reads streamed into the caller's sink (never a whole file in memory, and TDLib's local file is read in place — never moved or deleted), per-file serialization (TDLib keeps one download conversation per file), `cancelDownloadFile` on abandon, and the `FILE_REFERENCE_*` → `getMessage` refresh surfacing as `StaleReference` with identity unmoved (SYNC-040..046, DOM-007). The `FetchCatalog` seam supplies per-item facts from the metadata store; conformance for ranged reads runs in `tests/fetch_conformance.rs` |
+| `thumbnail` | `ThumbnailMachine` + `TdThumbnailer`: the eager-preview adapter (TASK-260715-3nl3mu) — the `DriveSource::thumbnail` side of this source. Serves POL-2's always-eager small previews from what the normalizer already captured: a downloadable TDLib thumbnail *file* (distinct from full-content hydration — a different `file_id` than the media) or the inline minithumbnail decoded in-crate (no base64 dependency). POL-4 refuses a restricted/view-once attachment before any request; a `max_preview_bytes` cap keeps a mis-projected `file_id` from ever becoming a full-media download; the same per-file serialization and `cancelDownloadFile`-on-abandon as `download`. A stale preview reference surfaces as `StaleReference` (the message's own refresh path re-learns it — no in-adapter `getMessage` here). The `ThumbnailCatalog` seam supplies per-item facts (`ThumbnailTarget::from_descriptor`); the adapter suite is `tests/thumbnail_source.rs`, and the POL-4 door runs in `tests/fetch_conformance.rs` |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
@@ -335,7 +337,9 @@ isolation and secret lookup on `AccountId` (DOM-020/DOM-021), and the
 `snapshot`, `updates`, and `folders` layers speak `ChatListKind`/`FolderId` for
 the lists and folders they enumerate and keep current; `gramdrive-source` —
 the `download` adapter implements the contract's ranged-read side
-(`FetchRequest`, `ContentSink`, the `SourceError` taxonomy). External:
+(`FetchRequest`, `ContentSink`, the `SourceError` taxonomy) and the
+`thumbnail` adapter its eager-preview side (`ThumbnailSpec`, `Thumbnail`).
+External:
 `serde_json` — JSON is tdjson's wire format and the config request type.
 Dev-only: `gramdrive-state` — the snapshot, update, and folder-catalog
 integration suites apply commits through the real typed repositories;

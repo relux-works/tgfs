@@ -811,7 +811,7 @@ fn gate(
 
 /// Whether a TDLib rejection is Telegram's stale-file-reference class
 /// (`FILE_REFERENCE_EXPIRED` and friends).
-fn is_stale_reference(error: &TdError) -> bool {
+pub(crate) fn is_stale_reference(error: &TdError) -> bool {
     matches!(error, TdError::Td { message, .. } if message.contains("FILE_REFERENCE"))
 }
 
@@ -828,7 +828,7 @@ fn is_message_gone(error: &TdError) -> bool {
 /// no TDLib error type crosses the source boundary). Flood waits carry
 /// their stated delay intact — the one number the engine can act on
 /// (SYNC-044).
-fn classify_runtime_error(error: TdError, operation: &str) -> SourceError {
+pub(crate) fn classify_runtime_error(error: TdError, operation: &str) -> SourceError {
     if let Some(retry_after_secs) = retryable_after(&error) {
         return match retry_after_secs {
             Some(secs) => SourceError::RateLimited {
@@ -864,9 +864,11 @@ fn classify_runtime_error(error: TdError, operation: &str) -> SourceError {
 
 /// One download conversation per file (module docs): fetches serialize per
 /// `file_id`, waiters wake on release and re-race deterministically under
-/// a single-threaded executor.
+/// a single-threaded executor. Shared with the thumbnail adapter
+/// ([`crate::thumbnail`]), which serializes its whole-file preview downloads
+/// on the same per-`file_id` discipline.
 #[derive(Debug, Default)]
-struct FileLocks {
+pub(crate) struct FileLocks {
     table: Arc<LockTable>,
 }
 
@@ -890,7 +892,7 @@ impl LockTable {
 }
 
 impl FileLocks {
-    fn acquire(&self, file_id: i32) -> LockFuture {
+    pub(crate) fn acquire(&self, file_id: i32) -> LockFuture {
         LockFuture {
             table: Arc::clone(&self.table),
             file_id,
@@ -898,7 +900,7 @@ impl FileLocks {
     }
 }
 
-struct LockFuture {
+pub(crate) struct LockFuture {
     table: Arc<LockTable>,
     file_id: i32,
 }
@@ -925,7 +927,7 @@ impl Future for LockFuture {
     }
 }
 
-struct LockGuard {
+pub(crate) struct LockGuard {
     table: Arc<LockTable>,
     file_id: i32,
 }
@@ -961,24 +963,26 @@ impl Drop for LockGuard {
 /// downloading — the SYNC-043 "cease network work" half of a dropped
 /// future. Disarmed the moment the download resolves; the response of the
 /// fired cancel is deliberately discarded (the abandoning caller is gone).
-struct CancelGuard {
+/// Shared with the thumbnail adapter ([`crate::thumbnail`]), whose preview
+/// download abandons the same way.
+pub(crate) struct CancelGuard {
     client: TdClient,
     request: Option<Value>,
 }
 
 impl CancelGuard {
-    fn disarmed(client: TdClient) -> CancelGuard {
+    pub(crate) fn disarmed(client: TdClient) -> CancelGuard {
         CancelGuard {
             client,
             request: None,
         }
     }
 
-    fn arm(&mut self, request: Option<Value>) {
+    pub(crate) fn arm(&mut self, request: Option<Value>) {
         self.request = request;
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.request = None;
     }
 }
@@ -1102,8 +1106,10 @@ impl TdDownloader {
 }
 
 /// Read exactly `len` bytes at `offset` from TDLib's file, read-only. A
-/// short file is an error — the download response promised coverage.
-fn read_exact_at(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, std::io::Error> {
+/// short file is an error — the download response promised coverage. Shared
+/// with the thumbnail adapter ([`crate::thumbnail`]), which reads a whole
+/// preview file as one `offset == 0` slice.
+pub(crate) fn read_exact_at(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, std::io::Error> {
     let len = usize::try_from(len).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
