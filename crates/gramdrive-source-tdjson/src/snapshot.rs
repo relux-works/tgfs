@@ -118,7 +118,7 @@ use serde_json::{Value, json};
 use gramdrive_model::identity::{ChatListKind, FolderId};
 
 use crate::error::{TdError, trailing_integer};
-use crate::wire::{KindFact, active_username, list_json, parse_chat_kind, parse_list, parse_order};
+use crate::wire::{KindFact, active_username, list_json, parse_chat_kind, parse_int64, parse_list};
 
 /// The cursor stream name the composing caller is expected to persist
 /// snapshot resume tokens under (one cursor per account; SYNC-004).
@@ -870,7 +870,7 @@ impl SnapshotMachine {
         let Some(list) = position.get("list").and_then(parse_list) else {
             return;
         };
-        let Some(order) = position.get("order").and_then(parse_order) else {
+        let Some(order) = position.get("order").and_then(parse_int64) else {
             return;
         };
         let fact = if order == 0 {

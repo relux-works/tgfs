@@ -94,7 +94,7 @@ use serde_json::Value;
 use gramdrive_model::identity::ChatListKind;
 
 use crate::snapshot::SnapshotChatKind;
-use crate::wire::{KindFact, active_username, parse_chat_kind, parse_list, parse_order};
+use crate::wire::{KindFact, active_username, parse_chat_kind, parse_int64, parse_list};
 
 /// Canonical metadata of one chat as the live mapper last observed it — the
 /// facts the caller upserts as the chat's canonical record (SYNC-026: identity
@@ -520,7 +520,7 @@ impl UpdateMachine {
         let Some(list) = position.get("list").and_then(parse_list) else {
             return;
         };
-        let Some(order) = position.get("order").and_then(parse_order) else {
+        let Some(order) = position.get("order").and_then(parse_int64) else {
             return;
         };
         let map = self.positions.entry(chat_id).or_default();

@@ -51,6 +51,15 @@
 //!   POL-1 invalidation classification (reorder regenerates `order.json`, a
 //!   rename renames the folder), idempotent under duplicate and out-of-order
 //!   delivery, and gap reporting for unknown chats (SYNC-023).
+//! - [`message`] — [`normalize_message`], the pure message normalizer
+//!   (TASK-260715-1ynmct, PRD-022): one TDLib `message` object becomes one
+//!   typed, provider-neutral [`MessageRecord`] — identity, time, sender,
+//!   text/caption entities, reply, topic, album key, reactions, service
+//!   actions, POL-4 protection facts, and attachment descriptors. Unknown
+//!   content degrades explicitly ([`MessageContent::Unsupported`], raw JSON
+//!   preserved under a schema version for migration), never a panic and
+//!   never a silent drop; the history crawl (TASK-260715-26dnp6) and the
+//!   ordered update loop (TASK-260715-10p5zp) are its composing callers.
 //! - [`folders`] — [`FolderCatalogMachine`], the deterministic sans-IO folder
 //!   (chat filter) catalog reducer (TASK-260715-54nopz): TDLib's
 //!   `updateChatFolders` folds into a normalized folder create/rename/delete/
@@ -81,6 +90,9 @@
 //! [`TdError`]: error::TdError
 //! [`MockTdJson`]: mock::MockTdJson
 //! [`AuthMachine`]: auth::AuthMachine
+//! [`normalize_message`]: message::normalize_message
+//! [`MessageRecord`]: message::MessageRecord
+//! [`MessageContent::Unsupported`]: message::MessageContent::Unsupported
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
 //! [`UpdateMachine`]: updates::UpdateMachine
 //! [`FolderCatalogMachine`]: folders::FolderCatalogMachine
@@ -98,6 +110,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod folders;
+pub mod message;
 pub mod mock;
 pub mod removal;
 pub mod runtime;
@@ -124,6 +137,12 @@ pub use config::{
 };
 pub use error::TdError;
 pub use folders::{FolderCatalogBatch, FolderCatalogMachine, FolderDefinition, FolderInvalidation};
+pub use message::{
+    AttachmentAvailability, AttachmentDescriptor, AttachmentKind, ExpiredKind, FormattedText,
+    MessageContent, MessageError, MessageRecord, ProtectionFacts, RAW_SCHEMA_VERSION, Reaction,
+    ReactionKind, ReplyTarget, SelfDestruct, SenderRef, ServiceAction, TextEntity, TextEntityKind,
+    TopicRef, UnsupportedContent, normalize_content, normalize_message, normalize_reactions,
+};
 pub use removal::{
     AccountRemoval, ExportPolicy, RemovalError, RemovalMode, RemovalRequest, RemovalStep,
 };

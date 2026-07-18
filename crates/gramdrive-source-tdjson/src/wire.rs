@@ -1,10 +1,12 @@
 //! Leaf parsers for TDLib's C JSON wire shapes, shared by the snapshot
-//! ([`crate::snapshot`]) and the live-update mapper ([`crate::updates`]).
+//! ([`crate::snapshot`]), the live-update mapper ([`crate::updates`]), and
+//! the message normalizer ([`crate::message`]).
 //!
-//! These are the small, subtle decoders both machines must agree on
-//! byte-for-byte — most of all the int64 `order`, which tdjson serializes as a
-//! decimal *string* and which a float round trip would silently corrupt. One
-//! copy, one set of tests, so the two machines cannot drift.
+//! These are the small, subtle decoders the machines must agree on
+//! byte-for-byte — most of all int64 fields (a position `order`, a
+//! `media_album_id`, a custom emoji id), which tdjson serializes as decimal
+//! *strings* and which a float round trip would silently corrupt. One copy,
+//! one set of tests, so the machines cannot drift.
 
 use serde_json::Value;
 
@@ -75,9 +77,10 @@ pub(crate) fn parse_chat_kind(value: &Value) -> KindFact {
     }
 }
 
-/// Parse a TDLib int64 position order: the C JSON interface serializes int64
-/// as a decimal string; a plain number is tolerated for robustness.
-pub(crate) fn parse_order(value: &Value) -> Option<i64> {
+/// Parse a TDLib int64 field (a position order, an album id, a custom emoji
+/// id): the C JSON interface serializes int64 as a decimal string; a plain
+/// number is tolerated for robustness.
+pub(crate) fn parse_int64(value: &Value) -> Option<i64> {
     match value {
         Value::String(text) => text.parse().ok(),
         Value::Number(_) => value.as_i64(),
@@ -113,14 +116,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn order_parses_the_string_shape_tdjson_sends() {
+    fn int64_parses_the_string_shape_tdjson_sends() {
         assert_eq!(
-            parse_order(&Value::String("2685396931233784969".to_owned())),
+            parse_int64(&Value::String("2685396931233784969".to_owned())),
             Some(2685396931233784969)
         );
-        assert_eq!(parse_order(&json!(42)), Some(42));
-        assert_eq!(parse_order(&Value::String("x".to_owned())), None);
-        assert_eq!(parse_order(&json!(null)), None);
+        assert_eq!(parse_int64(&json!(42)), Some(42));
+        assert_eq!(parse_int64(&Value::String("x".to_owned())), None);
+        assert_eq!(parse_int64(&json!(null)), None);
     }
 
     #[test]
