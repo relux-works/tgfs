@@ -13,9 +13,79 @@
 
 use std::time::Duration;
 
+use gramdrive_model::ByteRange;
+use gramdrive_model::version::ContentVersion;
+use gramdrive_source::FetchRequest;
+use gramdrive_source_tdjson::message::AttachmentAvailability;
 use gramdrive_source_tdjson::real::RealTdJson;
-use gramdrive_source_tdjson::{RuntimeConfig, TdRuntime, UpdateRecvError};
-use serde_json::json;
+use gramdrive_source_tdjson::{
+    CatalogEntry, DownloadConfig, DownloadMachine, DownloadStep, FileTarget, RuntimeConfig,
+    TdError, TdRuntime, UpdateRecvError,
+};
+use serde_json::{Value, json};
+
+/// Every request shape `download.rs` can put on the wire — the ranged
+/// download, the reference refresh, and the cancel — built by the machine
+/// itself, so the probe cannot drift from the adapter.
+fn download_adapter_payloads() -> Vec<Value> {
+    use gramdrive_model::identity::{
+        AccountId, AccountKey, AccountScope, AttachmentIndex, AttachmentKey, CanonicalKey, ChatId,
+        ChatKey, ItemKey, MessageId, MessageKey, NamespaceVersion,
+    };
+    let item = ItemKey::Canonical(CanonicalKey::Attachment(AttachmentKey {
+        message: MessageKey {
+            chat: ChatKey {
+                scope: AccountScope {
+                    account: AccountKey {
+                        account_id: AccountId(1),
+                    },
+                    namespace_version: NamespaceVersion(1),
+                },
+                chat_id: ChatId(1),
+            },
+            message_id: MessageId(1),
+        },
+        index: AttachmentIndex(0),
+    }))
+    .id();
+    let request = FetchRequest {
+        item,
+        version: ContentVersion::new("c1").expect("valid token"),
+        range: ByteRange::new(0, 64).expect("valid range"),
+    };
+    let target = FileTarget {
+        file_id: 1,
+        chat_id: 1,
+        message_id: 1,
+        availability: AttachmentAvailability::Fetchable,
+        remote_unique_id: None,
+        size: None,
+        version: ContentVersion::new("c1").expect("valid token"),
+    };
+    let mut machine = DownloadMachine::new(
+        &request,
+        Some(CatalogEntry::File(target)),
+        &DownloadConfig::default(),
+    );
+    let mut payloads = Vec::new();
+    let Ok(DownloadStep::Submit { payload, .. }) = machine.next_step() else {
+        panic!("the first obligation is the download");
+    };
+    payloads.push(payload);
+    payloads.extend(machine.cancel_request());
+    // A stale-reference rejection turns the machine to the refresh request.
+    machine
+        .on_response(Err(TdError::Td {
+            code: 400,
+            message: "FILE_REFERENCE_EXPIRED".to_owned(),
+        }))
+        .expect("a stale reference arms the refresh");
+    let Ok(DownloadStep::Submit { payload, .. }) = machine.next_step() else {
+        panic!("the refresh is a request obligation");
+    };
+    payloads.push(payload);
+    payloads
+}
 
 /// TDLib answers the version probe from local state, but its client thread
 /// has to start first; generous so slow CI cannot flake this.
@@ -52,6 +122,29 @@ fn runtime_over_real_tdjson_correlates_and_shuts_down() {
     assert_eq!(version["@extra"], request_id);
     let version_string = version["value"].as_str().expect("a version string");
     assert!(!version_string.is_empty());
+
+    // The download adapter's wire shapes, against the real parser
+    // (TASK-260715-1onbmf). No authorization exists, so TDLib rejects each
+    // request on its state — but it *parses* them first, and a mistyped
+    // field name in `download.rs` is exactly what only the real library
+    // rejects differently ("Failed to parse ..."). The mock cannot catch
+    // that class; this probe does, with no api_id and no network.
+    for payload in download_adapter_payloads() {
+        let kind = payload["@type"].as_str().expect("payload names its type");
+        let rejection = client
+            .request(payload.clone())
+            .expect("request submits")
+            .wait_timeout(REAL_GUARD)
+            .expect("TDLib answered the probe")
+            .expect_err("no authorization exists, so the request is rejected");
+        let TdError::Td { message, .. } = &rejection else {
+            panic!("{kind}: expected a TDLib rejection, got {rejection:?}");
+        };
+        assert!(
+            !message.contains("Failed to parse"),
+            "{kind}: the real parser rejected the adapter's wire shape: {message}"
+        );
+    }
 
     // Clean client close: ok response, then authorizationStateClosed on
     // the update stream, then a closed stream.

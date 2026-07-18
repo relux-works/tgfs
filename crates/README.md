@@ -34,7 +34,7 @@ neutrality violation invisible to the scan ships undetected.
 |---|---|---|---|
 | 0 | `gramdrive-model` | Domain vocabulary: identity, virtual tree, naming, versions, cursors, byte ranges | STORY-260715-3qxar5 (identity-and-namespace) |
 | 1 | `gramdrive-source` | Provider-neutral `DriveSource` contract (DEC-003) | STORY-260715-255sa3 (drive-source-contract) |
-| 1 | `gramdrive-source-tdjson` | Local TDLib source: safe tdjson runtime (lifecycle, correlation, update dispatch, shutdown); the `DriveSource` adapter follows in the owning story | STORY-260715-3elo6l (tdlib-runtime-integration) |
+| 1 | `gramdrive-source-tdjson` | Local TDLib source: safe tdjson runtime (lifecycle, correlation, update dispatch, shutdown) and the ranged download adapter (`DriveSource::fetch` side); the enumeration side of the adapter follows in the owning stories | STORY-260715-3elo6l (tdlib-runtime-integration) |
 | 1 | `gramdrive-state` | SQLite state store, schema migrations, reconciliation | STORY-260715-16ik2x (metadata-state-store) |
 | 1 | `gramdrive-render` | Deterministic NDJSON/Markdown renderers and render planning | STORY-260715-1oq9jg (deterministic-rendering) |
 | 2 | `gramdrive-engine` | Transfer/cache engine: hydration, quota, eviction, resumable downloads | STORY-260715-2hs8cf (transfer-and-cache-engine) |

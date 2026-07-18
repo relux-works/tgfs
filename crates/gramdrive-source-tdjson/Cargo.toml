@@ -25,6 +25,14 @@ build = "build.rs"
 # -> gramdrive-model is on the architecture allow list (crates/README.md).
 gramdrive-model = { workspace = true }
 
+# The provider-neutral DriveSource contract (DEC-003). The download adapter
+# ([`download`]) implements the contract's ranged-read side — FetchRequest,
+# ContentSink, and the SourceError taxonomy every backend failure must be
+# normalized into — so the contract crate is a product dependency here. The
+# direction gramdrive-source-tdjson -> gramdrive-source is on the
+# architecture allow list (crates/README.md).
+gramdrive-source = { workspace = true }
+
 # JSON is tdjson's wire format (TDLib's td_json_client interface); the
 # runtime parses every received event to correlate responses and route
 # updates, so the parsed Value is also what the caller gets. The config
@@ -43,6 +51,14 @@ serde_json = { workspace = true }
 # direction table binds [dependencies]; product code never links state from
 # here — the composing caller (engine/ffi) owns that wiring.
 gramdrive-state = { workspace = true }
+
+# The download adapter's conformance run (tests/fetch_conformance.rs) proves
+# the ranged-read side against the one DriveSource conformance suite
+# (SYNC-002): fetch goes through the real adapter over the mock tdjson,
+# enumeration through the testkit fake whose own conformance the testkit
+# already proves. Dev-only by architecture rule — the testkit never links
+# into a product artifact.
+gramdrive-testkit = { workspace = true }
 
 [lints]
 # Shared lint set: Cargo.toml [workspace.lints].

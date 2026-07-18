@@ -367,7 +367,9 @@ name = "gramdrive-source-tdjson"
 version = "0.1.0"
 dependencies = [
  "gramdrive-model",
+ "gramdrive-source",
  "gramdrive-state",
+ "gramdrive-testkit",
  "serde_json",
 ]
 

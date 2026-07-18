@@ -8,8 +8,9 @@ client lifecycle, `@extra` request correlation, ordered bounded update
 dispatch, typed error conversion, and coordinated shutdown with a
 deterministic drain. On top of it sit the configuration layer (`config`,
 TASK-260715-1hdnuy) and the authorization state machine (`auth`,
-TASK-260715-51n6jb); the `DriveSource` adapter over this runtime (DEC-003)
-lands with the enumeration follow-ups of the owning stories.
+TASK-260715-51n6jb). Of the `DriveSource` adapter over this runtime
+(DEC-003), the ranged-read side is here (`download`, TASK-260715-1onbmf);
+the enumeration side lands with the follow-ups of the owning stories.
 
 ## Ownership
 
@@ -29,6 +30,7 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `live` | `LiveMachine`: the deterministic sans-IO ordered live message update loop (TASK-260715-10p5zp) — `updateNewMessage`/`updateMessageSendSucceeded`, edit signals resolved through a `getMessage` refresh, and permanent `updateDeleteMessages` folded into ordered per-chat commits over `normalize_message`, each carrying the cursor advance it justifies (`chat_sync_state` newest, merged by the caller, SYNC-022); a live message above an unverified committed window opens a targeted `getChatHistory` gap bridge, recovered before the cursor moves (SYNC-023), and a failed bridge freezes the cursor explicitly |
 | `updates` | `UpdateMachine`: the deterministic sans-IO live chat-metadata/list update mapper (TASK-260715-1c8fea) — TDLib's push updates (title/photo/position/removed-from-list/protected-content, plus the user/supergroup username feed) folded into the same normalized change stream, with POL-1 invalidation classification (reorder → `order.json`, rename → folder rename), idempotent under duplicate and out-of-order delivery, and gap reporting for unknown chats |
 | `folders` | `FolderCatalogMachine`: the deterministic sans-IO folder (chat filter) catalog reducer (TASK-260715-54nopz) — `updateChatFolders` folded into a normalized folder create/rename/delete/reorder change stream with POL-1 invalidation classification, yielding the ordered folder set the snapshot enumerates; folder membership stays the chat machines' appearances, so a folder deletion removes only appearances |
+| `download` | `DownloadMachine` + `TdDownloader`: the ranged download adapter (TASK-260715-1onbmf) — the `DriveSource::fetch` side of this source. POL-4/version-pin/extent gates before any network call, synchronous ranged `downloadFile` with priority passthrough (1..=32), bounded local reads streamed into the caller's sink (never a whole file in memory, and TDLib's local file is read in place — never moved or deleted), per-file serialization (TDLib keeps one download conversation per file), `cancelDownloadFile` on abandon, and the `FILE_REFERENCE_*` → `getMessage` refresh surfacing as `StaleReference` with identity unmoved (SYNC-040..046, DOM-007). The `FetchCatalog` seam supplies per-item facts from the metadata store; conformance for ranged reads runs in `tests/fetch_conformance.rs` |
 | `runtime` | `TdRuntime` (the one receive owner), `TdClient`, `PendingRequest` (blocking wait, `Future`, cancellation), `UpdateStream`, `RuntimeConfig`, `RuntimeStats` |
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
@@ -331,12 +333,15 @@ policy).
 Internal: `gramdrive-model` — the `config` layer keys per-account storage
 isolation and secret lookup on `AccountId` (DOM-020/DOM-021), and the
 `snapshot`, `updates`, and `folders` layers speak `ChatListKind`/`FolderId` for
-the lists and folders they enumerate and keep current; `gramdrive-source`
-remains reserved for the coming `DriveSource` adapter. External: `serde_json` —
-JSON is tdjson's wire format and the config request type. Dev-only:
-`gramdrive-state` — the snapshot, update, and folder-catalog integration suites
-apply commits through the real typed repositories;
-product code never links it from here (the composing caller owns that wiring).
+the lists and folders they enumerate and keep current; `gramdrive-source` —
+the `download` adapter implements the contract's ranged-read side
+(`FetchRequest`, `ContentSink`, the `SourceError` taxonomy). External:
+`serde_json` — JSON is tdjson's wire format and the config request type.
+Dev-only: `gramdrive-state` — the snapshot, update, and folder-catalog
+integration suites apply commits through the real typed repositories;
+`gramdrive-testkit` — the ranged-read conformance run (SYNC-002) and its
+verifying sink; product code never links either from here (the composing
+caller owns that wiring).
 Platform-specific code: forbidden — the keychain lives behind the
 `SecretSource` seam, implemented in the native adapter. See `crates/README.md`.
 

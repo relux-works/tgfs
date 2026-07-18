@@ -5,23 +5,16 @@ backlog
 (none)
 
 ## Created
-2026-07-15T00:52:44Z
+2026-07-18T03:08:36Z
 
 ## Last Update
 2026-07-18T03:08:36Z
 
 ## Blocked By
-- EPIC-260715-1hm0ka
+- (none)
 
 ## Blocks
-- EPIC-260715-2ptb18
-- EPIC-260715-3i9uyp
-- EPIC-260715-1mlv5j
-- EPIC-260715-y0fshx
-- EPIC-260715-3uynbw
-- EPIC-260715-1hnglv
-- EPIC-260715-2y4q0r
-- EPIC-260715-tkb4ft
+- (none)
 
 ## Checklist
 (empty)

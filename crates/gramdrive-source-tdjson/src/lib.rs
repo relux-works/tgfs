@@ -88,6 +88,18 @@
 //!   the chat machines' `chat_list_entries` appearances, so a chat in several
 //!   folders is one canonical record with one appearance per folder and a
 //!   folder deletion removes only those appearances (SYNC-026, DOM-022).
+//! - [`download`] — [`DownloadMachine`] and [`TdDownloader`], the ranged
+//!   download adapter (TASK-260715-1onbmf): the `DriveSource::fetch` side of
+//!   this source. POL-4 and version-pin gates before any network call, a
+//!   synchronous ranged `downloadFile` with priority passthrough (1..=32),
+//!   bounded local reads delivered straight into the caller's sink (never a
+//!   whole file in memory), per-file serialization (TDLib keeps one download
+//!   conversation per file), prompt cancellation with `cancelDownloadFile`
+//!   on abandon, and the `FILE_REFERENCE_*` refresh that surfaces as
+//!   `StaleReference` without ever moving identity (SYNC-040..046, DOM-007).
+//!   The [`FetchCatalog`] seam supplies the per-item facts the state layer
+//!   owns; the conformance run for ranged reads lives in
+//!   `tests/fetch_conformance.rs`.
 //! - [`mock`] — [`MockTdJson`], the deterministic in-process tdjson double
 //!   this crate's own tests run against, and the reason the crate compiles
 //!   and tests without the TDLib artifact.
@@ -96,13 +108,14 @@
 //!   `libtdjson.dylib`, exercised by the `real_tdjson_smoke` integration
 //!   test via `make tdjson-smoke`.
 //!
-//! The `DriveSource` adapter that maps this runtime onto the
-//! provider-neutral contract (DEC-003) is deliberately absent here: it
-//! lands with the enumeration follow-ups of the owning stories, composing
-//! the configuration ([`config`]) and authorization ([`auth`]) layers that
-//! are already here. This layer's contract is only that tdjson's
-//! asynchrony — one global receive stream multiplexing every client's
-//! responses and updates — becomes safe, correlated, cancellable Rust.
+//! Of the `DriveSource` adapter that maps this runtime onto the
+//! provider-neutral contract (DEC-003), only the ranged-read side exists
+//! here so far ([`download`]); the enumeration side lands with the
+//! follow-ups of the owning stories, composing the configuration
+//! ([`config`]) and authorization ([`auth`]) layers that are already here.
+//! The runtime layer's contract is only that tdjson's asynchrony — one
+//! global receive stream multiplexing every client's responses and updates
+//! — becomes safe, correlated, cancellable Rust.
 //!
 //! [`TdSendApi`]: api::TdSendApi
 //! [`TdReceiveApi`]: api::TdReceiveApi
@@ -113,6 +126,9 @@
 //! [`normalize_message`]: message::normalize_message
 //! [`MessageRecord`]: message::MessageRecord
 //! [`MessageContent::Unsupported`]: message::MessageContent::Unsupported
+//! [`DownloadMachine`]: download::DownloadMachine
+//! [`TdDownloader`]: download::TdDownloader
+//! [`FetchCatalog`]: download::FetchCatalog
 //! [`CrawlMachine`]: history::CrawlMachine
 //! [`LiveMachine`]: live::LiveMachine
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
@@ -131,6 +147,7 @@ pub mod api;
 pub mod attachment;
 pub mod auth;
 pub mod config;
+pub mod download;
 pub mod error;
 pub mod folders;
 pub mod history;
@@ -160,6 +177,11 @@ pub use config::{
     AccountConfig, AccountStoragePaths, ApiCredentials, DATABASE_KEY_LEN, DatabaseKey,
     DeviceMetadata, InMemorySecrets, MemoryOptions, Proxy, Secret, SecretError, SecretSource,
     SecretStore, StorageLayout, StoragePolicy, TdlibConfig, set_database_encryption_key_request,
+};
+pub use download::{
+    CatalogEntry, DownloadConfig, DownloadMachine, DownloadPhase, DownloadPriority,
+    DownloadProgress, DownloadStep, FetchCatalog, FileTarget, InvalidPriority, SubmitKind,
+    TdDownloader,
 };
 pub use error::TdError;
 pub use folders::{FolderCatalogBatch, FolderCatalogMachine, FolderDefinition, FolderInvalidation};
