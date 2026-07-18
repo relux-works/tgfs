@@ -60,6 +60,15 @@
 //!   preserved under a schema version for migration), never a panic and
 //!   never a silent drop; the history crawl (TASK-260715-26dnp6) and the
 //!   ordered update loop (TASK-260715-10p5zp) are its composing callers.
+//! - [`history`] — [`CrawlMachine`], the deterministic sans-IO resumable
+//!   per-chat history crawl (TASK-260715-26dnp6, SYNC-021): `getChatHistory`
+//!   paging into [`normalize_message`] records, one commit per page carrying
+//!   the durable `[oldest, newest]` window facts the state layer's
+//!   `chat_sync_state` row persists transactionally (SYNC-022), priority
+//!   scheduling that favors visible/requested chats while round-robining
+//!   equals page by page, flood-wait backoff advice (SYNC-044), and explicit
+//!   per-chat unavailability for left/inaccessible chats — never a media
+//!   request (SYNC-020), never a silent skip.
 //! - [`folders`] — [`FolderCatalogMachine`], the deterministic sans-IO folder
 //!   (chat filter) catalog reducer (TASK-260715-54nopz): TDLib's
 //!   `updateChatFolders` folds into a normalized folder create/rename/delete/
@@ -93,6 +102,7 @@
 //! [`normalize_message`]: message::normalize_message
 //! [`MessageRecord`]: message::MessageRecord
 //! [`MessageContent::Unsupported`]: message::MessageContent::Unsupported
+//! [`CrawlMachine`]: history::CrawlMachine
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
 //! [`UpdateMachine`]: updates::UpdateMachine
 //! [`FolderCatalogMachine`]: folders::FolderCatalogMachine
@@ -110,6 +120,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod folders;
+pub mod history;
 pub mod message;
 pub mod mock;
 pub mod removal;
@@ -137,6 +148,10 @@ pub use config::{
 };
 pub use error::TdError;
 pub use folders::{FolderCatalogBatch, FolderCatalogMachine, FolderDefinition, FolderInvalidation};
+pub use history::{
+    ChatCrawl, ChatProgress, ChatUnavailable, CrawlBackoff, CrawlError, CrawlMachine, CrawlPhase,
+    CrawlPlan, CrawlPriority, CrawlStep, CrawlWindow, HistoryCommit, UnavailableReason,
+};
 pub use message::{
     AttachmentAvailability, AttachmentDescriptor, AttachmentKind, ExpiredKind, FormattedText,
     MessageContent, MessageError, MessageRecord, ProtectionFacts, RAW_SCHEMA_VERSION, Reaction,

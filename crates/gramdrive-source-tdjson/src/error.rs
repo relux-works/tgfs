@@ -79,6 +79,29 @@ impl std::fmt::Display for TdError {
 
 impl std::error::Error for TdError {}
 
+/// Retryable-failure classification (SYNC-044): `Some(stated delay)` for
+/// flood control (code 429 / `FLOOD_WAIT`), `Some(None)` for TDLib's
+/// transport failures (code 500). Everything else is not retry advice —
+/// what it *is* instead is each machine's call (`snapshot` fails its run,
+/// `history` fails the one chat).
+pub(crate) fn retryable_after(error: &TdError) -> Option<Option<u64>> {
+    match error {
+        TdError::Td { code, message } => {
+            if *code == 429
+                || message.starts_with("Too Many Requests")
+                || message.starts_with("FLOOD_WAIT")
+            {
+                Some(trailing_integer(message))
+            } else if *code == 500 {
+                Some(None)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The trailing decimal integer of `message`, if it ends with one — how
 /// both flood-wait message shapes ("Too Many Requests: retry after 17",
 /// "FLOOD_WAIT_17") state their delay. Shared by every flow that
@@ -91,7 +114,33 @@ pub(crate) fn trailing_integer(message: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::trailing_integer;
+    use super::{TdError, retryable_after, trailing_integer};
+
+    #[test]
+    fn retryable_classification_matches_flood_and_transport_only() {
+        let flood = TdError::Td {
+            code: 429,
+            message: "Too Many Requests: retry after 17".to_owned(),
+        };
+        assert_eq!(retryable_after(&flood), Some(Some(17)));
+        let flood_bare = TdError::Td {
+            code: 420,
+            message: "FLOOD_WAIT_120".to_owned(),
+        };
+        assert_eq!(retryable_after(&flood_bare), Some(Some(120)));
+        let transport = TdError::Td {
+            code: 500,
+            message: "Failed to connect".to_owned(),
+        };
+        assert_eq!(retryable_after(&transport), Some(None));
+        let fatal = TdError::Td {
+            code: 400,
+            message: "CHAT_ID_INVALID".to_owned(),
+        };
+        assert_eq!(retryable_after(&fatal), None);
+        assert_eq!(retryable_after(&TdError::ClientClosed), None);
+        assert_eq!(retryable_after(&TdError::Shutdown), None);
+    }
 
     #[test]
     fn trailing_integer_parses_both_flood_message_shapes() {
