@@ -128,6 +128,7 @@
 #![cfg_attr(real_tdjson, deny(unsafe_code))]
 
 pub mod api;
+pub mod attachment;
 pub mod auth;
 pub mod config;
 pub mod error;
@@ -150,6 +151,7 @@ mod wire;
 #[allow(unsafe_code)]
 pub mod real;
 
+pub use attachment::{MappedAttachment, map_attachment, map_message_attachments};
 pub use auth::{
     AuthError, AuthInput, AuthMachine, AuthRejection, AuthState, AuthStep, CodeInfo, PasswordInfo,
     RetryAdvice,
@@ -171,9 +173,10 @@ pub use live::{
 };
 pub use message::{
     AttachmentAvailability, AttachmentDescriptor, AttachmentKind, ExpiredKind, FormattedText,
-    MessageContent, MessageError, MessageRecord, ProtectionFacts, RAW_SCHEMA_VERSION, Reaction,
-    ReactionKind, ReplyTarget, SelfDestruct, SenderRef, ServiceAction, TextEntity, TextEntityKind,
-    TopicRef, UnsupportedContent, normalize_content, normalize_message, normalize_reactions,
+    MessageContent, MessageError, MessageRecord, Minithumbnail, ProtectionFacts,
+    RAW_SCHEMA_VERSION, Reaction, ReactionKind, ReplyTarget, SelfDestruct, SenderRef,
+    ServiceAction, TextEntity, TextEntityKind, ThumbnailDescriptor, ThumbnailFormat, TopicRef,
+    UnsupportedContent, normalize_content, normalize_message, normalize_reactions,
 };
 pub use removal::{
     AccountRemoval, ExportPolicy, RemovalError, RemovalMode, RemovalRequest, RemovalStep,

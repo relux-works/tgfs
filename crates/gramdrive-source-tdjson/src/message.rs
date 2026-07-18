@@ -63,7 +63,10 @@
 //! fetched), everything else is fetchable. Expired self-destruct
 //! placeholders (`messageExpiredPhoto` and friends) normalize to
 //! [`MessageContent::Expired`] — explicitly unavailable, no attachment, no
-//! fabricated recoverability (PRD-024).
+//! fabricated recoverability (PRD-024). Previews follow the same rule: a
+//! [`ThumbnailDescriptor`] and inline [`Minithumbnail`] are captured only for
+//! a fetchable attachment, so a restricted or view-once item carries no
+//! preview bytes or locators at all (POL-4, fail-closed).
 //!
 //! # Albums
 //!
@@ -353,10 +356,79 @@ pub enum AttachmentAvailability {
     ViewOnce,
 }
 
+/// The image format of a downloadable [`ThumbnailDescriptor`] — TDLib's
+/// `ThumbnailFormat`. Unknown formats degrade to [`ThumbnailFormat::Unknown`]
+/// rather than dropping the thumbnail, matching the module's degrade-don't-omit
+/// rule; the serving layer decides what it can decode (TASK-260715-3nl3mu).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbnailFormat {
+    /// JPEG.
+    Jpeg,
+    /// PNG.
+    Png,
+    /// WebP (static stickers, images).
+    Webp,
+    /// GIF.
+    Gif,
+    /// MPEG-4 (video/animation preview).
+    Mpeg4,
+    /// Lottie sticker (`.tgs`, gzipped JSON).
+    Tgs,
+    /// WebM (video stickers, animation preview).
+    Webm,
+    /// A format this build does not know, or a `thumbnail` whose format
+    /// object was absent or typeless.
+    Unknown {
+        /// The TDLib `@type`; `None` when the format object was missing.
+        raw_type: Option<String>,
+    },
+}
+
+/// A downloadable preview image the source already holds a locator for —
+/// TDLib's `thumbnail` (or `album_cover_thumbnail` for audio, or the smallest
+/// `photoSize` of a photo). Records where the preview is and how big; fetching
+/// it is the engine's job (POL-2: thumbnails are eager). Populated only for a
+/// [`AttachmentAvailability::Fetchable`] attachment — a restricted or
+/// view-once attachment never carries one (POL-4, fail-closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbnailDescriptor {
+    /// The preview's image format.
+    pub format: ThumbnailFormat,
+    /// TDLib's file id for the preview — the locator `downloadFile` takes.
+    pub file_id: i32,
+    /// Telegram's refreshable remote locator, when known (SYNC-045).
+    pub remote_id: Option<String>,
+    /// Telegram's stable remote file identifier, when known.
+    pub remote_unique_id: Option<String>,
+    /// Preview size in bytes, when TDLib or Telegram states one.
+    pub size: Option<u64>,
+    /// Preview pixel width, when stated.
+    pub width: Option<u32>,
+    /// Preview pixel height, when stated.
+    pub height: Option<u32>,
+}
+
+/// TDLib's inline `minithumbnail` — a tiny blurred JPEG delivered inside the
+/// message itself, so no fetch is needed to show it. Populated under the same
+/// POL-4 rule as [`ThumbnailDescriptor`]: present only for a fetchable
+/// attachment. `data` is base64 exactly as the tdjson interface encodes bytes;
+/// decoding it is the thumbnail source's job (TASK-260715-3nl3mu), which keeps
+/// this crate free of a base64 dependency and this a pure metadata mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Minithumbnail {
+    /// Preview pixel width, when stated.
+    pub width: Option<u32>,
+    /// Preview pixel height, when stated.
+    pub height: Option<u32>,
+    /// The blurred JPEG bytes, base64-encoded as tdjson delivers them.
+    pub data_base64: String,
+}
+
 /// One downloadable attachment as the message describes it — the source's
 /// half of DOM § Attachment: original metadata plus Telegram locators.
-/// Attachment identity (chat, message, ordinal) is the consumer's key; v1
-/// message contents carry at most one attachment, at ordinal zero.
+/// Attachment identity (chat, message, ordinal) and the deterministic safe
+/// name are bound by the mapping layer ([`crate::attachment`]); v1 message
+/// contents carry at most one attachment, at ordinal zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentDescriptor {
     /// The attachment flavor.
@@ -382,6 +454,12 @@ pub struct AttachmentDescriptor {
     pub height: Option<u32>,
     /// Duration in seconds, for timed media.
     pub duration_secs: Option<u32>,
+    /// A downloadable preview image, when the media carries one and its bytes
+    /// may be fetched. Never populated for a non-fetchable attachment (POL-4).
+    pub thumbnail: Option<ThumbnailDescriptor>,
+    /// The inline blurred preview delivered with the message, when present and
+    /// the media is fetchable (POL-4, same fail-closed rule as `thumbnail`).
+    pub minithumbnail: Option<Minithumbnail>,
     /// Whether the bytes may ever be fetched (POL-4).
     pub availability: AttachmentAvailability,
 }
@@ -608,6 +686,29 @@ pub enum MessageContent {
         /// The preserved raw content.
         content: UnsupportedContent,
     },
+}
+
+impl MessageContent {
+    /// The attachment this content carries, if any. A v1 message content holds
+    /// at most one attachment; the mapping layer ([`crate::attachment`]) still
+    /// treats the result as an ordered list so an album of one-attachment
+    /// messages — and any future multi-attachment content — maps uniformly.
+    pub fn attachment(&self) -> Option<&AttachmentDescriptor> {
+        match self {
+            Self::Photo { attachment, .. }
+            | Self::Video { attachment, .. }
+            | Self::Animation { attachment, .. }
+            | Self::Audio { attachment, .. }
+            | Self::Document { attachment, .. }
+            | Self::VoiceNote { attachment, .. }
+            | Self::VideoNote { attachment }
+            | Self::Sticker { attachment, .. } => Some(attachment),
+            Self::Text { .. }
+            | Self::Expired { .. }
+            | Self::Service { .. }
+            | Self::Unsupported { .. } => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1304,8 @@ fn media_attachment(
         }
         _ => (u32_field(media, "width"), u32_field(media, "height")),
     };
+    let availability = protection.availability();
+    let (thumbnail, minithumbnail) = previews(media, thumbnail_members(kind), availability);
     Some(AttachmentDescriptor {
         kind,
         file_id: file.file_id,
@@ -1214,7 +1317,9 @@ fn media_attachment(
         width,
         height,
         duration_secs: u32_field(media, "duration"),
-        availability: protection.availability(),
+        thumbnail,
+        minithumbnail,
+        availability,
     })
 }
 
@@ -1237,13 +1342,28 @@ fn photo_attachment(
     photo: Option<&Value>,
     protection: ProtectionFacts,
 ) -> Option<AttachmentDescriptor> {
-    let sizes = photo?.get("sizes").and_then(Value::as_array)?;
-    let best = sizes.iter().max_by_key(|size| {
+    let photo = photo?;
+    let sizes = photo.get("sizes").and_then(Value::as_array)?;
+    let pixels = |size: &&Value| {
         let width = size.get("width").and_then(Value::as_i64).unwrap_or(0);
         let height = size.get("height").and_then(Value::as_i64).unwrap_or(0);
         width.saturating_mul(height)
-    })?;
+    };
+    let best = sizes.iter().max_by_key(pixels)?;
     let file = parse_file(best.get("photo")?)?;
+    let availability = protection.availability();
+    // A photo carries no separate `thumbnail` object; its smallest stored size
+    // is the preview. Only expose it (and the inline minithumbnail) when the
+    // bytes are fetchable at all (POL-4, fail-closed).
+    let (thumbnail, minithumbnail) = if availability == AttachmentAvailability::Fetchable {
+        let smallest = sizes.iter().min_by_key(pixels);
+        let thumbnail = smallest
+            .filter(|size| !std::ptr::eq(*size, best))
+            .and_then(photo_size_thumbnail);
+        (thumbnail, minithumbnail(photo.get("minithumbnail")))
+    } else {
+        (None, None)
+    };
     Some(AttachmentDescriptor {
         kind: AttachmentKind::Photo,
         file_id: file.file_id,
@@ -1255,7 +1375,106 @@ fn photo_attachment(
         width: u32_field(best, "width"),
         height: u32_field(best, "height"),
         duration_secs: None,
-        availability: protection.availability(),
+        thumbnail,
+        minithumbnail,
+        availability,
+    })
+}
+
+// -- thumbnail assembly -----------------------------------------------------
+
+/// The `(thumbnail, minithumbnail)` member names of a media object, or `None`
+/// for a kind that carries no preview. Audio previews are album covers under
+/// their own member names; voice notes have none; photos are handled by
+/// [`photo_attachment`] (their sizes are the previews, not a `thumbnail`).
+fn thumbnail_members(kind: AttachmentKind) -> Option<(&'static str, &'static str)> {
+    match kind {
+        AttachmentKind::Video
+        | AttachmentKind::Animation
+        | AttachmentKind::Document
+        | AttachmentKind::VideoNote
+        | AttachmentKind::Sticker => Some(("thumbnail", "minithumbnail")),
+        AttachmentKind::Audio => Some(("album_cover_thumbnail", "album_cover_minithumbnail")),
+        AttachmentKind::Photo | AttachmentKind::VoiceNote => None,
+    }
+}
+
+/// Both previews of a media object, gated on the attachment being fetchable
+/// (POL-4: a restricted or view-once attachment persists no preview bytes or
+/// locators).
+fn previews(
+    media: &Value,
+    members: Option<(&str, &str)>,
+    availability: AttachmentAvailability,
+) -> (Option<ThumbnailDescriptor>, Option<Minithumbnail>) {
+    if availability != AttachmentAvailability::Fetchable {
+        return (None, None);
+    }
+    let Some((thumb_field, mini_field)) = members else {
+        return (None, None);
+    };
+    (
+        media.get(thumb_field).and_then(parse_thumbnail),
+        minithumbnail(media.get(mini_field)),
+    )
+}
+
+/// Parse a TDLib `thumbnail` object: format, dimensions, and the file locator.
+fn parse_thumbnail(value: &Value) -> Option<ThumbnailDescriptor> {
+    let file = parse_file(value.get("file")?)?;
+    Some(ThumbnailDescriptor {
+        format: thumbnail_format(value.get("format")),
+        file_id: file.file_id,
+        remote_id: file.remote_id,
+        remote_unique_id: file.remote_unique_id,
+        size: file.size,
+        width: u32_field(value, "width"),
+        height: u32_field(value, "height"),
+    })
+}
+
+/// Treat one `photoSize` as a thumbnail — its stored bytes are already a JPEG
+/// preview, so the format is fixed rather than read from a `format` member.
+fn photo_size_thumbnail(size: &Value) -> Option<ThumbnailDescriptor> {
+    let file = parse_file(size.get("photo")?)?;
+    Some(ThumbnailDescriptor {
+        format: ThumbnailFormat::Jpeg,
+        file_id: file.file_id,
+        remote_id: file.remote_id,
+        remote_unique_id: file.remote_unique_id,
+        size: file.size,
+        width: u32_field(size, "width"),
+        height: u32_field(size, "height"),
+    })
+}
+
+fn thumbnail_format(value: Option<&Value>) -> ThumbnailFormat {
+    match value
+        .and_then(|value| value.get("@type"))
+        .and_then(Value::as_str)
+    {
+        Some("thumbnailFormatJpeg") => ThumbnailFormat::Jpeg,
+        Some("thumbnailFormatPng") => ThumbnailFormat::Png,
+        Some("thumbnailFormatWebp") => ThumbnailFormat::Webp,
+        Some("thumbnailFormatGif") => ThumbnailFormat::Gif,
+        Some("thumbnailFormatMpeg4") => ThumbnailFormat::Mpeg4,
+        Some("thumbnailFormatTgs") => ThumbnailFormat::Tgs,
+        Some("thumbnailFormatWebm") => ThumbnailFormat::Webm,
+        other => ThumbnailFormat::Unknown {
+            raw_type: other.map(str::to_owned),
+        },
+    }
+}
+
+/// Parse a TDLib `minithumbnail` object. A minithumbnail with no `data` is not
+/// a preview, so it degrades to `None` rather than an empty-bytes descriptor.
+fn minithumbnail(value: Option<&Value>) -> Option<Minithumbnail> {
+    let value = value?;
+    let data_base64 = nonempty_string(value, "data")?;
+    Some(Minithumbnail {
+        width: u32_field(value, "width"),
+        height: u32_field(value, "height"),
+        data_base64,
     })
 }
 
@@ -1524,6 +1743,153 @@ mod tests {
         assert_eq!(
             (attachment.width, attachment.height),
             (Some(240), Some(240))
+        );
+    }
+
+    fn video_with_previews() -> Value {
+        json!({
+            "@type": "messageVideo",
+            "caption": {"text": "clip"},
+            "video": {
+                "duration": 12, "width": 1920, "height": 1080,
+                "file_name": "clip.mp4", "mime_type": "video/mp4",
+                "minithumbnail": {"width": 40, "height": 22, "data": "TDs4 z=="},
+                "thumbnail": {
+                    "@type": "thumbnail",
+                    "format": {"@type": "thumbnailFormatJpeg"},
+                    "width": 320, "height": 180,
+                    "file": {"id": 88, "size": 4000, "remote": {"id": "tr", "unique_id": "tu"}}
+                },
+                "video": {"id": 5, "size": 900_000, "remote": {"id": "r", "unique_id": "u"}}
+            }
+        })
+    }
+
+    #[test]
+    fn media_thumbnail_and_minithumbnail_are_extracted() {
+        let MessageContent::Video { attachment, .. } =
+            normalize_content(&video_with_previews(), OPEN).expect("normalizes")
+        else {
+            panic!("expected Video");
+        };
+        let thumbnail = attachment.thumbnail.expect("thumbnail present");
+        assert_eq!(thumbnail.format, ThumbnailFormat::Jpeg);
+        assert_eq!(thumbnail.file_id, 88);
+        assert_eq!(thumbnail.remote_unique_id.as_deref(), Some("tu"));
+        assert_eq!((thumbnail.width, thumbnail.height), (Some(320), Some(180)));
+        assert_eq!(thumbnail.size, Some(4000));
+        let mini = attachment.minithumbnail.expect("minithumbnail present");
+        assert_eq!((mini.width, mini.height), (Some(40), Some(22)));
+        assert_eq!(mini.data_base64, "TDs4 z==");
+        // The main file locator is unchanged by preview extraction.
+        assert_eq!(attachment.file_id, 5);
+    }
+
+    #[test]
+    fn restricted_and_view_once_media_carry_no_previews() {
+        for protection in [
+            ProtectionFacts {
+                can_be_saved: false,
+                self_destructing: false,
+            },
+            ProtectionFacts {
+                can_be_saved: true,
+                self_destructing: true,
+            },
+        ] {
+            let MessageContent::Video { attachment, .. } =
+                normalize_content(&video_with_previews(), protection).expect("normalizes")
+            else {
+                panic!("expected Video");
+            };
+            assert_ne!(attachment.availability, AttachmentAvailability::Fetchable);
+            assert_eq!(
+                attachment.thumbnail, None,
+                "non-fetchable media must not carry a thumbnail locator (POL-4)"
+            );
+            assert_eq!(
+                attachment.minithumbnail, None,
+                "non-fetchable media must not carry inline preview bytes (POL-4)"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_thumbnail_format_degrades_but_keeps_the_locator() {
+        let format = thumbnail_format(Some(&json!({"@type": "thumbnailFormatHologram"})));
+        assert_eq!(
+            format,
+            ThumbnailFormat::Unknown {
+                raw_type: Some("thumbnailFormatHologram".to_owned())
+            }
+        );
+        assert_eq!(
+            thumbnail_format(None),
+            ThumbnailFormat::Unknown { raw_type: None }
+        );
+    }
+
+    #[test]
+    fn minithumbnail_without_data_is_not_a_preview() {
+        assert_eq!(
+            minithumbnail(Some(&json!({"width": 40, "height": 22}))),
+            None
+        );
+        assert_eq!(minithumbnail(None), None);
+    }
+
+    #[test]
+    fn photo_thumbnail_is_the_smallest_stored_size() {
+        let content = json!({
+            "@type": "messagePhoto",
+            "photo": {
+                "minithumbnail": {"width": 20, "height": 15, "data": "bWluaQ=="},
+                "sizes": [
+                    {"type": "s", "width": 90, "height": 60,
+                     "photo": {"id": 3, "size": 1_000, "remote": {"id": "rs", "unique_id": "us"}}},
+                    {"type": "x", "width": 800, "height": 600,
+                     "photo": {"id": 2, "size": 90_000, "remote": {"id": "rx", "unique_id": "ux"}}}
+                ]
+            }
+        });
+        let MessageContent::Photo { attachment, .. } =
+            normalize_content(&content, OPEN).expect("normalizes")
+        else {
+            panic!("expected Photo");
+        };
+        // The attachment is the largest size; its thumbnail is the smallest.
+        assert_eq!(attachment.file_id, 2);
+        let thumbnail = attachment.thumbnail.expect("photo thumbnail present");
+        assert_eq!(thumbnail.file_id, 3);
+        assert_eq!(thumbnail.format, ThumbnailFormat::Jpeg);
+        assert_eq!((thumbnail.width, thumbnail.height), (Some(90), Some(60)));
+        assert_eq!(
+            attachment
+                .minithumbnail
+                .expect("minithumbnail present")
+                .data_base64,
+            "bWluaQ=="
+        );
+    }
+
+    #[test]
+    fn single_size_photo_has_no_separate_thumbnail() {
+        let content = json!({
+            "@type": "messagePhoto",
+            "photo": {"sizes": [
+                {"type": "x", "width": 800, "height": 600,
+                 "photo": {"id": 2, "size": 90_000, "remote": {"id": "rx", "unique_id": "ux"}}}
+            ]}
+        });
+        let MessageContent::Photo { attachment, .. } =
+            normalize_content(&content, OPEN).expect("normalizes")
+        else {
+            panic!("expected Photo");
+        };
+        assert_eq!(attachment.file_id, 2);
+        assert_eq!(
+            attachment.thumbnail, None,
+            "the only size is the attachment itself, not a distinct preview"
         );
     }
 }
