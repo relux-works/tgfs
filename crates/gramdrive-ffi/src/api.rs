@@ -14,7 +14,10 @@ use std::sync::Arc;
 /// (§ Versioning policy).
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     major: 0,
-    minor: 1,
+    // 0.2.0: shared durable state (crate::shared_state) — layout, role-based
+    // open, item-metadata snapshot reads, data_version change probe, and
+    // coordinator-only corruption recovery. Additive, hence minor.
+    minor: 2,
     patch: 0,
 };
 

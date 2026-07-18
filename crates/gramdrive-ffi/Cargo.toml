@@ -33,6 +33,9 @@ bindgen = ["uniffi/cli"]
 [dependencies]
 gramdrive-engine = { workspace = true }
 gramdrive-model = { workspace = true }
+# Shared durable state across host processes (src/shared_state.rs): the FFI
+# opens the store and serves the provider extension's snapshot reads.
+gramdrive-state = { workspace = true }
 # `tokio` feature: exported async fns are wrapped so tokio-backed primitives
 # (timers, I/O) work regardless of which thread polls the future. The
 # threading model is documented in README.md.

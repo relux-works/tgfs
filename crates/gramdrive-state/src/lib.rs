@@ -32,6 +32,7 @@ pub use gramdrive_model as model;
 mod error;
 mod migrate;
 mod reconcile;
+mod recovery;
 mod repair;
 pub mod repo;
 mod schema;
@@ -43,6 +44,7 @@ pub use reconcile::{
     Finding, LocalStorage, ReconcilePlan, ReconcileReport, Resolution, StorageError, StoredObject,
     Unresolved,
 };
+pub use recovery::{ProbeOutcome, QuarantineReport, probe_database, quarantine_if_corrupt};
 pub use repair::{RepairKind, RepairMarker};
 pub use repo::{ReadTxn, WriteTxn};
 pub use schema::SCHEMA_VERSION;

@@ -11,8 +11,8 @@
 GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings \
-        package package-reproducible tdlib tdlib-smoke tdjson-smoke tdlib-verify \
-        clean-gates
+        smoke-shared-state package package-reproducible tdlib tdlib-smoke \
+        tdjson-smoke tdlib-verify clean-gates
 
 # check — the pre-push gate: everything CI runs.
 check:
@@ -60,6 +60,16 @@ bindings:
 # kotlinc, java; see .scripts/smoke/run_bindings_smoke.py).
 smoke-bindings:
 	python3 .scripts/smoke/run_bindings_smoke.py
+
+# smoke-shared-state — the multi-process shared-container proof: a Rust
+# coordinator process seeds, two concurrent Swift provider processes (the
+# apple/GramDriveSupport package over the packaged artifact) must read
+# identical item metadata, and a watcher process must observe the change
+# doorbell plus the data-version probe across a foreign commit. Needs Xcode;
+# stages `make package` if no artifact is present
+# (see .scripts/smoke/run_shared_state_smoke.py).
+smoke-shared-state:
+	python3 .scripts/smoke/run_shared_state_smoke.py
 
 # --- Artifact packaging ------------------------------------------------------
 # Not gate targets, and deliberately not steps of `check`: they need Xcode and a

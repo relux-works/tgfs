@@ -21,7 +21,7 @@ use crate::schema::ensure_schema;
 ///
 /// Transactions in this crate are short by design; a hold longer than this
 /// is a bug worth surfacing, not worth waiting out.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One configured connection to the state database.
 ///
@@ -108,6 +108,23 @@ impl StateStore {
         Ok(self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    /// SQLite's connection-relative change stamp (`PRAGMA data_version`).
+    ///
+    /// The value differs from a previously observed one exactly when a
+    /// *different* connection — including one in another process — has
+    /// committed since this connection last read it; this connection's own
+    /// commits do not move it. That makes it the cheap "did anything change
+    /// since I last looked?" primitive multi-process change signaling pairs
+    /// with: a doorbell notification says *look*, this stamp says whether
+    /// there is anything new to see. The value is meaningful only relative
+    /// to earlier reads on the same connection — never persist it, never
+    /// compare it across connections or processes.
+    pub fn data_version(&self) -> Result<i64, StateError> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
     }
 
     /// Every open repair marker, oldest first (SYNC-071, NFR-034).

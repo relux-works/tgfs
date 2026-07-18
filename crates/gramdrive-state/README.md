@@ -193,6 +193,30 @@ SQLite's locking is file-based, so `tests/repo_concurrency.rs` exercises
 the real primitives with two connections: a stable read snapshot across a
 foreign commit, two contending writers never double-claiming a transfer,
 and a reader that can never observe a cursor ahead of the state it seals.
+What two connections cannot exercise, `tests/multiprocess.rs` does with
+real processes (TASK-260715-gnsa2s): several writer processes contending
+with no shared memory at all, and a writer SIGKILLed mid-transaction —
+WAL recovery on the next open must discard the dead process's half-written
+work, and the cursor-behind-state invariant must hold through every kill.
+
+Two primitives support cross-process coordination directly:
+
+- **`StateStore::data_version()`** — SQLite's connection-relative change
+  stamp: it moves exactly when *another* connection (any process) has
+  committed since this connection last read it. The cheap "anything new?"
+  probe change signaling pairs with; meaningful only relative to earlier
+  reads on the same connection.
+- **`recovery::probe_database` / `recovery::quarantine_if_corrupt`**
+  (`src/recovery.rs`) — file-level corruption handling. Detection is
+  separate from destruction: the probe only reads (`PRAGMA quick_check`),
+  and quarantine re-probes and moves files — sidecars first, main file
+  last, so a crash mid-quarantine leaves a re-probeable file and never a
+  stale `-wal` beside a fresh database — only when SQLite itself reports
+  `SQLITE_CORRUPT`/`SQLITE_NOTADB`. Exactly one process role (the
+  engine host; enforced at the FFI boundary) may quarantine: two
+  concurrent recoverers could quarantine each other's fresh files. The
+  damaged files are preserved under `quarantine/` for diagnosis, never
+  deleted.
 
 ## Evidence
 
@@ -233,6 +257,16 @@ and a reader that can never observe a cursor ahead of the state it seals.
 - `tests/repo_concurrency.rs` — two connections over one WAL file: stable
   read snapshots, serialized writers with no double-claim, and cursor
   never ahead of state under a concurrent reader.
+- `tests/multiprocess.rs` — the same invariants with real processes
+  (re-executed test binary): three writer processes racing 75 batches and
+  75 serialized counter bumps with an observer asserting cursor-behind-
+  state throughout, and a crash-writer SIGKILLed mid-stream across three
+  rounds — after every kill the file passes `quick_check` and the messages
+  equal exactly the batches the cursor seals.
+- `tests/recovery.rs` — corruption probe and quarantine against real
+  files: deterministic corrupt fixtures (garbage bytes, damaged header),
+  healthy/missing files declined, sidecars quarantined with the main
+  file, and a fresh open on the cleared path.
 - `tests/reconcile.rs` — the NFR-034 fixtures: *missing* (a row for bytes
   that are gone), *extra* (bytes no row claims), and *corruption* (in-flight
   state that outlived its process), each asserted to converge, to converge

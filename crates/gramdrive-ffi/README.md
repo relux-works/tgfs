@@ -2,18 +2,20 @@
 
 The FFI boundary — the only crate native consumers link. Exposes the UniFFI
 contract in `src/api.rs` (provider-neutral async operations, records,
-errors, cancellation, progress) for Swift and Kotlin; Windows/Linux hosts
-consume the crate as a plain Rust dependency instead. Builds as `rlib` +
-`staticlib` + `cdylib`. Provider-neutral by contract (DEC-003): no Telegram
-or OS-native types cross this boundary — paths are strings, times are
-integer milliseconds.
+errors, cancellation, progress) and `src/shared_state.rs` (multi-process
+shared durable state — § Shared state surface) for Swift and Kotlin;
+Windows/Linux hosts consume the crate as a plain Rust dependency instead.
+Builds as `rlib` + `staticlib` + `cdylib`. Provider-neutral by contract
+(DEC-003): no Telegram or OS-native types cross this boundary — paths are
+strings, times are integer milliseconds.
 
 ## Ownership
 
 STORY-260715-2p879f (workspace-and-bindings), EPIC-260715-1poogc
 (shared-rust-core). UniFFI contract and generation pipeline:
 TASK-260715-265gqq; artifact packaging (XCFramework, Android libraries,
-shipped-target list): TASK-260715-3akqs8.
+shipped-target list): TASK-260715-3akqs8; shared-state surface:
+TASK-260715-gnsa2s (STORY-260715-33oacu, macos-engine-host).
 
 ## Binding style: proc-macros, not UDL
 
@@ -134,6 +136,50 @@ languages, measured against uniffi 0.32 generated code:
 Re-evaluate the Swift limitation on every uniffi upgrade; the token contract
 stays either way.
 
+## Shared state surface
+
+`src/shared_state.rs` (TASK-260715-gnsa2s) is how separate host processes —
+on Apple: app, companion agent, File Provider extension — coordinate over
+one durable SQLite database with no shared-memory assumptions
+(PLAT-MAC-003; `.spec/architecture.md`):
+
+- **`shared_state_layout(data_root)`** fixes the file layout under a
+  host-chosen data root (`state/gramdrive.sqlite3`, `state/quarantine/`,
+  `cache/`), so every process derives identical paths from one rule. The
+  data root itself is the host's: on Apple the Swift support package
+  (`apple/GramDriveSupport`) derives it from the App Group container.
+- **`SharedStateStore.open(data_root, role)`** opens the database the one
+  supported way (WAL or refuse, busy timeout, schema ensured; migrations
+  run on open, from either role — they are short, resumable, and
+  serialized by the write lock). `role` names the process's rights:
+  `Coordinator` (the engine host) may recover from corruption;
+  `Provider` (extension, UI) never destroys shared files.
+- **Reads are short snapshots.** `item` / `children` / `child_by_name`
+  each run as one WAL read snapshot: consistent for the call, never
+  blocking the writer, never holding locks between calls. The calls are
+  synchronous and touch disk — call from a background queue. There are
+  **no writes** at this boundary by design: durable state is written by
+  the engine in its host process, and a foreign write surface would
+  invite the extension to mutate state the engine owns (DEC-006).
+- **`data_version()`** is the change probe that pairs with the host's
+  change doorbell (on Apple, a Darwin notification — see
+  `apple/GramDriveSupport`): on a ring or a poll tick, compare against
+  the last value seen on the same handle and re-read only on change.
+- **`quarantine_corrupt_state(data_root, role)`** is corruption recovery:
+  it re-probes the file itself and, only if SQLite reports it corrupt,
+  moves database + sidecars into `state/quarantine/` for a fresh start
+  (the database is a projection; it re-seeds through sync). Coordinator
+  only — two processes recovering concurrently could quarantine each
+  other's fresh files — and detection is separate from destruction, so a
+  misdiagnosed error cannot destroy a healthy database. Mechanism and
+  crash-safety ordering: `gramdrive-state/src/recovery.rs`.
+
+The multi-process behavior behind this surface is proven twice: real
+SIGKILL crash tests and multi-writer stress in
+`gramdrive-state/tests/multiprocess.rs`, and a real two-process Swift
+read-consistency smoke over the packaged artifact
+(`make smoke-shared-state`; `.scripts/smoke/run_shared_state_smoke.py`).
+
 ## Error contract
 
 `DriveError` categories are stable and contractual (NFR-030); the `detail`
@@ -170,10 +216,10 @@ by a product build; toggles no provider or platform code.
 
 ## Dependencies
 
-Internal: `gramdrive-engine`, `gramdrive-model` (any core crate allowed;
-nothing may depend on this crate). External: `uniffi` (runtime + macros),
-`tokio` (`macros`, `sync`, `time`). Platform-specific code: forbidden. See
-`crates/README.md`.
+Internal: `gramdrive-engine`, `gramdrive-model`, `gramdrive-state` (any
+core crate allowed; nothing may depend on this crate). External: `uniffi`
+(runtime + macros), `tokio` (`macros`, `sync`, `time`). Platform-specific
+code: forbidden. See `crates/README.md`.
 
 **License gate status**: the uniffi crates are MPL-2.0, which is outside the
 POL-6 allow list and an owner-accepted named exception per **DEC-021**
@@ -184,5 +230,6 @@ POL-6 allow list and an owner-accepted named exception per **DEC-021**
 
 ```sh
 cargo test -p gramdrive-ffi
-python3 .scripts/smoke/run_bindings_smoke.py   # end-to-end Swift + Kotlin smoke
+python3 .scripts/smoke/run_bindings_smoke.py     # end-to-end Swift + Kotlin smoke
+python3 .scripts/smoke/run_shared_state_smoke.py # two-process shared-state smoke
 ```

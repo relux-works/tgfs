@@ -1,0 +1,60 @@
+// swift-tools-version:6.0
+//
+// GramDriveSupport — the Apple provider-support package (TASK-260715-gnsa2s;
+// `.spec/architecture.md`): App Group container resolution, shared-state
+// access per process role, and the cross-process change doorbell. The app,
+// the companion agent, and the File Provider extension all link this
+// package so every process derives identical container paths and follows
+// the same multi-process rules.
+//
+// The core dependency is a *built artifact*, never committed: `make package`
+// stages the GramDriveCore SwiftPM package (XCFramework + generated
+// bindings) at .temp/packaging/GramDriveCore, and this manifest resolves it
+// by path. Building here without the artifact fails at resolution — run
+// `make package` first, or point GRAMDRIVE_CORE_PACKAGE at a staged
+// artifact. The path dependency's identity comes from its directory name
+// (GramDriveCore), which the packaging pipeline guarantees.
+
+import Foundation
+import PackageDescription
+
+let corePackagePath =
+    ProcessInfo.processInfo.environment["GRAMDRIVE_CORE_PACKAGE"]
+    ?? "../../.temp/packaging/GramDriveCore"
+
+let package = Package(
+    name: "GramDriveSupport",
+    // POL-5 / DEC-017: macOS 14+ arm64 is the v1 support matrix.
+    platforms: [.macOS(.v14)],
+    products: [
+        .library(name: "GramDriveSupport", targets: ["GramDriveSupport"]),
+        // Used by .scripts/smoke/run_shared_state_smoke.py: reader, watcher
+        // and doorbell-poster processes for the two-process smoke.
+        .executable(name: "gramdrive-shared-state-smoke", targets: ["SharedStateSmoke"]),
+    ],
+    dependencies: [
+        .package(name: "GramDriveCore", path: corePackagePath)
+    ],
+    targets: [
+        .target(
+            name: "GramDriveSupport",
+            dependencies: [
+                .product(name: "GramDriveCore", package: "GramDriveCore")
+            ]
+        ),
+        .executableTarget(
+            name: "SharedStateSmoke",
+            dependencies: [
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+        .testTarget(
+            name: "GramDriveSupportTests",
+            dependencies: [
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+    ]
+)

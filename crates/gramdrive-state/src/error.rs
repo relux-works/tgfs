@@ -181,6 +181,40 @@ pub enum StateError {
         /// The host's description of the failure.
         detail: String,
     },
+    /// A filesystem operation on the database's own files failed while
+    /// quarantining a corrupt database ([`crate::recovery`]) — creating the
+    /// quarantine directory, or moving a damaged file into it.
+    QuarantineIo {
+        /// The quarantine step that failed.
+        step: &'static str,
+        /// The underlying I/O failure.
+        source: std::io::Error,
+    },
+}
+
+impl StateError {
+    /// Whether this error reports *file-level* database corruption —
+    /// SQLite's `SQLITE_CORRUPT` ("database disk image is malformed") or
+    /// `SQLITE_NOTADB` ("file is not a database").
+    ///
+    /// This is the [`crate::recovery`] trigger: a `true` here is the one
+    /// condition under which quarantining the file is the correct reaction.
+    /// Row-level decode failures ([`StateError::CorruptRow`],
+    /// [`StateError::CursorCorrupt`]) are deliberately *not* included: they
+    /// can also mean version skew, and destroying the whole file over one
+    /// undecodable row would trade a bounded repair for total loss.
+    /// Wrapper variants ([`StateError::MigrationFailed`]) answer for the
+    /// error they wrap.
+    pub fn is_database_corruption(&self) -> bool {
+        match self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ),
+            Self::MigrationFailed { source, .. } => source.is_database_corruption(),
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for StateError {
@@ -244,6 +278,9 @@ impl std::fmt::Display for StateError {
             Self::LocalStorage { detail } => {
                 write!(f, "local storage could not be inventoried: {detail}")
             }
+            Self::QuarantineIo { step, source } => {
+                write!(f, "quarantine step '{step}' failed: {source}")
+            }
         }
     }
 }
@@ -255,6 +292,7 @@ impl std::error::Error for StateError {
             Self::MigrationFailed { source, .. } => Some(source),
             Self::CursorOutOfScope { source } => Some(source),
             Self::CursorCorrupt { source } => Some(source),
+            Self::QuarantineIo { source, .. } => Some(source),
             Self::UnsupportedSchemaVersion { .. }
             | Self::MigrationRequired { .. }
             | Self::MigrationStalled { .. }
