@@ -69,6 +69,17 @@
 //!   equals page by page, flood-wait backoff advice (SYNC-044), and explicit
 //!   per-chat unavailability for left/inaccessible chats — never a media
 //!   request (SYNC-020), never a silent skip.
+//! - [`live`] — [`LiveMachine`], the deterministic sans-IO ordered live
+//!   message update loop (TASK-260715-10p5zp, SYNC-022/023): TDLib's message
+//!   pushes (`updateNewMessage`/`updateMessageSendSucceeded`, the
+//!   `updateMessageContent`/`updateMessageEdited` edit signals resolved
+//!   through a `getMessage` refresh, and permanent `updateDeleteMessages`)
+//!   become ordered per-chat commits over [`normalize_message`], each carrying
+//!   the cursor advance it justifies. A live message above an unverified
+//!   committed window opens a targeted `getChatHistory` gap bridge — offline
+//!   gaps are re-fetched and committed before the durable cursor moves
+//!   (SYNC-023) — and a failed bridge freezes the cursor explicitly rather
+//!   than letting it lie; the crawl owns recovery then.
 //! - [`folders`] — [`FolderCatalogMachine`], the deterministic sans-IO folder
 //!   (chat filter) catalog reducer (TASK-260715-54nopz): TDLib's
 //!   `updateChatFolders` folds into a normalized folder create/rename/delete/
@@ -103,6 +114,7 @@
 //! [`MessageRecord`]: message::MessageRecord
 //! [`MessageContent::Unsupported`]: message::MessageContent::Unsupported
 //! [`CrawlMachine`]: history::CrawlMachine
+//! [`LiveMachine`]: live::LiveMachine
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
 //! [`UpdateMachine`]: updates::UpdateMachine
 //! [`FolderCatalogMachine`]: folders::FolderCatalogMachine
@@ -121,6 +133,7 @@ pub mod config;
 pub mod error;
 pub mod folders;
 pub mod history;
+pub mod live;
 pub mod message;
 pub mod mock;
 pub mod removal;
@@ -151,6 +164,10 @@ pub use folders::{FolderCatalogBatch, FolderCatalogMachine, FolderDefinition, Fo
 pub use history::{
     ChatCrawl, ChatProgress, ChatUnavailable, CrawlBackoff, CrawlError, CrawlMachine, CrawlPhase,
     CrawlPlan, CrawlPriority, CrawlStep, CrawlWindow, HistoryCommit, UnavailableReason,
+};
+pub use live::{
+    ChatDegraded, LiveBackoff, LiveChange, LiveChat, LiveCommit, LiveError, LiveMachine, LivePlan,
+    LiveStep,
 };
 pub use message::{
     AttachmentAvailability, AttachmentDescriptor, AttachmentKind, ExpiredKind, FormattedText,
