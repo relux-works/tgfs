@@ -7,6 +7,30 @@
 //! appends nothing and changes nothing. Combined with a cursor write under
 //! the same transaction ([`WriteTxn::put_cursor`]), that gives SYNC-022 its
 //! exactly-once *effect* from at-least-once delivery.
+//!
+//! # Retention mapping (POL-3, DEC-015)
+//!
+//! The event log is append-only in both retention modes — an event row is
+//! never removed here, so watermarks (`event_seq`) never rewind and replay
+//! stays recognizable. What the account's [`RetentionMode`] governs is
+//! *content*, applied as the single sanctioned payload purge the schema
+//! trigger allows:
+//!
+//! * **Audit** retains everything observed — every revision keeps its
+//!   payload, and a deletion is a content-preserving tombstone (the deletion
+//!   event itself never carries content, but the prior revisions do).
+//! * **Mirror** keeps only what current Telegram state shows. An edit
+//!   replaces prior revisions: the newest revision keeps its payload and
+//!   every earlier revision of that message is purged to a marker. An
+//!   observed deletion purges *all* of the message's revision content,
+//!   leaving only the id/timestamp markers POL-3 keeps for sync correctness.
+//!
+//! The current revision of a live message always keeps its payload in both
+//! modes — it is the message's current state, the projection's join target,
+//! and what the replay check compares against. The mode only decides whether
+//! *superseded* content (older revisions, deleted messages) survives.
+//! Switching an account's mode mid-life is [`WriteTxn::set_retention_mode`],
+//! which applies the Mirror invariant retroactively.
 
 use gramdrive_model::identity::{
     AccountScope, ChatId, ChatKey, MessageId, MessageKey, SchemaFamily,
@@ -14,7 +38,7 @@ use gramdrive_model::identity::{
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::error::StateError;
-use crate::repo::{ReadTxn, WriteTxn, scope_columns};
+use crate::repo::{ReadTxn, RetentionMode, WriteTxn, scope_columns};
 
 /// One full observed revision of a message: first sight or an edit — the
 /// normalizer does not need to know which, [`WriteTxn::apply_message_changes`]
@@ -424,25 +448,46 @@ impl WriteTxn<'_> {
     /// edit time is older than the projected one is skipped (a history page
     /// fetched before an edit, replayed after it, must not rewind state).
     ///
-    /// The chat's canonical row must exist ([`WriteTxn::upsert_chat`]).
-    /// Atomicity with the cursor is the transaction's job: call
-    /// [`WriteTxn::put_cursor`] under the same transaction (SYNC-022).
+    /// The account's [`RetentionMode`] is read once for the batch and governs
+    /// content purging — Mirror replaces prior revisions and purges deleted
+    /// messages' content, Audit retains everything (module docs). The
+    /// deletion of a delete-for-everyone and a delete-for-me both reach this
+    /// method as one [`MessageChange::Deleted`]: TDLib exposes no reliable
+    /// signal distinguishing them (the archive mirrors this account's own
+    /// view, in which both are permanent removals), so they map identically
+    /// and the archive claims nothing about which it was.
+    ///
+    /// The chat's canonical row must exist ([`WriteTxn::upsert_chat`]), which
+    /// implies its account row exists; a batch for a chat whose account is
+    /// gone is [`StateError::RowNotFound`]. Atomicity with the cursor is the
+    /// transaction's job: call [`WriteTxn::put_cursor`] under the same
+    /// transaction (SYNC-022).
     pub fn apply_message_changes(
         &self,
         chat: &ChatKey,
         changes: &[MessageChange],
     ) -> Result<AppliedChanges, StateError> {
+        let retention = self
+            .read()
+            .retention_mode(chat.scope.account)?
+            .ok_or(StateError::RowNotFound { entity: "account" })?;
         let mut applied = AppliedChanges::default();
         for change in changes {
             match change {
                 MessageChange::Observed(revision) => {
-                    self.apply_revision(chat, revision, &mut applied)?;
+                    self.apply_revision(chat, revision, retention, &mut applied)?;
                 }
                 MessageChange::Deleted {
                     message_id,
                     observed_at_ms,
                 } => {
-                    self.apply_deletion(chat, *message_id, *observed_at_ms, &mut applied)?;
+                    self.apply_deletion(
+                        chat,
+                        *message_id,
+                        *observed_at_ms,
+                        retention,
+                        &mut applied,
+                    )?;
                 }
             }
         }
@@ -453,6 +498,7 @@ impl WriteTxn<'_> {
         &self,
         chat: &ChatKey,
         revision: &MessageRevision,
+        retention: RetentionMode,
         applied: &mut AppliedChanges,
     ) -> Result<(), StateError> {
         type CurrentRevision = (i64, Option<i64>, bool, Option<i64>, Option<Vec<u8>>);
@@ -556,7 +602,16 @@ impl WriteTxn<'_> {
             ])?;
         match event_kind {
             MessageEventKind::Observed => applied.observed += 1,
-            MessageEventKind::Edited => applied.edited += 1,
+            MessageEventKind::Edited => {
+                applied.edited += 1;
+                // Mirror replaces prior revisions: the message keeps only its
+                // current content (the event just appended), every earlier
+                // revision purged to a marker (POL-3). A first observation has
+                // no prior revision, so only an edit triggers this.
+                if retention == RetentionMode::Mirror {
+                    self.purge_message_content(chat, revision.message_id, Some(event_seq))?;
+                }
+            }
             MessageEventKind::Deleted => {}
         }
         Ok(())
@@ -567,6 +622,7 @@ impl WriteTxn<'_> {
         chat: &ChatKey,
         message_id: MessageId,
         observed_at_ms: i64,
+        retention: RetentionMode,
         applied: &mut AppliedChanges,
     ) -> Result<(), StateError> {
         let (account_id, namespace) = scope_columns(&chat.scope);
@@ -617,10 +673,60 @@ impl WriteTxn<'_> {
                         message_id.0,
                         event_seq,
                     ])?;
+                // Mirror purges a deleted message's content entirely: the
+                // tombstone just appended carries none, and every revision it
+                // supersedes is purged to a marker (POL-3). Audit keeps those
+                // revisions as the content-preserving side of the tombstone.
+                if retention == RetentionMode::Mirror {
+                    self.purge_message_content(chat, message_id, None)?;
+                }
                 applied.deleted += 1;
             }
         }
         Ok(())
+    }
+
+    /// Purges the payload of a message's event rows to a marker (the schema's
+    /// single sanctioned `message_events` update) — the Mirror content purge.
+    ///
+    /// `keep` is the one event whose payload survives (the current revision of
+    /// a live message); `None` purges every revision (a deleted message keeps
+    /// no content). Only rows that still carry a payload are touched, so the
+    /// call is idempotent and its changed-count is the content actually
+    /// removed. Deletion-kind rows already hold no payload and are skipped by
+    /// that guard.
+    fn purge_message_content(
+        &self,
+        chat: &ChatKey,
+        message_id: MessageId,
+        keep: Option<i64>,
+    ) -> Result<usize, StateError> {
+        let (account_id, namespace) = scope_columns(&chat.scope);
+        let changed = match keep {
+            Some(keep_seq) => self
+                .conn()
+                .prepare_cached(
+                    "UPDATE message_events SET payload = NULL, payload_schema = NULL
+                     WHERE account_id = ?1 AND namespace_version = ?2 AND chat_id = ?3
+                       AND message_id = ?4 AND payload IS NOT NULL AND event_seq <> ?5",
+                )?
+                .execute(params![
+                    account_id,
+                    namespace,
+                    chat.chat_id.0,
+                    message_id.0,
+                    keep_seq,
+                ])?,
+            None => self
+                .conn()
+                .prepare_cached(
+                    "UPDATE message_events SET payload = NULL, payload_schema = NULL
+                     WHERE account_id = ?1 AND namespace_version = ?2 AND chat_id = ?3
+                       AND message_id = ?4 AND payload IS NOT NULL",
+                )?
+                .execute(params![account_id, namespace, chat.chat_id.0, message_id.0])?,
+        };
+        Ok(changed)
     }
 
     /// Records a chat's history-traversal state (SYNC-021).

@@ -66,6 +66,30 @@ impl RetentionMode {
     }
 }
 
+/// What a [`WriteTxn::set_retention_mode`] call did (POL-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionChange {
+    /// The mode before the call.
+    pub previous: RetentionMode,
+    /// The mode after the call (equal to `previous` when nothing changed).
+    pub current: RetentionMode,
+    /// Event rows whose content this call purged — non-zero only when
+    /// switching to Mirror retroactively purges retained history.
+    pub purged_events: usize,
+    /// Generated documents marked dirty for re-render — every one of the
+    /// account's, because the retention mode is stamped in each document's
+    /// header, so any switch changes their bytes.
+    pub invalidated_docs: usize,
+}
+
+impl RetentionChange {
+    /// Whether the mode actually moved. `false` means the requested mode was
+    /// already in effect and nothing was purged or invalidated.
+    pub fn changed(self) -> bool {
+        self.previous != self.current
+    }
+}
+
 /// One configured account (domain-model § Account).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
@@ -179,6 +203,19 @@ impl ReadTxn<'_> {
         Ok(accounts)
     }
 
+    /// The account's POL-3 retention mode, or `None` if the account is not
+    /// configured. The lean read the change appliers do once per batch, so
+    /// the stored column — not a caller-supplied value — is always what
+    /// governs content purging.
+    pub fn retention_mode(&self, account: AccountKey) -> Result<Option<RetentionMode>, StateError> {
+        let text: Option<String> = self
+            .conn()
+            .prepare_cached("SELECT retention_mode FROM accounts WHERE account_id = ?1")?
+            .query_row(params![account.account_id.0], |row| row.get(0))
+            .optional()?;
+        text.map(|text| RetentionMode::parse(&text)).transpose()
+    }
+
     /// The current scope of an account — its identity at today's namespace
     /// epoch — or `None` if the account is not configured.
     pub fn current_scope(&self, account: AccountKey) -> Result<Option<AccountScope>, StateError> {
@@ -200,11 +237,19 @@ impl ReadTxn<'_> {
 
 impl WriteTxn<'_> {
     /// Inserts the account, or updates every fact of an existing row except
-    /// the namespace epoch and creation time.
+    /// the namespace epoch, creation time, and retention mode.
     ///
     /// The epoch is excluded on purpose: it only moves forward, through
     /// [`WriteTxn::bump_namespace`], so a stale in-memory record replayed
     /// through upsert can never rewind it (DOM-021).
+    ///
+    /// Retention mode is excluded from the *update* for a different reason:
+    /// changing it mid-life is not a plain metadata write — Mirror must purge
+    /// the history Audit retained and both directions invalidate rendered
+    /// documents (POL-3). An upsert that silently flipped the column would
+    /// leave purged-but-still-rendered content, so a mode change goes through
+    /// [`WriteTxn::set_retention_mode`], which does the purge and invalidation
+    /// atomically. On *insert* the record's mode is honored (account setup).
     pub fn upsert_account(&self, record: &AccountRecord) -> Result<(), StateError> {
         if record.auth_state.is_empty() {
             return Err(StateError::InvalidArgument {
@@ -226,7 +271,6 @@ impl WriteTxn<'_> {
                      source_kind = excluded.source_kind,
                      display_name = excluded.display_name,
                      auth_state = excluded.auth_state,
-                     retention_mode = excluded.retention_mode,
                      archive_mode = excluded.archive_mode,
                      secret_ref = excluded.secret_ref,
                      updated_at_ms = excluded.updated_at_ms",
@@ -272,5 +316,96 @@ impl WriteTxn<'_> {
             Some(value) => namespace_from_column("accounts", value),
             None => Err(StateError::RowNotFound { entity: "account" }),
         }
+    }
+
+    /// Changes an account's POL-3 retention mode, applying the consequences
+    /// atomically (DEC-015).
+    ///
+    /// A no-op when the mode is already in effect. Otherwise, in one
+    /// transaction with the column write:
+    ///
+    /// * **Switching to Mirror** purges the history Audit retained — every
+    ///   superseded revision and every deleted message's content across the
+    ///   account, keeping only the current revision of each live message.
+    ///   Content that was already purged, or history never observed, is not
+    ///   invented back; there is no recovery, only forgetting (POL-3 scope).
+    /// * **Switching to Audit** purges nothing and recovers nothing:
+    ///   already-purged content is gone for good. Audit history begins
+    ///   accumulating from this point forward.
+    ///
+    /// Both directions mark every one of the account's generated documents
+    /// dirty, because the retention mode is written into each document's
+    /// header — a switch changes their bytes even where the message set is
+    /// unchanged. The re-render happens through the normal watermark protocol
+    /// (SYNC-024); this call only records that the work is due.
+    ///
+    /// Returns [`RetentionChange`] describing what happened; the account must
+    /// exist ([`StateError::RowNotFound`]).
+    pub fn set_retention_mode(
+        &self,
+        account: AccountKey,
+        mode: RetentionMode,
+        updated_at_ms: i64,
+    ) -> Result<RetentionChange, StateError> {
+        let previous = self
+            .read()
+            .retention_mode(account)?
+            .ok_or(StateError::RowNotFound { entity: "account" })?;
+        if previous == mode {
+            return Ok(RetentionChange {
+                previous,
+                current: mode,
+                purged_events: 0,
+                invalidated_docs: 0,
+            });
+        }
+
+        self.conn()
+            .prepare_cached(
+                "UPDATE accounts SET retention_mode = ?2, updated_at_ms = ?3
+                 WHERE account_id = ?1",
+            )?
+            .execute(params![account.account_id.0, mode.as_str(), updated_at_ms])?;
+
+        // Switching to Mirror applies its invariant retroactively: purge every
+        // event payload that is not the current revision of a live message.
+        // A deleted message's rows are all superseded (is_deleted = 1 excludes
+        // it from the keep set), so its content goes; a live message keeps
+        // exactly the one revision the projection points at.
+        let purged_events = if mode == RetentionMode::Mirror {
+            self.conn()
+                .prepare_cached(
+                    "UPDATE message_events SET payload = NULL, payload_schema = NULL
+                     WHERE account_id = ?1 AND payload IS NOT NULL
+                       AND event_seq NOT IN (
+                           SELECT latest_event_seq FROM messages
+                           WHERE account_id = ?1 AND is_deleted = 0
+                       )",
+                )?
+                .execute(params![account.account_id.0])?
+        } else {
+            0
+        };
+
+        // Every generated document carries the mode in its header, so all of
+        // the account's re-render (SYNC-024). Docs never rendered have no
+        // render_state row and are already stale by absence.
+        let invalidated_docs = self
+            .conn()
+            .prepare_cached(
+                "UPDATE render_state SET dirty = 1
+                 WHERE item_id IN (
+                     SELECT item_id FROM items
+                     WHERE account_id = ?1 AND kind = 'generated_doc'
+                 )",
+            )?
+            .execute(params![account.account_id.0])?;
+
+        Ok(RetentionChange {
+            previous,
+            current: mode,
+            purged_events,
+            invalidated_docs,
+        })
     }
 }

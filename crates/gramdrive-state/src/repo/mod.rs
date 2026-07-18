@@ -56,6 +56,7 @@ mod render;
 mod transfers;
 
 pub use accounts::AccountRecord;
+pub use accounts::RetentionChange;
 pub use accounts::RetentionMode;
 pub use accounts::SourceKind;
 pub use attachments::{AttachmentAvailability, AttachmentFacts, AttachmentState, BlobRecord};
