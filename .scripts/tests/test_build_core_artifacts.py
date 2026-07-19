@@ -240,6 +240,12 @@ class ShippedTargetsTest(unittest.TestCase):
         self.assertEqual([s.triple for s in packaging.SLICES], ["aarch64-apple-darwin"])
         self.assertEqual([s.label for s in packaging.SLICES], ["macos-arm64"])
 
+    def test_swift_arch_spelling_of_the_shipped_triples(self):
+        # `swift build --arch` speaks Apple's arch names, cargo speaks Rust
+        # triples; the cross-link verifier translates between them.
+        self.assertEqual(packaging.swift_arch("aarch64-apple-darwin"), "arm64")
+        self.assertEqual(packaging.swift_arch("x86_64-apple-darwin"), "x86_64")
+
 
 class VerifierReportTest(unittest.TestCase):
     def test_parses_report_among_other_output(self):
@@ -620,13 +626,21 @@ class PipelineTest(unittest.TestCase):
         (out_dir / "GramDriveCoreFFI.modulemap").write_text("module GramDriveCoreFFI {}")
 
     def run_pipeline(self, tmp: Path, out_dir: Path | None = None, **kwargs):
-        """Drive package() with fakes standing in for cargo/xcodebuild/swift."""
+        """Drive package() with fakes standing in for cargo/xcodebuild/swift.
+
+        host_machine defaults to arm64 here so the suite's verdicts do not
+        depend on which CI host happens to run it: the repo suite runs both on
+        the arm64 reference host and on the x86_64 self-hosted runner, and a
+        default of platform.machine() would silently flip the pipeline into
+        cross-link mode on the latter.
+        """
         out_dir = out_dir or (tmp / "out")
         out_dir.mkdir(parents=True, exist_ok=True)
         runner = FakeRunner()
         repo = self.stage(tmp, runner)
 
         report = kwargs.pop("report", '{"contract_version": "0.1.0"}')
+        kwargs.setdefault("host_machine", "arm64")
 
         def scripted(argv, cwd, env=None):
             argv = tuple(str(a) for a in argv)
@@ -634,11 +648,18 @@ class PipelineTest(unittest.TestCase):
             runner.envs.append(env)
             joined = " ".join(argv)
             if "rustc" in joined and "--crate-type" in joined:
-                # A real cargo writes into CARGO_TARGET_DIR; a fake that wrote
-                # anywhere else would hide a pipeline looking in the wrong place.
-                release = Path(env["CARGO_TARGET_DIR"]) / "aarch64-apple-darwin" / "release"
+                # A real cargo writes into CARGO_TARGET_DIR under the triple it
+                # was asked for; a fake that wrote anywhere else would hide a
+                # pipeline looking in the wrong place.
+                triple = argv[argv.index("--target") + 1]
+                release = Path(env["CARGO_TARGET_DIR"]) / triple / "release"
                 release.mkdir(parents=True, exist_ok=True)
                 (release / "libgramdrive_ffi.a").write_bytes(b"archive")
+                return 0, ""
+            if argv[0] == "lipo" and "-create" in joined:
+                output = Path(argv[argv.index("-output") + 1])
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(b"universal-archive")
                 return 0, ""
             if "uniffi-bindgen" in joined and "generate" in joined:
                 self.bindgen_side_effect(Path(argv[argv.index("--out-dir") + 1]))
@@ -802,6 +823,76 @@ class PipelineTest(unittest.TestCase):
                     environ={"HOME": "/h"},
                 )
             self.assertIn("produced no", str(caught.exception))
+
+    def test_manifest_records_native_run_verify_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _, _ = self.run_pipeline(Path(tmp))
+            self.assertEqual(manifest["verify_mode"], "native-run")
+            self.assertIsNone(manifest["host_test_slice"])
+
+    def test_cross_link_verify_on_a_host_that_cannot_run_the_slice(self):
+        # The x86_64 runner staging the arm64-only artifact: the consumer must
+        # be cross-BUILT for the shipped arch (a real resolve + link proof) and
+        # must NOT be run, and the manifest must say what actually happened
+        # rather than presenting a contract version nothing probed.
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, runner, out_dir = self.run_pipeline(Path(tmp), host_machine="x86_64")
+            build = runner.argv_containing("swift build")
+            self.assertIn("--arch", build)
+            self.assertEqual(build[build.index("--arch") + 1], "arm64")
+            self.assertFalse(any("GramDriveVerify" in " ".join(c) for c in runner.calls))
+            self.assertEqual(manifest["verify_mode"], "cross-link-only")
+            self.assertEqual(manifest["contract_version"], "unverified")
+            self.assertIsNone(manifest["host_test_slice"])
+            self.assertTrue((out_dir / "GramDriveCore-unverified.zip").is_file())
+
+    def test_host_test_slice_builds_a_twin_and_runs_the_verifier(self):
+        # --host-test-slice on the x86_64 runner: both triples build from the
+        # same clean target dir, lipo folds them into one archive, xcodebuild
+        # gets exactly one -library, and the verifier executes natively -- so
+        # the contract version is real, and the staging is marked test-only.
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, runner, out_dir = self.run_pipeline(
+                Path(tmp), host_machine="x86_64", host_test_slice=True
+            )
+            targets = [
+                argv[argv.index("--target") + 1]
+                for argv in runner.calls
+                if "--crate-type" in " ".join(argv)
+            ]
+            self.assertEqual(
+                sorted(targets), ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+            )
+            lipo = runner.argv_containing("lipo -create")
+            self.assertIn("-output", lipo)
+            xcf = runner.argv_containing("-create-xcframework")
+            self.assertEqual(sum(1 for a in xcf if a == "-library"), 1)
+            self.assertIn("universal", xcf[xcf.index("-library") + 1])
+            self.assertTrue(any("GramDriveVerify" in " ".join(c) for c in runner.calls))
+            self.assertEqual(manifest["verify_mode"], "native-run")
+            self.assertEqual(manifest["contract_version"], "0.1.0")
+            self.assertEqual(
+                manifest["host_test_slice"]["triple"], "x86_64-apple-darwin"
+            )
+            readme = (out_dir / "GramDriveCore" / "README.md").read_text()
+            self.assertIn("CI test staging", readme)
+            # The shipped slice list must not gain the twin: SLICES is the
+            # product decision and this staging is not it.
+            self.assertEqual(
+                [entry["triple"] for entry in manifest["slices"]],
+                ["aarch64-apple-darwin"],
+            )
+
+    def test_host_test_slice_is_a_noop_on_the_shipping_host(self):
+        # An arm64 host already runs the shipped slice; asking for the twin
+        # must not lipo or change the staged shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, runner, _ = self.run_pipeline(
+                Path(tmp), host_machine="arm64", host_test_slice=True
+            )
+            self.assertFalse(any(argv[0] == "lipo" for argv in runner.calls))
+            self.assertIsNone(manifest["host_test_slice"])
+            self.assertEqual(manifest["verify_mode"], "native-run")
 
     def test_renamed_bindgen_output_is_caught(self):
         # The build succeeds and bindgen exits 0 having written nothing under

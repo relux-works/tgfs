@@ -107,6 +107,13 @@ PRODUCT_NAME = "GramDrive"
 APP_BUNDLE_NAME = f"{PRODUCT_NAME}.app"
 APPEX_BUNDLE_NAME = "GramDriveFileProvider.appex"
 
+# The shipped architecture (POL-5/DEC-017: macOS arm64 is the whole v1 matrix).
+# Passed to every `swift build` explicitly so an x86_64 CI host cross-builds
+# the same arm64 executables an arm64 host builds natively, instead of silently
+# staging its own arch (TASK-260719-1dwaj8); enforced per built product with
+# `lipo -archs` in build_products.
+BUILD_ARCH = "arm64"
+
 # macOS deployment floor (POL-5/DEC-017), matching Package.swift's .macOS(.v14).
 MINIMUM_SYSTEM_VERSION = "14.0"
 
@@ -657,12 +664,23 @@ class AppPackager:
         for spec in BINARIES:
             self.run(
                 f"swift-build-{spec.product}",
-                ("swift", "build", "-c", "release", "--product", spec.product),
+                (
+                    "swift",
+                    "build",
+                    "-c",
+                    "release",
+                    "--arch",
+                    BUILD_ARCH,
+                    "--product",
+                    spec.product,
+                ),
                 cwd=package,
                 env=env,
             )
         code, output = self.runner(
-            ("swift", "build", "-c", "release", "--show-bin-path"), package, env
+            ("swift", "build", "-c", "release", "--arch", BUILD_ARCH, "--show-bin-path"),
+            package,
+            env,
         )
         if code != 0:
             raise StepFailed(f"could not resolve swift bin path:\n{output}")
@@ -672,6 +690,21 @@ class AppPackager:
                 raise StepFailed(
                     f"swift build reported success but {spec.product} is missing "
                     f"from {bin_dir}"
+                )
+        # The arch gate, not a trust-me: a cross-compiling host that quietly
+        # fell back to its own arch would stage binaries the shipped platform
+        # cannot run. `lipo -archs` reads the built file, so the claim is about
+        # the bytes, and anything but exactly the shipped arch fails here.
+        for spec in BINARIES:
+            output = self.run(
+                f"lipo-archs-{spec.product}",
+                ("lipo", "-archs", str(bin_dir / spec.product)),
+            )
+            archs = output.split()
+            if archs != [BUILD_ARCH]:
+                raise StepFailed(
+                    f"{spec.product} was built for {' '.join(archs) or 'no arch'}; "
+                    f"the shipped platform is {BUILD_ARCH} only (POL-5/DEC-017)"
                 )
         return bin_dir
 
@@ -932,6 +965,10 @@ def build_manifest(
         "name": PRODUCT_NAME,
         "product_version": product_version,
         "platform": "macos-arm64",
+        "binary_arch": {
+            "required": BUILD_ARCH,
+            "verified_by": "lipo -archs on every built product (build_products)",
+        },
         "minimum_system_version": MINIMUM_SYSTEM_VERSION,
         "app_group": APP_GROUP,
         "signed": is_signed,

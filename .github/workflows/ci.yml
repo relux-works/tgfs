@@ -37,14 +37,19 @@ concurrency:
 
 jobs:
   rust-core:
-    # The reference host is macOS arm64 (POL-5 / DEC-017) and the core crates
-    # are platform-neutral, so their gate runs on the one target v1 ships;
-    # macos-15 is Apple Silicon. This job runs `--suite all`: the Rust gates
-    # (fmt, clippy, test, architecture, cargo-deny/POL-6) plus the repo gates
-    # (traceability validator, script self-tests) — everything except the
-    # portable secret scan below.
+    # SELF-HOSTED (TASK-260719-1dwaj8). GitHub-hosted runners are blocked by
+    # org billing (macOS and Linux both: runs 29700024728 / 29700024758 failed
+    # at start with the billing error), so every job runs on the persistent
+    # self-hosted mac runner `relux-gramdrive` (label gramdrive-mac).
+    #
+    # DEVIATION from the arm64 reference host (POL-5 / DEC-017): that runner is
+    # an x86_64 Mac, and this job's gates (fmt, clippy, test, architecture,
+    # cargo-deny/POL-6, traceability, script self-tests — everything except the
+    # secret scan below) compile and test the platform-neutral core natively
+    # for x86_64. The shipped target is unchanged: arm64 artifacts are
+    # cross-compiled and arch-verified (lipo/file(1)) in native-ci and release.
     name: rust-core
-    runs-on: macos-15
+    runs-on: [self-hosted, gramdrive-mac]
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -55,18 +60,17 @@ jobs:
         # restates it and it cannot drift. The suite's `toolchain` step then
         # re-verifies the active compiler actually matches before any gate
         # trusts it.
+        #
+        # No hosted-cache step (the Swatinem/rust-cache the hosted runner used):
+        # the cache service sits behind the same blocked billing, and on a
+        # persistent runner incremental state lives in the machine-local
+        # CARGO_TARGET_DIR the runner's .env sets — still speed only, never
+        # correctness, for the same reason as before: toolchain and lockfile
+        # are pinned, and cargo fingerprints rebuilds.
         run: |
           rustup show
           rustc --version
           cargo --version
-
-      - name: Cache cargo registry and build
-        # Speed only, never correctness (AC: cache cannot alter results). The
-        # key includes the rustc version and Cargo.lock, and both the toolchain
-        # and the lockfile are pinned, so a cache hit can only hold artifacts
-        # built from identical inputs. A stale or poisoned cache cannot change a
-        # fmt/clippy/test verdict — only make a miss slower to rebuild.
-        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
 
       - name: Install cargo-deny (pinned)
         uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
@@ -90,11 +94,17 @@ jobs:
           retention-days: 14
 
   secret-scan:
-    # Portable, no Rust toolchain — runs on the cheaper Linux runner (barycenter:
-    # portable jobs on Linux). Its own component because it is the only gate
-    # needing gitleaks, and it is a merge-boundary check.
+    # Portable, no Rust toolchain. Its own component because it is the only
+    # gate needing gitleaks, and it is a merge-boundary check.
+    #
+    # DECISION (TASK-260719-1dwaj8): this job moves to the self-hosted mac
+    # runner rather than staying on ubuntu-24.04 — the billing block covers
+    # hosted Linux minutes too (this exact job failed at start with the billing
+    # error on run 29700024728), and gitleaks is portable. Same version pin,
+    # same checksum discipline; the binary is the darwin_x64 release asset and
+    # the checksum tool is macOS's shasum.
     name: secret-scan
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, gramdrive-mac]
     steps:
       - name: Checkout full history
         # gitleaks git scans every commit; a shallow clone would silently scan
@@ -110,12 +120,12 @@ jobs:
         # download fails the step instead of scanning with an unknown binary.
         env:
           GITLEAKS_VERSION: 8.30.1
-          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          GITLEAKS_SHA256: dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709
         run: |
           set -euo pipefail
-          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_darwin_x64.tar.gz"
           curl -sSfL "$url" -o gitleaks.tar.gz
-          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | shasum -a 256 -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf gitleaks.tar.gz -C "$HOME/.local/bin" gitleaks
           chmod 0755 "$HOME/.local/bin/gitleaks"

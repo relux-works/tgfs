@@ -289,6 +289,8 @@ class PipelineTest(unittest.TestCase):
                 return 0, str(bin_dir) + "\n"
             if joined.startswith("swift build"):
                 return 0, ""
+            if joined.startswith("lipo -archs"):
+                return 0, "arm64\n"
             if "-d --entitlements" in joined:
                 return 0, entitlements_xml_for(argv[-1])
             if "-d --verbose=4" in joined:
@@ -354,6 +356,34 @@ class PipelineTest(unittest.TestCase):
             **kwargs,
         )
         return manifest, calls, out
+
+    def test_swift_builds_target_the_shipped_arch(self):
+        # POL-5/DEC-017 via TASK-260719-1dwaj8: the x86_64 CI host must
+        # cross-build the same arm64 executables an arm64 host builds natively,
+        # so the arch is explicit on every product build and on the bin-path
+        # query that locates their output.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, calls, _ = self.run_pipeline(Path(tmp))
+            builds = [c for c in calls if c[:2] == ("swift", "build")]
+            self.assertTrue(builds)
+            for argv in builds:
+                self.assertIn("--arch", argv)
+                self.assertEqual(argv[argv.index("--arch") + 1], "arm64")
+
+    def test_a_wrong_arch_binary_fails_the_build(self):
+        # A host that quietly fell back to its own arch stages binaries the
+        # shipped platform cannot run; `lipo -archs` reads the built bytes and
+        # anything but exactly arm64 must fail loudly.
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(app.StepFailed) as caught:
+                self.run_pipeline(Path(tmp), extra={"lipo -archs": (0, "x86_64\n")})
+            self.assertIn("arm64 only", str(caught.exception))
+
+    def test_manifest_records_the_enforced_binary_arch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _, _ = self.run_pipeline(Path(tmp))
+            self.assertEqual(manifest["binary_arch"]["required"], "arm64")
+            self.assertIn("lipo -archs", manifest["binary_arch"]["verified_by"])
 
     def test_assembles_the_expected_bundle_layout(self):
         with tempfile.TemporaryDirectory() as tmp:

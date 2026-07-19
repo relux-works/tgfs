@@ -1,8 +1,9 @@
 # Tag-triggered release — the signed, notarized, attested GramDrive.app + dmg and
 # its provenance (TASK-260715-3bhbkv). Mirrors the relux-works/barycenter
-# release.yml pattern: a `v*` tag, macos-15, a Developer ID identity imported
-# from a secret into a THROWAWAY keychain, hardened-runtime signing, dmg,
-# notarize + staple, and GitHub artifact attestation (id-token + attestations).
+# release.yml pattern: a `v*` tag, the self-hosted mac runner (see the job
+# comment), a Developer ID identity imported from a secret into a THROWAWAY
+# keychain, hardened-runtime signing, dmg, notarize + staple, and GitHub
+# artifact attestation (id-token + attestations).
 #
 # WHY A SEPARATE WORKFLOW FROM ci.yml / native-ci.yml. Those gate every PR and
 # main; they read only the checkout, mint no token, and hold no secret. Release
@@ -50,7 +51,23 @@ concurrency:
 jobs:
   release:
     name: release-macos
-    runs-on: macos-15 # POL-5 / DEC-017 reference host (Apple Silicon)
+    # SELF-HOSTED (TASK-260719-1dwaj8): the persistent x86_64 mac runner —
+    # hosted macOS minutes are blocked by org billing. The signed artifacts
+    # stay arm64 (POL-5 / DEC-017): the core is cross-compiled per the SLICES
+    # list and the app executables are built --arch arm64 and arch-verified
+    # with lipo inside build_app_bundle.py. Xcode comes from the runner's .env
+    # (DEVELOPER_DIR), not from a hosted image.
+    #
+    # PERSISTENT-RUNNER SECRET DISCIPLINE — this machine outlives the run, so
+    # the ephemeral-VM assumptions are replaced with explicit cleanup:
+    #   * the throwaway keychain lives in RUNNER_TEMP and is deleted in the
+    #     always() step, which ALSO restores the original default keychain and
+    #     search list (making the throwaway default would otherwise dangle);
+    #   * decoded secret files exist only inside the import step and are
+    #     removed there, with a belt-and-suspenders rm in the cleanup;
+    #   * the always() cleanup wipes .temp, so the workspace keeps no signed
+    #     bundle, dmg or provenance beyond the uploaded artifacts.
+    runs-on: [self-hosted, gramdrive-mac]
     # POL-8 / DEC-020 single human approval gate (see header).
     environment: release
     permissions:
@@ -63,7 +80,13 @@ jobs:
         # profile for this run; deleted in the always() cleanup step. Kept in
         # RUNNER_TEMP so it never lands in the workspace or a cache. Exported here
         # because the `runner` context is not available in a job-level `env:`.
-        run: echo "KEYCHAIN_PATH=$RUNNER_TEMP/gramdrive-signing.keychain-db" >> "$GITHUB_ENV"
+        # The original default keychain is recorded now so the cleanup can
+        # restore it — on a persistent runner "whatever it was" still matters
+        # after the run.
+        run: |
+          echo "KEYCHAIN_PATH=$RUNNER_TEMP/gramdrive-signing.keychain-db" >> "$GITHUB_ENV"
+          original="$(security default-keychain -d user | sed 's/^[[:space:]]*//;s/"//g')"
+          echo "ORIGINAL_DEFAULT_KEYCHAIN=$original" >> "$GITHUB_ENV"
 
       - name: Checkout full history and tags
         # Version stamping reads `git describe --tags` (marketing version) and
@@ -225,11 +248,26 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Delete the signing keychain
+      - name: Delete the signing keychain and restore the runner's keychain state
         # Always, even on failure: the throwaway keychain and any decoded secret
-        # file must never outlive the run. The runner is ephemeral, but leaving
-        # nothing behind is the contract, not a convenience.
+        # file must never outlive the run. On this PERSISTENT runner that
+        # contract carries further than the ephemeral-VM original
+        # (TASK-260719-1dwaj8): the throwaway was made the default keychain and
+        # put on the search list, so both are restored, and the workspace's
+        # .temp — the signed bundle, dmg and provenance, all already uploaded
+        # as artifacts above — is wiped so nothing release-related stays on the
+        # machine outside the run.
         if: always()
         run: |
           security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" 2>/dev/null || true
+          # Drop the (now deleted) throwaway from the search list, keeping the
+          # rest of the list as it was; then restore the recorded default.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s \
+            $(security list-keychains -d user | sed 's/"//g' | grep -v "gramdrive-signing.keychain-db") \
+            2>/dev/null || true
+          if [ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" 2>/dev/null || true
+          fi
+          rm -rf .temp

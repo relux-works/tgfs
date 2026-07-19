@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # The repo runner registered by TASK-260719-1dwaj8 (relux, x86_64 mac).
+  labels:
+    - gramdrive-mac

@@ -48,14 +48,24 @@ concurrency:
 jobs:
   tdlib:
     # The pinned TDLib tdjson artifact GramDrive's local Telegram source links
-    # against, built from source and cached on the pin. Its own component job
-    # (barycenter one-job-per-component): the apple legs below build the core
-    # mock-only and do not consume it, but native release paths and the tdjson
-    # runtime do, so native CI proves it builds reproducibly and its link smoke
-    # passes. Cache-first: a warm run restores the artifact and re-runs only the
-    # fast Rust link smoke; the from-source C++ build happens on a cold cache.
+    # against. Its own component job (barycenter one-job-per-component): the
+    # apple legs below build the core mock-only and do not consume it, but
+    # native release paths and the tdjson runtime do.
+    #
+    # SELF-HOSTED REALITY (TASK-260719-1dwaj8). The x86_64 runner cannot
+    # cross-build the pinned *arm64* TDLib (the C++ build links OpenSSL, and
+    # brew on an Intel host has only x86_64 OpenSSL), so the from-source cold
+    # path moved to the arm64 host that owns the artifact: the runner-local
+    # cache below is SEEDED from that host (make tdlib there, then rsync
+    # .temp/tdlib/out to ~/gramdrive-ci/cache/tdlib-<key>/out on the runner),
+    # and this job proves the seeded artifact — file(1) says arm64, and the
+    # Rust link smoke cross-links it for the shipped target. The runtime probe
+    # (call the C JSON interface, read the version) ran on the arm64 build
+    # host; the artifact's manifest.json records that build. actions/cache is
+    # gone for the same reason the hosted runners are: the cache service sits
+    # behind the blocked billing.
     name: tdlib
-    runs-on: macos-15
+    runs-on: [self-hosted, gramdrive-mac]
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -66,34 +76,45 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-
-      - name: Cache the pinned TDLib artifact
+      - name: Restore the pinned TDLib artifact (runner-local cache)
         id: tdlib-cache
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          # The pin is a constant in build_tdlib.py, so hashing that file keys
-          # the cache to the exact TDLib commit and build recipe: a bump misses,
-          # an unchanged pin hits.
-          path: .temp/tdlib/out
-          key: tdlib-${{ runner.os }}-${{ hashFiles('.scripts/tdlib/build_tdlib.py') }}
+        # Key discipline is unchanged from the hosted actions/cache version:
+        # the hash of build_tdlib.py pins the exact TDLib commit and recipe,
+        # so a pin bump misses (and needs a fresh seed from the arm64 host).
+        run: |
+          set -euo pipefail
+          key="tdlib-$(shasum -a 256 .scripts/tdlib/build_tdlib.py | cut -c1-16)"
+          cache_dir="$HOME/gramdrive-ci/cache/$key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          if [ -d "$cache_dir/out" ]; then
+            mkdir -p .temp/tdlib
+            rm -rf .temp/tdlib/out
+            cp -R "$cache_dir/out" .temp/tdlib/out
+            echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Install TDLib build dependencies (cold cache only)
+      - name: Fail actionably on a cold cache
+        # An honest gate, not a silent skip: this host cannot rebuild the
+        # arm64 artifact, so a cache miss is a seeding task, and the failure
+        # says exactly what to run where.
         if: steps.tdlib-cache.outputs.cache-hit != 'true'
-        run: brew install cmake gperf openssl@3
+        run: |
+          echo "::error::runner-local TDLib cache miss for key '${{ steps.tdlib-cache.outputs.key }}'. Cross-building arm64 TDLib on this x86_64 host is blocked (arm64 OpenSSL deps). Seed from an arm64 host: 'make tdlib' there, then rsync .temp/tdlib/out to ~/gramdrive-ci/cache/${{ steps.tdlib-cache.outputs.key }}/out on the runner (TASK-260719-1dwaj8)."
+          exit 1
 
-      - name: Build TDLib from source (cold cache only)
-        # build_tdlib.py runs its Rust link smoke as its final step, so a cold
-        # build is already proven end to end here.
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
-        run: make tdlib
+      - name: Prove the restored artifact is the shipped architecture (file(1))
+        run: |
+          set -euo pipefail
+          file .temp/tdlib/out/lib/libtdjson.dylib
+          file .temp/tdlib/out/lib/libtdjson.dylib | grep -q "arm64"
 
-      - name: Prove the restored TDLib artifact (warm cache only)
-        # Re-link the cached libtdjson through the Rust link smoke: a cache that
-        # restored a broken artifact fails here instead of being trusted.
-        if: steps.tdlib-cache.outputs.cache-hit == 'true'
-        run: make tdlib-smoke
+      - name: Prove the restored artifact still links (cross-link smoke)
+        # cargo build --target aarch64-apple-darwin against the staged dylib:
+        # a real link of the shipped target on this host; execution is the
+        # arm64 build host's half (see the job comment).
+        run: make tdlib-smoke-link
 
       - name: Upload TDLib provenance
         if: always()
@@ -107,10 +128,20 @@ jobs:
   apple-build-test:
     # The macOS native leg: compile and unit-test apple/GramDriveSupport (the
     # File Provider extension, companion agent, menu-bar shell, shared state)
-    # against the staged GramDriveCore, through the pinned `apple` suite. macos-15
-    # is Apple Silicon, the POL-5 reference host.
+    # against the staged GramDriveCore, through the pinned `apple` suite.
+    #
+    # SELF-HOSTED DEVIATION (TASK-260719-1dwaj8, POL-5 / DEC-017): the runner
+    # is x86_64, and a test suite cannot execute arm64 binaries there — so the
+    # core is staged with `make package-host-test`, which lipo's an x86_64
+    # twin of the same source into the staged slice. swift build + swift test
+    # then run NATIVELY against that twin: the tests really execute, and the
+    # deviation is that they exercise the x86_64 build of the source rather
+    # than the shipped arm64 bytes — the same deviation ci.yml's rust-core
+    # documents for cargo test. The staging's manifest and README record it,
+    # and the shipped arm64 artifact is proven by apple-package-unsigned and
+    # release, which stage arm64-only and arch-verify every binary.
     name: apple-build-test
-    runs-on: macos-15
+    runs-on: [self-hosted, gramdrive-mac]
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -120,19 +151,19 @@ jobs:
           fetch-depth: 0
 
       - name: Install the pinned Rust toolchain
+        # No hosted-cache step: see ci.yml rust-core (persistent runner,
+        # machine-local CARGO_TARGET_DIR from the runner's .env).
         run: |
           rustup show
           rustc --version
           cargo --version
 
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-
-      - name: Stage the GramDriveCore artifact
-        # The Swift package resolves GramDriveCore by path; `make package` builds
+      - name: Stage the GramDriveCore artifact (host-test slice)
+        # The Swift package resolves GramDriveCore by path; the staging builds
         # the XCFramework + bindings into .temp/packaging/GramDriveCore and
         # writes its own manifest. It builds the core mock-only (no TDLib).
-        run: make package
+        # package-host-test, not package: see the job comment.
+        run: make package-host-test
 
       - name: Run acceptance suite (apple)
         # The same entrypoint a developer runs (`make check-apple` shorthand):
@@ -155,8 +186,15 @@ jobs:
     # entitlement plists generated — then STOP before codesign. Proves the
     # packaging/assembly contract on a runner that holds no Developer ID identity.
     # Gated on the build-test leg: there is nothing to package if it is red.
+    #
+    # SELF-HOSTED (TASK-260719-1dwaj8): this leg stages the SHIPPED shape —
+    # `make package` (arm64-only core; on this x86_64 host the consumer verify
+    # downgrades to cross-link-only, recorded in the staging manifest) and
+    # arm64 cross-built executables (--arch arm64, enforced per product with
+    # lipo -archs inside build_app_bundle.py). The file(1) step below prints
+    # the evidence into the job log.
     name: apple-package-unsigned
-    runs-on: macos-15
+    runs-on: [self-hosted, gramdrive-mac]
     needs: apple-build-test
     steps:
       - name: Checkout
@@ -167,14 +205,34 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup show
 
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-
       - name: Stage the GramDriveCore artifact
         run: make package
 
       - name: Assemble the unsigned app bundle (no Developer ID)
         run: python3 .scripts/apple-app/build_app_bundle.py --unsigned --out-dir .temp/app-packaging
+
+      - name: Verify every staged Mach-O is arm64 (file(1) evidence)
+        # build_app_bundle.py already fails on a wrong-arch product via
+        # lipo -archs; this step re-reads the assembled bundle with file(1)
+        # and prints each verdict, so the run log itself carries the proof
+        # (task AC: cross-built binaries are arm64 per file(1)).
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' f; do
+            info="$(file "$f")"
+            case "$info" in
+              *Mach-O*)
+                found=1
+                echo "$info"
+                if ! printf '%s' "$info" | grep -q "arm64"; then
+                  echo "::error::not arm64: $f"
+                  exit 1
+                fi
+                ;;
+            esac
+          done < <(find .temp/app-packaging/GramDrive.app -type f -print0)
+          test "$found" -eq 1
 
       - name: Upload unsigned-package provenance
         if: always()

@@ -11,10 +11,10 @@
 GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo check-security check-apple gates fmt build test bindings \
-        smoke-bindings smoke-shared-state smoke-agent-lifecycle package \
+        smoke-bindings smoke-shared-state smoke-agent-lifecycle package package-host-test \
         package-reproducible package-app package-app-unsigned package-app-notarize \
-        release-provenance tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates \
-        accept-macos accept-macos-runsheet
+        release-provenance tdlib tdlib-smoke tdlib-smoke-link tdjson-smoke tdlib-verify \
+        clean-gates accept-macos accept-macos-runsheet
 
 # check — the pre-push gate: the core and repo suites (what CI's rust-core job
 # runs). Secret scanning is a separate suite (make check-security) because it
@@ -139,6 +139,15 @@ accept-macos-runsheet:
 package:
 	python3 .scripts/packaging/build_core_artifacts.py
 
+# package-host-test — CI staging for a macOS host that cannot execute the
+# shipped arm64 slice (the x86_64 self-hosted runner, TASK-260719-1dwaj8): the
+# shipped slice plus a host-arch twin of the same source lipo'd into the
+# archive, so the packaging verifier and the apple suite's tests can run
+# natively. The manifest and README of that staging say so. Never a release
+# input: release staging is `make package` and stays arm64-only (POL-5/DEC-017).
+package-host-test:
+	python3 .scripts/packaging/build_core_artifacts.py --host-test-slice
+
 # package-reproducible — build the shipped library at two different paths from
 # clean and compare bytes. The manifest's path_independent claim is only worth
 # the check behind it, and a check that does not vary the path cannot falsify it.
@@ -210,6 +219,17 @@ tdlib:
 tdlib-smoke:
 	GRAMDRIVE_TDLIB_ARTIFACT_DIR="$(CURDIR)/.temp/tdlib/out" \
 		cargo run --quiet --release --manifest-path .scripts/tdlib/link-smoke/Cargo.toml
+
+# tdlib-smoke-link — cross-link the staged arm64 artifact without executing it:
+# the smoke binary is built --target aarch64-apple-darwin against the staged
+# libtdjson, which proves the artifact still links for the shipped target on a
+# host that cannot run it (the x86_64 runner, TASK-260719-1dwaj8). The runtime
+# probe (call the C JSON interface, read the version) ran on the arm64 host
+# that built the artifact; its manifest.json records that build.
+tdlib-smoke-link:
+	GRAMDRIVE_TDLIB_ARTIFACT_DIR="$(CURDIR)/.temp/tdlib/out" \
+		cargo build --quiet --release --target aarch64-apple-darwin \
+		--manifest-path .scripts/tdlib/link-smoke/Cargo.toml
 
 # tdjson-smoke — run the gramdrive-source-tdjson wrapper's real-linkage smoke
 # against the staged artifact. The env variable is the gate: with it set, the
