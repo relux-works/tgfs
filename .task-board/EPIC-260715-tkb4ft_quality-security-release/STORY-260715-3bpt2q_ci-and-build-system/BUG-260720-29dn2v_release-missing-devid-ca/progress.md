@@ -1,5 +1,5 @@
 ## Status
-blocked
+done
 
 ## Assigned To
 [reviewer] reviewer (claude)
@@ -8,7 +8,7 @@ blocked
 2026-07-19T20:39:38Z
 
 ## Last Update
-2026-07-19T21:06:24Z
+2026-07-19T21:46:16Z
 
 ## Blocked By
 - (none)
@@ -18,7 +18,7 @@ blocked
 
 ## Checklist
 - [x] DeveloperIDG2CA.cer downloaded with pinned sha256 and imported into the throwaway keychain in the same import step; find-identity check >=1
-- [ ] Unpublished v0.1.0 tag re-pointed to the fix commit; release run on gramdrive-mac green end-to-end incl. notarization and GitHub Release with dmg asset
+- [x] Unpublished v0.1.0 tag re-pointed to the fix commit; release run on gramdrive-mac green end-to-end incl. notarization and GitHub Release with dmg asset
 - [x] actionlint clean; keychain-sim on relux still clean after run
 - [x] Code written per task description and AC
 - [x] Relevant tests written for new or changed behavior and passing

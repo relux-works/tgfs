@@ -1,5 +1,5 @@
 ## Status
-blocked
+done
 
 ## Assigned To
 [reviewer] reviewer (claude)
@@ -8,7 +8,7 @@ blocked
 2026-07-19T21:19:41Z
 
 ## Last Update
-2026-07-19T21:36:13Z
+2026-07-19T21:46:16Z
 
 ## Blocked By
 - (none)
@@ -44,6 +44,7 @@ BLOCKED (not done): the remaining two AC clauses — release run green end-to-en
 EXACT HUMAN INPUT NEEDED: commit+merge the fix to main; git tag -f v0.1.0 <sha> && git push -f origin v0.1.0; approve the environment:release gate; confirm green run + job-summary shows attestation: unavailable (private-repo plan) + v0.1.0 Release carries the dmg. Then this closes done, no code rework. Full verdict: BUG-260720-116eli_reviewer-verdict.md.
 agent completed: [reviewer] reviewer (claude) (exit=0)
 spawn run completed: claude (run=RUN-260719-afaa0f, pid=14260, exit=0)
+Release run 29704670509 GREEN end-to-end on gramdrive-mac; v0.1.0 GitHub Release live with GramDrive-0.1.0.dmg; local verify: stapler validate OK, spctl accepted source=Notarized Developer ID. Attestation degraded as designed (private-repo plan), recorded in manifest+summary.
 
 ## Precondition Resources
 (none)
