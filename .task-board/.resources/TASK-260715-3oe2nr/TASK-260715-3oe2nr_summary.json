@@ -1,0 +1,569 @@
+{
+  "schema": 1,
+  "kind": "macos-native-acceptance",
+  "run_id": "local-accept-macos",
+  "commit": "23cd3c2524a85efe74cf35914e823a8e1336401a",
+  "started_at": "2026-07-19T18:50:55.020123+00:00",
+  "environment": {
+    "ready": false,
+    "macos_version": "26.5",
+    "arch": "arm64",
+    "app_path": ".temp/app-packaging/GramDrive.app",
+    "signature_valid": false,
+    "gatekeeper": "rejected",
+    "fileproviderctl_available": true,
+    "app_group_container": null,
+    "reasons": [
+      ".temp/app-packaging/GramDrive.app failed codesign --verify --deep --strict"
+    ]
+  },
+  "result": "prepared",
+  "scenarios": [
+    {
+      "key": "registration",
+      "title": "Domain registration",
+      "spec_refs": [
+        "PLAT-MAC-001",
+        "SYNC-070",
+        "gate:macOS-spike"
+      ],
+      "gate": "the account's File Provider domain registers and appears in Finder's sidebar",
+      "machine_verdict": "fail",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "domain-present",
+          "purpose": "the GramDrive provider domain is registered with the system",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "fail",
+          "detail": "GramDrive File Provider domain is registered \u2014 command exit 124",
+          "log": "registration.domain-present.log"
+        },
+        {
+          "name": "domain-log",
+          "purpose": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "command": [
+            "log",
+            "show",
+            "--last",
+            "1h",
+            "--style",
+            "compact",
+            "--predicate",
+            "subsystem == \"com.reluxworks.gramdrive\" && category == \"file-provider-domains\""
+          ],
+          "status": "captured",
+          "detail": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "log": "registration.domain-log.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "sidebar-entry",
+          "action": "open Finder after authorizing the test account",
+          "expected": "a GramDrive location for the account appears under Locations in the sidebar",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "enumeration",
+      "title": "Enumeration (dataless placeholders)",
+      "spec_refs": [
+        "PLAT-MAC-004",
+        "SYNC-003",
+        "SYNC-040",
+        "gate:macOS-spike"
+      ],
+      "gate": "Finder shows the chat tree as stable dataless placeholders, no content hydrated by browsing",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "fileproviderctl-dump",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "enumeration.fileproviderctl-dump.log"
+        },
+        {
+          "name": "cloudstorage-root",
+          "purpose": "list the File Provider mount root and its dataless markers",
+          "command": [
+            "sh",
+            "-c",
+            "ls -la@O ~/Library/CloudStorage 2>&1 || true"
+          ],
+          "status": "captured",
+          "detail": "list the File Provider mount root and its dataless markers",
+          "log": "enumeration.cloudstorage-root.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "tree-visible",
+          "action": "browse the GramDrive location down to a chat folder",
+          "expected": "the Account/Main/<chat> tree renders; message/media items show as not-yet-downloaded (cloud/download badge), and browsing downloads nothing",
+          "verdict": "pending"
+        },
+        {
+          "name": "no-eager-hydrate",
+          "action": "watch the download indicator while scrolling a large chat folder",
+          "expected": "no file starts downloading merely from being listed (SYNC-040)",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "hydrate",
+      "title": "Hydration of a dataless file",
+      "spec_refs": [
+        "PLAT-MAC-004",
+        "SYNC-041",
+        "SYNC-042",
+        "gate:macOS-spike"
+      ],
+      "gate": "opening a dataless file streams the correct bytes and promotes it atomically",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "pre-open-dataless",
+          "purpose": "placeholder: operator records `stat -f '%Sf' <file>` before opening to show the dataless flag; captured in the evidence form",
+          "command": [
+            "sh",
+            "-c",
+            "true"
+          ],
+          "status": "captured",
+          "detail": "placeholder: operator records `stat -f '%Sf' <file>` before opening to show the dataless flag; captured in the evidence form",
+          "log": "hydrate.pre-open-dataless.log"
+        },
+        {
+          "name": "hydration-log",
+          "purpose": "capture the full GramDrive unified log for this window (com.reluxworks.gramdrive, all categories)",
+          "command": [
+            "log",
+            "show",
+            "--last",
+            "1h",
+            "--style",
+            "compact",
+            "--predicate",
+            "subsystem == \"com.reluxworks.gramdrive\""
+          ],
+          "status": "captured",
+          "detail": "capture the full GramDrive unified log for this window (com.reluxworks.gramdrive, all categories)",
+          "log": "hydrate.hydration-log.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "open-file",
+          "action": "double-click a known dataless media file (e.g. a fixture image)",
+          "expected": "it downloads, opens, and its bytes/size match the known fixture (SYNC-042 atomic promote)",
+          "verdict": "pending"
+        },
+        {
+          "name": "materialized-after",
+          "action": "check the file's Finder badge after it opens",
+          "expected": "the file now shows as downloaded/materialized, not a placeholder",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "cancel",
+      "title": "Cancellation of an in-flight hydration",
+      "spec_refs": [
+        "PLAT-MAC-004",
+        "SYNC-043",
+        "SYNC-005",
+        "gate:macOS-spike"
+      ],
+      "gate": "cancelling a download stops promptly and leaves the item safely dataless, not corrupt",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "fileproviderctl-dump-after-cancel",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "cancel.fileproviderctl-dump-after-cancel.log"
+        },
+        {
+          "name": "cancel-log",
+          "purpose": "capture the full GramDrive unified log for this window (com.reluxworks.gramdrive, all categories)",
+          "command": [
+            "log",
+            "show",
+            "--last",
+            "1h",
+            "--style",
+            "compact",
+            "--predicate",
+            "subsystem == \"com.reluxworks.gramdrive\""
+          ],
+          "status": "captured",
+          "detail": "capture the full GramDrive unified log for this window (com.reluxworks.gramdrive, all categories)",
+          "log": "cancel.cancel-log.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "cancel-download",
+          "action": "start downloading a large file, then cancel it from Finder's progress UI",
+          "expected": "the download stops promptly; no partial file is presented as complete",
+          "verdict": "pending"
+        },
+        {
+          "name": "reopen-after-cancel",
+          "action": "open the same file again after cancelling",
+          "expected": "it hydrates cleanly from scratch (resumable/disposable state, SYNC-043)",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "pin",
+      "title": "Offline pinning",
+      "spec_refs": [
+        "PLAT-MAC-004",
+        "SYNC-051",
+        "gate:macOS-spike"
+      ],
+      "gate": "pinning keeps content offline; it survives eviction pressure",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "fileproviderctl-dump-pins",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "pin.fileproviderctl-dump-pins.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "keep-downloaded",
+          "action": "right-click a materialized file and choose \"Keep Downloaded\" (pin)",
+          "expected": "the file is marked always-kept-offline",
+          "verdict": "pending"
+        },
+        {
+          "name": "pin-survives",
+          "action": "trigger cache pressure / eviction (or the companion's evict action) and re-check the pinned file",
+          "expected": "the pinned file stays materialized while unpinned content may evict (SYNC-051)",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "update",
+      "title": "Title/order change keeps stable identity",
+      "spec_refs": [
+        "PLAT-MAC-002",
+        "SYNC-026",
+        "SYNC-045",
+        "gate:macOS-spike"
+      ],
+      "gate": "a chat title/order change updates the appearance without breaking item identity",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "fileproviderctl-dump-before-update",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "update.fileproviderctl-dump-before-update.log"
+        },
+        {
+          "name": "update-log",
+          "purpose": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "command": [
+            "log",
+            "show",
+            "--last",
+            "1h",
+            "--style",
+            "compact",
+            "--predicate",
+            "subsystem == \"com.reluxworks.gramdrive\" && category == \"file-provider-domains\""
+          ],
+          "status": "captured",
+          "detail": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "log": "update.update-log.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "rename-observed",
+          "action": "change the chat's Telegram title (or its dialog order) and let the change sync",
+          "expected": "the Finder folder's display name/position updates to match",
+          "verdict": "pending"
+        },
+        {
+          "name": "identity-stable",
+          "action": "confirm a previously materialized or pinned file inside that chat after the rename",
+          "expected": "the file is still materialized/pinned \u2014 its identity did not change (SYNC-026/045)",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "restart",
+      "title": "Provider / app process restart",
+      "spec_refs": [
+        "PLAT-MAC-001",
+        "SYNC-004",
+        "SYNC-031",
+        "NFR-004",
+        "gate:macOS-spike"
+      ],
+      "gate": "after a provider/app restart Finder shows stable placeholders and materialized state persists",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "agent-launchctl",
+          "purpose": "capture the companion agent's launchd state before/after restart",
+          "command": [
+            "sh",
+            "-c",
+            "launchctl print gui/$(id -u)/com.reluxworks.gramdrive.agent 2>&1 | head -40 || true"
+          ],
+          "status": "captured",
+          "detail": "capture the companion agent's launchd state before/after restart",
+          "log": "restart.agent-launchctl.log"
+        },
+        {
+          "name": "fileproviderctl-dump-after-restart",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "restart.fileproviderctl-dump-after-restart.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "restart-provider",
+          "action": "quit and relaunch GramDrive (or reboot); reopen the GramDrive location in Finder",
+          "expected": "the same chat tree and stable placeholders reappear (identity survives restart, SYNC-004)",
+          "verdict": "pending"
+        },
+        {
+          "name": "materialized-persists",
+          "action": "check a file that was materialized/pinned before the restart",
+          "expected": "it is still materialized/pinned; no re-download of already-local content",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "repair",
+      "title": "User-triggered domain repair",
+      "spec_refs": [
+        "PLAT-MAC-004",
+        "SYNC-070",
+        "SYNC-071",
+        "NFR-034",
+        "gate:macOS-spike"
+      ],
+      "gate": "the companion \"Repair File Provider Domains\" action rebuilds provider state without data loss",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "fileproviderctl-dump-before-repair",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "repair.fileproviderctl-dump-before-repair.log"
+        },
+        {
+          "name": "repair-log",
+          "purpose": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "command": [
+            "log",
+            "show",
+            "--last",
+            "1h",
+            "--style",
+            "compact",
+            "--predicate",
+            "subsystem == \"com.reluxworks.gramdrive\" && category == \"file-provider-domains\""
+          ],
+          "status": "captured",
+          "detail": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "log": "repair.repair-log.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "run-repair",
+          "action": "invoke the companion menu action \"Repair File Provider Domains\u2026\"",
+          "expected": "a lost account domain is re-registered and recovers its existing Finder state; strays are cleaned with downloads preserved (SYNC-071)",
+          "verdict": "pending"
+        },
+        {
+          "name": "no-total-teardown",
+          "action": "observe repair when the canonical account set reads empty while a domain is still registered",
+          "expected": "repair refuses the total teardown and leaves domains in place (TotalTeardownPolicy.refuse)",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "upgrade",
+      "title": "In-place upgrade",
+      "spec_refs": [
+        "PLAT-004",
+        "NFR-013",
+        "SYNC-072",
+        "gate:macOS-spike"
+      ],
+      "gate": "installing a newer signed build over the old one preserves domains, pins, and materialized state",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "app-version-before",
+          "purpose": "record the installed app version before the upgrade",
+          "command": [
+            "sh",
+            "-c",
+            "defaults read '/Applications/GramDrive.app/Contents/Info' CFBundleShortVersionString 2>&1 || true"
+          ],
+          "status": "captured",
+          "detail": "record the installed app version before the upgrade",
+          "log": "upgrade.app-version-before.log"
+        },
+        {
+          "name": "fileproviderctl-dump-before-upgrade",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "upgrade.fileproviderctl-dump-before-upgrade.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "install-over",
+          "action": "install the newer signed build over the existing one and relaunch",
+          "expected": "the app upgrades; the launch reconcile re-registers the same domains without wiping Finder state",
+          "verdict": "pending"
+        },
+        {
+          "name": "state-survives-upgrade",
+          "action": "check domains, pins, and materialized files after the upgrade",
+          "expected": "all survive; any DB/schema migration is transactional/resumable (NFR-013/SYNC-072)",
+          "verdict": "pending"
+        }
+      ]
+    },
+    {
+      "key": "remove",
+      "title": "Account removal / uninstall cleanup",
+      "spec_refs": [
+        "PLAT-MAC-004",
+        "PLAT-004",
+        "SYNC-062",
+        "gate:macOS-spike"
+      ],
+      "gate": "removing the account (or uninstalling) tears the domain down cleanly with no orphan state",
+      "machine_verdict": "no-machine-checks",
+      "human_verdict": "pending",
+      "probes": [
+        {
+          "name": "fileproviderctl-dump-after-remove",
+          "purpose": "capture current File Provider domain + item state",
+          "command": [
+            "fileproviderctl",
+            "dump"
+          ],
+          "status": "captured",
+          "detail": "capture current File Provider domain + item state",
+          "log": "remove.fileproviderctl-dump-after-remove.log"
+        },
+        {
+          "name": "cloudstorage-after-remove",
+          "purpose": "confirm the provider mount for the removed account is gone",
+          "command": [
+            "sh",
+            "-c",
+            "ls -la ~/Library/CloudStorage 2>&1 || true"
+          ],
+          "status": "captured",
+          "detail": "confirm the provider mount for the removed account is gone",
+          "log": "remove.cloudstorage-after-remove.log"
+        },
+        {
+          "name": "remove-log",
+          "purpose": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "command": [
+            "log",
+            "show",
+            "--last",
+            "1h",
+            "--style",
+            "compact",
+            "--predicate",
+            "subsystem == \"com.reluxworks.gramdrive\" && category == \"file-provider-domains\""
+          ],
+          "status": "captured",
+          "detail": "capture the domain reconcile/repair log (com.reluxworks.gramdrive / file-provider-domains)",
+          "log": "remove.remove-log.log"
+        }
+      ],
+      "manual_checks": [
+        {
+          "name": "remove-account",
+          "action": "remove the test account from the companion (or uninstall the app)",
+          "expected": "the account's GramDrive location disappears from Finder; the domain is unregistered",
+          "verdict": "pending"
+        },
+        {
+          "name": "no-orphans",
+          "action": "re-check fileproviderctl dump and ~/Library/CloudStorage after removal",
+          "expected": "no orphan domain or mount for the removed account remains (clean removal)",
+          "verdict": "pending"
+        }
+      ]
+    }
+  ],
+  "finished_at": "2026-07-19T18:51:56.951952+00:00"
+}

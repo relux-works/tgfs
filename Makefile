@@ -13,7 +13,8 @@ GATE := python3 .scripts/acceptance/run_automated.py
 .PHONY: check check-core check-repo check-security check-apple gates fmt build test bindings \
         smoke-bindings smoke-shared-state smoke-agent-lifecycle package \
         package-reproducible package-app package-app-unsigned package-app-notarize \
-        release-provenance tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates
+        release-provenance tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates \
+        accept-macos accept-macos-runsheet
 
 # check — the pre-push gate: the core and repo suites (what CI's rust-core job
 # runs). Secret scanning is a separate suite (make check-security) because it
@@ -95,6 +96,28 @@ smoke-shared-state:
 # (see .scripts/smoke/run_agent_lifecycle_smoke.py).
 smoke-agent-lifecycle:
 	python3 .scripts/smoke/run_agent_lifecycle_smoke.py
+
+# --- Native macOS acceptance (human-in-the-loop) -----------------------------
+# The release-gate manual acceptance for the macOS File Provider drive
+# (`.spec/quality-and-release.md`, macOS spike gates): the ten Finder flows —
+# register, enumerate, hydrate, cancel, pin, update, restart, repair, upgrade,
+# remove (TASK-260715-3oe2nr). Deliberately NOT a gate step: it needs a real
+# signed, installed GramDrive.app, a Telegram test account, and a person at
+# Finder, so it can never pass unattended. The harness prepares the run — runs
+# the machine-checkable probes, captures evidence, and emits the run-sheet and
+# the evidence/sign-off form — and a human executes and signs off. Pipeline and
+# rationale: .scripts/acceptance/README.md.
+
+# accept-macos — prepare a native-acceptance run: preflight the host, capture
+# probes/evidence, and write runsheet.md + evidence-template.md + summary.json.
+# Output: .temp/acceptance/local-accept-macos/. Never reports a scenario passed.
+accept-macos:
+	python3 .scripts/acceptance/run_native_macos.py --run-id local-accept-macos
+
+# accept-macos-runsheet — render just the operator run-sheet to stdout (no host,
+# no probes), for review or printing.
+accept-macos-runsheet:
+	python3 .scripts/acceptance/run_native_macos.py --emit-runsheet -
 
 # --- Artifact packaging ------------------------------------------------------
 # Not gate targets, and deliberately not steps of `check`: they need Xcode and a
