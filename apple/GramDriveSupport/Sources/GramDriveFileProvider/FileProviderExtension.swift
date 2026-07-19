@@ -28,11 +28,13 @@ public enum FileProviderExtensionError: Error, Equatable {
 /// This type owns exactly the domain→account wiring: parse the domain
 /// identifier, open shared state, resolve the account and its root item
 /// identifier (``accountContext()``). Item mapping (TASK-260715-i3mp9x)
-/// and enumeration (TASK-260715-rhcnhc) sit on top of that context;
-/// content fetch is still its own story (STORY-260715-14n7wp), and until
-/// it lands the content callbacks answer `CocoaError.featureUnsupported`
-/// rather than faking bytes.
-public final class GramDriveFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
+/// and enumeration (TASK-260715-rhcnhc) sit on top of that context, and
+/// content fetch (TASK-260715-kkglhx) bridges to the companion agent's
+/// hydration endpoint through ``ContentFetcher`` — the extension asks the
+/// engine's host process for bytes, never a source directly.
+public final class GramDriveFileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
+    @unchecked Sendable
+{
     /// The account context every provider callback starts from: the
     /// configured account (including `rootItemId`, the durable identifier
     /// behind `NSFileProviderItemIdentifier.rootContainer`) and the open
@@ -47,6 +49,7 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
     private let resolveDataRoot: @Sendable () throws -> URL
     private let lock = NSLock()
     private var cachedStore: SharedStateStore?
+    let contentFetcher: ContentFetcher
 
     /// The system's entry point: resolve shared state inside the App
     /// Group container the signed extension is entitled to.
@@ -60,11 +63,44 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
     }
 
     /// The testable entry point: same wiring over a substitute container
-    /// (the shared-state layer's substitute-container rule).
-    public init(domain: NSFileProviderDomain, dataRoot: @escaping @Sendable () throws -> URL) {
+    /// (the shared-state layer's substitute-container rule). `hydration`
+    /// and `fetchScratchDirectory` default to the real agent channel and
+    /// the domain's provider-managed scratch location; tests substitute
+    /// both.
+    public init(
+        domain: NSFileProviderDomain,
+        dataRoot: @escaping @Sendable () throws -> URL,
+        hydration: (any HydrationRequesting)? = nil,
+        fetchScratchDirectory: (@Sendable () throws -> URL)? = nil
+    ) {
         self.domain = domain
         self.resolveDataRoot = dataRoot
+        self.contentFetcher = ContentFetcher(
+            hydration: hydration
+                ?? AgentHydrationClient(socketURL: {
+                    HydrationContract.socketURL(dataRoot: try dataRoot())
+                }),
+            scratchDirectory: fetchScratchDirectory
+                ?? Self.providerScratchDirectory(domain: domain))
         super.init()
+    }
+
+    /// The default scratch location for fetched content: the domain's
+    /// provider-managed temporary directory (same volume as the system's
+    /// store, so the returned file moves without a byte copy). Outside a
+    /// registered domain (tests, smoke harnesses) the extension-local
+    /// temporary directory stands in.
+    private static func providerScratchDirectory(
+        domain: NSFileProviderDomain
+    ) -> @Sendable () throws -> URL {
+        let boxed = UncheckedSendable(domain)
+        return {
+            if let manager = NSFileProviderManager(for: boxed.value) {
+                return try manager.temporaryDirectoryURL()
+            }
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("gramdrive-fetch-scratch", isDirectory: true)
+        }
     }
 
     /// Resolves the domain to its configured account and an open
@@ -85,6 +121,7 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
     }
 
     public func invalidate() {
+        contentFetcher.cancelAll()
         lock.lock()
         cachedStore = nil
         lock.unlock()
@@ -142,14 +179,48 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
             metadata: metadata, accountRootId: context.account.rootItemId)
     }
 
+    /// Content fetch (TASK-260715-kkglhx): the whole behavior lives in
+    /// ``ContentFetcher`` — this callback only binds it to the domain's
+    /// account context (minus the `NSFileProviderRequest` plumbing, which
+    /// has no test-constructible form). A domain that does not resolve to
+    /// a configured account answers `noSuchItem`, exactly like the item
+    /// surface.
     public func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
         version requestedVersion: NSFileProviderItemVersion?,
         request: NSFileProviderRequest,
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
-        completionHandler(nil, nil, itemError(for: itemIdentifier))
-        return completedProgress()
+        let handler = UncheckedSendable(completionHandler)
+        return fetchContentsCore(
+            itemIdentifier: itemIdentifier,
+            requestedVersion: requestedVersion
+        ) { url, item, error in
+            handler.value(url, item, error)
+        }
+    }
+
+    /// The testable form of `fetchContents`.
+    func fetchContentsCore(
+        itemIdentifier: NSFileProviderItemIdentifier,
+        requestedVersion: NSFileProviderItemVersion?,
+        completionHandler: @escaping ContentFetcher.Completion
+    ) -> Progress {
+        contentFetcher.fetchContents(
+            itemIdentifier: itemIdentifier,
+            requestedVersion: requestedVersion,
+            context: { [self] in
+                do {
+                    let context = try accountContext()
+                    return (account: context.account, store: context.store)
+                } catch let error as FileProviderExtensionError {
+                    switch error {
+                    case .unrecognizedDomainIdentifier, .accountNotConfigured:
+                        throw NSFileProviderError(.noSuchItem)
+                    }
+                }
+            },
+            completionHandler: completionHandler)
     }
 
     public func createItem(
@@ -253,25 +324,6 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
 
     // MARK: - Internals
 
-    /// The one error rule of the not-yet-implemented callbacks: a domain
-    /// that does not resolve to a configured account answers `noSuchItem`
-    /// (there is genuinely nothing to serve); a resolvable domain answers
-    /// `featureUnsupported` until the content task lands. Shared-state
-    /// failures pass through as-is (the system retries).
-    func itemError(for identifier: NSFileProviderItemIdentifier) -> Error {
-        do {
-            _ = try accountContext()
-            return CocoaError(.featureUnsupported)
-        } catch let error as FileProviderExtensionError {
-            switch error {
-            case .unrecognizedDomainIdentifier, .accountNotConfigured:
-                return NSFileProviderError(.noSuchItem)
-            }
-        } catch {
-            return error
-        }
-    }
-
     private func openedStore() throws -> SharedStateStore {
         lock.lock()
         defer { lock.unlock() }
@@ -287,5 +339,16 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
         let progress = Progress(totalUnitCount: 1)
         progress.completedUnitCount = 1
         return progress
+    }
+}
+
+/// Carries a value the SDK has not annotated `Sendable` (the domain object,
+/// the system's completion handlers) across an isolation boundary the
+/// platform contract already makes safe.
+struct UncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
     }
 }

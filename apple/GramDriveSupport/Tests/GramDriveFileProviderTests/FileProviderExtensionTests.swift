@@ -31,6 +31,13 @@ private func withSubstituteDataRoot<T>(_ body: (URL) throws -> T) rethrows -> T 
     return try body(root)
 }
 
+private func withSubstituteDataRootAsync<T>(_ body: (URL) async throws -> T) async rethrows -> T {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("gramdrive-fpext-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    return try await body(root)
+}
+
 @Suite("File Provider extension skeleton")
 struct FileProviderExtensionTests {
     @Test("A foreign domain identifier is refused typed, never aliased")
@@ -74,24 +81,38 @@ struct FileProviderExtensionTests {
         }
     }
 
-    @Test("An unresolvable domain answers the item surface with noSuchItem")
-    func itemSurfaceAnswersNoSuchItem() {
-        withSubstituteDataRoot { dataRoot in
+    @Test("An unresolvable domain answers the fetch surface with noSuchItem")
+    func fetchSurfaceAnswersNoSuchItem() async {
+        await withSubstituteDataRootAsync { dataRoot in
             let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
-            let error = ext.itemError(for: .rootContainer) as NSError
-            #expect(error.domain == NSFileProviderError.errorDomain)
-            #expect(error.code == NSFileProviderError.Code.noSuchItem.rawValue)
+            let future = TestFuture<FetchOutcome>()
+            _ = ext.fetchContentsCore(
+                itemIdentifier: .rootContainer,
+                requestedVersion: nil
+            ) { url, item, error in
+                future.fulfill(FetchOutcome(url: url, item: item, error: error))
+            }
+            let outcome = await future.settled
+            outcome.expectProviderError(.noSuchItem)
         }
     }
 
     @Test("A broken data root surfaces the storage failure as-is, not as a fake noSuchItem")
-    func storageFailurePassesThrough() throws {
-        try withSubstituteDataRoot { dataRoot in
+    func storageFailurePassesThrough() async throws {
+        try await withSubstituteDataRootAsync { dataRoot in
             // A file where the data root should be makes the open fail.
             try Data("not a directory".utf8).write(to: dataRoot)
             let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
-            let error = ext.itemError(for: .rootContainer) as NSError
-            #expect(error.domain != NSFileProviderError.errorDomain)
+            let future = TestFuture<FetchOutcome>()
+            _ = ext.fetchContentsCore(
+                itemIdentifier: .rootContainer,
+                requestedVersion: nil
+            ) { url, item, error in
+                future.fulfill(FetchOutcome(url: url, item: item, error: error))
+            }
+            let outcome = await future.settled
+            #expect(outcome.url == nil)
+            #expect(outcome.nsError?.domain != NSFileProviderError.errorDomain)
         }
     }
 

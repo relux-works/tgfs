@@ -9,22 +9,27 @@ import Foundation
 /// process working directory temporarily moved to the socket's parent (the
 /// classic `fchdir` + relative-leaf technique). The working directory is
 /// process-global state, so long-path operations serialize behind one lock
-/// and restore the original directory before returning — everything else
-/// in the agent uses absolute paths, and socket setup is rare (startup,
-/// health probes), so the brief cwd excursion is bounded and contained.
-enum UnixSocketAddress {
+/// and restore the original directory before returning — every GramDrive
+/// process uses absolute paths elsewhere, and socket setup is rare
+/// (startup, health probes, one hydration connect per fetch), so the brief
+/// cwd excursion is bounded and contained.
+///
+/// Lives in the support package because both sides of every agent IPC
+/// channel need it: the agent binds (`GramDriveAgentCore`), while clients —
+/// the app and the File Provider extension — connect.
+public enum UnixSocketAddress {
     /// Maximum byte length of a directly representable path (excludes NUL).
-    static let maxDirectPathLength = MemoryLayout.size(ofValue: sockaddr_un().sun_path) - 1
+    public static let maxDirectPathLength = MemoryLayout.size(ofValue: sockaddr_un().sun_path) - 1
 
     private static let workingDirectoryLock = NSLock()
 
-    static func bind(descriptor: Int32, path: String) throws {
+    public static func bind(descriptor: Int32, path: String) throws {
         try operate(on: descriptor, path: path, operation: "bind") { fd, addr, len in
             Darwin.bind(fd, addr, len)
         }
     }
 
-    static func connect(descriptor: Int32, path: String) throws {
+    public static func connect(descriptor: Int32, path: String) throws {
         try operate(on: descriptor, path: path, operation: "connect") { fd, addr, len in
             Darwin.connect(fd, addr, len)
         }

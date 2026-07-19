@@ -1,4 +1,5 @@
 import Foundation
+import GramDriveSupport
 
 /// Host-owned runtime files of the companion agent, beside — never inside —
 /// the core-owned shared-state layout (`sharedStateLayout` fixes
@@ -31,6 +32,13 @@ public struct AgentRuntimeLayout: Equatable, Sendable {
     /// The health endpoint's UNIX socket: `<root>/agent/health.sock`.
     public var healthSocket: URL {
         agentDirectory.appendingPathComponent("health.sock", isDirectory: false)
+    }
+
+    /// The hydration endpoint's UNIX socket: `<root>/agent/hydration.sock`.
+    /// The path rule lives in ``HydrationContract`` — the File Provider
+    /// extension derives the same path without linking this module.
+    public var hydrationSocket: URL {
+        HydrationContract.socketURL(dataRoot: dataRoot)
     }
 
     /// The agent settings document: `<root>/agent/settings.json`.

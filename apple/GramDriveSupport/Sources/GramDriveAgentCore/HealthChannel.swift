@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import GramDriveSupport
 
 /// The agent's bounded local IPC: a health/status endpoint on a UNIX
 /// socket inside the shared container (PLAT-MAC-002's "narrow native

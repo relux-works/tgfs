@@ -17,17 +17,24 @@ public struct AgentConfiguration {
     /// Power-event source; `nil` disables power observation (tests that
     /// need none, tools).
     public var powerEvents: (any PowerEventSource)?
+    /// The transfer-engine bridge behind the hydration endpoint. `nil` —
+    /// the truthful state until the FFI exports the engine's fetch path —
+    /// means the endpoint is not offered at all: a fetching extension gets
+    /// "agent unavailable" rather than an answer nobody can honor.
+    public var hydrator: (any ContentHydrating)?
 
     public init(
         dataRoot: URL,
         drainGracePeriod: Duration = .seconds(10),
         drainCancelWait: Duration = .seconds(5),
-        powerEvents: (any PowerEventSource)? = nil
+        powerEvents: (any PowerEventSource)? = nil,
+        hydrator: (any ContentHydrating)? = nil
     ) {
         self.dataRoot = dataRoot
         self.drainGracePeriod = drainGracePeriod
         self.drainCancelWait = drainCancelWait
         self.powerEvents = powerEvents
+        self.hydrator = hydrator
     }
 }
 
@@ -55,6 +62,8 @@ public enum AgentStartError: Error {
     case runtimeDirectory(underlying: Error)
     /// The health endpoint could not be established.
     case healthEndpoint(underlying: Error)
+    /// The hydration endpoint could not be established.
+    case hydrationEndpoint(underlying: Error)
 }
 
 /// The companion agent's lifecycle: the one coordinator process per shared
@@ -93,6 +102,7 @@ public final class AgentLifecycle: @unchecked Sendable {
     private var state: AgentRunState = .launching
     private var instanceLock: SingleInstanceLock?
     private var healthServer: AgentHealthServer?
+    private var hydrationServer: HydrationServer?
     private var powerObservation: PowerEventObservation?
     private var settings: AgentSettings?
     private var events: [String] = []
@@ -199,6 +209,25 @@ public final class AgentLifecycle: @unchecked Sendable {
             throw AgentStartError.healthEndpoint(underlying: error)
         }
 
+        if let hydrator = configuration.hydrator {
+            do {
+                let server = try HydrationServer.start(
+                    socketURL: layout.hydrationSocket,
+                    registry: transfers,
+                    admission: { [weak self] request in
+                        self?.admitHydration(request)
+                            ?? .refuse(
+                                HydrationFailure(
+                                    category: .draining, detail: "agent is gone"))
+                    },
+                    hydrator: hydrator)
+                setLocked { self.hydrationServer = server }
+            } catch {
+                teardownAfterFailedStart()
+                throw AgentStartError.hydrationEndpoint(underlying: error)
+            }
+        }
+
         if let source = configuration.powerEvents {
             let observation = source.observe { [weak self] event in
                 self?.handle(power: event)
@@ -225,8 +254,9 @@ public final class AgentLifecycle: @unchecked Sendable {
             record("drain-abandoned:\(outcome.abandoned)")
         }
 
-        let (observation, server, instance) = releaseResourcesAndStop()
+        let (observation, server, hydration, instance) = releaseResourcesAndStop()
         observation?.cancel()
+        hydration?.stop()
         server?.stop()
         instance?.release()
         record("stopped:\(reason.rawValue)")
@@ -272,18 +302,71 @@ public final class AgentLifecycle: @unchecked Sendable {
     /// `NSLock` may not be taken from an async context, so the locked
     /// extraction lives in this sync helper.
     private func releaseResourcesAndStop() -> (
-        PowerEventObservation?, AgentHealthServer?, SingleInstanceLock?
+        PowerEventObservation?, AgentHealthServer?, HydrationServer?, SingleInstanceLock?
     ) {
         lock.lock()
         defer { lock.unlock() }
-        let resources = (powerObservation, healthServer, instanceLock)
+        let resources = (powerObservation, healthServer, hydrationServer, instanceLock)
         powerObservation = nil
         healthServer = nil
+        hydrationServer = nil
         instanceLock = nil
         store = nil
         core = nil
         state = .stopped
         return resources
+    }
+
+    /// The hydration admission gate over durable state: everything a
+    /// snapshot read can refuse is refused here, before any engine work —
+    /// unknown account or item (or a POL-3 tombstone), a POL-4 availability
+    /// that withholds bytes (restricted and gone content both refuse as
+    /// `restricted`: the item exists, its bytes are ungettable), a
+    /// directory (nothing to hydrate), and a pinned content version that is
+    /// no longer current (`versionConflict` — the requester re-resolves and
+    /// restarts, SYNC-042).
+    private func admitHydration(_ request: HydrationRequest) -> HydrationAdmission {
+        let store = setLockedReturning { self.store }
+        guard let store else {
+            return .refuse(
+                HydrationFailure(category: .draining, detail: "state not open"))
+        }
+        do {
+            guard try store.account(accountId: request.accountId) != nil else {
+                return .refuse(
+                    HydrationFailure(category: .notFound, detail: "unknown account"))
+            }
+            guard
+                let item = try store.item(id: request.itemId),
+                item.deletedAtMs == nil
+            else {
+                return .refuse(
+                    HydrationFailure(category: .notFound, detail: "unknown item"))
+            }
+            guard !item.isDirectory else {
+                return .refuse(
+                    HydrationFailure(
+                        category: .internalError, detail: "directories have no content"))
+            }
+            guard item.availability == .fetchable else {
+                return .refuse(
+                    HydrationFailure(
+                        category: .restricted,
+                        detail: item.availability == .restricted
+                            ? "content restricted per POL-4"
+                            : "content gone at the source"))
+            }
+            if let pinned = request.contentVersion, pinned != item.contentVersion {
+                return .refuse(
+                    HydrationFailure(
+                        category: .versionConflict,
+                        detail: "pinned content version is not current"))
+            }
+            return .admit
+        } catch {
+            return .refuse(
+                HydrationFailure(category: .storage, detail: "state read failed"))
+        }
     }
 
     private func openStoreWithRecovery() throws -> SharedStateStore {
@@ -360,13 +443,16 @@ public final class AgentLifecycle: @unchecked Sendable {
     private func teardownAfterFailedStart() {
         lock.lock()
         let server = healthServer
+        let hydration = hydrationServer
         let instance = instanceLock
         healthServer = nil
+        hydrationServer = nil
         instanceLock = nil
         store = nil
         core = nil
         state = .stopped
         lock.unlock()
+        hydration?.stop()
         server?.stop()
         instance?.release()
     }
