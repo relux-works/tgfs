@@ -177,6 +177,21 @@ pub enum ItemAvailability {
     Unavailable,
 }
 
+/// Where an item's durable offline pin came from (POL-2). A read-only
+/// provider host maps either variant to the same "keep this available
+/// offline" intent — quota-exempt and never evicted by policy (SYNC-051);
+/// the origin exists only because the two release independently (POL-2,
+/// SYNC-062), which is the engine's concern, not a foreign reader's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PinOrigin {
+    /// An explicit user "available offline" pin.
+    User,
+    /// Archive-Mode coverage — the per-scope pin-all opt-in (POL-2). The
+    /// engine folds coverage onto items as it backfills the scope, so a
+    /// provider reading these is reading exactly the paced state.
+    ArchiveMode,
+}
+
 /// One provider-visible node's metadata, as durably stored (DOM-001).
 ///
 /// Identifiers are the stable text form of the item's [`ItemId`] (DOM-024)
@@ -215,6 +230,16 @@ pub struct ItemMetadata {
     /// POL-3 tombstone: when the node's deletion was observed. A `Some`
     /// here means the node is no longer live.
     pub deleted_at_ms: Option<i64>,
+    /// Durable offline-pin state (POL-2), or `None` when no pin covers the
+    /// item. A provider host maps `Some(_)` to "keep available offline"
+    /// (eager, never evicted) and `None` to the evictable placeholder
+    /// default (SYNC-052); the origin only says who may release it. Read
+    /// from the durable `pins` table, so it survives restarts and precedes
+    /// materialization — a pin set before hydration still protects the
+    /// eventual bytes. Defaulted so adding it stays an additive contract
+    /// change for foreign construction sites.
+    #[uniffi(default = None)]
+    pub pin: Option<PinOrigin>,
 }
 
 /// One provider-visible item change: the item's current state under the
@@ -304,8 +329,11 @@ impl SharedStateStore {
         let id = parse_item_id(&id)?;
         let mut store = self.store()?;
         let txn = store.read_txn().map_err(map_state_error)?;
-        let record = txn.item(&id).map_err(map_state_error)?;
-        record.map(item_metadata).transpose()
+        let Some(record) = txn.item(&id).map_err(map_state_error)? else {
+            return Ok(None);
+        };
+        let pin = read_pin(&txn, &record.id)?;
+        Ok(Some(item_metadata(record, pin)?))
     }
 
     /// One page of a directory's live children in stable identifier order,
@@ -327,7 +355,13 @@ impl SharedStateStore {
         let records = txn
             .children_page(&parent, after.as_ref(), limit)
             .map_err(map_state_error)?;
-        records.into_iter().map(item_metadata).collect()
+        records
+            .into_iter()
+            .map(|record| {
+                let pin = read_pin(&txn, &record.id)?;
+                item_metadata(record, pin)
+            })
+            .collect()
     }
 
     /// The live child of `parent` named `safe_name`, for resolving a path
@@ -341,10 +375,14 @@ impl SharedStateStore {
         let parent = parse_item_id(&parent)?;
         let mut store = self.store()?;
         let txn = store.read_txn().map_err(map_state_error)?;
-        let record = txn
+        let Some(record) = txn
             .child_by_name(&parent, &safe_name)
-            .map_err(map_state_error)?;
-        record.map(item_metadata).transpose()
+            .map_err(map_state_error)?
+        else {
+            return Ok(None);
+        };
+        let pin = read_pin(&txn, &record.id)?;
+        Ok(Some(item_metadata(record, pin)?))
     }
 
     /// Every configured account in stable identity order — what a
@@ -410,9 +448,10 @@ impl SharedStateStore {
         records
             .into_iter()
             .map(|record| {
+                let pin = read_pin(&txn, &record.item.id)?;
                 Ok(ItemChange {
                     sequence: record.sequence,
-                    metadata: item_metadata(record.item)?,
+                    metadata: item_metadata(record.item, pin)?,
                 })
             })
             .collect()
@@ -496,7 +535,24 @@ fn parse_item_id_str(text: &str) -> Result<ItemId, DriveError> {
     parse_item_id(text)
 }
 
-fn item_metadata(record: gramdrive_state::repo::ItemRecord) -> Result<ItemMetadata, DriveError> {
+/// Reads one item's durable offline-pin state within an open snapshot, in
+/// provider vocabulary. The read is a same-transaction indexed point lookup,
+/// so folding it into each item projection stays a snapshot-consistent read
+/// (the pin and the metadata cannot disagree across a concurrent commit).
+fn read_pin(
+    txn: &gramdrive_state::ReadTxn<'_>,
+    id: &ItemId,
+) -> Result<Option<PinOrigin>, DriveError> {
+    Ok(txn
+        .pin(id)
+        .map_err(map_state_error)?
+        .map(|record| map_pin_origin(record.origin)))
+}
+
+fn item_metadata(
+    record: gramdrive_state::repo::ItemRecord,
+    pin: Option<PinOrigin>,
+) -> Result<ItemMetadata, DriveError> {
     let kind = map_kind(item_kind(&record.id).map_err(map_state_error)?);
     let (mime_type, logical_size, content_version) = match record.content {
         None => (None, None, None),
@@ -523,6 +579,7 @@ fn item_metadata(record: gramdrive_state::repo::ItemRecord) -> Result<ItemMetada
         created_at_ms: record.created_at_ms,
         modified_at_ms: record.modified_at_ms,
         deleted_at_ms: record.deleted_at_ms,
+        pin,
     })
 }
 
@@ -583,6 +640,14 @@ fn map_availability(availability: gramdrive_state::repo::ItemAvailability) -> It
     }
 }
 
+fn map_pin_origin(origin: gramdrive_state::repo::PinOrigin) -> PinOrigin {
+    use gramdrive_state::repo::PinOrigin as Stored;
+    match origin {
+        Stored::User => PinOrigin::User,
+        Stored::ArchiveMode => PinOrigin::ArchiveMode,
+    }
+}
+
 /// Maps the state store's failure vocabulary onto the boundary categories
 /// (NFR-030). Everything is a local-persistence failure ([`DriveError::
 /// Storage`]) except the conditions with their own categories: caller
@@ -612,7 +677,8 @@ mod tests {
     };
     use gramdrive_model::version::{ContentVersion, MetadataVersion};
     use gramdrive_state::repo::{
-        AccountRecord, FileFacts, ItemRecord, RetentionMode, SourceKind as StoredSourceKind,
+        AccountRecord, FileFacts, ItemRecord, PinOrigin as StoredPinOrigin, RetentionMode,
+        SourceKind as StoredSourceKind,
     };
 
     /// A unique data root under the OS temp dir, removed on drop.
@@ -811,6 +877,127 @@ mod tests {
         assert_eq!(file.logical_size, Some(2_048));
         assert_eq!(file.content_version.as_deref(), Some("c1"));
         assert_eq!(file.availability, ItemAvailability::Fetchable);
+    }
+
+    #[test]
+    fn durable_pins_surface_on_every_provider_read_and_survive_a_reopen() {
+        let root = TempRoot::new();
+        seed(&root);
+        // The coordinator pins the file (explicit user intent) and the chat
+        // directory (Archive-Mode coverage), through the state crate exactly
+        // as the engine host would — in-process, off the read-only boundary.
+        let layout = shared_state_layout(root.as_str().to_owned()).expect("layout");
+        let mut writer = StateStore::open(&layout.database_file).expect("open writer");
+        let txn = writer.write_txn().expect("write txn");
+        txn.pin_item(&file_id(), StoredPinOrigin::User, 3_000)
+            .expect("pin file");
+        txn.pin_item(&chat_dir_id(), StoredPinOrigin::ArchiveMode, 3_000)
+            .expect("pin chat dir");
+        txn.commit().expect("commit");
+
+        // A fresh Provider handle — the "after restart" read — sees the
+        // durable pins: the projection reads them from the pins table, not
+        // from any in-memory carry-over.
+        let store =
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider).expect("open");
+
+        // item(): both origins map, and an unpinned item reads `None`.
+        assert_eq!(
+            store
+                .item(file_id().text())
+                .expect("item")
+                .expect("file")
+                .pin,
+            Some(PinOrigin::User)
+        );
+        assert_eq!(
+            store
+                .item(chat_dir_id().text())
+                .expect("item")
+                .expect("chat dir")
+                .pin,
+            Some(PinOrigin::ArchiveMode)
+        );
+        assert_eq!(
+            store
+                .item(root_id().text())
+                .expect("item")
+                .expect("root")
+                .pin,
+            None,
+            "an unpinned item projects the evictable default"
+        );
+
+        // children(): each child in the page carries its own pin.
+        let root_children = store
+            .children(root_id().text(), None, 100)
+            .expect("root children");
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0].pin, Some(PinOrigin::ArchiveMode));
+        let chat_children = store
+            .children(chat_dir_id().text(), None, 100)
+            .expect("chat children");
+        assert_eq!(chat_children.len(), 1);
+        assert_eq!(chat_children[0].pin, Some(PinOrigin::User));
+
+        // child_by_name(): the name resolver projects the same pin.
+        let by_name = store
+            .child_by_name(chat_dir_id().text(), "photo.jpg".to_owned())
+            .expect("child_by_name")
+            .expect("file");
+        assert_eq!(by_name.pin, Some(PinOrigin::User));
+
+        // item_changes_since(): the change feed carries the current pin, so a
+        // working-set re-read reflects offline intent, not just tree shape.
+        let changes = store.item_changes_since(7, 0, 100).expect("changes");
+        let file_change = changes
+            .iter()
+            .find(|change| change.metadata.id == file_id().text())
+            .expect("file change");
+        assert_eq!(file_change.metadata.pin, Some(PinOrigin::User));
+        let root_change = changes
+            .iter()
+            .find(|change| change.metadata.id == root_id().text())
+            .expect("root change");
+        assert_eq!(root_change.metadata.pin, None);
+    }
+
+    #[test]
+    fn unpinning_drops_the_projection_back_to_the_evictable_default() {
+        let root = TempRoot::new();
+        seed(&root);
+        let layout = shared_state_layout(root.as_str().to_owned()).expect("layout");
+        let mut writer = StateStore::open(&layout.database_file).expect("open writer");
+        let txn = writer.write_txn().expect("write txn");
+        txn.pin_item(&file_id(), StoredPinOrigin::User, 3_000)
+            .expect("pin file");
+        txn.commit().expect("commit");
+
+        let store =
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider).expect("open");
+        assert_eq!(
+            store
+                .item(file_id().text())
+                .expect("item")
+                .expect("file")
+                .pin,
+            Some(PinOrigin::User)
+        );
+
+        // A foreign unpin commit is visible to the same handle (each read is
+        // its own WAL snapshot), and the projection drops to `None`.
+        let mut writer = StateStore::open(&layout.database_file).expect("reopen writer");
+        let txn = writer.write_txn().expect("write txn");
+        assert!(txn.unpin_item(&file_id()).expect("unpin"));
+        txn.commit().expect("commit");
+        assert_eq!(
+            store
+                .item(file_id().text())
+                .expect("item")
+                .expect("file")
+                .pin,
+            None
+        );
     }
 
     #[test]

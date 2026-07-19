@@ -58,7 +58,8 @@ private func makeMetadata(
     availability: ItemAvailability = .fetchable,
     createdAtMs: Int64? = nil,
     modifiedAtMs: Int64? = nil,
-    deletedAtMs: Int64? = nil
+    deletedAtMs: Int64? = nil,
+    pin: PinOrigin? = nil
 ) -> ItemMetadata {
     ItemMetadata(
         id: id,
@@ -74,7 +75,8 @@ private func makeMetadata(
         availability: availability,
         createdAtMs: createdAtMs,
         modifiedAtMs: modifiedAtMs,
-        deletedAtMs: deletedAtMs
+        deletedAtMs: deletedAtMs,
+        pin: pin
     )
 }
 
@@ -161,6 +163,101 @@ struct FileProviderItemAvailabilityTests {
                 availability: .restricted))
         #expect(item.contentType == .jpeg)
         #expect(item.documentSize == NSNumber(value: 4096))
+    }
+}
+
+// MARK: - Content policy (offline pin / eviction — POL-2, SYNC-051..053)
+
+@Suite("File Provider item mapping — content policy (pinning)")
+struct FileProviderItemContentPolicyTests {
+    @Test("A pinned fetchable file is kept downloaded and eviction-proof, either origin")
+    func pinnedFileIsKeptDownloaded() {
+        for origin in [PinOrigin.user, .archiveMode] {
+            let item = makeItem(
+                makeMetadata(kind: .attachment, availability: .fetchable, pin: origin))
+            #expect(
+                item.contentPolicy == .downloadEagerlyAndKeepDownloaded,
+                "a \(origin) pin keeps content available offline")
+        }
+    }
+
+    @Test("An unpinned fetchable file downloads lazily and stays evictable (POL-2 default)")
+    func unpinnedFileIsLazyAndEvictable() {
+        // Lazy-on-open plus eviction under disk pressure is exactly the
+        // dataless-placeholder default (SYNC-052 dehydrate on quota pressure).
+        let item = makeItem(makeMetadata(kind: .attachment, availability: .fetchable, pin: nil))
+        #expect(item.contentPolicy == .downloadLazily)
+    }
+
+    @Test("A pinned directory is eager, so Archive-Mode coverage keeps its subtree")
+    func pinnedDirectoryIsEager() {
+        let item = makeItem(makeMetadata(kind: .chat, pin: .archiveMode))
+        #expect(item.contentPolicy == .downloadEagerlyAndKeepDownloaded)
+    }
+
+    @Test("An unpinned directory inherits, so the tree default flows down")
+    func unpinnedDirectoryInherits() {
+        let item = makeItem(makeMetadata(kind: .chat, pin: nil))
+        #expect(item.contentPolicy == .inherited)
+    }
+
+    @Test("Restricted or unavailable content is never marked eager, even if pinned (POL-4)")
+    func withheldContentIsNeverEager() {
+        for availability in [ItemAvailability.restricted, .unavailable] {
+            for origin in [PinOrigin.user, .archiveMode] {
+                let item = makeItem(
+                    makeMetadata(kind: .attachment, availability: availability, pin: origin))
+                #expect(
+                    item.contentPolicy == .downloadLazily,
+                    "\(availability) bytes are never fetched, so a pin cannot make them eager")
+            }
+        }
+    }
+
+    @Test("Eviction respects pins: a pin flips a file from evictable to kept")
+    func pinFlipsEvictability() {
+        let unpinned = makeItem(
+            makeMetadata(kind: .attachment, availability: .fetchable, pin: nil))
+        let pinned = makeItem(
+            makeMetadata(kind: .attachment, availability: .fetchable, pin: .user))
+        #expect(unpinned.contentPolicy == .downloadLazily)
+        #expect(pinned.contentPolicy == .downloadEagerlyAndKeepDownloaded)
+        #expect(unpinned.contentPolicy != pinned.contentPolicy)
+    }
+
+    @Test("Pin intent is durable: the policy is a pure re-derivation of durable metadata")
+    func policyIsPureAndSurvivesReDerivation() {
+        // The pin lives in durable state and the provider re-derives the
+        // policy on every read, so an app/provider restart that rebuilds items
+        // from the same metadata lands the same eager policy. The store-layer
+        // durability itself is pinned by the Rust suite's reopen test.
+        let metadata = makeMetadata(kind: .attachment, availability: .fetchable, pin: .user)
+        let first = GramDriveFileProviderItem.contentPolicy(for: metadata)
+        let second = GramDriveFileProviderItem.contentPolicy(for: metadata)
+        #expect(first == .downloadEagerlyAndKeepDownloaded)
+        #expect(first == second)
+    }
+
+    @Test("Every kind × availability × pin maps to a defined content policy")
+    func everyCombinationMapsToAKnownPolicy() {
+        let known: Set<NSFileProviderContentPolicy> = [
+            .inherited, .downloadLazily, .downloadLazilyAndEvictOnRemoteUpdate,
+            .downloadEagerlyAndKeepDownloaded,
+        ]
+        for kind in allItemKinds {
+            for availability in allAvailabilities {
+                for pin in [nil, PinOrigin.user, PinOrigin.archiveMode] {
+                    let item = makeItem(
+                        makeMetadata(kind: kind, availability: availability, pin: pin))
+                    #expect(known.contains(item.contentPolicy))
+                    // The invariant that guards POL-4: withheld bytes are never
+                    // eager, whatever the pin claims.
+                    if availability != .fetchable, !expectedIsDirectory(kind) {
+                        #expect(item.contentPolicy != .downloadEagerlyAndKeepDownloaded)
+                    }
+                }
+            }
+        }
     }
 }
 

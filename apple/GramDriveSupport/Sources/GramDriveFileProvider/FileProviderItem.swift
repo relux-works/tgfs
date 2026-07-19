@@ -75,6 +75,15 @@ public final class GramDriveFileProviderItem: NSObject, NSFileProviderItem {
         Self.fileSystemFlags(for: metadata)
     }
 
+    // MARK: - Content policy (offline pin / eviction)
+
+    /// How the system keeps this item's content (TASK-260715-3s461k; POL-2,
+    /// SYNC-051..053): eager and eviction-proof when the item is pinned
+    /// "available offline", the evictable placeholder default otherwise.
+    public var contentPolicy: NSFileProviderContentPolicy {
+        Self.contentPolicy(for: metadata)
+    }
+
     // MARK: - Versioning
 
     public var itemVersion: NSFileProviderItemVersion {
@@ -152,6 +161,31 @@ extension GramDriveFileProviderItem {
         case .restricted, .unavailable:
             return []
         }
+    }
+
+    /// Maps durable offline-pin state onto the system's content policy — the
+    /// provider half of pin/eviction reconciliation (SYNC-051..053, POL-2).
+    ///
+    /// A pin — an explicit user "available offline" or Archive-Mode coverage —
+    /// means keep the bytes: the system downloads eagerly and never evicts
+    /// under disk pressure (SYNC-051), which is what makes pinned content
+    /// quota-exempt from the user's view. A directory pin propagates to
+    /// inheriting children, so Archive-Mode coverage of a scope keeps its
+    /// whole subtree materialized. Only content that can actually be fetched
+    /// is ever marked eager: restricted or dropped content (POL-4) carries
+    /// bytes the engine never fetches, so eager-pinning it would ask the
+    /// system to retry a fetch that can never land — it takes the default.
+    ///
+    /// Without a pin, content is the dataless placeholder default (POL-2):
+    /// files download lazily on open and stay independently evictable under
+    /// pressure (SYNC-052) even beneath an eager ancestor; directories
+    /// inherit, so the (lazy) root default flows down the tree while an eager
+    /// ancestor pin still reaches its as-yet-unpinned descendants.
+    static func contentPolicy(for metadata: ItemMetadata) -> NSFileProviderContentPolicy {
+        if metadata.pin != nil, metadata.isDirectory || metadata.availability == .fetchable {
+            return .downloadEagerlyAndKeepDownloaded
+        }
+        return metadata.isDirectory ? .inherited : .downloadLazily
     }
 
     static func metadataVersionData(for metadata: ItemMetadata) -> Data {

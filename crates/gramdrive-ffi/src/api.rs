@@ -23,7 +23,11 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // 0.4.0: the item change journal reads (change_journal_state /
     // item_changes_since) — durable change enumeration for provider
     // change anchors. Additive, hence minor.
-    minor: 4,
+    // 0.5.0: durable offline-pin projection on item reads (ItemMetadata.pin,
+    // PinOrigin) — what a provider host maps to keep-offline vs evictable
+    // content policy (POL-2, SYNC-051..053). A new defaulted record field,
+    // hence additive and minor.
+    minor: 5,
     patch: 0,
 };
 
