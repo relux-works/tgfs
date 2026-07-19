@@ -10,12 +10,14 @@
 
 GATE := python3 .scripts/acceptance/run_automated.py
 
-.PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings \
-        smoke-shared-state smoke-agent-lifecycle package package-reproducible \
-        package-app package-app-notarize \
+.PHONY: check check-core check-repo check-security gates fmt build test bindings \
+        smoke-bindings smoke-shared-state smoke-agent-lifecycle package \
+        package-reproducible package-app package-app-notarize \
         tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates
 
-# check — the pre-push gate: everything CI runs.
+# check — the pre-push gate: the core and repo suites (what CI's rust-core job
+# runs). Secret scanning is a separate suite (make check-security) because it
+# needs gitleaks; CI runs it as its own required job.
 check:
 	$(GATE) --suite all --run-id local-all
 
@@ -26,6 +28,11 @@ check-core:
 # check-repo — docs and tooling: traceability, script self-tests.
 check-repo:
 	$(GATE) --suite repo --run-id local-repo
+
+# check-security — gitleaks secret scan of committed history (needs gitleaks:
+# `brew install gitleaks`). Run as its own required CI job (secret-scan).
+check-security:
+	$(GATE) --suite security --run-id local-security
 
 # gates — list the suites and the exact command each step runs.
 gates:

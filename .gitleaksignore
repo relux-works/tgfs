@@ -1,0 +1,14 @@
+# Gitleaks false-positive suppressions — one fingerprint per line
+# (format: <commit>:<file>:<rule>:<line>). Each line pins ONE exact finding in
+# one historical commit; it disables no rule, so the same rule still fires on
+# every other match. Add an entry only after eyeballing the finding and
+# confirming it is not a secret.
+#
+# Verified false positives:
+#
+# generic-api-key on a board checklist line — "Tests: key roundtrip,
+# missing/corrupt key behavior (typed error, no plaintext fallback), no secrets
+# in logs" — on the session-secret-storage task. The rule matched the prose
+# around the word "key"; there is no secret, just a task-tracking note under
+# .task-board/, committed at fd9bbd8.
+fd9bbd8ff1f2210dd5894cbe6056c821fd094942:.task-board/EPIC-260715-2ptb18_local-tdlib-source/STORY-260715-2nqkhl_authorization-and-session/TASK-260715-2odowl_session-secret-storage/progress.md:generic-api-key:21

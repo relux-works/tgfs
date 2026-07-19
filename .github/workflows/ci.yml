@@ -1,0 +1,136 @@
+# Shared core CI — mirrors the relux-works/barycenter pattern: per-component
+# jobs, each running the ONE pinned acceptance entrypoint (never an ad-hoc list
+# of cargo commands), each uploading its run's provenance as an artifact.
+#
+# The gate a PR sees is the gate a developer runs before pushing:
+#   python3 .scripts/acceptance/run_automated.py --suite all      --run-id local-all
+#   python3 .scripts/acceptance/run_automated.py --suite security --run-id local-security
+# CI adds --require-clean (so the recorded commit is the tested tree) and pins
+# every tool; it invents no step of its own.
+#
+# Making these checks block a merge is a branch-protection rule, not something a
+# workflow file can grant itself: mark the "rust-core" and "secret-scan" jobs as
+# required status checks on main. See README "Continuous integration".
+name: CI
+
+# Gate everything targeting main, and main itself after a merge. The
+# pull_request trigger is what a required-check rule attaches to (AC: a PR
+# cannot merge while a required job fails).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege for the whole workflow: it only reads the checkout. No job
+# here writes to the repo, publishes anything, or mints an OIDC token. Release
+# signing/attestation is a separate tag-triggered workflow with its own
+# elevated permissions (TASK-260715-3bhbkv).
+permissions:
+  contents: read
+
+# One in-flight run per ref. A new push to a PR cancels the now-moot previous
+# run; runs on main are never cancelled, so every merged commit keeps a complete
+# gate record.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust-core:
+    # The reference host is macOS arm64 (POL-5 / DEC-017) and the core crates
+    # are platform-neutral, so their gate runs on the one target v1 ships;
+    # macos-15 is Apple Silicon. This job runs `--suite all`: the Rust gates
+    # (fmt, clippy, test, architecture, cargo-deny/POL-6) plus the repo gates
+    # (traceability validator, script self-tests) — everything except the
+    # portable secret scan below.
+    name: rust-core
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install the pinned Rust toolchain
+        # rustup reads rust-toolchain.toml and installs 1.91.0 with rustfmt and
+        # clippy. The version lives in exactly that one file, so nothing here
+        # restates it and it cannot drift. The suite's `toolchain` step then
+        # re-verifies the active compiler actually matches before any gate
+        # trusts it.
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and build
+        # Speed only, never correctness (AC: cache cannot alter results). The
+        # key includes the rustc version and Cargo.lock, and both the toolchain
+        # and the lockfile are pinned, so a cache hit can only hold artifacts
+        # built from identical inputs. A stale or poisoned cache cannot change a
+        # fmt/clippy/test verdict — only make a miss slower to rebuild.
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Install cargo-deny (pinned)
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Run acceptance suite (all)
+        run: python3 .scripts/acceptance/run_automated.py --suite all --require-clean --run-id ci-all
+
+      - name: Upload acceptance provenance
+        # Always, even on failure — the provenance of a red run is the point
+        # (NFR-052: a result must be attributable to a commit). if-no-files-found
+        # error turns a runner that never wrote provenance (a silently skipped
+        # gate) into a failure instead of a green run with an empty artifact.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: acceptance-ci-all
+          path: .temp/acceptance/ci-all
+          if-no-files-found: error
+          retention-days: 14
+
+  secret-scan:
+    # Portable, no Rust toolchain — runs on the cheaper Linux runner (barycenter:
+    # portable jobs on Linux). Its own component because it is the only gate
+    # needing gitleaks, and it is a merge-boundary check.
+    name: secret-scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout full history
+        # gitleaks git scans every commit; a shallow clone would silently scan
+        # only the tip and miss a secret introduced earlier on the branch.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned + checksum-verified)
+        # Not the Marketplace action: gitleaks-action gates organisation use
+        # behind a licence key. The release tarball is pinned by version and
+        # verified against a sha256 committed in this file, so a tampered
+        # download fails the step instead of scanning with an unknown binary.
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$url" -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf gitleaks.tar.gz -C "$HOME/.local/bin" gitleaks
+          chmod 0755 "$HOME/.local/bin/gitleaks"
+          rm -f gitleaks.tar.gz
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/gitleaks" version
+
+      - name: Run acceptance suite (security)
+        run: python3 .scripts/acceptance/run_automated.py --suite security --require-clean --run-id ci-security
+
+      - name: Upload acceptance provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: acceptance-ci-security
+          path: .temp/acceptance/ci-security
+          if-no-files-found: error
+          retention-days: 14

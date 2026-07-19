@@ -76,10 +76,11 @@ script with the same suite names — a gate that exists only inside a CI config
 cannot be run before pushing, and drifts the first time either side is edited.
 
 ```sh
-make check        # everything CI runs: the core suite plus the repo suite
-make check-core   # Rust core only: toolchain, format, lint, test, architecture, supply chain
-make gates        # print every suite and the exact command behind each step
-make fmt          # apply rustfmt (the gate only checks formatting)
+make check          # pre-push gate: the core suite plus the repo suite
+make check-core     # Rust core only: toolchain, format, lint, test, architecture, supply chain
+make check-security # gitleaks secret scan of committed history (needs gitleaks)
+make gates          # print every suite and the exact command behind each step
+make fmt            # apply rustfmt (the gate only checks formatting)
 ```
 
 `make check` is shorthand for
@@ -96,7 +97,44 @@ Prerequisites: `rustup` (it reads `rust-toolchain.toml` and installs the pinned
 toolchain automatically), `cargo-deny` (`brew install cargo-deny`), and Python
 3.11+. The `toolchain` step fails with an explicit message if any of them is
 missing or is the wrong version, rather than letting an unpinned compiler
-quietly produce a different verdict.
+quietly produce a different verdict. The `security` suite additionally needs
+`gitleaks` (`brew install gitleaks`); it is deliberately kept out of `make check`
+so the everyday pre-push gate does not require it.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs the same acceptance entrypoint on every pull
+request (and on `main` after merge). It invents no step of its own — each job is
+`run_automated.py --suite <x> --require-clean`, so a check that fails in CI fails
+the same way locally:
+
+| Job | Runner | Suite | Provenance artifact |
+|-----|--------|-------|---------------------|
+| `rust-core` | `macos-15` (arm64, POL-5 reference host) | `all` — toolchain, format, lint, test, architecture, cargo-deny (POL-6), traceability, script self-tests | `acceptance-ci-all` |
+| `secret-scan` | `ubuntu-24.04` | `security` — gitleaks over committed history | `acceptance-ci-security` |
+
+Design notes:
+
+- **Least privilege.** The workflow grants `contents: read` and nothing else; no
+  job writes to the repo or mints a token. Release signing/attestation is a
+  separate tag-triggered workflow.
+- **Pinned, so cache cannot change a verdict.** The Rust toolchain is pinned by
+  `rust-toolchain.toml`, dependencies by `Cargo.lock`, `cargo-deny` and
+  `gitleaks` by exact version (gitleaks additionally by sha256), and every action
+  by commit SHA. The cargo cache is keyed on the toolchain and lockfile, so a hit
+  can only ever hold artifacts built from identical inputs — it speeds up a run,
+  it cannot alter its result.
+- **No secrets in logs.** Neither job needs a repository secret, and the secret
+  scan runs gitleaks with `--redact` so a matched value never reaches the
+  uploaded log. Verified false positives are pinned by fingerprint in
+  `.gitleaksignore`; `.gitleaks.toml` is the committed, shared rule config.
+- **Provenance.** Each job uploads `.temp/acceptance/<run-id>/` (`if: always()`,
+  `if-no-files-found: error`, 14-day retention) so a result — green or red — is
+  attributable to a commit (NFR-052).
+
+**Required checks (branch protection, one-time repo-admin setup).** A workflow
+file cannot make itself blocking. Mark `rust-core` and `secret-scan` as required
+status checks on `main` so a pull request cannot merge while either fails.
 
 The bindings smoke (`make smoke-bindings`, not part of `make check`)
 additionally needs `swiftc` (Xcode command line tools), `kotlinc`

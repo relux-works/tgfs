@@ -1,0 +1,28 @@
+# Gitleaks configuration — the secret-scanning gate (NFR-050 / SEC).
+#
+# Run through the one acceptance entrypoint, never a hand-typed gitleaks line:
+#
+#     python3 .scripts/acceptance/run_automated.py --suite security --run-id local-security
+#
+# CI and local runs load this same committed config, so "no secret reached the
+# repo" means the identical thing in both places — the acceptance-runner
+# contract that a gate living only in a YAML file cannot be run before pushing.
+#
+# The gate scans committed git history (`gitleaks git`), not just the working
+# tree: a secret that was committed and later deleted is still a leak, because
+# it lives forever in the history a clone hands out. Build output never reaches
+# the scan — git mode only sees tracked content, so target/ and .temp/ are out
+# of scope by construction, not by an ignore rule that could drift.
+#
+# Known false positives are pinned by fingerprint in .gitleaksignore, not by
+# weakening rules here: a fingerprint suppresses one exact finding and nothing
+# else, so the same rule still fails the gate on any other match.
+
+title = "GramDrive secret-scanning gate"
+
+[extend]
+# Start from the full upstream ruleset (cloud keys, private keys, provider
+# tokens, generic high-entropy api keys, ...) instead of hand-maintaining a
+# rule list that silently rots behind each gitleaks release. Suppress specific
+# false positives in .gitleaksignore; never delete a default rule.
+useDefault = true

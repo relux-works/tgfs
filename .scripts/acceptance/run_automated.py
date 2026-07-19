@@ -31,7 +31,8 @@ Exit codes:
     2   the run could not start (bad arguments, dirty worktree)
 
 Requires: cargo, rustc, git and cargo-deny on PATH (`--suite core` verifies
-this in its first step). Python 3.11+, stdlib only.
+this in its first step); gitleaks on PATH for `--suite security`. Python 3.11+,
+stdlib only.
 """
 
 from __future__ import annotations
@@ -160,6 +161,24 @@ def build_steps() -> dict[str, Step]:
                 ),
                 purpose="self-tests for the scripts in .scripts/",
             ),
+            # git mode, not the working tree: a secret that was committed and
+            # later deleted still ships in every clone's history. --redact keeps
+            # the matched value out of the provenance log (the AC is "logs
+            # contain no secrets"); .gitleaks.toml + .gitleaksignore are the
+            # committed, pinned config so local and CI verdicts agree.
+            Step(
+                name="secret-scan",
+                argv=(
+                    "gitleaks",
+                    "git",
+                    ".",
+                    "--config",
+                    ".gitleaks.toml",
+                    "--redact",
+                    "--no-banner",
+                ),
+                purpose="gitleaks: no secret in committed history (redacted output)",
+            ),
         )
     }
 
@@ -182,6 +201,12 @@ SUITES: dict[str, tuple[str, ...]] = {
         "traceability",
         "scripts",
     ),
+    # Secret scanning. Its own suite, deliberately NOT folded into `all`: it is
+    # the only gate that needs gitleaks on PATH (a third tool footprint after
+    # core's Rust and repo's Python) and it is a merge-boundary check, so the
+    # everyday pre-push `all` run stays gitleaks-free while CI runs this as its
+    # own required job.
+    "security": ("secret-scan",),
     "all": ("core", "repo"),
 }
 

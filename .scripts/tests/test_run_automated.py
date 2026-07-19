@@ -84,6 +84,17 @@ class SuiteResolutionTests(unittest.TestCase):
         repo = [step.name for step in run_automated.resolve_suite("repo", self.catalog)]
         self.assertEqual(names, core + repo)
 
+    def test_security_suite_runs_the_secret_scan(self):
+        names = [step.name for step in run_automated.resolve_suite("security", self.catalog)]
+        self.assertEqual(names, ["secret-scan"])
+
+    def test_all_suite_excludes_secret_scan(self):
+        # Kept out of the everyday pre-push gate on purpose: secret scanning is
+        # the one step needing gitleaks, and it is a merge-boundary job. Folding
+        # it into `all` would make the common local run fail without gitleaks.
+        names = [step.name for step in run_automated.resolve_suite("all", self.catalog)]
+        self.assertNotIn("secret-scan", names)
+
     def test_suite_expansion_never_repeats_a_step(self):
         for suite in run_automated.SUITES:
             names = [step.name for step in run_automated.resolve_suite(suite, self.catalog)]
@@ -132,6 +143,20 @@ class SuiteResolutionTests(unittest.TestCase):
     def test_format_step_checks_rather_than_rewrites(self):
         # `cargo fmt` without --check would silently mutate the tree and pass.
         self.assertIn("--check", self.catalog["format"].argv)
+
+    def test_secret_scan_redacts_so_provenance_logs_carry_no_secret(self):
+        # The AC is "logs contain no secrets": without --redact, gitleaks prints
+        # the matched value, and the runner writes that straight into the
+        # uploaded provenance log.
+        secret_scan = self.catalog["secret-scan"]
+        self.assertIn("--redact", secret_scan.argv)
+
+    def test_secret_scan_reads_the_committed_pinned_config(self):
+        # Local and CI must scan with the same rules and the same false-positive
+        # suppressions, or "no secret reached the repo" means two things.
+        secret_scan = self.catalog["secret-scan"]
+        self.assertIn("--config", secret_scan.argv)
+        self.assertIn(".gitleaks.toml", secret_scan.argv)
 
 
 class RunSuiteTests(unittest.TestCase):
