@@ -163,6 +163,29 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$keychain_pw" "$KEYCHAIN_PATH" >/dev/null
           rm -f "$cert_path"
 
+          # Import the Apple "Developer ID Certification Authority" (G2)
+          # intermediate that the leaf chains through up to the (system-trusted)
+          # Apple Root CA. Hosted GitHub runners preinstall this intermediate;
+          # this persistent runner does not (BUG-260720-29dn2v), so without it
+          # the imported leaf never builds a valid chain and `find-identity -v`
+          # lists 0 codesigning identities even though "1 identity imported".
+          # Fetch the public CA from Apple pinned by sha256 — fail CLOSED on any
+          # mismatch so a swapped or MITM'd cert never reaches the keychain — and
+          # add it to the SAME throwaway keychain. It carries no private key (no
+          # -T) and no trust override (the anchor stays the OS-trusted Apple Root
+          # CA, never this run); it is a public cert, not a secret, and it is
+          # gone with the keychain in the always() cleanup. Verify the pinned
+          # sha256 against https://www.apple.com/certificateauthority/ before
+          # bumping it.
+          devid_ca="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          devid_ca_sha256="f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a"
+          curl --fail --location --silent --show-error \
+            --output "$devid_ca" \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          echo "$devid_ca_sha256  $devid_ca" | shasum -a 256 --check --status
+          security import "$devid_ca" -k "$KEYCHAIN_PATH"
+          rm -f "$devid_ca"
+
           # Store the notary profile in the SAME throwaway keychain (not the login
           # keychain), so notarization needs no key on disk and cleanup is one
           # delete-keychain. build_app_bundle.py is told which keychain via
@@ -269,7 +292,8 @@ jobs:
         if: always()
         run: |
           security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" \
+            "$RUNNER_TEMP/DeveloperIDG2CA.cer" 2>/dev/null || true
           # Restore the recorded search list VERBATIM (delete-keychain leaves a
           # dangling entry and an empty -s is a no-op — see the naming step),
           # then the recorded default. IFS=newline so a path with spaces stays
