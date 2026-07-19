@@ -63,6 +63,12 @@ assumed:
 Measured on the current build: `codesign --verify --deep --strict` passes,
 `flags=0x10000(runtime)` on all three binaries, `TeamIdentifier=262RZ595FP`.
 
+When notarizing, **both the `.app` and the `.dmg` are stapled**, and the `.app`
+is stapled *before* the dmg is built — so the copy a user drags out of the
+mounted dmg carries its own offline ticket, not just the dmg. (Stapling only the
+dmg leaves the extracted app unverifiable offline; the app is zipped and
+notarized first so its cdhash is registered, then stapled, then packed.)
+
 ### Credential-free
 
 No signing key, notarization key, or Telegram secret is read from or written to
@@ -148,9 +154,13 @@ artifact.
   embedded with a fixed rpath and likely
   `com.apple.security.cs.disable-library-validation`. That belongs to the
   TDLib-integration/release work (LOGBOOK; TASK-260715-3bhbkv).
-- **The release workflow.** Importing the cert from `MACOS_CERT_P12` into a temp
-  keychain, tag-triggering, GitHub attestations, SBOM, and rollback metadata are
-  TASK-260715-3bhbkv. This script is what that workflow runs.
+- **The release workflow** now exists (`.github/workflows/release.yml`,
+  TASK-260715-3bhbkv): tag-triggering, importing the cert from `MACOS_CERT_P12`
+  into a throwaway keychain, GitHub artifact attestation, and — via
+  `.scripts/release/build_release_provenance.py` — the SBOM, changelog and
+  rollback metadata. This script is what that workflow runs to build the signed
+  artifact; it is invoked with `--notarize --notary-keychain <the throwaway
+  keychain>` so notarization needs no key on disk.
 
 ## Self-tests
 

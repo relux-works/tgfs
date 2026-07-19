@@ -13,7 +13,7 @@ GATE := python3 .scripts/acceptance/run_automated.py
 .PHONY: check check-core check-repo check-security check-apple gates fmt build test bindings \
         smoke-bindings smoke-shared-state smoke-agent-lifecycle package \
         package-reproducible package-app package-app-unsigned package-app-notarize \
-        tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates
+        release-provenance tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates
 
 # check — the pre-push gate: the core and repo suites (what CI's rust-core job
 # runs). Secret scanning is a separate suite (make check-security) because it
@@ -147,11 +147,21 @@ package-app:
 package-app-unsigned:
 	python3 .scripts/apple-app/build_app_bundle.py --unsigned
 
-# package-app-notarize — the full release path: package-app, then submit the dmg
-# to Apple via the gramdrive-notary keychain profile, wait, staple, and re-check
-# Gatekeeper. Needs network and the notary profile / ASC secrets.
+# package-app-notarize — the full release path: package-app, then notarize +
+# staple the .app AND the dmg via the gramdrive-notary keychain profile, waiting
+# and re-checking Gatekeeper. Needs network and the notary profile / ASC secrets.
 package-app-notarize:
 	python3 .scripts/apple-app/build_app_bundle.py --notarize
+
+# release-provenance — the non-signing half of a release, runnable locally as a
+# dry-run (TASK-260715-3bhbkv): read the packaged .app manifest and produce the
+# SBOM, changelog, rollback metadata, a release manifest tying every artifact to
+# a sha256, and the credential scrub. Needs a prior packaging run for the
+# manifest (`make package-app` or `make package-app-unsigned`); needs no signing
+# identity, Xcode or network — only git and cargo. The tag-triggered release.yml
+# runs this same script. Output: .temp/release/.
+release-provenance:
+	python3 .scripts/release/build_release_provenance.py
 
 # --- TDLib artifact ----------------------------------------------------------
 # The pinned tdjson library GramDrive's local Telegram source links against.

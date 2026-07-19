@@ -297,6 +297,10 @@ class PipelineTest(unittest.TestCase):
                 return 0, ""
             if joined.startswith("spctl"):
                 return 0, "accepted\n"
+            if joined.startswith("ditto"):
+                # Zipping the .app into its notarization container.
+                Path(argv[-1]).write_bytes(b"app-zip-bytes")
+                return 0, ""
             if joined.startswith("hdiutil"):
                 dmg = Path(argv[argv.index("create") + 0])  # placeholder
                 out = Path(argv[-1])
@@ -499,6 +503,45 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(manifest["notarization"]["status"], "Accepted")
             self.assertTrue(any("notarytool submit" in " ".join(c) for c in calls))
             self.assertTrue(any(c[:2] == ("xcrun", "stapler") for c in calls))
+            # Both the app and the dmg are notarized+stapled, recorded per target.
+            self.assertEqual(manifest["notarization"]["app"]["target"], "app")
+            self.assertEqual(manifest["notarization"]["dmg"]["target"], "dmg")
+
+    def test_the_app_is_stapled_before_the_dmg_is_built(self):
+        # The offline-ticket fix (packaging review 2115): the app must be zipped,
+        # notarized and stapled BEFORE hdiutil builds the dmg, so the copy inside
+        # the dmg carries a ticket a user can verify offline.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, calls, _ = self.run_pipeline(Path(tmp), notarize=True)
+            joined = [" ".join(c) for c in calls]
+            staple_app_idx = next(
+                i for i, j in enumerate(joined)
+                if j.startswith("xcrun stapler") and j.rstrip().endswith("GramDrive.app")
+            )
+            hdiutil_idx = next(i for i, j in enumerate(joined) if j.startswith("hdiutil"))
+            self.assertLess(staple_app_idx, hdiutil_idx)
+            # The app went through a ditto zip container, not submitted bare.
+            self.assertTrue(any(j.startswith("ditto") for j in joined))
+
+    def test_notary_keychain_is_passed_to_notarytool_when_set(self):
+        # CI stores the gramdrive-notary profile in a throwaway keychain and
+        # passes it through so nothing touches the login keychain.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, calls, _ = self.run_pipeline(
+                Path(tmp), notarize=True, notary_keychain=Path("/tmp/ci.keychain-db")
+            )
+            submits = [c for c in calls if "notarytool" in c and "submit" in c]
+            self.assertTrue(submits)
+            for c in submits:
+                self.assertIn("--keychain", c)
+                self.assertIn("/tmp/ci.keychain-db", c)
+
+    def test_notary_keychain_defaults_to_the_login_keychain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, calls, _ = self.run_pipeline(Path(tmp), notarize=True)
+            submits = [c for c in calls if "notarytool" in c and "submit" in c]
+            self.assertTrue(submits)
+            self.assertFalse(any("--keychain" in c for c in submits))
 
     def test_notarization_rejection_fails_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:

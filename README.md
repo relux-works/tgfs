@@ -187,6 +187,54 @@ contract — health over the bounded IPC channel, single-instance refusal of
 a second agent, SIGTERM drain of a hosted transfer, and instant successor
 startup after SIGKILL.
 
+#### Release (signed, notarized, attested)
+
+`.github/workflows/release.yml` is the tag-triggered release (`TASK-260715-3bhbkv`):
+push a `v*` tag and it produces one signed, notarized `GramDrive.app` + `.dmg` and
+its provenance. It is the only workflow with elevated permissions
+(`contents: write`, `id-token: write`, `attestations: write`) and the only one
+that holds a secret, so it is isolated to that single trigger. It re-implements no
+signing command — it **invokes** the same reusable scripts native-ci proves
+unsigned.
+
+Pipeline (macos-15, `environment: release`):
+
+1. **Supply-chain gate first (POL-6).** `run_automated.py --suite supply-chain`
+   fails the release *closed* — before any credential is imported — if a
+   dependency pulls in a disallowed license or an open advisory.
+2. **Import into a throwaway keychain.** The Developer ID Application identity
+   (from `MACOS_CERT_P12` / `MACOS_CERT_PASSWORD`) and the `gramdrive-notary`
+   profile (from `APPSTORE_KEY_ID` / `APPSTORE_ISSUER_ID` / `APPSTORE_PRIVATE_KEY`)
+   go into one `RUNNER_TEMP` keychain, deleted in an `always()` step. No secret is
+   echoed; no key material touches the workspace, a cache, or the login keychain.
+3. **Build the signed artifact.** `build_app_bundle.py --notarize` signs
+   inside-out with the hardened runtime + a trusted timestamp, then notarizes and
+   staples **both the `.app` and the `.dmg`** (so an app dragged out of the dmg
+   verifies offline). Version stamping is automatic: marketing version from the
+   tag's `git describe`, `CFBundleVersion` from the rev-count (Sparkle ordering).
+4. **Build the release provenance.** `build_release_provenance.py` emits the
+   CycloneDX **SBOM** (POL-6 dependency inventory), a **changelog** since the last
+   tag, **rollback metadata**, a **release manifest** tying every artifact to a
+   sha256, and a **credential scrub** that fails the release if any produced file
+   looks like it carries a secret.
+5. **Attest + publish.** `actions/attest-build-provenance` records an OIDC-bound
+   attestation for the dmg (verifiable with `gh attestation verify`), then
+   `gh release create` publishes the dmg, checksums, SBOM, changelog, rollback and
+   release manifest with the changelog as the release notes.
+
+The **human approval gate** (POL-8 / DEC-020: public release is the single
+mandatory human stop) is `environment: release` — its required-reviewer protection
+rule (owner sign-off) is a repo-admin setting, the same transparent limitation the
+required-status-check rule has above.
+
+Local dry-run of the non-signing half (needs a prior `make package-app` /
+`make package-app-unsigned` for the manifest; no signing identity, Xcode, or
+network — only git and cargo):
+
+```sh
+make release-provenance    # SBOM + changelog + rollback + release manifest + scrub → .temp/release/
+```
+
 ### Packaging the core for native consumers
 
 ```sh
@@ -227,6 +275,8 @@ Available utilities:
 | `.scripts/smoke/run_bindings_smoke.py` | End-to-end bindings smoke: builds the FFI library, generates bindings, compiles and runs the Swift and Kotlin smoke consumers (`.scripts/smoke/{swift,kotlin}/`) asserting async, progress, error, and cancellation round-trips | `make smoke-bindings`, or `python3 .scripts/smoke/run_bindings_smoke.py [--skip-swift] [--skip-kotlin]` (needs `swiftc`, `kotlinc`, `java`) | Exit 0 + `BINDINGS SMOKE PASSED`, or non-zero with the failing step's log; artifacts and per-step logs in `.temp/bindings-smoke/` |
 | `.scripts/smoke/run_shared_state_smoke.py` | Multi-process shared-state smoke (TASK-260715-gnsa2s): a Rust coordinator process seeds a substitute App Group container, two concurrent Swift provider processes (`apple/GramDriveSupport` over the packaged artifact) must read byte-identical item metadata, and a watcher process must observe the Darwin change doorbell plus the `dataVersion` probe across a foreign commit | `make smoke-shared-state`, or `python3 .scripts/smoke/run_shared_state_smoke.py [--repackage]` (macOS; needs Xcode; stages `make package` when no artifact is present) | Exit 0 + `SHARED-STATE SMOKE PASSED`, or non-zero with the failing step's output; container and per-step logs in `.temp/shared-state-smoke/` |
 | `.scripts/packaging/build_core_artifacts.py` | Builds what native consumers ship against: release staticlib (LTO restored via a crate-type override), Swift bindings generated from that exact binary, XCFramework, manifest (contract version read from the built artifact, `git describe`, toolchain), checksums, and a deterministic zip; verifies it all by resolving and running a real minimal SwiftPM package (`.scripts/packaging/swift-consumer/`). Owns the shipped-target list | `make package`, `make package-reproducible`, or `python3 .scripts/packaging/build_core_artifacts.py [--skip-verify] [--check-reproducible]` (macOS; needs `xcodebuild`, `swift`) | Exit 0 + `PACKAGING PASSED`, or non-zero with the failing step's log; artifacts, `manifest.json`, `CHECKSUMS.sha256` and per-step logs in `.temp/packaging/` |
+| `.scripts/release/build_release_provenance.py` | The release provenance bundle (TASK-260715-3bhbkv), derived from the signed `.app` manifest + git history + `cargo metadata`: CycloneDX SBOM (POL-6 dependency inventory, license per crate), changelog since the last tag, rollback metadata, a release manifest tying every artifact to a sha256, and a credential scrub that fails on any secret-shaped content. POL-6 is *enforced* by `cargo deny` (core CI), not re-adjudicated here. Invoked by the tag-triggered `release.yml` | `make release-provenance`, or `python3 .scripts/release/build_release_provenance.py [--package-dir DIR] [--out-dir DIR] [--tag vX.Y.Z]` (needs a prior packaging run for the manifest; only git + cargo, no signing/Xcode/network) | Exit 0; `sbom.json`, `CHANGELOG.md`, `rollback.json`, `release-manifest.json`, `RELEASE-CHECKSUMS.sha256` in `.temp/release/` |
+| `.scripts/apple-app/build_app_bundle.py` | Assembles, signs (Developer ID, hardened runtime, inside-out), notarizes + staples the `.app` **and** `.dmg`, and records a manifest with per-binary entitlements/cdhashes + checksums (TASK-260715-1dk9ik). Pipeline: `.scripts/apple-app/README.md` | `make package-app` (sign+verify, no notarize), `make package-app-unsigned` (assemble only), `make package-app-notarize` (full), or `python3 .scripts/apple-app/build_app_bundle.py [--notarize] [--unsigned] [--notary-keychain PATH]` (macOS; needs Xcode, a Developer ID identity, staged core) | Exit 0 + `APP PACKAGING PASSED`; `GramDrive.app`, `.dmg`, `manifest.json`, `CHECKSUMS.sha256` in `.temp/app-packaging/` |
 | `.scripts/smoke/run_agent_lifecycle_smoke.py` | Multi-process agent-lifecycle smoke (TASK-260715-1yx9ly): the `gramdrive-agent` companion binary over a substitute container — startup with health served over the bounded UNIX-socket IPC, single-instance refusal (exit 2) of a second agent, SIGTERM drain cancelling a hosted transfer through its token (exit 0, endpoint removed), and a successor starting immediately after SIGKILL with healthy durable state | `make smoke-agent-lifecycle`, or `python3 .scripts/smoke/run_agent_lifecycle_smoke.py [--repackage]` (macOS; needs Xcode; stages `make package` when no artifact is present) | Exit 0 + `PASSED: agent lifecycle smoke`, or non-zero with the failing step's output; container and per-step logs in `.temp/agent-lifecycle-smoke/` |
 | `.scripts/tdlib/build_tdlib.py` | Reproducible build of the pinned TDLib tdjson artifact the local Telegram source links against (BSL-1.0 recorded per POL-6): fetch at the pinned commit, CMake build, staged `libtdjson.dylib` + headers + license, manifest and checksums, proved by the `link-smoke/` Rust binary; pipeline documented in `.scripts/tdlib/README.md` | `make tdlib`, `make tdlib-smoke` (re-run only the link smoke), `make tdlib-verify` (same-path reproducibility), or `python3 .scripts/tdlib/build_tdlib.py` (macOS arm64; needs Xcode clang, `cmake`, `gperf`, Homebrew `openssl@3`) | Staged artifact, `manifest.json` and `CHECKSUMS.sha256` in `.temp/tdlib/out/`; smoke prints the running library's version |
 | `make tdjson-smoke` | Real-linkage smoke of the `gramdrive-source-tdjson` runtime (crate docs: `crates/gramdrive-source-tdjson/README.md`): with `GRAMDRIVE_TDLIB_ARTIFACT_DIR` set, the crate's env-gated `build.rs` links the staged `libtdjson.dylib` and the otherwise-empty `real_tdjson_smoke` test drives correlation, client close, and shutdown against the real library. Every `make check` runs the same runtime mock-only, artifact-free | `make tdjson-smoke` (after `make tdlib` staged the artifact) | `cargo test` output: 1 test against the real library, exit non-zero on failure |

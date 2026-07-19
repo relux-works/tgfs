@@ -1,0 +1,235 @@
+# Tag-triggered release — the signed, notarized, attested GramDrive.app + dmg and
+# its provenance (TASK-260715-3bhbkv). Mirrors the relux-works/barycenter
+# release.yml pattern: a `v*` tag, macos-15, a Developer ID identity imported
+# from a secret into a THROWAWAY keychain, hardened-runtime signing, dmg,
+# notarize + staple, and GitHub artifact attestation (id-token + attestations).
+#
+# WHY A SEPARATE WORKFLOW FROM ci.yml / native-ci.yml. Those gate every PR and
+# main; they read only the checkout, mint no token, and hold no secret. Release
+# is the one workflow with elevated permissions and the signing identity, so it
+# is isolated to a single tag trigger with its own least-privilege grant. It
+# never re-implements a signing or codesign command: it INVOKES the reusable
+# scripts native-ci already proves unsigned (`build_app_bundle.py`,
+# `build_release_provenance.py`) — the one-entrypoint contract, one step deeper.
+#
+# THE HUMAN GATE. POL-8 / DEC-020: public release is the single mandatory human
+# approval gate. That is the `environment: release` below — its required-reviewer
+# protection rule (owner sign-off) is a repo-admin setting a workflow file cannot
+# grant itself, the same transparent limitation the required-status-check rule
+# has in ci.yml. Until it is set, the job runs unguarded; setting it makes the
+# tag wait for owner approval before any credential is touched.
+#
+# SECRETS (never in the repo or logs — SEC-001/NFR-053; the gitleaks gate + the
+# release provenance scrub both enforce it):
+#   MACOS_CERT_P12        base64 of the Developer ID Application .p12
+#   MACOS_CERT_PASSWORD   the .p12 export password
+#   APPSTORE_KEY_ID       App Store Connect API key id (notarization)
+#   APPSTORE_ISSUER_ID    App Store Connect issuer id
+#   APPSTORE_PRIVATE_KEY  the ASC API .p8 private key contents
+# No Telegram api_id/api_hash here: `make package` builds the core mock-only and
+# the bundle links no TDLib, so the signed artifact needs no runtime secret.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege, but wider than the gate workflows because a release publishes:
+#   contents: write      create the GitHub Release and upload its assets
+#   id-token: write      mint the OIDC token the attestation is bound to
+#   attestations: write  record the build-provenance attestation
+permissions:
+  contents: read
+
+concurrency:
+  # One release per tag; never cancel one in flight — a cancelled run mid-notarize
+  # or mid-publish leaves a half-made release. (Unlike PR gates, which cancel.)
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release-macos
+    runs-on: macos-15 # POL-5 / DEC-017 reference host (Apple Silicon)
+    # POL-8 / DEC-020 single human approval gate (see header).
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Name the throwaway signing keychain
+        # The one keychain that holds BOTH the signing identity and the notary
+        # profile for this run; deleted in the always() cleanup step. Kept in
+        # RUNNER_TEMP so it never lands in the workspace or a cache. Exported here
+        # because the `runner` context is not available in a job-level `env:`.
+        run: echo "KEYCHAIN_PATH=$RUNNER_TEMP/gramdrive-signing.keychain-db" >> "$GITHUB_ENV"
+
+      - name: Checkout full history and tags
+        # Version stamping reads `git describe --tags` (marketing version) and
+        # `git rev-list --count HEAD` (CFBundleVersion, Sparkle ordering), and
+        # the changelog spans from the previous tag — all need full history+tags.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Install cargo-deny (pinned)
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Supply-chain gate before signing (POL-6)
+        # Fail CLOSED before any credential is imported: a tag that pulls in a
+        # disallowed license or an open advisory must never reach the signing
+        # identity. Run through the ONE acceptance entrypoint (single step name),
+        # not an ad-hoc cargo-deny line, so it is the exact gate CI and devs run.
+        run: python3 .scripts/acceptance/run_automated.py --suite supply-chain --run-id release-supply-chain
+
+      - name: Import the Developer ID identity and notary profile (throwaway keychain)
+        # Every secret arrives via env and is written only to RUNNER_TEMP files
+        # that are deleted in the same step. No secret is ever echoed (no set -x),
+        # and the keychain password is generated here — it never leaves the run.
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          cert_path="$RUNNER_TEMP/cert.p12"
+          asc_key="$RUNNER_TEMP/asc_key.p8"
+          keychain_pw="$(openssl rand -base64 24)"
+
+          # A dedicated keychain, unlocked, set as default and added to the search
+          # list so codesign finds the identity. Auto-lock long enough for the run.
+          security create-keychain -p "$keychain_pw" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$keychain_pw" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          # Keep the existing keychains in the search list; strip only the quotes
+          # security prints around each path and let word-splitting separate them
+          # (each remains its own argument). Word-splitting is intentional here.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | sed 's/"//g')
+
+          # Import the Developer ID Application identity, then authorise codesign
+          # to use its private key without an interactive prompt.
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$cert_path"
+          security import "$cert_path" -k "$KEYCHAIN_PATH" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_pw" "$KEYCHAIN_PATH" >/dev/null
+          rm -f "$cert_path"
+
+          # Store the notary profile in the SAME throwaway keychain (not the login
+          # keychain), so notarization needs no key on disk and cleanup is one
+          # delete-keychain. build_app_bundle.py is told which keychain via
+          # --notary-keychain.
+          printf '%s' "$APPSTORE_PRIVATE_KEY" > "$asc_key"
+          xcrun notarytool store-credentials gramdrive-notary \
+            --key "$asc_key" \
+            --key-id "$APPSTORE_KEY_ID" \
+            --issuer "$APPSTORE_ISSUER_ID" \
+            --keychain "$KEYCHAIN_PATH"
+          rm -f "$asc_key"
+
+          # Confirm the identity is present (name only — never the key).
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -c "Developer ID Application"
+
+      - name: Stage the GramDriveCore artifact
+        # The Swift package resolves GramDriveCore by path; `make package` builds
+        # the XCFramework + bindings (core mock-only, no TDLib) into .temp.
+        run: make package
+
+      - name: Build the signed, notarized bundle and dmg
+        # The reusable pipeline: build the three executables, assemble GramDrive.app
+        # with the nested appex, sign inside-out with the hardened runtime and a
+        # trusted timestamp, notarize + staple the .app AND the dmg, and write
+        # manifest.json + CHECKSUMS.sha256. Version stamping is automatic here:
+        # marketing version from the tag's `git describe`, CFBundleVersion from
+        # the rev-count. The identity default is the Relux Works Developer ID.
+        run: |
+          python3 .scripts/apple-app/build_app_bundle.py \
+            --notarize \
+            --notary-profile gramdrive-notary \
+            --notary-keychain "$KEYCHAIN_PATH"
+
+      - name: Build the release provenance (SBOM, changelog, rollback, manifest)
+        # Derived from the signed artifact's manifest + git history + cargo
+        # metadata: CycloneDX SBOM (POL-6 inventory), changelog since the last
+        # tag, rollback metadata, a release manifest tying every artifact to a
+        # sha256, and a credential scrub that FAILS the release if any produced
+        # file looks like it carries a secret.
+        run: |
+          python3 .scripts/release/build_release_provenance.py \
+            --package-dir .temp/app-packaging \
+            --out-dir .temp/release \
+            --tag "${GITHUB_REF_NAME}"
+
+      - name: Attest build provenance for the dmg
+        # GitHub artifact attestation: a signed, OIDC-bound statement that this
+        # dmg was built by this workflow at this commit — independently verifiable
+        # with `gh attestation verify`. This is what makes the release traceable
+        # to a reviewed commit (the task AC) without embedding anything.
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            .temp/app-packaging/GramDrive-*.dmg
+            .temp/release/release-manifest.json
+
+      - name: Publish the GitHub Release
+        # The `gh` CLI (preinstalled, not a third-party action — no extra supply
+        # chain) creates the release from the tag with the changelog as its notes
+        # and every artifact + its provenance attached. --verify-tag ensures the
+        # tag being released is the one that triggered the run.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "GramDrive ${GITHUB_REF_NAME}" \
+            --notes-file .temp/release/CHANGELOG.md \
+            --verify-tag \
+            .temp/app-packaging/GramDrive-*.dmg \
+            .temp/app-packaging/CHECKSUMS.sha256 \
+            .temp/app-packaging/manifest.json#app-manifest.json \
+            .temp/release/sbom.json \
+            .temp/release/CHANGELOG.md \
+            .temp/release/rollback.json \
+            .temp/release/release-manifest.json \
+            .temp/release/RELEASE-CHECKSUMS.sha256
+
+      - name: Upload release provenance artifact
+        # The full provenance set, retained on the run itself (not only the
+        # Release) so a red or interrupted run still leaves an attributable record
+        # (NFR-052) — same posture as the gate workflows.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-provenance
+          path: |
+            .temp/release
+            .temp/app-packaging/manifest.json
+            .temp/app-packaging/CHECKSUMS.sha256
+            .temp/acceptance/release-supply-chain
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Delete the signing keychain
+        # Always, even on failure: the throwaway keychain and any decoded secret
+        # file must never outlive the run. The runner is ephemeral, but leaving
+        # nothing behind is the contract, not a convenience.
+        if: always()
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" 2>/dev/null || true

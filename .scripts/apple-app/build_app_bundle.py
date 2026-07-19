@@ -433,25 +433,45 @@ def cdhash_probe_argv(target: Path) -> tuple[str, ...]:
     return ("codesign", "-d", "--verbose=4", str(target))
 
 
-def notarize_submit_argv(dmg: Path, profile: str) -> tuple[str, ...]:
-    """Submit the dmg for notarization and wait, using a keychain profile so no
-    key is read here. `--output-format json` makes the submission id and status
-    machine-readable for the manifest."""
-    return (
+def notarize_submit_argv(
+    target: Path, profile: str, keychain: Path | None = None
+) -> tuple[str, ...]:
+    """Submit a notarizable container (a `.dmg` or a zipped `.app`) and wait,
+    using a keychain profile so no key is read here. `--output-format json`
+    makes the submission id and status machine-readable for the manifest.
+
+    `keychain` names which keychain holds the profile. Omitted, notarytool reads
+    the login keychain (local dev, where `gramdrive-notary` already lives). CI
+    stores the profile in a throwaway keychain alongside the signing identity and
+    passes it here, so nothing touches the login keychain and cleanup is one
+    `security delete-keychain`.
+    """
+    argv = [
         "xcrun",
         "notarytool",
         "submit",
-        str(dmg),
+        str(target),
         "--keychain-profile",
         profile,
-        "--wait",
-        "--output-format",
-        "json",
-    )
+    ]
+    if keychain is not None:
+        argv += ["--keychain", str(keychain)]
+    argv += ["--wait", "--output-format", "json"]
+    return tuple(argv)
 
 
-def staple_argv(dmg: Path) -> tuple[str, ...]:
-    return ("xcrun", "stapler", "staple", str(dmg))
+def ditto_zip_argv(app: Path, zip_path: Path) -> tuple[str, ...]:
+    """Zip the `.app` into a notarizable container. notarytool takes a
+    dmg/pkg/zip, never a bare `.app`; `--keepParent` keeps the `.app` directory
+    as the archive root so the submission's code is the app itself."""
+    return ("ditto", "-c", "-k", "--keepParent", str(app), str(zip_path))
+
+
+def staple_argv(target: Path) -> tuple[str, ...]:
+    """Staple the notarization ticket into a `.app` or a `.dmg`. The ticket is
+    looked up by the target's cdhash, so the code must have been notarized (its
+    cdhash registered with Apple) before this can succeed."""
+    return ("xcrun", "stapler", "staple", str(target))
 
 
 def hdiutil_argv(app_staging: Path, dmg: Path, volname: str) -> tuple[str, ...]:
@@ -798,10 +818,40 @@ class AppPackager:
         shutil.rmtree(staging)
         return dmg
 
-    def notarize(self, dmg: Path, profile: str) -> dict:
-        """Submit, wait, verify accepted, then staple. Returns the record for
-        the manifest (submission id + status), never any credential."""
-        output = self.run("notarize-submit", notarize_submit_argv(dmg, profile))
+    def notarize_app(self, app: Path, profile: str, keychain: Path | None = None) -> dict:
+        """Notarize and staple the `.app` itself, BEFORE the dmg is built, so the
+        app carries its own offline ticket.
+
+        Why this and not just the dmg: stapling the dmg leaves the `.app` inside
+        it un-stapled, so a user who drags the app out of the mounted dmg gets a
+        bundle with no notarization ticket — its first launch is blocked offline
+        (Gatekeeper cannot reach Apple to verify). Stapling the app requires its
+        cdhash be registered with Apple first, and notarytool takes a container,
+        not a bare `.app` — so the app is zipped, submitted, and on Accepted the
+        ORIGINAL `.app` is stapled. Doing it here, before build_dmg, means the
+        copy that lands in the dmg is the stapled one (packaging review 2115).
+        """
+        zip_path = self.out_dir / f"{APP_BUNDLE_NAME}.notarize.zip"
+        zip_path.unlink(missing_ok=True)
+        self.run("ditto-zip-app", ditto_zip_argv(app, zip_path))
+        output = self.run(
+            "notarize-app-submit", notarize_submit_argv(zip_path, profile, keychain)
+        )
+        record = parse_notary_submission(output)
+        status = record.get("status")
+        if status != "Accepted":
+            raise StepFailed(
+                f"app notarization did not succeed (status={status!r}, "
+                f"id={record.get('id')!r}); see the log and `notarytool log`"
+            )
+        self.run("staple-app", staple_argv(app))
+        zip_path.unlink(missing_ok=True)
+        return {"submitted": True, "target": "app", "id": record.get("id"), "status": status}
+
+    def notarize(self, dmg: Path, profile: str, keychain: Path | None = None) -> dict:
+        """Submit the dmg, wait, verify accepted, then staple. Returns the record
+        for the manifest (submission id + status), never any credential."""
+        output = self.run("notarize-submit", notarize_submit_argv(dmg, profile, keychain))
         record = parse_notary_submission(output)
         status = record.get("status")
         if status != "Accepted":
@@ -810,7 +860,7 @@ class AppPackager:
                 f"id={record.get('id')!r}); see the log and `notarytool log`"
             )
         self.run("staple", staple_argv(dmg))
-        return {"submitted": True, "profile": profile, "id": record.get("id"), "status": status}
+        return {"submitted": True, "target": "dmg", "profile": profile, "id": record.get("id"), "status": status}
 
 
 def assert_entitlements(key: str, expected: dict, dumped: dict) -> None:
@@ -926,6 +976,7 @@ def package(
     core_package: Path,
     notarize: bool = False,
     notary_profile: str = DEFAULT_NOTARY_PROFILE,
+    notary_keychain: Path | None = None,
     timestamp: bool = True,
     unsigned: bool = False,
     runner: Runner = default_runner,
@@ -968,9 +1019,23 @@ def package(
         signed = packager.sign(app, entitlement_files, timestamp=timestamp)
         packager.verify(app, signed)
         spctl_verdict = packager.assess(app)
+        if notarize:
+            # Staple the app FIRST, before the dmg is built, so the copy inside
+            # the dmg carries an offline ticket too (see notarize_app).
+            app_note = packager.notarize_app(app, notary_profile, notary_keychain)
         dmg = packager.build_dmg(app, short_version, timestamp=timestamp)
         if notarize:
-            notarization = packager.notarize(dmg, notary_profile)
+            dmg_note = packager.notarize(dmg, notary_profile, notary_keychain)
+            notarization = {
+                "submitted": True,
+                "profile": notary_profile,
+                # The dmg's id/status stay at the top level so existing readers
+                # keep working; the per-target records name which is which.
+                "id": dmg_note.get("id"),
+                "status": dmg_note.get("status"),
+                "app": app_note,
+                "dmg": dmg_note,
+            }
             # Re-assess the stapled app: now it must be accepted.
             spctl_verdict = packager.assess(app)
 
@@ -1050,6 +1115,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_NOTARY_PROFILE,
         help=f"notarytool keychain profile (default: {DEFAULT_NOTARY_PROFILE})",
     )
+    parser.add_argument(
+        "--notary-keychain",
+        type=Path,
+        default=None,
+        help="keychain holding the notary profile (default: the login keychain). "
+        "CI passes the throwaway keychain the profile was stored in.",
+    )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -1080,6 +1152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             core_package=core_package,
             notarize=args.notarize,
             notary_profile=args.notary_profile,
+            notary_keychain=args.notary_keychain.resolve() if args.notary_keychain else None,
             unsigned=args.unsigned,
         )
     except StepFailed as failure:
