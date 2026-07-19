@@ -33,8 +33,14 @@ let package = Package(
         // health snapshot and its bounded local IPC channel. The agent
         // executable and the app shell both link it.
         .library(name: "GramDriveAgentCore", targets: ["GramDriveAgentCore"]),
+        // The companion shell (TASK-260715-13pxnu): SwiftUI menu-bar UX —
+        // authorization flow, account/provider status, cache/Archive settings,
+        // diagnostics, repair, removal — over the CompanionBackend seam.
+        .library(name: "GramDriveCompanion", targets: ["GramDriveCompanion"]),
         // The companion background agent (launch agent) binary itself.
         .executable(name: "gramdrive-agent", targets: ["GramDriveAgentMain"]),
+        // The companion shell app (menu-bar).
+        .executable(name: "gramdrive-companion", targets: ["GramDriveCompanionMain"]),
         // Used by .scripts/smoke/run_shared_state_smoke.py: reader, watcher
         // and doorbell-poster processes for the two-process smoke.
         .executable(name: "gramdrive-shared-state-smoke", targets: ["SharedStateSmoke"]),
@@ -56,9 +62,26 @@ let package = Package(
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
             ]
         ),
+        .target(
+            name: "GramDriveCompanion",
+            dependencies: [
+                "GramDriveAgentCore",
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
         .executableTarget(
             name: "GramDriveAgentMain",
             dependencies: [
+                "GramDriveAgentCore",
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+        .executableTarget(
+            name: "GramDriveCompanionMain",
+            dependencies: [
+                "GramDriveCompanion",
                 "GramDriveAgentCore",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
@@ -81,6 +104,15 @@ let package = Package(
         .testTarget(
             name: "GramDriveAgentCoreTests",
             dependencies: [
+                "GramDriveAgentCore",
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+        .testTarget(
+            name: "GramDriveCompanionTests",
+            dependencies: [
+                "GramDriveCompanion",
                 "GramDriveAgentCore",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),

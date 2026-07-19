@@ -71,4 +71,45 @@ public struct AgentHealthSnapshot: Codable, Equatable, Sendable {
     /// construction: fixed vocabulary composed by the agent, never user
     /// data, paths, or account material (NFR-032).
     public var recentEvents: [String]
+
+    /// Public memberwise initializer so consumers of the payload (the app
+    /// shell) and their tests can construct a snapshot; in production the
+    /// snapshot is decoded from the agent's JSON, never built by hand.
+    public init(
+        payloadVersion: Int,
+        agentVersion: String,
+        contractVersion: String,
+        pid: Int32,
+        state: AgentRunState,
+        startedAtMs: Int64,
+        launchAtLogin: Bool?,
+        stateSchemaVersion: Int64?,
+        dataVersion: Int64?,
+        pendingTransferCount: Int,
+        lastSourceUpdateMs: Int64?,
+        changeCursor: String?,
+        cachePressure: String?,
+        providerRegistrationState: String?,
+        lastSleepMs: Int64?,
+        lastWakeMs: Int64?,
+        recentEvents: [String]
+    ) {
+        self.payloadVersion = payloadVersion
+        self.agentVersion = agentVersion
+        self.contractVersion = contractVersion
+        self.pid = pid
+        self.state = state
+        self.startedAtMs = startedAtMs
+        self.launchAtLogin = launchAtLogin
+        self.stateSchemaVersion = stateSchemaVersion
+        self.dataVersion = dataVersion
+        self.pendingTransferCount = pendingTransferCount
+        self.lastSourceUpdateMs = lastSourceUpdateMs
+        self.changeCursor = changeCursor
+        self.cachePressure = cachePressure
+        self.providerRegistrationState = providerRegistrationState
+        self.lastSleepMs = lastSleepMs
+        self.lastWakeMs = lastWakeMs
+        self.recentEvents = recentEvents
+    }
 }

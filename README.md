@@ -62,7 +62,7 @@ Conventions:
 
 - `.spec/` — product and architecture source of truth.
 - `crates/` — the shared Rust core workspace (`crates/README.md` documents layers, dependency direction, and feature policy).
-- `apple/` — Apple-native packages; currently `apple/GramDriveSupport`, the provider-support Swift package every GramDrive process links (App Group container resolution, shared-state access per process role, the cross-process change doorbell — `apple/GramDriveSupport/README.md`).
+- `apple/` — Apple-native packages; currently `apple/GramDriveSupport`, the provider-support Swift package every GramDrive process links (App Group container resolution, shared-state access per process role, the cross-process change doorbell), which also ships the `gramdrive-agent` companion agent and the `gramdrive-companion` menu-bar shell (authorization, status, cache/Archive settings, diagnostics, repair, removal — `apple/GramDriveSupport/README.md`).
 - `.research/` — permanent research archive.
 - `.task-board/` and `.planning/` — project decomposition and generated execution plans.
 - `.scripts/` — reusable repo utilities.

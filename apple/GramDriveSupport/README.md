@@ -38,7 +38,7 @@ lifecycle is `launching → recovering → running → draining → stopped`:
 | `SingleInstanceLock` | One coordinator per container, via `flock` — the kernel releases a crashed agent's lock, so recovery needs no stale-lock cleanup |
 | `TransferRegistry` | The in-flight transfer ledger and the drain: admission refusal once draining, a grace period, then cancellation through each operation's FFI `CancellationToken`. Process-local by design; durable transfer state is the engine's, which is why a crash cannot duplicate work |
 | `AgentHealthServer` / `AgentHealthClient` | The bounded local IPC: one endpoint, no request vocabulary — connect, receive one `AgentHealthSnapshot` (NFR-032 shape; unwired fields are honest `nil`s), EOF. A UNIX socket in the container rather than an XPC mach service so the channel stays provable in tests and the smoke; paths beyond `sun_path` are handled |
-| `AgentSettings` / `AgentSettingsStore` | Durable host preferences (launch-at-login), atomic JSON under `agent/`; never in the engine's database (DEC-006) |
+| `AgentSettings` / `AgentSettingsStore` | Durable host preferences — launch-at-login, managed-cache quota and global Archive Mode (POL-2) — as atomic JSON under `agent/`; never in the engine's database (DEC-006). The app writes it, the agent reads it; decoding tolerates a missing key as its default, so a shell or agent update never orphans the document |
 | `LaunchAtLoginPolicy` / `SMAppServiceAgentLoginItem` | Idempotent reconciliation of the user's preference with `SMAppService` registration. Called by the *app* (the launchd plist lives in the app bundle — platform constraint); the agent honors the preference by reporting it and never self-registering |
 | `PowerEventSource` / `WorkspacePowerEventSource` | Sleep/wake observation; wake re-probes `dataVersion` because a doorbell rung during sleep is lost |
 
@@ -48,6 +48,28 @@ carries its own version and the core's contract version in health so the
 shell can detect a stale agent after an update. Accounts live inside the
 shared database (`AccountScope`), so one agent hosts every account of the
 container — the multiple-accounts path never means multiple coordinators.
+
+## The companion shell (TASK-260715-13pxnu)
+
+The package also ships the menu-bar companion app (PLAT-MAC-005):
+`GramDriveCompanion` (the view-model + seam library) and
+`gramdrive-companion` (the SwiftUI `MenuBarExtra` executable). It hosts no
+engine and performs **no Telegram operation itself** — it is a presentation
+layer that renders the agent's status and drives it through one seam.
+
+| Type | Owns |
+|---|---|
+| `CompanionBackend` | The single boundary between shell and agent — the AC's "UI drives the agent via IPC; no Telegram ops from filesystem callbacks" is this seam existing and the shell holding nothing else. `LiveCompanionBackend` wires the reads that exist today (health over the bounded socket, settings over the durable document); commands (authorization, repair, removal) report `ControlChannelUnavailable.notWired` until the agent grows a control channel, because the health socket is read-only by design and the FFI exposes no such surface yet |
+| `AuthorizationViewModel` / `CompanionAuthState` … | The sign-in flow (phone → code → optional 2FA, or QR → optional 2FA), a faithful mirror of the core's `gramdrive-source-tdjson::auth` vocabulary (`AuthState`/`AuthInput`/`AuthRejection`/`RetryAdvice`). The state stream from the `AuthorizationSession` seam is the single source of truth for the screen, exactly as TDLib's reported state is for the core machine |
+| `CompanionStatusViewModel` | Account, File Provider domain, and diagnostics status — pure projections of the last `AgentHealthSnapshot`, with honest "not reported yet" where the engine has not wired a field |
+| `CompanionSettingsViewModel` | The managed-cache quota, global Archive Mode with the POL-2 pre-enable check (projected disk usage + low-disk warning), and launch-at-login reconciled through `LaunchAtLoginPolicy` |
+| `RepairViewModel` / `AccountRemovalViewModel` | The repair pass and the irreversible account removal (SEC-004), each gated and rendered by the shell but executed in the agent; removal is behind a typed, echo-the-label confirmation |
+| `InMemoryCompanionBackend` / `ScriptedAuthorizationSession` | Preview- and test-support seam implementations (mirroring `gramdrive-testkit`) that make every screen state reachable deterministically |
+
+Every screen state is a deterministic view-model tested via scripted fakes
+(`Tests/GramDriveCompanionTests`); the SwiftUI views switch over those
+states so every one is reachable. The command-channel wiring lands with the
+control-channel story (this story blocks `STORY-260715-2pe5sa`).
 
 ## The core dependency is a built artifact
 
@@ -75,7 +97,13 @@ consuming a staged or released artifact elsewhere.
   bindings, doorbell post/observe/cancel round-trips, and the agent
   suites (lock contention, launch-policy matrix, health channel including
   beyond-`sun_path` sockets, registry drain semantics, and the full
-  lifecycle against real shared state and a real hosted probe transfer).
+  lifecycle against real shared state and a real hosted probe transfer);
+  and the companion-shell suites — every authorization screen state and
+  flow (phone/code/2FA/QR, rejection→advice, invalid-input refusal,
+  control-channel-unavailable), status/diagnostics projection, settings
+  round-trip with the Archive Mode preflight and launch-at-login reconcile,
+  repair/removal outcomes, and `AgentSettings` forward/backward decode
+  compatibility.
 - `make smoke-agent-lifecycle` (repo root) — the agent as real processes:
   startup with health over the socket, single-instance refusal of a
   second agent, SIGTERM drain (hosted transfer cancelled through its

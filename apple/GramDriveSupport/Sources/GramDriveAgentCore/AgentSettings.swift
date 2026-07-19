@@ -8,7 +8,18 @@ import Foundation
 /// directory instead. The app writes it, the agent reads it; atomic
 /// replacement keeps a concurrent reader from ever seeing a half-written
 /// document.
+///
+/// Decoding tolerates a missing key as its default, the same additive-
+/// evolution rule the FFI contract and health payload follow: a settings
+/// document written by an older shell (only `launchAtLogin`, or none of the
+/// keys) still loads, so a shell update never orphans an agent's settings
+/// and vice versa.
 public struct AgentSettings: Codable, Equatable, Sendable {
+    /// POL-2 / DEC-014 default managed-cache quota: 10 GB (base-10, the unit
+    /// the product promise is stated in). Unpinned content is evicted LRU to
+    /// stay under it; pinned content and Archive Mode are quota-exempt.
+    public static let defaultCacheQuotaBytes: UInt64 = 10_000_000_000
+
     /// Whether the user wants the agent registered as a login item.
     ///
     /// Off by default: registering a background item without the user's
@@ -16,8 +27,44 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     /// inventing one.
     public var launchAtLogin: Bool
 
-    public init(launchAtLogin: Bool = false) {
+    /// Managed-cache quota in bytes (POL-2). The app owns this knob; the
+    /// engine's cache/eviction work (TASK-260715-11abx8) reads it. Carried
+    /// durably here whether or not the engine acts on it yet — an honest
+    /// preference the user set, not a value invented by whoever reads it.
+    public var cacheQuotaBytes: UInt64
+
+    /// Global Archive Mode (POL-2): the "download everything" opt-in —
+    /// pin-all + eager backfill, quota-exempt. Off by default (Dropbox
+    /// placeholder semantics are the default everywhere). Per-chat Archive
+    /// Mode is engine/drive state, not a host preference, so it does not
+    /// live here.
+    public var archiveModeEnabled: Bool
+
+    public init(
+        launchAtLogin: Bool = false,
+        cacheQuotaBytes: UInt64 = AgentSettings.defaultCacheQuotaBytes,
+        archiveModeEnabled: Bool = false
+    ) {
         self.launchAtLogin = launchAtLogin
+        self.cacheQuotaBytes = cacheQuotaBytes
+        self.archiveModeEnabled = archiveModeEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case launchAtLogin
+        case cacheQuotaBytes
+        case archiveModeEnabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.launchAtLogin =
+            try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
+        self.cacheQuotaBytes =
+            try container.decodeIfPresent(UInt64.self, forKey: .cacheQuotaBytes)
+            ?? AgentSettings.defaultCacheQuotaBytes
+        self.archiveModeEnabled =
+            try container.decodeIfPresent(Bool.self, forKey: .archiveModeEnabled) ?? false
     }
 }
 
