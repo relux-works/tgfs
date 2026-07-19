@@ -443,6 +443,69 @@ def assert_credential_free(out_dir: Path) -> None:
         )
 
 
+# -- attestation status ------------------------------------------------------
+
+# GitHub artifact attestation (actions/attest-build-provenance) is entitled per
+# org plan: a private repo needs a paid plan, a public repo gets it free. On a
+# private repo without that entitlement the create-attestation API rejects with
+# "Feature not available … upgrade the billing plan, or make this repository
+# public" (BUG-260720-116eli). The release workflow preflights that entitlement
+# and passes the result here so the release record states the provenance gap
+# explicitly instead of silently shipping without an attestation.
+ATTESTATION_AVAILABLE = "available"
+ATTESTATION_UNAVAILABLE = "unavailable"
+ATTESTATION_UNKNOWN = "unknown"
+ATTESTATION_STATUSES = (ATTESTATION_AVAILABLE, ATTESTATION_UNAVAILABLE, ATTESTATION_UNKNOWN)
+
+
+def build_attestation_record(status: str) -> dict:
+    """The release manifest's `attestation` block.
+
+    `status` is what the release workflow's entitlement preflight found:
+
+      unavailable  the feature is not entitled for this (private) repo — the
+                   release ships WITHOUT a GitHub attestation and says so; the
+                   notarization ticket, CHECKSUMS/RELEASE-CHECKSUMS and the SBOM
+                   carry integrity. Resumes with zero config once the plan
+                   enables it or the repo is made public.
+      available    the feature is entitled and an attestation was produced for
+                   the dmg and this manifest (verify with `gh attestation
+                   verify`).
+      unknown      status was not determined (e.g. a local `make
+                   release-provenance` dry run that never touches the API).
+    """
+    if status == ATTESTATION_UNAVAILABLE:
+        return {
+            "available": False,
+            "status": "unavailable (private-repo plan)",
+            "note": (
+                "GitHub artifact attestation is not entitled for this private repo "
+                "under the current org plan; this release ships without a build-"
+                "provenance attestation. Integrity is carried by the notarization "
+                "ticket, CHECKSUMS/RELEASE-CHECKSUMS and the SBOM. Attestation "
+                "resumes with zero config once the plan enables it or the repo is "
+                "made public."
+            ),
+        }
+    if status == ATTESTATION_AVAILABLE:
+        return {
+            "available": True,
+            "status": "attested",
+            "note": (
+                "A GitHub build-provenance attestation was produced for the dmg and "
+                "this manifest; verify it with `gh attestation verify`."
+            ),
+        }
+    return {
+        "available": None,
+        "status": "unknown",
+        "note": (
+            "Attestation entitlement was not determined for this run (e.g. a local "
+            "provenance dry run that does not reach the attestation API)."
+        ),
+    }
+
+
 # -- release manifest --------------------------------------------------------
 
 
@@ -454,6 +517,7 @@ def build_release_manifest(
     app_manifest: dict,
     artifacts: dict[str, str],
     prev_tag: str | None,
+    attestation_status: str,
 ) -> dict:
     return {
         "schema": 1,
@@ -475,6 +539,7 @@ def build_release_manifest(
         "artifacts": [
             {"name": name, "sha256": digest} for name, digest in sorted(artifacts.items())
         ],
+        "attestation": build_attestation_record(attestation_status),
         "reproducible": {
             "byte_identical": False,
             "attributable": True,
@@ -512,12 +577,18 @@ def generate(
     package_dir: Path,
     out_dir: Path,
     tag: str | None,
+    attestation_status: str = ATTESTATION_UNKNOWN,
     runner: Runner = default_runner,
     echo: Callable[[str], None] = print,
     environ: dict[str, str] | None = None,
 ) -> dict:
     """Produce the whole provenance bundle and return the release manifest."""
     environ = environ if environ is not None else dict(os.environ)
+    if attestation_status not in ATTESTATION_STATUSES:
+        raise ReleaseError(
+            f"unknown attestation status {attestation_status!r}; "
+            f"expected one of {', '.join(ATTESTATION_STATUSES)}"
+        )
 
     app_manifest = load_app_manifest(package_dir)
     product_version = app_manifest.get("product_version", {"short": "0.0.0", "build": "0"})
@@ -598,6 +669,7 @@ def generate(
         app_manifest=app_manifest,
         artifacts=artifacts,
         prev_tag=prev_tag,
+        attestation_status=attestation_status,
     )
     write_json(out_dir / "release-manifest.json", release_manifest)
 
@@ -620,6 +692,7 @@ def generate(
     echo(f"changelog:    {len(commits)} commits since {prev_tag or '(first release)'}")
     echo(f"dmg:          {dmg_name or '(none — dry run / unsigned)'}")
     echo(f"notarized:    {notarized}")
+    echo(f"attestation:  {release_manifest['attestation']['status']}")
     echo(f"scrub:        passed")
     echo(f"out:          {out_dir}")
     return release_manifest
@@ -644,6 +717,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="the release tag (e.g. v1.2.0); default: the artifact's git describe",
     )
+    parser.add_argument(
+        "--attestation-status",
+        choices=ATTESTATION_STATUSES,
+        default=ATTESTATION_UNKNOWN,
+        help=(
+            "whether GitHub artifact attestation is entitled for this repo, as found "
+            "by the release workflow's preflight; recorded in the release manifest. "
+            f"default: {ATTESTATION_UNKNOWN} (a local dry run that never reaches the API)"
+        ),
+    )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
 
@@ -653,6 +736,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             package_dir=args.package_dir,
             out_dir=args.out_dir,
             tag=args.tag,
+            attestation_status=args.attestation_status,
         )
     except ReleaseError as exc:
         print(f"error: {exc}", file=sys.stderr)

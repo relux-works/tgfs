@@ -219,28 +219,113 @@ jobs:
             --notary-profile gramdrive-notary \
             --notary-keychain "$KEYCHAIN_PATH"
 
+      - name: Preflight the GitHub attestation entitlement for this repo
+        # Artifact attestation is entitled per org plan: a public repo gets it
+        # free, a PRIVATE repo needs a paid plan. On this private repo without
+        # that entitlement the create-attestation API rejects with "Feature not
+        # available … upgrade the billing plan, or make this repository public"
+        # (BUG-260720-116eli) — which, unguarded, fails the whole release AFTER
+        # signing and notarizing, before `gh release create` ever runs.
+        #
+        # A `uses:` action's error text can't be captured, so the entitlement is
+        # PREFLIGHTED here with one controlled call: POST an intentionally
+        # invalid bundle to the create endpoint. The org-plan check fires BEFORE
+        # body validation (verified against this repo), so nothing is ever
+        # created (the body is not a valid sigstore bundle) and the response
+        # distinguishes the two cases:
+        #   * feature UNAVAILABLE → the exact plan message;
+        #   * feature AVAILABLE   → a bundle-validation error (any other message).
+        # Degrade ONLY on the narrow feature-unavailable signature — BOTH the
+        # "Feature not available" phrase AND the "upgrade the billing plan" hint.
+        # Every other outcome (a validation error, a transport failure, an
+        # unexpected 5xx) leaves attestation ENABLED, so the real attest step
+        # below still HARD-FAILS on real errors (task AC). When the plan is later
+        # upgraded — or the repo made public — the probe passes and attestation
+        # resumes with zero config.
+        id: attest_preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          resp="$(gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/attestations" \
+            -f 'bundle=preflight-entitlement-probe' 2>&1 || true)"
+          if printf '%s' "$resp" | grep -q 'Feature not available' \
+             && printf '%s' "$resp" | grep -q 'upgrade the billing plan'; then
+            echo "attestation_available=false" >> "$GITHUB_OUTPUT"
+            echo "attestation: unavailable (private-repo plan) — recording the gap and continuing the release."
+            echo "::notice title=Attestation unavailable::GitHub artifact attestation is not entitled for this private repo under the current org plan; recording the provenance gap and continuing."
+          else
+            echo "attestation_available=true" >> "$GITHUB_OUTPUT"
+            echo "attestation: entitled — the attest step will run and hard-fail on real errors."
+          fi
+
       - name: Build the release provenance (SBOM, changelog, rollback, manifest)
         # Derived from the signed artifact's manifest + git history + cargo
         # metadata: CycloneDX SBOM (POL-6 inventory), changelog since the last
         # tag, rollback metadata, a release manifest tying every artifact to a
         # sha256, and a credential scrub that FAILS the release if any produced
-        # file looks like it carries a secret.
+        # file looks like it carries a secret. The attestation entitlement the
+        # preflight found is recorded in the manifest so the provenance gap (or
+        # its absence) is explicit and independently readable.
+        env:
+          ATTESTATION_AVAILABLE: ${{ steps.attest_preflight.outputs.attestation_available }}
         run: |
+          set -euo pipefail
+          if [ "$ATTESTATION_AVAILABLE" = "true" ]; then
+            attestation_status=available
+          else
+            attestation_status=unavailable
+          fi
           python3 .scripts/release/build_release_provenance.py \
             --package-dir .temp/app-packaging \
             --out-dir .temp/release \
-            --tag "${GITHUB_REF_NAME}"
+            --tag "${GITHUB_REF_NAME}" \
+            --attestation-status "$attestation_status"
 
       - name: Attest build provenance for the dmg
         # GitHub artifact attestation: a signed, OIDC-bound statement that this
         # dmg was built by this workflow at this commit — independently verifiable
         # with `gh attestation verify`. This is what makes the release traceable
         # to a reviewed commit (the task AC) without embedding anything.
+        #
+        # Gated on the entitlement preflight: it runs ONLY when attestation is
+        # available, and when it runs it HARD-FAILS on any error (task AC). When
+        # the feature is unavailable this step is skipped, the manifest and job
+        # summary record the gap, and the release continues on the notarization +
+        # checksums + SBOM integrity story.
+        id: attest
+        if: steps.attest_preflight.outputs.attestation_available == 'true'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             .temp/app-packaging/GramDrive-*.dmg
             .temp/release/release-manifest.json
+
+      - name: Record the attestation status in the job summary
+        # Make the provenance decision visible on the run itself, both ways: the
+        # produced attestation when entitled, or the explicit gap when it is not.
+        # Runs on the normal path — the attest step above is SKIPPED (not failed)
+        # when unavailable, so success() still holds here; a REAL attest failure
+        # fails the job before this step and nothing ships.
+        env:
+          ATTESTATION_AVAILABLE: ${{ steps.attest_preflight.outputs.attestation_available }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### Build provenance attestation"
+            echo ""
+            if [ "$ATTESTATION_AVAILABLE" = "true" ]; then
+              echo "**attestation: attested** — a GitHub build-provenance attestation was produced for the dmg and the release manifest. Verify with \`gh attestation verify\`."
+              if [ -n "${ATTESTATION_URL:-}" ]; then
+                echo ""
+                echo "Attestation: ${ATTESTATION_URL}"
+              fi
+            else
+              echo "**attestation: unavailable (private-repo plan)** — GitHub artifact attestation is not entitled for this private repo under the current org plan, so this release ships without a build-provenance attestation. Integrity is carried by the notarization ticket, CHECKSUMS/RELEASE-CHECKSUMS and the SBOM. Attestation resumes with zero config once the plan enables it or the repo is made public."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish the GitHub Release
         # The `gh` CLI (preinstalled, not a third-party action — no extra supply

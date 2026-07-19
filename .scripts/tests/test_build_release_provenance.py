@@ -127,7 +127,15 @@ def stage_package(tmp: Path, *, manifest=None, dmg="GramDrive-1.2.0.dmg") -> Pat
     return pkg
 
 
-def run(tmp: Path, *, tag="v1.2.0", runner=None, manifest=None, dmg="GramDrive-1.2.0.dmg"):
+def run(
+    tmp: Path,
+    *,
+    tag="v1.2.0",
+    runner=None,
+    manifest=None,
+    dmg="GramDrive-1.2.0.dmg",
+    attestation_status=rel.ATTESTATION_UNKNOWN,
+):
     pkg = stage_package(tmp, manifest=manifest, dmg=dmg)
     out = tmp / "release"
     m = rel.generate(
@@ -135,6 +143,7 @@ def run(tmp: Path, *, tag="v1.2.0", runner=None, manifest=None, dmg="GramDrive-1
         package_dir=pkg,
         out_dir=out,
         tag=tag,
+        attestation_status=attestation_status,
         runner=runner or FakeGit(),
         echo=lambda _: None,
         environ={},
@@ -261,6 +270,52 @@ class ReleaseManifestTest(unittest.TestCase):
             rendered = (out / "RELEASE-CHECKSUMS.sha256").read_text()
             for name in ("sbom.json", "CHANGELOG.md", "rollback.json", "release-manifest.json"):
                 self.assertIn(name, rendered)
+
+
+class AttestationStatusTest(unittest.TestCase):
+    """The release manifest states the attestation gap explicitly when GitHub
+    artifact attestation is not entitled for this private repo, and records a
+    real attestation when it is (BUG-260720-116eli)."""
+
+    def test_unavailable_records_the_private_repo_plan_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m, _ = run(Path(tmp), attestation_status=rel.ATTESTATION_UNAVAILABLE)
+            att = m["attestation"]
+            self.assertFalse(att["available"])
+            self.assertEqual(att["status"], "unavailable (private-repo plan)")
+            # The note keeps the alternative integrity story explicit.
+            self.assertIn("notarization", att["note"].lower())
+            self.assertIn("resumes with zero config", att["note"])
+
+    def test_available_records_an_attestation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m, _ = run(Path(tmp), attestation_status=rel.ATTESTATION_AVAILABLE)
+            att = m["attestation"]
+            self.assertTrue(att["available"])
+            self.assertEqual(att["status"], "attested")
+            self.assertIn("gh attestation verify", att["note"])
+
+    def test_default_is_unknown_for_a_local_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # run()'s default is ATTESTATION_UNKNOWN, matching a local
+            # `make release-provenance` that never reaches the attestation API.
+            m, _ = run(Path(tmp))
+            att = m["attestation"]
+            self.assertIsNone(att["available"])
+            self.assertEqual(att["status"], "unknown")
+
+    def test_an_unknown_status_value_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(rel.ReleaseError) as caught:
+                run(Path(tmp), attestation_status="bogus")
+            self.assertIn("attestation status", str(caught.exception))
+
+    def test_attestation_note_survives_the_credential_scrub(self):
+        # The manifest carries the attestation note into the scrubbed output; its
+        # wording must not trip the structured-leak or secret-material patterns.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, out = run(Path(tmp), attestation_status=rel.ATTESTATION_UNAVAILABLE)
+            self.assertEqual(rel.scrub_findings(out), [])
 
 
 class VersionSourceTest(unittest.TestCase):
