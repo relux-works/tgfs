@@ -59,12 +59,18 @@ pub const BASELINE_VERSION: i64 = 1;
 const JOURNAL_SQL: &str = include_str!("schema/journal.sql");
 
 /// Every migration this build carries, in application order.
-///
-/// Empty, and correctly so: [`SCHEMA_VERSION`] is [`BASELINE_VERSION`], so
-/// there is no version to migrate *to* yet. The runner below is not waiting
-/// on that — it is what a v2 will be written against, and it is exercised
-/// against real v1 fixture databases by this module's tests.
-pub(crate) const MIGRATIONS: &[Migration] = &[];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    // v2 — the provider-visible item change journal (TASK-260715-rhcnhc):
+    // pure DDL plus one seed row, so it fits one transaction. No backfill,
+    // deliberately: items that predate the journal have no changes to
+    // report — a provider without an anchor performs a full enumeration
+    // anyway and takes the journal's current sequence as its first anchor.
+    Migration {
+        version: 2,
+        name: "item_change_journal",
+        step: MigrationStep::Sql(include_str!("schema/v2.sql")),
+    },
+];
 
 /// [`SCHEMA_VERSION`] and [`MIGRATIONS`] are one fact stated twice, so the
 /// build refuses to link them out of agreement. A migration added without a
@@ -348,11 +354,11 @@ mod tests {
     //! migration that does the thing this framework exists for: a schema
     //! change plus a data backfill too big for one transaction.
     //!
-    //! The migrations here are test-only, and that is not a stand-in for the
-    //! real thing — there *is* no real one yet ([`MIGRATIONS`] is empty
-    //! because `SCHEMA_VERSION` is the baseline). What the tests exercise is
-    //! the runner itself, which is the deliverable, applied to the same
-    //! fixture a v2 will be written against.
+    //! Most migrations here are test-only, targeting the runner's own
+    //! mechanics (chunking, checkpoints, interruption, resume) with a
+    //! resumable shape the shipped registry does not have yet. The shipped
+    //! [`MIGRATIONS`] are applied to the same v1 fixture in their own test
+    //! below.
 
     use std::cell::Cell;
     use std::path::PathBuf;
@@ -529,13 +535,17 @@ mod tests {
         }
     }
 
-    /// Brings `conn` to the v1 fixture state: the frozen baseline applied the
-    /// way a real open applies it, then the seed rows, with foreign keys on
-    /// so the fixture cannot claim rows the schema would reject.
+    /// Brings `conn` to the v1 fixture state: the frozen baseline plus the
+    /// runner's journal — exactly what a database created by the v1 build
+    /// looks like — then the seed rows, with foreign keys on so the fixture
+    /// cannot claim rows the schema would reject. Deliberately *not*
+    /// `ensure_schema`, which would migrate the fixture past the version
+    /// these tests exist to start from.
     fn seed_v1(conn: &mut Connection) {
         conn.pragma_update(None, "foreign_keys", true)
             .expect("foreign keys");
-        crate::schema::ensure_schema(conn).expect("baseline schema");
+        crate::schema::apply_baseline(conn).expect("baseline schema");
+        ensure_journal(conn).expect("journal");
         conn.execute_batch(V1_SEED_SQL).expect("v1 seed rows");
     }
 
@@ -646,6 +656,36 @@ mod tests {
             .expect("query")
             .count();
         assert_eq!(violations, 0);
+    }
+
+    // --- The shipped registry against the fixture --------------------------
+
+    #[test]
+    fn the_shipped_v2_migration_creates_the_item_change_journal() {
+        let mut conn = memory_v1();
+
+        run(&mut conn, MIGRATIONS, SCHEMA_VERSION).expect("migrate the v1 fixture");
+
+        assert_eq!(version_of(&conn), SCHEMA_VERSION);
+        let instance: String = conn
+            .query_row(
+                "SELECT instance_id FROM item_change_journal WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the journal identity row");
+        assert_eq!(
+            instance.len(),
+            32,
+            "a 16-byte random identity in lowercase hex"
+        );
+        let changes: i64 = conn
+            .query_row("SELECT count(*) FROM item_changes", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            changes, 0,
+            "no backfill: items that predate the journal have no changes to report"
+        );
     }
 
     // --- Applying a migration ---------------------------------------------

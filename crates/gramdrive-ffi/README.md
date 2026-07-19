@@ -169,6 +169,16 @@ one durable SQLite database with no shared-memory assumptions
   change doorbell (on Apple, a Darwin notification — see
   `apple/GramDriveSupport`): on a ring or a poll tick, compare against
   the last value seen on the same handle and re-read only on change.
+- **`change_journal_state()` / `item_changes_since(account, after, limit)`**
+  (TASK-260715-rhcnhc) are the durable half of change signaling: where
+  `data_version` answers only "did anything change?" and must never be
+  persisted, journal sequences are stable across handles, processes, and
+  restarts within one journal life, so a provider host mints its File
+  Provider sync anchors from them. Each change is the item's *current*
+  state (a POL-3 tombstone pages as a deletion); the journal identity
+  (`instance_id`) distinguishes database lives, so an anchor surviving a
+  quarantine-and-reseed expires explicitly instead of pointing at
+  unrelated sequences.
 - **`quarantine_corrupt_state(data_root, role)`** is corruption recovery:
   it re-probes the file itself and, only if SQLite reports it corrupt,
   moves database + sidecars into `state/quarantine/` for a fresh start

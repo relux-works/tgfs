@@ -104,7 +104,7 @@ fn the_v1_fixture_opens_at_the_current_version_with_its_rows_intact() {
         .expect("rows");
     assert_eq!(
         history,
-        vec![SCHEMA_VERSION],
+        (1..=SCHEMA_VERSION).collect::<Vec<_>>(),
         "opening a current file must not record a second application"
     );
 

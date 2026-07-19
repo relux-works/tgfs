@@ -217,6 +217,34 @@ pub struct ItemMetadata {
     pub deleted_at_ms: Option<i64>,
 }
 
+/// One provider-visible item change: the item's current state under the
+/// journal sequence of its latest change (TASK-260715-rhcnhc). A change
+/// whose `metadata` carries a POL-3 tombstone (`deleted_at_ms` set) is a
+/// deletion; everything else is a create-or-update — change enumeration
+/// replays current state, not history.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ItemChange {
+    /// The change's journal sequence — strictly increasing across one
+    /// journal life, never reused. Anchors page by it.
+    pub sequence: i64,
+    /// The item's current durable metadata, tombstone included.
+    pub metadata: ItemMetadata,
+}
+
+/// The change journal's identity and high-water mark, read in one snapshot
+/// — what a provider host mints durable sync anchors from.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ChangeJournalState {
+    /// Names this journal's sequence space. A persisted anchor carrying a
+    /// different value is from another database life (corruption recovery
+    /// starts sequences over) and must be treated as expired, never
+    /// compared.
+    pub instance_id: String,
+    /// The highest sequence the journal has ever issued; 0 before the
+    /// first recorded change. Monotonic across coalescing and cascades.
+    pub latest_sequence: i64,
+}
+
 /// One process's handle on the shared durable state (module docs).
 ///
 /// Every read runs as its own short WAL snapshot transaction: consistent
@@ -340,6 +368,54 @@ impl SharedStateStore {
         let txn = store.read_txn().map_err(map_state_error)?;
         let record = txn.account(key).map_err(map_state_error)?;
         Ok(record.map(account_info))
+    }
+
+    /// The item change journal's identity and high-water mark
+    /// (TASK-260715-rhcnhc): the durable half of change signaling. The
+    /// doorbell plus [`Self::data_version`] answer *whether* to look;
+    /// anchors minted from this state plus [`Self::item_changes_since`]
+    /// answer *what changed* — and unlike `data_version`, journal
+    /// sequences are stable across handles, processes, and restarts
+    /// within one `instance_id`.
+    pub fn change_journal_state(&self) -> Result<ChangeJournalState, DriveError> {
+        let mut store = self.store()?;
+        let txn = store.read_txn().map_err(map_state_error)?;
+        let state = txn.change_journal_state().map_err(map_state_error)?;
+        Ok(ChangeJournalState {
+            instance_id: state.instance_id,
+            latest_sequence: state.latest_sequence,
+        })
+    }
+
+    /// One page of an account's item changes with journal sequence greater
+    /// than `after_sequence`, in sequence order — each change the item's
+    /// *current* state (a set `deleted_at_ms` is a deletion). A full page
+    /// (`len == limit`) means more may follow, anchored after the last
+    /// returned sequence; a short page is the journal's current end. The
+    /// page is one read snapshot.
+    pub fn item_changes_since(
+        &self,
+        account_id: i64,
+        after_sequence: i64,
+        limit: u32,
+    ) -> Result<Vec<ItemChange>, DriveError> {
+        let key = AccountKey {
+            account_id: AccountId(account_id),
+        };
+        let mut store = self.store()?;
+        let txn = store.read_txn().map_err(map_state_error)?;
+        let records = txn
+            .item_changes_since(key, after_sequence, limit)
+            .map_err(map_state_error)?;
+        records
+            .into_iter()
+            .map(|record| {
+                Ok(ItemChange {
+                    sequence: record.sequence,
+                    metadata: item_metadata(record.item)?,
+                })
+            })
+            .collect()
     }
 
     /// The database's connection-relative change stamp.
@@ -875,6 +951,69 @@ mod tests {
             store.data_version().expect("data_version"),
             before,
             "a foreign commit must move the stamp"
+        );
+    }
+
+    #[test]
+    fn the_change_journal_reads_expose_durable_sequences_across_handles() {
+        let root = TempRoot::new();
+        seed(&root);
+        let store =
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider).expect("open");
+
+        let state = store.change_journal_state().expect("journal state");
+        assert_eq!(state.instance_id.len(), 32, "the journal names its life");
+        assert!(state.latest_sequence > 0, "the seed writes were journaled");
+
+        // The whole journal, paged one change at a time: strictly
+        // increasing sequences composing into exactly the seeded tree.
+        let mut anchor = 0;
+        let mut walked = Vec::new();
+        loop {
+            let page = store
+                .item_changes_since(7, anchor, 1)
+                .expect("changes page");
+            let Some(change) = page.first() else { break };
+            assert_eq!(page.len(), 1);
+            assert!(change.sequence > anchor);
+            anchor = change.sequence;
+            walked.push(change.metadata.id.clone());
+        }
+        assert_eq!(
+            walked,
+            vec![root_id().text(), chat_dir_id().text(), file_id().text()]
+        );
+        assert_eq!(anchor, state.latest_sequence);
+
+        // A foreign commit — another connection tombstoning the file — is a
+        // change this handle pages from its anchor, as a deletion.
+        let layout = store.layout();
+        let mut writer = StateStore::open(&layout.database_file).expect("open writer");
+        let txn = writer.write_txn().expect("write txn");
+        txn.tombstone_item(
+            &file_id(),
+            2_000,
+            &MetadataVersion::new("m2").expect("version"),
+        )
+        .expect("tombstone");
+        txn.commit().expect("commit");
+
+        let changes = store
+            .item_changes_since(7, anchor, 100)
+            .expect("changes after anchor");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].metadata.id, file_id().text());
+        assert_eq!(
+            changes[0].metadata.deleted_at_ms,
+            Some(2_000),
+            "a tombstone pages as a deletion"
+        );
+        assert_eq!(
+            store
+                .change_journal_state()
+                .expect("journal state")
+                .latest_sequence,
+            changes[0].sequence
         );
     }
 

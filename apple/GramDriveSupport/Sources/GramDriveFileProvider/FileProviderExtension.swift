@@ -25,13 +25,13 @@ public enum FileProviderExtensionError: Error, Equatable {
 /// bindings; there is no TDLib to link. Everything Telegram happens in
 /// the companion agent, on the other side of the database.
 ///
-/// This skeleton owns exactly the domain→account wiring: parse the
-/// domain identifier, open shared state, resolve the account and its
-/// root item identifier (``accountContext()``). Item mapping, working-set
-/// enumeration, and content fetch land on top of that context in their
-/// own tasks (STORY-260715-14k4l9, STORY-260715-14n7wp); until then the
-/// callbacks answer `CocoaError.featureUnsupported` rather than faking a
-/// tree.
+/// This type owns exactly the domain→account wiring: parse the domain
+/// identifier, open shared state, resolve the account and its root item
+/// identifier (``accountContext()``). Item mapping (TASK-260715-i3mp9x)
+/// and enumeration (TASK-260715-rhcnhc) sit on top of that context;
+/// content fetch is still its own story (STORY-260715-14n7wp), and until
+/// it lands the content callbacks answer `CocoaError.featureUnsupported`
+/// rather than faking bytes.
 public final class GramDriveFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     /// The account context every provider callback starts from: the
     /// configured account (including `rootItemId`, the durable identifier
@@ -192,20 +192,72 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
         return completedProgress()
     }
 
+    /// An enumerator over one container (TASK-260715-rhcnhc): the working
+    /// set (the domain-wide change feed on macOS), the root, or a live
+    /// directory. A directory that is unknown, tombstoned, or not even a
+    /// parseable identifier answers `noSuchItem`; a *file* identifier
+    /// answers `featureUnsupported` (the item exists, it just has no
+    /// children to enumerate), as does the trash of this read-only domain
+    /// (nothing can ever be trashed — DEC-007).
     public func enumerator(
         for containerItemIdentifier: NSFileProviderItemIdentifier,
         request: NSFileProviderRequest
     ) throws -> NSFileProviderEnumerator {
-        throw itemError(for: containerItemIdentifier)
+        try makeEnumerator(for: containerItemIdentifier)
+    }
+
+    /// The construction `enumerator(for:request:)` performs, minus the
+    /// `NSFileProviderRequest` plumbing (the request has no
+    /// test-constructible form).
+    func makeEnumerator(
+        for containerItemIdentifier: NSFileProviderItemIdentifier
+    ) throws -> NSFileProviderEnumerator {
+        let context: AccountContext
+        do {
+            context = try accountContext()
+        } catch let error as FileProviderExtensionError {
+            switch error {
+            case .unrecognizedDomainIdentifier, .accountNotConfigured:
+                throw NSFileProviderError(.noSuchItem)
+            }
+        }
+        if containerItemIdentifier == .trashContainer {
+            throw CocoaError(.featureUnsupported)
+        }
+        if containerItemIdentifier != .workingSet, containerItemIdentifier != .rootContainer {
+            let coreId = ItemIdentifierMapping.coreItemId(
+                for: containerItemIdentifier, accountRootId: context.account.rootItemId)
+            let metadata: ItemMetadata?
+            do {
+                metadata = try context.store.item(id: coreId)
+            } catch let error as DriveError {
+                // A system-held identifier that does not even parse as a
+                // core id names nothing — it is not a caller bug to retry.
+                if case .InvalidArgument = error {
+                    throw NSFileProviderError(.noSuchItem)
+                }
+                throw error
+            }
+            guard let metadata, metadata.deletedAtMs == nil else {
+                throw NSFileProviderError(.noSuchItem)
+            }
+            guard metadata.isDirectory else {
+                throw CocoaError(.featureUnsupported)
+            }
+        }
+        return GramDriveEnumerator(
+            store: context.store,
+            accountId: context.account.accountId,
+            container: containerItemIdentifier)
     }
 
     // MARK: - Internals
 
-    /// The one error rule of the skeleton: a domain that does not resolve
-    /// to a configured account answers `noSuchItem` (there is genuinely
-    /// nothing to serve); a resolvable domain answers
-    /// `featureUnsupported` until the enumeration and content tasks land.
-    /// Shared-state failures pass through as-is (the system retries).
+    /// The one error rule of the not-yet-implemented callbacks: a domain
+    /// that does not resolve to a configured account answers `noSuchItem`
+    /// (there is genuinely nothing to serve); a resolvable domain answers
+    /// `featureUnsupported` until the content task lands. Shared-state
+    /// failures pass through as-is (the system retries).
     func itemError(for identifier: NSFileProviderItemIdentifier) -> Error {
         do {
             _ = try accountContext()

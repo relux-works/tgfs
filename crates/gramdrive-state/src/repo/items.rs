@@ -436,6 +436,51 @@ impl ReadTxn<'_> {
     }
 }
 
+/// The provider-visible column tuple of one `items` row — exactly the
+/// columns `upsert_item`'s ON CONFLICT clause updates, read for the change
+/// detection that keeps the item change journal quiet on identical
+/// re-pushes.
+type ProviderVisibleRow = (
+    Option<Vec<u8>>, // parent_item_id
+    String,          // display_name
+    String,          // safe_name
+    Option<String>,  // mime_type
+    Option<i64>,     // logical_size
+    String,          // metadata_version
+    Option<String>,  // content_version
+    String,          // availability
+    Option<i64>,     // created_at_ms
+    Option<i64>,     // modified_at_ms
+    Option<i64>,     // deleted_at_ms
+);
+
+/// The columns `update_item_content` compares and rewrites, in SELECT
+/// order: content_version, mime_type, logical_size, metadata_version,
+/// modified_at_ms.
+type StoredContentRow = (
+    Option<String>, // content_version
+    Option<String>, // mime_type
+    Option<i64>,    // logical_size
+    String,         // metadata_version
+    Option<i64>,    // modified_at_ms
+);
+
+fn provider_visible_row(row: &Row<'_>) -> rusqlite::Result<ProviderVisibleRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
 impl WriteTxn<'_> {
     /// Inserts or fully replaces one provider node.
     ///
@@ -478,6 +523,41 @@ impl WriteTxn<'_> {
             Some((kind, folder)) => (Some(kind), folder),
             None => (None, None),
         };
+        // Change detection for the item change journal: an upsert that
+        // rewrites the row it would replace — the engine re-baselining after
+        // a restart (SYNC-021 replay) — is provider-invisible and must not
+        // advance the item's change sequence, or every restart would replay
+        // the whole tree at the provider boundary. The compared columns are
+        // exactly the ones the ON CONFLICT clause below updates.
+        let stored: Option<ProviderVisibleRow> = self
+            .conn()
+            .prepare_cached(
+                "SELECT parent_item_id, display_name, safe_name, mime_type, logical_size,
+                        metadata_version, content_version, availability, created_at_ms,
+                        modified_at_ms, deleted_at_ms
+                 FROM items WHERE item_id = ?1",
+            )?
+            .query_row(params![record.id.as_bytes()], provider_visible_row)
+            .optional()?;
+        let incoming: ProviderVisibleRow = (
+            record.parent.as_ref().map(|id| id.as_bytes().to_vec()),
+            record.display_name.clone(),
+            record.safe_name.clone(),
+            content.mime_type.clone(),
+            logical_size,
+            record.metadata_version.as_str().to_owned(),
+            content
+                .content_version
+                .as_ref()
+                .map(|version| version.as_str().to_owned()),
+            record.availability.as_str().to_owned(),
+            record.created_at_ms,
+            record.modified_at_ms,
+            record.deleted_at_ms,
+        );
+        if stored.as_ref() == Some(&incoming) {
+            return Ok(());
+        }
         self.conn()
             .prepare_cached(
                 "INSERT INTO items (item_id, account_id, namespace_version, kind,
@@ -522,6 +602,7 @@ impl WriteTxn<'_> {
                 record.modified_at_ms,
                 record.deleted_at_ms,
             ])?;
+        self.journal_item_change(&record.id)?;
         Ok(())
     }
 
@@ -545,20 +626,44 @@ impl WriteTxn<'_> {
                 what: "directories carry no content facts",
             });
         }
-        let stored: Option<Option<String>> = self
+        let stored: Option<StoredContentRow> = self
             .conn()
-            .prepare_cached("SELECT content_version FROM items WHERE item_id = ?1")?
-            .query_row(params![id.as_bytes()], |row| row.get(0))
+            .prepare_cached(
+                "SELECT content_version, mime_type, logical_size, metadata_version,
+                            modified_at_ms
+                     FROM items WHERE item_id = ?1",
+            )?
+            .query_row(params![id.as_bytes()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
             .optional()?;
-        let stored = stored.ok_or(StateError::RowNotFound { entity: "item" })?;
-        if stored.as_deref() != expected.map(ContentVersion::as_str) {
+        let (stored_version, stored_mime, stored_size, stored_metadata, stored_modified) =
+            stored.ok_or(StateError::RowNotFound { entity: "item" })?;
+        if stored_version.as_deref() != expected.map(ContentVersion::as_str) {
             return Err(StateError::VersionConflict {
                 entity: "item content",
                 expected: expected.map(|version| version.as_str().to_owned()),
-                found: stored,
+                found: stored_version,
             });
         }
         let logical_size = facts.logical_size.map(size_to_column).transpose()?;
+        // The journal's no-op discipline: republishing the identical facts
+        // under the identical versions is provider-invisible.
+        if stored_mime == facts.mime_type
+            && stored_size == logical_size
+            && stored_version.as_deref()
+                == facts.content_version.as_ref().map(ContentVersion::as_str)
+            && stored_metadata == new_metadata_version.as_str()
+            && stored_modified == Some(modified_at_ms)
+        {
+            return Ok(());
+        }
         self.conn()
             .prepare_cached(
                 "UPDATE items
@@ -574,6 +679,7 @@ impl WriteTxn<'_> {
                 new_metadata_version.as_str(),
                 modified_at_ms,
             ])?;
+        self.journal_item_change(id)?;
         Ok(())
     }
 
@@ -608,7 +714,11 @@ impl WriteTxn<'_> {
             if exists.is_none() {
                 return Err(StateError::RowNotFound { entity: "item" });
             }
+            // Already tombstoned: the idempotent re-observation changed
+            // nothing provider-visible, so the journal stays quiet.
+            return Ok(());
         }
+        self.journal_item_change(id)?;
         Ok(())
     }
 }

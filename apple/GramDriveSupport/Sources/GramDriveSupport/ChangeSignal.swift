@@ -15,8 +15,9 @@ import notify
 /// The name carries the App Group prefix, which is what sandboxed
 /// processes are permitted to post and observe. Signaling *Finder* about
 /// provider changes is a different channel (`NSFileProviderManager
-/// .signalEnumerator`, owned by the File Provider domain work); this
-/// doorbell coordinates GramDrive's own processes.
+/// .signalEnumerator`, bridged from this doorbell by the File Provider
+/// layer's `ChangeSignalRelay`); this doorbell coordinates GramDrive's
+/// own processes.
 public enum ChangeSignal {
     /// The Darwin notification name, derived from the App Group identifier
     /// (DEC-019 namespace rule).

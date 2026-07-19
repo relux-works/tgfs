@@ -20,7 +20,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // 0.3.0: account snapshot reads (accounts/account with root item
     // identifiers) — what a provider host maps File Provider domains from.
     // Additive, hence minor.
-    minor: 3,
+    // 0.4.0: the item change journal reads (change_journal_state /
+    // item_changes_since) — durable change enumeration for provider
+    // change anchors. Additive, hence minor.
+    minor: 4,
     patch: 0,
 };
 

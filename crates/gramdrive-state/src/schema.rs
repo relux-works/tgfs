@@ -25,7 +25,7 @@ use crate::migrate::{self, BASELINE_VERSION};
 ///
 /// Tied to [`crate::migrate::MIGRATIONS`] by a const assertion there: this
 /// number and that list are one fact, and the build fails if they disagree.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The v1 DDL, applied verbatim inside one transaction. The file is frozen:
 /// schema changes are new migration scripts, never edits here (NFR-041).
@@ -71,7 +71,11 @@ pub(crate) fn ensure_schema(conn: &mut Connection) -> Result<(), StateError> {
 /// Creates the whole v1 schema and its version stamp in one transaction — a
 /// crash mid-apply leaves user_version at 0 and the next open retries from
 /// nothing (SYNC-072).
-fn apply_baseline(conn: &mut Connection) -> Result<(), StateError> {
+///
+/// `pub(crate)` for the migration runner's unit tests, which need genuine
+/// *baseline* databases to migrate forward — [`ensure_schema`] would carry
+/// them all the way to [`SCHEMA_VERSION`].
+pub(crate) fn apply_baseline(conn: &mut Connection) -> Result<(), StateError> {
     let tx = conn.transaction()?;
     tx.execute_batch(SCHEMA_V1_SQL)?;
     tx.pragma_update(None, "user_version", BASELINE_VERSION)?;

@@ -51,6 +51,7 @@ mod cache;
 mod changes;
 mod chats;
 mod cursors;
+mod item_changes;
 mod items;
 mod ranges;
 mod render;
@@ -71,6 +72,7 @@ pub use changes::{
     MessagePayload, MessageRevision, MessageState, SyncWindow,
 };
 pub use chats::{ChatListEntry, ChatRecord, ChatType};
+pub use item_changes::{ChangeJournalState, ItemChangeRecord};
 pub use items::{FileFacts, ItemAvailability, ItemKind, ItemRecord, item_kind};
 pub use render::{RenderOutput, RenderPublish, RenderStateRecord};
 pub use transfers::{

@@ -20,10 +20,11 @@ amalgamation (version rationale in the workspace `Cargo.toml`).
 Platform-specific code: forbidden — the database location is chosen by the
 embedding host. See `crates/README.md`.
 
-## The schema (v1)
+## The schema (v2)
 
-`src/schema/v1.sql` is the schema and carries the full rationale per table;
-this is the map. `StateStore::open` applies it atomically to a fresh file
+`src/schema/v1.sql` is the baseline and `src/schema/v2.sql` the one
+migration so far (the item change journal, TASK-260715-rhcnhc); each file
+carries the full rationale per table — this is the map. `StateStore::open` applies it atomically to a fresh file
 (`PRAGMA user_version` 0 → 1), migrates an older file forward, recognizes a
 current file, and refuses — with a named `StateError` category — a file from
 a newer build (NFR-041). Every table is STRICT; foreign keys are enforced on
@@ -36,6 +37,7 @@ every connection; file databases run in WAL with `synchronous=NORMAL`.
 | The message log | `message_events`, `messages` | The append-only canonical store (POL-3, DEC-015): appends only, enforced by trigger — the one sanctioned update is the Mirror-mode payload purge; `messages` is the current-state projection, whose FK refuses to purge the event backing it. `AUTOINCREMENT` keeps sequence numbers watermark-safe forever |
 | Attachments and bytes | `attachments`, `blobs` | Attachment identity is (chat, message, ordinal); Telegram locators are refreshable metadata, never identity (DOM-007, SYNC-045); blobs are content-addressed per account and linked only after verification |
 | Provider projection | `items` | Every provider-visible node under its stable binary `ItemId` (DEC-008): canonical structural roots and appearance rows in one table (DOM-002/022), a real parent self-FK for the tree, live-sibling name uniqueness (SYNC-012), one appearance per (canonical, view) |
+| Item change journal | `item_change_journal`, `item_changes` | Durable change enumeration for provider sync anchors (PLAT-MAC-004): one coalesced row per item at its latest `AUTOINCREMENT` sequence — bounded by item count, never rewound — refreshed by the item write paths only on provider-visible change, so an engine re-baseline replays nothing; the identity row names the database life so anchors from a quarantined file expire explicitly |
 | Hydration | `transfers` | Durable transfer journal pinned to a content version (SYNC-042), JSON-validated ranges, the SYNC-044 failure taxonomy, a partial index over live states for the queue head |
 | Cache | `cache_entries`, `pins` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; `pins` is durable offline intent independent of materialization |
 | Sync positions | `change_cursors`, `chat_sync_state` | One durable feed position per (account, stream) — scope verification stays with `ChangeCursor::require_scope` (SYNC-004); per-chat resumable history windows (SYNC-021) |

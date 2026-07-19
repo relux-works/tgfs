@@ -62,16 +62,26 @@ fn fresh_memory_database_reaches_schema_version() {
 #[test]
 fn schema_history_records_the_applied_version() {
     let store = StateStore::open_in_memory().expect("open");
-    let (version, applied_at_ms): (i64, i64) = store
+    let history: Vec<(i64, i64)> = store
         .connection()
-        .query_row(
-            "SELECT version, applied_at_ms FROM schema_history",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .expect("history row");
-    assert_eq!(version, SCHEMA_VERSION);
-    assert!(applied_at_ms > 0, "applied_at_ms must be a real timestamp");
+        .prepare("SELECT version, applied_at_ms FROM schema_history ORDER BY version")
+        .expect("prepare")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        history
+            .iter()
+            .map(|(version, _)| *version)
+            .collect::<Vec<_>>(),
+        (1..=SCHEMA_VERSION).collect::<Vec<_>>(),
+        "every version from the baseline to the current one is recorded"
+    );
+    assert!(
+        history.iter().all(|(_, applied_at_ms)| *applied_at_ms > 0),
+        "applied_at_ms must be a real timestamp"
+    );
 }
 
 #[test]
@@ -93,7 +103,10 @@ fn file_database_uses_wal_and_reopens_idempotently() {
         .connection()
         .query_row("SELECT count(*) FROM schema_history", [], |r| r.get(0))
         .expect("count");
-    assert_eq!(history_rows, 1, "reopen must not re-apply the schema");
+    assert_eq!(
+        history_rows, SCHEMA_VERSION,
+        "reopen must not re-apply the schema: one row per applied version, nothing more"
+    );
 }
 
 #[test]
