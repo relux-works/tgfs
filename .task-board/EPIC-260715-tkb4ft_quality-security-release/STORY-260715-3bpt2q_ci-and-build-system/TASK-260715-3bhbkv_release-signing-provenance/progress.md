@@ -8,7 +8,7 @@ done
 2026-07-15T00:52:57Z
 
 ## Last Update
-2026-07-19T18:31:00Z
+2026-07-19T19:01:52Z
 
 ## Blocked By
 - (none)
@@ -52,6 +52,7 @@ Stale-edge removal (152wjq->3bhbkv) UPHELD: reversed direction, POL-6 gate alrea
 Non-blocking nits (not requesting changes): (1) workflow-level permissions comment enumerates 3 write scopes directly above contents:read — reads as if describing that block, but scopes are correctly granted at job level; doc-clarity only. (2) published app manifest.json is a release asset not run through the provenance scrub (scrub scans .temp/release only) — credential-free by construction and its copied fields land in the scanned release-manifest.json; defensible.
 agent completed: [reviewer] reviewer (claude) (exit=0)
 spawn run completed: claude (run=RUN-260719-2a862e, pid=6721, exit=0)
+2026-07-19 orchestrator note: GitHub environment release created. Plan limitation: required-reviewer protection rules are not supported for private repos on the current billing plan (HTTP 422), so the environment-based approval is inert. Effective human gate per POL-8: (1) only the owner pushes v* tags, (2) release-readiness review TASK-260715-1nxcst in manual-actions remains the sign-off. If the repo moves to a plan with deployment protection rules, add the owner as required reviewer on the release environment.
 
 ## Precondition Resources
 - [TASK-260715-3bhbkv_ci-barycenter-reference.md](file://TASK-260715-3bhbkv/TASK-260715-3bhbkv_ci-barycenter-reference.md)
