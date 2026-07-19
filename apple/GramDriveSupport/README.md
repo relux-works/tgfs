@@ -85,7 +85,7 @@ bindings, and it opens shared state read-only as `.provider`.
 | `DomainIdentity` | The identity rule: a domain identifier is a pure function of the account's stable numeric identity (`account-<id>`) — never of display name, auth state, or namespace epoch — so the same account always maps to the same domain across restarts, reinstalls, and reauthorization. Naming follows POL-7: one account presents as exactly **GramDrive**; several disambiguate with the account's display name (collisions append the identity). Parsing back is strict by round-trip, so a foreign domain identifier can never alias a real account |
 | `DomainReconciler` | The idempotent converge-toward-desired pass behind every acceptance path (first run, restart, duplicate install, reauthorization, multiple accounts): a pure `plan` (adds / renames / keeps / strays) diffed from the durable account rows, applied through the registrar seam. Registered domains no account explains are *reported* as strays, never touched — removal and repair are owned by TASK-260715-gnat2x, and the registrar seam has no remove operation at all, which makes "registration never destroys Finder state" structural |
 | `DomainRegistrar` / `SystemDomainRegistrar` | The narrow seam to the platform registry, so reconciliation is fully testable against fakes. The live implementation wraps `NSFileProviderManager` (`domains()` / upserting `add`); platform constraint: it must run inside the app that embeds the extension — the companion shell calls it at launch — and is proven live by the signing/packaging task (TASK-260715-1dk9ik) |
-| `DomainStartupReconcile` | The launch-time pass the companion app runs off the main thread: resolve container → open shared state as `.provider` → reconcile → report an outcome (`skipped`/`reconciled`/`failed`) for the log. Never throws and never blocks startup; registration is durable in the system, so this pass is what "recovers after app/provider restart" means |
+| `DomainStartupReconcile` | The add-only launch pass the app runs at startup (SYNC-070): resolve container → open shared state as `.provider` → reconcile → report an outcome (`skipped`/`reconciled`/`failed`) for the log. Never throws and never blocks startup; registration is durable in the system, so this pass is what "recovers after app/provider restart" means. It only ever adds and renames — never removes — so a partial or empty canonical read at launch can never tear a domain down. Stray cleanup is the user-triggered `DomainRepair` (see below), never the launch path |
 | `GramDriveFileProviderExtension` | The replicated-extension skeleton: parse the domain identifier, open shared state, resolve the account and its root item identifier (`accountContext()`). Item mapping, enumeration, and content land on top of that context in their own stories (STORY-260715-14k4l9, STORY-260715-14n7wp); until then callbacks answer `CocoaError.featureUnsupported` for a resolvable domain and `NSFileProviderError(.noSuchItem)` for one that maps to no configured account |
 
 The desired domain set derives from `SharedStateStore.accounts()` /
@@ -96,6 +96,56 @@ path is proven by the shared-state smoke's `domains` step: a separate
 provider process maps the Rust-seeded account to its domain and the real
 extension type resolves that domain back to the same root item the seeder
 reported.
+
+## Domain removal, repair, and cleanup (TASK-260715-gnat2x)
+
+Registration only ever adds; taking a domain *away* — on logout, on
+local-only removal, or when a registration is stale/corrupt — is a
+distinct capability with its own seam, so "registration never destroys
+Finder state" stays structural. The removal seam (`DomainRemover`) is
+handed only to the explicit removal and repair flows, never to the
+reconciler.
+
+| Type | Owns |
+|---|---|
+| `DomainDataDisposition` | The preserve-or-delete-per-user-choice decision (PLAT-MAC-004; SEC-004), narrowed to what a read-only V1 can offer: `deleteLocalData` (the platform's `removeAll` — the trace-free wipe) or `preserveDownloads` (`preserveDownloadedUserData` — the system moves the user's downloaded files aside and returns where they now live). The third platform mode, `preserveDirtyUserData`, is deliberately absent: read-only means there is never dirty user data to keep |
+| `DomainRemover` / `SystemDomainRemover` | The narrow *removal* seam — deliberately separate from `DomainRegistrar`, which has no remove operation at all. Removes one registered domain with a disposition and returns the preserved-downloads location. The live implementation wraps `NSFileProviderManager.remove(_:mode:)`; same platform constraint as the registrar (runs in the app that embeds the extension; proven live by the signing/packaging task, not unit tests) |
+| `DomainRemoval` | Targeted, idempotent per-account domain removal — the provider-registration step of the SEC-004 cleanup sequence (logout and the on-disk wipe are the engine's). Reads the registered set, removes the one matching the account's stable identifier if present, and reports a no-op when it is already gone, so re-running a completed removal touches nothing. Interruption-safe by ordering: the engine drops the canonical account row first, then this removes the domain; a crash between the two leaves a stray that repair cleans up — never a domain re-registered for an account that is gone |
+| `DomainRepair` | The **user-triggered** repair (SYNC-071): `DomainReconciler` plus the one thing it refuses to do — resolve strays. Re-registers every account's lost domain (recovering its Finder state under the stable identifier, so rebuild loses no data) and removes strays no account row explains (default `preserveDownloads`, so even orphan cleanup keeps files). Because it can *remove* domains it never runs at launch — only from the explicit "Repair File Provider Domains" action. Adds/renames run before stray removal, so an interrupted pass re-runs into a completed one from either side; a completed one re-runs into a settled no-op. It also guards the *total-teardown* case (`TotalTeardownPolicy`): an empty desired set makes every registered domain a stray, so unless the teardown is explicitly confirmed it withholds them all rather than trust a possibly-spurious empty read. `run(dataRoot:)` / `run()` are the never-throwing app entry points, mirroring `DomainStartupReconcile` |
+
+The launch path runs the add-only `DomainStartupReconcile.run()`
+(SYNC-070) — never `DomainRepair` — so startup only ever adds and renames
+and can never tear a domain down. `DomainRepair.run()` is wired behind the
+explicit **"Repair File Provider Domains"** command in the companion app
+(SYNC-071): a menu action, off the main thread, that re-registers lost
+domains and cleans genuine orphans. Repair fails closed — if the canonical
+store cannot be read it removes nothing — and never removes a domain that
+maps to a live account. It also refuses a *total teardown*: an empty
+account set (no accounts configured) is a normal, non-throwing answer from
+the canonical store, indistinguishable from a spurious-empty read (an App
+Group id change across an upgrade, an externally reset state dir), so it
+does **not** wipe every registered domain on that signal — it withholds
+them unless the teardown is explicitly confirmed. Cleared strays keep their
+downloads (default `preserveDownloads`). The genuine last-account logout
+removes its domain through the targeted `DomainRemoval` flow, driven by the
+logout itself — not by repair inferring teardown from emptiness.
+
+### Uninstall cleanup (PLAT-004 / SEC-004)
+
+macOS does not unregister a provider's File Provider domains when its
+containing app is deleted from `/Applications`: the domains, and any
+materialized files under them, persist and can show as a broken Finder
+root. Clean uninstall is therefore **remove the account(s) first, then
+delete the app** — the in-app removal unregisters each domain (disposing
+of local data per the user's choice) so nothing is left behind. If the app
+was deleted without removing accounts first, reinstalling and running a
+repair (or a removal per account) reconciles the leftover registrations;
+`NSFileProviderManager` domain management can only run from the app that
+embeds the extension, so there is no way to clean these up once the app is
+gone. This sequence is the macOS half of the SEC-004 documented cleanup
+(credentials, session/database files, provider registrations, partial
+transfers, cached content) and is validated on device by the
+signing/packaging task.
 
 ## The core dependency is a built artifact
 
@@ -134,7 +184,15 @@ consuming a staged or released artifact elsewhere.
   disambiguation), the reconcile plan and its idempotence (repeat pass,
   duplicate install, reauthorization, rename, strays untouched), the
   startup pass over real shared state, and the extension skeleton's typed
-  refusals over a substitute container.
+  refusals over a substitute container; and the removal/repair suites — the
+  disposition→platform-mode mapping, targeted removal idempotence
+  (already-gone is a no-op, delete preserves nothing, preserve surfaces the
+  kept-files location), and repair's re-registration after a lost domain,
+  stray cleanup with downloads preserved, idempotence, recovery when a
+  pass is interrupted mid-add or mid-stray-removal, and the total-teardown
+  guard (an empty account set against still-registered domains is withheld
+  by default, cleared only under an explicitly-confirmed teardown, while a
+  genuine orphan alongside a live account is still cleaned).
 - `make smoke-agent-lifecycle` (repo root) — the agent as real processes:
   startup with health over the socket, single-instance refusal of a
   second agent, SIGTERM drain (hosted transfer cancelled through its
