@@ -94,4 +94,49 @@ struct FileProviderExtensionTests {
             #expect(error.domain != NSFileProviderError.errorDomain)
         }
     }
+
+    @Test("resolveItem over a domain with no configured account throws noSuchItem")
+    func resolveItemUnresolvableDomain() {
+        withSubstituteDataRoot { dataRoot in
+            let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
+            do {
+                _ = try ext.resolveItem(for: .rootContainer)
+                Issue.record("expected resolveItem to throw for a missing account")
+            } catch {
+                let nsError = error as NSError
+                #expect(nsError.domain == NSFileProviderError.errorDomain)
+                #expect(nsError.code == NSFileProviderError.Code.noSuchItem.rawValue)
+            }
+        }
+    }
+
+    @Test("resolveItem over a foreign domain throws noSuchItem, never an item")
+    func resolveItemForeignDomain() {
+        withSubstituteDataRoot { dataRoot in
+            let ext = makeExtension(domainIdentifier: "not-an-account", dataRoot: dataRoot)
+            do {
+                _ = try ext.resolveItem(for: .rootContainer)
+                Issue.record("expected resolveItem to throw for a foreign domain")
+            } catch {
+                let nsError = error as NSError
+                #expect(nsError.domain == NSFileProviderError.errorDomain)
+                #expect(nsError.code == NSFileProviderError.Code.noSuchItem.rawValue)
+            }
+        }
+    }
+
+    @Test("resolveItem passes a storage failure through, not a fake noSuchItem")
+    func resolveItemStorageFailurePassesThrough() throws {
+        try withSubstituteDataRoot { dataRoot in
+            try Data("not a directory".utf8).write(to: dataRoot)
+            let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
+            do {
+                _ = try ext.resolveItem(for: .rootContainer)
+                Issue.record("expected resolveItem to throw on a broken data root")
+            } catch {
+                let nsError = error as NSError
+                #expect(nsError.domain != NSFileProviderError.errorDomain)
+            }
+        }
+    }
 }

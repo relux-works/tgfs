@@ -92,13 +92,54 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
 
     // MARK: - NSFileProviderReplicatedExtension callbacks
 
+    /// Resolves one identifier to its mapped item (TASK-260715-i3mp9x).
+    ///
+    /// `.rootContainer` folds back to the account root; every other
+    /// identifier is a durable id. An unknown id, or a POL-3 tombstone that
+    /// is no longer live, answers `noSuchItem` — there is genuinely nothing
+    /// to serve. A restricted or unavailable item (POL-4) is *not* absent:
+    /// it resolves to a real item whose capability surface withholds the
+    /// bytes, so the tree stays whole while the content stays ungettable.
     public func item(
         for identifier: NSFileProviderItemIdentifier,
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
-        completionHandler(nil, itemError(for: identifier))
+        do {
+            completionHandler(try resolveItem(for: identifier), nil)
+        } catch {
+            completionHandler(nil, error)
+        }
         return completedProgress()
+    }
+
+    /// The resolution `item(for:)` performs, minus the completion-handler
+    /// and `NSFileProviderRequest` plumbing (the request has no
+    /// test-constructible form). Returns the mapped item, or throws the
+    /// exact error the callback reports: `noSuchItem` for an unknown id, a
+    /// POL-3 tombstone, a foreign domain, or a gone account; a transient
+    /// storage failure as-is, so the system retries rather than caching a
+    /// false "no such item".
+    func resolveItem(for identifier: NSFileProviderItemIdentifier) throws -> NSFileProviderItem {
+        let context: AccountContext
+        do {
+            context = try accountContext()
+        } catch let error as FileProviderExtensionError {
+            switch error {
+            case .unrecognizedDomainIdentifier, .accountNotConfigured:
+                throw NSFileProviderError(.noSuchItem)
+            }
+        }
+        let coreItemId = ItemIdentifierMapping.coreItemId(
+            for: identifier, accountRootId: context.account.rootItemId)
+        guard
+            let metadata = try context.store.item(id: coreItemId),
+            metadata.deletedAtMs == nil
+        else {
+            throw NSFileProviderError(.noSuchItem)
+        }
+        return GramDriveFileProviderItem(
+            metadata: metadata, accountRootId: context.account.rootItemId)
     }
 
     public func fetchContents(

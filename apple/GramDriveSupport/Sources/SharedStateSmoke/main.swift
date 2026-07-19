@@ -49,6 +49,74 @@ func describe(_ item: ItemMetadata) -> String {
         + "size=\(size) mime=\(mime) availability=\(item.availability)"
 }
 
+/// The reserved-value-aware label of a File Provider identifier, so the
+/// smoke can assert the account root folds onto `.rootContainer`.
+func identifierLabel(_ identifier: NSFileProviderItemIdentifier) -> String {
+    identifier == .rootContainer ? "rootContainer" : identifier.rawValue
+}
+
+/// Whether an item advertises any mutating capability — the read-only
+/// invariant (DEC-007 / SYNC-060) the domains mode proves cross-process.
+func hasMutatingCapability(_ capabilities: NSFileProviderItemCapabilities) -> Bool {
+    let mutating: NSFileProviderItemCapabilities = [
+        .allowsWriting, .allowsRenaming, .allowsReparenting,
+        .allowsTrashing, .allowsDeleting, .allowsAddingSubItems,
+    ]
+    return !capabilities.intersection(mutating).isEmpty
+}
+
+/// The item's non-mutating access, by kind. On macOS
+/// `AllowsContentEnumerating` and `AllowsReading` are the *same* bit, so the
+/// meaning is read from the kind: a directory enumerates, a fetchable file
+/// reads, and a restricted/unavailable file grants nothing.
+func accessLabel(_ item: GramDriveFileProviderItem) -> String {
+    if item.metadata.isDirectory {
+        return item.capabilities.contains(.allowsContentEnumerating) ? "enumerate" : "none"
+    }
+    return item.capabilities.contains(.allowsReading) ? "read" : "none"
+}
+
+/// One mapped item as a deterministic line: identity folding, the on-disk
+/// name and content type, size, and the read-only capability surface — the
+/// item mapping (TASK-260715-i3mp9x) proven over metadata a separate
+/// coordinator process durably wrote.
+func describeMapped(_ item: GramDriveFileProviderItem) -> String {
+    let size = item.documentSize.map(String.init) ?? "-"
+    return "map id=\(item.metadata.id) "
+        + "identifier=\(identifierLabel(item.itemIdentifier)) "
+        + "parent=\(identifierLabel(item.parentItemIdentifier)) "
+        + "name=\(item.filename) type=\(item.contentType.identifier) size=\(size) "
+        + "readonly=\(!hasMutatingCapability(item.capabilities)) "
+        + "access=\(accessLabel(item))"
+}
+
+/// Maps every live item under the account root to `NSFileProviderItem` and
+/// prints its mapping line, in the same paged depth-first order as
+/// ``printTree``.
+func printMappedTree(store: SharedStateStore, accountRootId: String) throws {
+    guard let root = try store.item(id: accountRootId) else {
+        fail("root item \(accountRootId) not found")
+    }
+    print(describeMapped(GramDriveFileProviderItem(metadata: root, accountRootId: accountRootId)))
+    var stack: [String] = [root.id]
+    while let parent = stack.popLast() {
+        var after: String? = nil
+        while true {
+            let page = try store.children(parent: parent, after: after, limit: 2)
+            for child in page {
+                print(
+                    describeMapped(
+                        GramDriveFileProviderItem(metadata: child, accountRootId: accountRootId)))
+                if child.isDirectory {
+                    stack.append(child.id)
+                }
+            }
+            guard let last = page.last, page.count == 2 else { break }
+            after = last.id
+        }
+    }
+}
+
 /// Depth-first listing in stable id order, paged two at a time so the
 /// smoke also exercises page anchoring, not just one big page.
 func printTree(store: SharedStateStore, rootId: String) throws {
@@ -148,6 +216,13 @@ do {
         }
         print("context_root=\(rootItem.id)")
         print("context_root_name=\(rootItem.safeName)")
+
+        // The item mapping (TASK-260715-i3mp9x): map the seeded tree to
+        // NSFileProviderItem and prove — cross-process, over metadata the
+        // Rust coordinator durably wrote — that the account root folds onto
+        // .rootContainer, a direct child reparents onto it, and no item at
+        // any depth advertises a mutating capability.
+        try printMappedTree(store: context.store, accountRootId: context.account.rootItemId)
 
     case "watch":
         guard let rootId else { fail("--root is required for mode watch") }

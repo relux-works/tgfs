@@ -186,6 +186,31 @@ def main() -> None:
     expect("domains", domains, "domain_name=GramDrive")
     expect("domains", domains, f"context_root={facts['root']}")
 
+    # 2c. Item mapping (TASK-260715-i3mp9x): the same provider process maps
+    #     the seeded tree to NSFileProviderItem. The account root folds onto
+    #     rootContainer and is its own parent; the chat directory reparents
+    #     onto rootContainer and only enumerates; the attachment keeps its
+    #     own identity under the chat, is readable, and resolves to its jpeg
+    #     content type and byte size — all read-only, no mutating capability.
+    expect(
+        "domains", domains,
+        f"map id={facts['root']} identifier=rootContainer parent=rootContainer",
+    )
+    expect(
+        "domains", domains,
+        f"map id={facts['chat']} identifier={facts['chat']} parent=rootContainer",
+    )
+    expect("domains", domains, "readonly=true access=enumerate")
+    expect(
+        "domains", domains,
+        f"map id={facts['file']} identifier={facts['file']} parent={facts['chat']}",
+    )
+    expect("domains", domains, "name=photo.jpg type=public.jpeg size=2048")
+    expect("domains", domains, "readonly=true access=read")
+    if "readonly=false" in domains:
+        print("FAILED: domains: a mapped item leaked a mutating capability:\n" + domains)
+        sys.exit(1)
+
     # 3. Change flow: watcher (provider) must see the doorbell AND the
     #    moved data version around a foreign commit, then the new facts.
     print("--- watch: provider watcher across a foreign commit")
