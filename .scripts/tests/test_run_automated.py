@@ -95,6 +95,18 @@ class SuiteResolutionTests(unittest.TestCase):
         names = [step.name for step in run_automated.resolve_suite("all", self.catalog)]
         self.assertNotIn("secret-scan", names)
 
+    def test_apple_suite_builds_then_tests(self):
+        names = [step.name for step in run_automated.resolve_suite("apple", self.catalog)]
+        self.assertEqual(names, ["swift-build", "swift-test"])
+
+    def test_all_suite_excludes_the_apple_steps(self):
+        # The apple leg needs macOS + Xcode and the staged core (`make package`),
+        # so it must stay out of the everyday `all` gate that runs on any host.
+        # native-ci runs it as its own job after staging the core.
+        names = [step.name for step in run_automated.resolve_suite("all", self.catalog)]
+        self.assertNotIn("swift-build", names)
+        self.assertNotIn("swift-test", names)
+
     def test_suite_expansion_never_repeats_a_step(self):
         for suite in run_automated.SUITES:
             names = [step.name for step in run_automated.resolve_suite(suite, self.catalog)]

@@ -10,9 +10,9 @@
 
 GATE := python3 .scripts/acceptance/run_automated.py
 
-.PHONY: check check-core check-repo check-security gates fmt build test bindings \
+.PHONY: check check-core check-repo check-security check-apple gates fmt build test bindings \
         smoke-bindings smoke-shared-state smoke-agent-lifecycle package \
-        package-reproducible package-app package-app-notarize \
+        package-reproducible package-app package-app-unsigned package-app-notarize \
         tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates
 
 # check — the pre-push gate: the core and repo suites (what CI's rust-core job
@@ -33,6 +33,14 @@ check-repo:
 # `brew install gitleaks`). Run as its own required CI job (secret-scan).
 check-security:
 	$(GATE) --suite security --run-id local-security
+
+# check-apple — the macOS native leg: swift build + swift test of
+# apple/GramDriveSupport against the staged core. Needs Xcode and a prior
+# `make package` (the Swift package resolves GramDriveCore by path). Its own
+# suite, kept out of `make check` because that must run without Xcode or the
+# staged core; native-ci runs it as its own job. Same entrypoint as CI.
+check-apple:
+	$(GATE) --suite apple --run-id local-apple
 
 # gates — list the suites and the exact command each step runs.
 gates:
@@ -131,6 +139,13 @@ package-reproducible:
 # Output: .temp/app-packaging/.
 package-app:
 	python3 .scripts/apple-app/build_app_bundle.py
+
+# package-app-unsigned — the assembly gate: build and lay out GramDrive.app and
+# its plists, then stop before codesign (no Developer ID, no dmg, no
+# notarization). This is what native-ci runs on an ordinary runner to prove the
+# packaging/assembly contract without a signing identity. Output: .temp/app-packaging/.
+package-app-unsigned:
+	python3 .scripts/apple-app/build_app_bundle.py --unsigned
 
 # package-app-notarize — the full release path: package-app, then submit the dmg
 # to Apple via the gramdrive-notary keychain profile, wait, staple, and re-check

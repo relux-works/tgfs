@@ -739,6 +739,25 @@ class AppPackager:
             )
         return signed
 
+    def record_unsigned(self) -> list[SignedBinary]:
+        """Record the bundle's binaries without signing them — the assembly
+        gate's provenance.
+
+        No codesign runs, so `cdhash` stays None and the manifest's identity is
+        "unsigned". The bundle layout, Info.plists and entitlement plists are
+        real (assemble_bundle/write_entitlement_files produced them); only the
+        signature is absent. This is what lets the assembly contract be gated on
+        a runner that holds no Developer ID identity.
+        """
+        return [
+            SignedBinary(
+                key=spec.key,
+                bundle_id=spec.bundle_id,
+                entitlements=ENTITLEMENTS[spec.key](),
+            )
+            for spec in BINARIES
+        ]
+
     def verify(self, app: Path, signed: list[SignedBinary]) -> None:
         """Prove the signatures: strict/deep verify, then dump and assert the
         entitlements of each binary rather than trusting they were applied."""
@@ -832,6 +851,7 @@ def build_manifest(
     core_version: str,
     notarization: dict,
     source_date: str,
+    is_signed: bool = True,
 ) -> dict:
     """The artifact's identity record.
 
@@ -839,7 +859,24 @@ def build_manifest(
     notarization by submission id and status. The signed bytes are not
     byte-reproducible (a trusted timestamp varies per signature by design), so
     the record claims attributability, not byte-identity.
+
+    `is_signed` is False for the unsigned assembly gate: no codesign ran, so the
+    record carries no cdhashes and says so, but still attributes the assembled
+    bundle to its commit, toolchain and core contract version (NFR-052).
     """
+    reproducible_note = (
+        "The signed artifact is attributable to a commit, toolchain and core "
+        "contract version, but not byte-reproducible: Developer ID signing embeds "
+        "a trusted timestamp that varies per signature by design. NFR-052 asks for "
+        "attributability, which this manifest and CHECKSUMS.sha256 provide."
+    )
+    if not is_signed:
+        reproducible_note = (
+            "Assembly-only artifact (no Developer ID): the bundle was laid out and "
+            "its plists generated, but no codesign ran, so there are no cdhashes. The "
+            "assembled bundle is attributed to its commit, toolchain and core contract "
+            "version (NFR-052); signing/notarization is the release workflow's job."
+        )
     return {
         "schema": 1,
         "name": PRODUCT_NAME,
@@ -847,6 +884,7 @@ def build_manifest(
         "platform": "macos-arm64",
         "minimum_system_version": MINIMUM_SYSTEM_VERSION,
         "app_group": APP_GROUP,
+        "signed": is_signed,
         "signing_identity": identity,
         "team_id": TEAM_ID,
         "binaries": [
@@ -866,12 +904,7 @@ def build_manifest(
         "reproducible": {
             "byte_identical": False,
             "attributable": True,
-            "note": (
-                "The signed artifact is attributable to a commit, toolchain and core "
-                "contract version, but not byte-reproducible: Developer ID signing embeds "
-                "a trusted timestamp that varies per signature by design. NFR-052 asks for "
-                "attributability, which this manifest and CHECKSUMS.sha256 provide."
-            ),
+            "note": reproducible_note,
         },
     }
 
@@ -894,11 +927,18 @@ def package(
     notarize: bool = False,
     notary_profile: str = DEFAULT_NOTARY_PROFILE,
     timestamp: bool = True,
+    unsigned: bool = False,
     runner: Runner = default_runner,
     echo: Callable[[str], None] = print,
     environ: dict[str, str] | None = None,
 ) -> dict:
-    """Run the whole pipeline and return the manifest."""
+    """Run the whole pipeline and return the manifest.
+
+    `unsigned=True` is the assembly gate: build the executables, lay out the
+    bundle and generate its plists, then STOP before codesign — no Developer ID
+    identity, no dmg, no notarization. It proves the assembly contract on an
+    ordinary CI runner; signing/notarization stay in the release workflow.
+    """
     packager = AppPackager(
         repo_root,
         out_dir,
@@ -917,16 +957,22 @@ def package(
     bin_dir = packager.build_products()
     app = packager.assemble_bundle(bin_dir, (short_version, build_version))
     entitlement_files = packager.write_entitlement_files()
-    signed = packager.sign(app, entitlement_files, timestamp=timestamp)
-    packager.verify(app, signed)
-    spctl_verdict = packager.assess(app)
-    dmg = packager.build_dmg(app, short_version, timestamp=timestamp)
 
     notarization: dict = {"submitted": False}
-    if notarize:
-        notarization = packager.notarize(dmg, notary_profile)
-        # Re-assess the stapled app: now it must be accepted.
+    if unsigned:
+        # Assembly-only: the bundle and its plists exist, but nothing is signed.
+        signed = packager.record_unsigned()
+        spctl_verdict = "not-assessed"
+        dmg: Path | None = None
+    else:
+        signed = packager.sign(app, entitlement_files, timestamp=timestamp)
+        packager.verify(app, signed)
         spctl_verdict = packager.assess(app)
+        dmg = packager.build_dmg(app, short_version, timestamp=timestamp)
+        if notarize:
+            notarization = packager.notarize(dmg, notary_profile)
+            # Re-assess the stapled app: now it must be accepted.
+            spctl_verdict = packager.assess(app)
 
     manifest = build_manifest(
         product_version={"short": short_version, "build": build_version},
@@ -937,27 +983,28 @@ def package(
         core_version=packager.core_version(),
         notarization=notarization,
         source_date=source_date(git, dict(environ)),
+        is_signed=not unsigned,
     )
     manifest["gatekeeper"] = {"spctl": spctl_verdict, "notarized": notarization.get("submitted", False)}
 
-    checksums = {
-        f"{PRODUCT_NAME}-{short_version}.dmg": sha256_file(dmg),
-    }
+    checksums: dict[str, str] = {}
+    if dmg is not None:
+        checksums[f"{PRODUCT_NAME}-{short_version}.dmg"] = sha256_file(dmg)
     # The app bundle's files too, so the manifest covers the whole artifact.
     for name, digest in checksum_tree(app).items():
         checksums[f"{APP_BUNDLE_NAME}/{name}"] = digest
     (out_dir / "CHECKSUMS.sha256").write_text(format_checksums(checksums), encoding="utf-8")
 
-    manifest["sizes"] = {
-        "app_bytes": tree_size(app),
-        "dmg_bytes": dmg.stat().st_size,
-    }
+    manifest["sizes"] = {"app_bytes": tree_size(app)}
+    if dmg is not None:
+        manifest["sizes"]["dmg_bytes"] = dmg.stat().st_size
     manifest["checksums"] = checksums
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     echo("")
     echo(f"app:          {app}")
-    echo(f"dmg:          {dmg} ({manifest['sizes']['dmg_bytes']:,} bytes)")
+    if dmg is not None:
+        echo(f"dmg:          {dmg} ({manifest['sizes']['dmg_bytes']:,} bytes)")
     echo(f"identity:     {identity}")
     echo(f"spctl:        {spctl_verdict}")
     echo(f"notarized:    {notarization.get('submitted', False)}")
@@ -972,7 +1019,7 @@ def resolve_identity(args_identity: str | None, environ: dict[str, str]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Assemble, sign, and notarize GramDrive.app.",
+        description="Assemble, sign, and notarize GramDrive.app (or --unsigned: assemble only).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--out-dir", type=Path, default=None, help=f"default: {OUT_ROOT}")
@@ -993,12 +1040,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="submit the dmg for notarization and staple it (network; Apple)",
     )
     parser.add_argument(
+        "--unsigned",
+        action="store_true",
+        help="assembly gate: build and lay out the bundle, then stop before codesign "
+        "(no Developer ID, no dmg, no notarization) — the check ordinary CI can run",
+    )
+    parser.add_argument(
         "--notary-profile",
         default=DEFAULT_NOTARY_PROFILE,
         help=f"notarytool keychain profile (default: {DEFAULT_NOTARY_PROFILE})",
     )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.unsigned and args.notarize:
+        parser.error("--unsigned assembles without a signature; it cannot be combined with --notarize")
 
     repo_root = args.repo_root.resolve()
     if sys.platform != "darwin":
@@ -1012,7 +1068,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_dir = (args.out_dir or (repo_root / OUT_ROOT)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     core_package = (args.core_package or (repo_root / DEFAULT_CORE_PACKAGE)).resolve()
-    identity = resolve_identity(args.identity, dict(os.environ))
+    # The assembly gate signs nothing, so it resolves no Developer ID identity —
+    # the record simply says "unsigned".
+    identity = "unsigned" if args.unsigned else resolve_identity(args.identity, dict(os.environ))
 
     try:
         package(
@@ -1022,6 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             core_package=core_package,
             notarize=args.notarize,
             notary_profile=args.notary_profile,
+            unsigned=args.unsigned,
         )
     except StepFailed as failure:
         print(f"\nAPP PACKAGING FAILED\n{failure}", file=sys.stderr)

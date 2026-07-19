@@ -136,6 +136,38 @@ Design notes:
 file cannot make itself blocking. Mark `rust-core` and `secret-scan` as required
 status checks on `main` so a pull request cannot merge while either fails.
 
+#### Native platform CI
+
+`.github/workflows/native-ci.yml` extends the same pattern to the macOS native
+drive (POL-5 / DEC-017 reference target). It is **not** the fast per-PR gate: its
+jobs build TDLib from source and stage the core XCFramework, so it runs on a
+schedule (nightly), on demand (`workflow_dispatch`), on `main`, and on
+release-bound PRs (`release/**`) — which is what *"release branches require native
+acceptance evidence"* needs without taxing every feature PR. Each job builds from
+a clean checkout and, like core-ci, runs the pinned entrypoint (or a packaging
+script that writes its own manifest), never an ad-hoc swift command list.
+
+| Job | Runner | Suite / script | Provenance artifact |
+|-----|--------|----------------|---------------------|
+| `tdlib` | `macos-15` (arm64) | pinned TDLib built from source (cache-first, keyed on the pin) + Rust link smoke | `native-tdlib` |
+| `apple-build-test` | `macos-15` (arm64) | `apple` — `swift build` + `swift test` of `apple/GramDriveSupport` over the staged core (`make check-apple`) | `acceptance-ci-apple` |
+| `apple-package-unsigned` | `macos-15` (arm64) | `build_app_bundle.py --unsigned` — assembles `GramDrive.app` (nested appex, Info.plists, entitlement plists) with **no Developer ID** (`make package-app-unsigned`) | `native-app-package-unsigned` |
+
+Design notes:
+
+- **No secrets, ever.** Native-ci only assembles an **unsigned** bundle. Signing and
+  notarization (the Developer ID identity in a keychain) live in the separate
+  tag-triggered release workflow (`TASK-260715-3bhbkv`); this workflow keeps
+  `permissions: contents: read` and consumes no repository secret.
+- **TDLib cached on the pin.** The `tdlib` job keys its cache on `build_tdlib.py`
+  (which holds the pinned commit), so a warm run restores the artifact and re-runs
+  only the fast link smoke; the from-source C++ build happens on a cold cache.
+- **Support matrix (POL-5), documented not silently missing.** macOS is the v1
+  native leg. iOS (`EPIC-260715-3uynbw`), Windows (`EPIC-260715-1mlv5j`), Linux
+  (`EPIC-260715-1hnglv`) and Android (`EPIC-260715-y0fshx`) legs are **deferred**
+  with their backlog EPIC ids in the workflow header, and enter native-ci when the
+  platform EPIC starts — not stubbed, because a build path nothing runs rots.
+
 The bindings smoke (`make smoke-bindings`, not part of `make check`)
 additionally needs `swiftc` (Xcode command line tools), `kotlinc`
 (`brew install kotlin`), and Java 17+ (`brew install openjdk`); it downloads

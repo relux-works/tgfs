@@ -435,6 +435,62 @@ class PipelineTest(unittest.TestCase):
             self.assertFalse(manifest["notarization"]["submitted"])
             self.assertFalse(any("notarytool" in " ".join(c) for c in calls))
 
+    def test_unsigned_assembles_the_bundle_but_signs_nothing(self):
+        # The assembly gate: build + lay out GramDrive.app and its plists, then
+        # stop. No Developer ID, no codesign/spctl/hdiutil/notarytool, no dmg —
+        # the check an ordinary CI runner can make.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            repo, core = self.stage(tmp)
+            out = tmp / "out"
+            out.mkdir()
+            run, calls = self.scripted()
+            manifest = app.package(
+                repo,
+                out_dir=out,
+                identity="unsigned",
+                core_package=core,
+                unsigned=True,
+                runner=run,
+                echo=lambda _: None,
+                environ={"HOME": "/h", "PATH": "/bin"},
+            )
+            joined = [" ".join(c) for c in calls]
+
+            # It really built and assembled the nested extension bundle.
+            appex = out / "GramDrive.app" / "Contents" / "PlugIns" / "GramDriveFileProvider.appex"
+            self.assertTrue((appex / "Contents" / "MacOS" / "GramDriveFileProvider").is_file())
+            self.assertEqual(
+                read_plist(appex / "Contents" / "Info.plist")["NSExtension"][
+                    "NSExtensionPointIdentifier"
+                ],
+                "com.apple.fileprovider-nonui",
+            )
+
+            # ...but ran no signing, assessment, dmg, or notarization tool.
+            self.assertFalse(any(j.startswith("codesign") for j in joined))
+            self.assertFalse(any(j.startswith("spctl") for j in joined))
+            self.assertFalse(any(j.startswith("hdiutil") for j in joined))
+            self.assertFalse(any("notarytool" in j for j in joined))
+
+            # The manifest is honest about being an unsigned assembly.
+            self.assertFalse(manifest["signed"])
+            self.assertEqual(manifest["signing_identity"], "unsigned")
+            self.assertFalse(manifest["notarization"]["submitted"])
+            self.assertTrue(all(b["cdhash"] is None for b in manifest["binaries"]))
+
+            # No dmg, so nothing dmg-shaped is recorded; the .app is still
+            # checksummed so the assembly has real provenance (NFR-052).
+            self.assertNotIn("dmg_bytes", manifest["sizes"])
+            self.assertFalse(any(k.endswith(".dmg") for k in manifest["checksums"]))
+            self.assertTrue(any(k.startswith("GramDrive.app/") for k in manifest["checksums"]))
+
+    def test_unsigned_and_notarize_cannot_combine(self):
+        # Assembling without a signature and notarizing a signature are
+        # contradictory; the CLI refuses the combination up front.
+        with self.assertRaises(SystemExit):
+            app.main(["--unsigned", "--notarize"])
+
     def test_notarize_submits_staples_and_records_the_submission(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest, calls, _ = self.run_pipeline(Path(tmp), notarize=True)

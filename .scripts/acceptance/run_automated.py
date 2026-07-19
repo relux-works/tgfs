@@ -161,6 +161,23 @@ def build_steps() -> dict[str, Step]:
                 ),
                 purpose="self-tests for the scripts in .scripts/",
             ),
+            # The macOS native leg (POL-5 / DEC-017 reference target). Both
+            # steps compile and test apple/GramDriveSupport against the staged
+            # GramDriveCore artifact, so they need macOS + Xcode and a prior
+            # `make package` (like the smokes). That is why they are their own
+            # `apple` suite, never folded into `all`, which must run on any host
+            # without Xcode or the staged core. native-ci stages the core first,
+            # then runs this suite through the same entrypoint local devs use.
+            Step(
+                name="swift-build",
+                argv=("swift", "build", "--package-path", "apple/GramDriveSupport"),
+                purpose="apple/GramDriveSupport compiles against the staged GramDriveCore (needs `make package` first)",
+            ),
+            Step(
+                name="swift-test",
+                argv=("swift", "test", "--package-path", "apple/GramDriveSupport"),
+                purpose="apple/GramDriveSupport unit tests: File Provider, agent, companion, shared state",
+            ),
             # git mode, not the working tree: a secret that was committed and
             # later deleted still ships in every clone's history. --redact keeps
             # the matched value out of the provenance log (the AC is "logs
@@ -200,6 +217,13 @@ SUITES: dict[str, tuple[str, ...]] = {
     "repo": (
         "traceability",
         "scripts",
+    ),
+    # The macOS native leg. Its own suite (not in `all`) because it needs macOS
+    # + Xcode and the staged core; native-ci runs it as its own job after
+    # staging `make package`. Build then test, same order as the core suite.
+    "apple": (
+        "swift-build",
+        "swift-test",
     ),
     # Secret scanning. Its own suite, deliberately NOT folded into `all`: it is
     # the only gate that needs gitleaks on PATH (a third tool footprint after

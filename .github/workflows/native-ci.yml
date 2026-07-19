@@ -1,0 +1,186 @@
+# Native platform CI — extends the barycenter core-ci (ci.yml) to the macOS
+# native drive (POL-5 / DEC-017 reference target). Like ci.yml, every job runs
+# the ONE pinned acceptance entrypoint (`run_automated.py --suite <x>`) or a
+# purpose-built packaging script that writes its own stronger manifest.json —
+# never an ad-hoc list of swift commands a developer could not run before pushing.
+#
+# WHY A SEPARATE WORKFLOW, NOT the per-PR gate. The native chain builds TDLib
+# from source and stages the core XCFramework, so it is minutes, not seconds.
+# Ordinary feature PRs keep the fast ci.yml gate; native-ci runs on a schedule,
+# on demand, on main, and on release-bound PRs — which is what "release branches
+# require native acceptance evidence" (AC) needs without taxing every PR. Signing
+# and notarization are NOT here: they live in the tag-triggered release workflow
+# (TASK-260715-3bhbkv) with the Developer ID identity in a keychain. This workflow
+# only ever assembles an UNSIGNED bundle, so it needs no secret.
+#
+# BLIND GATES / DEFERRED TARGETS (POL-5) — documented, deliberately NOT silently
+# missing. Only macOS has a native runner and shipping native code today, so it
+# is the only native leg here. The other platforms enter this workflow as their
+# own legs when their EPIC starts:
+#   - iOS     (File Provider, Swift)        — deferred: EPIC-260715-3uynbw (backlog)
+#   - Windows (Cloud Files API, Rust)       — deferred: EPIC-260715-1mlv5j (backlog)
+#   - Linux   (FUSE, Rust)                  — deferred: EPIC-260715-1hnglv (backlog)
+#   - Android (DocumentsProvider, Kotlin)   — deferred: EPIC-260715-y0fshx (backlog)
+# The shared Rust core's platform-neutrality is already gated by ci.yml's
+# rust-core `architecture` step; a blind cross-compile leg for the Windows/Linux
+# core consumers is a follow-up once those platforms have a C/TDLib link story —
+# stubbing one now would be a build path nothing runs (the repo's anti-pattern).
+name: native-ci
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *" # nightly native acceptance evidence
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: ["release/**"] # release-bound PRs pay the native cost; feature PRs do not
+
+# Least privilege, same as ci.yml: this workflow only reads the checkout and
+# assembles an unsigned bundle. It writes nothing to the repo and mints no token.
+permissions:
+  contents: read
+
+concurrency:
+  group: native-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tdlib:
+    # The pinned TDLib tdjson artifact GramDrive's local Telegram source links
+    # against, built from source and cached on the pin. Its own component job
+    # (barycenter one-job-per-component): the apple legs below build the core
+    # mock-only and do not consume it, but native release paths and the tdjson
+    # runtime do, so native CI proves it builds reproducibly and its link smoke
+    # passes. Cache-first: a warm run restores the artifact and re-runs only the
+    # fast Rust link smoke; the from-source C++ build happens on a cold cache.
+    name: tdlib
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Cache the pinned TDLib artifact
+        id: tdlib-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          # The pin is a constant in build_tdlib.py, so hashing that file keys
+          # the cache to the exact TDLib commit and build recipe: a bump misses,
+          # an unchanged pin hits.
+          path: .temp/tdlib/out
+          key: tdlib-${{ runner.os }}-${{ hashFiles('.scripts/tdlib/build_tdlib.py') }}
+
+      - name: Install TDLib build dependencies (cold cache only)
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        run: brew install cmake gperf openssl@3
+
+      - name: Build TDLib from source (cold cache only)
+        # build_tdlib.py runs its Rust link smoke as its final step, so a cold
+        # build is already proven end to end here.
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        run: make tdlib
+
+      - name: Prove the restored TDLib artifact (warm cache only)
+        # Re-link the cached libtdjson through the Rust link smoke: a cache that
+        # restored a broken artifact fails here instead of being trusted.
+        if: steps.tdlib-cache.outputs.cache-hit == 'true'
+        run: make tdlib-smoke
+
+      - name: Upload TDLib provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-tdlib
+          path: .temp/tdlib/out
+          if-no-files-found: error
+          retention-days: 14
+
+  apple-build-test:
+    # The macOS native leg: compile and unit-test apple/GramDriveSupport (the
+    # File Provider extension, companion agent, menu-bar shell, shared state)
+    # against the staged GramDriveCore, through the pinned `apple` suite. macos-15
+    # is Apple Silicon, the POL-5 reference host.
+    name: apple-build-test
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # `make package` stamps the core artifact from `git describe` /
+          # rev-count, which need tags and full history.
+          fetch-depth: 0
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Stage the GramDriveCore artifact
+        # The Swift package resolves GramDriveCore by path; `make package` builds
+        # the XCFramework + bindings into .temp/packaging/GramDriveCore and
+        # writes its own manifest. It builds the core mock-only (no TDLib).
+        run: make package
+
+      - name: Run acceptance suite (apple)
+        # The same entrypoint a developer runs (`make check-apple` shorthand):
+        # swift build + swift test of apple/GramDriveSupport. --require-clean
+        # stamps the tested commit; make package writes only to .temp (gitignored).
+        run: python3 .scripts/acceptance/run_automated.py --suite apple --require-clean --run-id ci-apple
+
+      - name: Upload acceptance provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: acceptance-ci-apple
+          path: .temp/acceptance/ci-apple
+          if-no-files-found: error
+          retention-days: 14
+
+  apple-package-unsigned:
+    # The unsigned app-bundle assembly gate: build the three SwiftPM executables
+    # and lay them out as GramDrive.app with the appex nested, Info.plists and
+    # entitlement plists generated — then STOP before codesign. Proves the
+    # packaging/assembly contract on a runner that holds no Developer ID identity.
+    # Gated on the build-test leg: there is nothing to package if it is red.
+    name: apple-package-unsigned
+    runs-on: macos-15
+    needs: apple-build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Stage the GramDriveCore artifact
+        run: make package
+
+      - name: Assemble the unsigned app bundle (no Developer ID)
+        run: python3 .scripts/apple-app/build_app_bundle.py --unsigned --out-dir .temp/app-packaging
+
+      - name: Upload unsigned-package provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-app-package-unsigned
+          path: .temp/app-packaging
+          if-no-files-found: error
+          retention-days: 14
