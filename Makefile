@@ -11,8 +11,8 @@
 GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings \
-        smoke-shared-state package package-reproducible tdlib tdlib-smoke \
-        tdjson-smoke tdlib-verify clean-gates
+        smoke-shared-state smoke-agent-lifecycle package package-reproducible \
+        tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates
 
 # check — the pre-push gate: everything CI runs.
 check:
@@ -70,6 +70,15 @@ smoke-bindings:
 # (see .scripts/smoke/run_shared_state_smoke.py).
 smoke-shared-state:
 	python3 .scripts/smoke/run_shared_state_smoke.py
+
+# smoke-agent-lifecycle — the companion agent as real processes: startup with
+# health over the bounded IPC channel, single-instance refusal of a second
+# agent, SIGTERM drain (hosted transfer cancelled through its token, exit 0,
+# endpoint torn down), and instant successor startup after SIGKILL. Needs
+# Xcode; stages `make package` if no artifact is present
+# (see .scripts/smoke/run_agent_lifecycle_smoke.py).
+smoke-agent-lifecycle:
+	python3 .scripts/smoke/run_agent_lifecycle_smoke.py
 
 # --- Artifact packaging ------------------------------------------------------
 # Not gate targets, and deliberately not steps of `check`: they need Xcode and a

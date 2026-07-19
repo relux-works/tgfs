@@ -24,6 +24,31 @@ The `gramdrive-shared-state-smoke` executable is the harness process for
 `.scripts/smoke/run_shared_state_smoke.py` (reader / watcher / doorbell
 modes); it is not a product target.
 
+## The companion agent (TASK-260715-1yx9ly)
+
+The package also ships the macOS background agent: `GramDriveAgentCore`
+(the lifecycle library the agent binary and the app shell both link) and
+`gramdrive-agent` (the launch-agent executable, PLAT-MAC-002/-005). The
+lifecycle is `launching → recovering → running → draining → stopped`:
+
+| Type | Owns |
+|---|---|
+| `AgentLifecycle` | The coordinator process's lifecycle: single-instance guard first, then shared state as `.coordinator` with corruption recovery (quarantine + one retry), the `DriveCore` handle, the health endpoint, power observation. `shutdown(reason:)` drains before tearing anything down |
+| `AgentRuntimeLayout` | Host-owned runtime paths beside the core's layout: `agent/agent.lock`, `agent/health.sock`, `agent/settings.json` under the same data root |
+| `SingleInstanceLock` | One coordinator per container, via `flock` — the kernel releases a crashed agent's lock, so recovery needs no stale-lock cleanup |
+| `TransferRegistry` | The in-flight transfer ledger and the drain: admission refusal once draining, a grace period, then cancellation through each operation's FFI `CancellationToken`. Process-local by design; durable transfer state is the engine's, which is why a crash cannot duplicate work |
+| `AgentHealthServer` / `AgentHealthClient` | The bounded local IPC: one endpoint, no request vocabulary — connect, receive one `AgentHealthSnapshot` (NFR-032 shape; unwired fields are honest `nil`s), EOF. A UNIX socket in the container rather than an XPC mach service so the channel stays provable in tests and the smoke; paths beyond `sun_path` are handled |
+| `AgentSettings` / `AgentSettingsStore` | Durable host preferences (launch-at-login), atomic JSON under `agent/`; never in the engine's database (DEC-006) |
+| `LaunchAtLoginPolicy` / `SMAppServiceAgentLoginItem` | Idempotent reconciliation of the user's preference with `SMAppService` registration. Called by the *app* (the launchd plist lives in the app bundle — platform constraint); the agent honors the preference by reporting it and never self-registering |
+| `PowerEventSource` / `WorkspacePowerEventSource` | Sleep/wake observation; wake re-probes `dataVersion` because a doorbell rung during sleep is lost |
+
+Shutdown is signal-driven (`SIGTERM`/`SIGINT` → drain → exit 0), which is
+exactly what launchd delivers on unload, logout, and update; the agent
+carries its own version and the core's contract version in health so the
+shell can detect a stale agent after an update. Accounts live inside the
+shared database (`AccountScope`), so one agent hosts every account of the
+container — the multiple-accounts path never means multiple coordinators.
+
 ## The core dependency is a built artifact
 
 `Package.swift` resolves `GramDriveCore` (XCFramework + generated
@@ -47,7 +72,15 @@ consuming a staged or released artifact elsewhere.
 - `swift test` — Swift Testing suites: App Group identity and layout
   derivation, role-based open against a substitute container, provider
   quarantine refusal, coordinator corruption recovery through the
-  bindings, and doorbell post/observe/cancel round-trips.
+  bindings, doorbell post/observe/cancel round-trips, and the agent
+  suites (lock contention, launch-policy matrix, health channel including
+  beyond-`sun_path` sockets, registry drain semantics, and the full
+  lifecycle against real shared state and a real hosted probe transfer).
+- `make smoke-agent-lifecycle` (repo root) — the agent as real processes:
+  startup with health over the socket, single-instance refusal of a
+  second agent, SIGTERM drain (hosted transfer cancelled through its
+  token, exit 0, endpoint removed), and instant successor startup after
+  SIGKILL (see `.scripts/smoke/run_agent_lifecycle_smoke.py`).
 - `make smoke-shared-state` (repo root) — the real multi-process proof:
   a Rust coordinator process seeds, two concurrent Swift provider
   processes must read byte-identical item metadata through the packaged

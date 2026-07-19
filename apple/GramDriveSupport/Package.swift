@@ -28,6 +28,13 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "GramDriveSupport", targets: ["GramDriveSupport"]),
+        // The companion-agent lifecycle library (TASK-260715-1yx9ly):
+        // single-instance guard, launch-at-login policy, transfer drain,
+        // health snapshot and its bounded local IPC channel. The agent
+        // executable and the app shell both link it.
+        .library(name: "GramDriveAgentCore", targets: ["GramDriveAgentCore"]),
+        // The companion background agent (launch agent) binary itself.
+        .executable(name: "gramdrive-agent", targets: ["GramDriveAgentMain"]),
         // Used by .scripts/smoke/run_shared_state_smoke.py: reader, watcher
         // and doorbell-poster processes for the two-process smoke.
         .executable(name: "gramdrive-shared-state-smoke", targets: ["SharedStateSmoke"]),
@@ -42,6 +49,21 @@ let package = Package(
                 .product(name: "GramDriveCore", package: "GramDriveCore")
             ]
         ),
+        .target(
+            name: "GramDriveAgentCore",
+            dependencies: [
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+        .executableTarget(
+            name: "GramDriveAgentMain",
+            dependencies: [
+                "GramDriveAgentCore",
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
         .executableTarget(
             name: "SharedStateSmoke",
             dependencies: [
@@ -52,6 +74,14 @@ let package = Package(
         .testTarget(
             name: "GramDriveSupportTests",
             dependencies: [
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+        .testTarget(
+            name: "GramDriveAgentCoreTests",
+            dependencies: [
+                "GramDriveAgentCore",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
             ]
