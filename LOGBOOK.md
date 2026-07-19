@@ -3,6 +3,17 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-07-20
+
+### 0014 — Self-hosted runner migration: recon + provisioning findings (TASK-260719-1dwaj8)
+- FINDING: GitHub org billing blocks BOTH hosted macOS and Linux minutes (secret-scan on ubuntu-24.04 failed at start with the billing error, run 29700024728) — so secret-scan moved to the self-hosted mac too, gitleaks darwin_x64 asset, same 8.30.1 pin + sha256.
+- FINDING: local `/Applications/Xcode_26_5.app` is **arm64-only** (Mach-O arm64, LSMinimumSystemVersion 26.2) — the task's rsync-to-Intel fallback is dead on arrival. Resolved without stop-the-line: relux already has `/Applications/Xcode.app` = **Xcode 26.2 (17C52), universal x86_64+arm64, minOS 15.6**; `xcodebuild -showsdks` works via `DEVELOPER_DIR` (runner .env), no license prompt, no sudo.
+- FINDING: relux CLT python3 is 3.9 — too old for the gate entrypoint (`datetime.UTC` needs 3.11+; the earlier preflight spawn died on exactly this). Provisioned python-build-standalone cpython 3.12.13 (pinned + sha256) into `~/gramdrive-ci/bin/python3`.
+- ANOMALY (keychain, measured on relux): `security delete-keychain` deletes the file but leaves a **dangling search-list entry**; `security list-keychains -s` with zero args is a **silent no-op**; `security default-keychain -s` on a never-explicitly-set search list makes the list follow the new default. Consequence: a grep-filter cleanup can silently leave throwaway-keychain residue on a persistent runner.
+- FIX: release.yml records default keychain + full search list VERBATIM in the naming step (before any modification) and restores both in the always() cleanup; proven by a dummy-p12 lifecycle sim on relux (`~/gramdrive-ci/keychain-sim.sh`): keychain GONE, default RESTORED, search list RESTORED, zero residue.
+- DECISION: TDLib arm64 artifact cannot be cross-built on the Intel host (brew OpenSSL is x86_64-only there) — took the task's cache-seed path: pinned arm64 artifact rsync'd from this host into `~/gramdrive-ci/cache/tdlib-28775d200a3a0386/out`; native-ci proves it with file(1) arm64 + `make tdlib-smoke-link` (cross-link, no execution) and fails actionably on a cold miss.
+- SCOPE: runner `relux-gramdrive` (labels self-hosted/macOS/X64/gramdrive-mac) as LaunchAgent via svc.sh, survives stop/start, online. Toolchain: rustup 1.91.0 + aarch64-apple-darwin target, cmake 4.3.3 universal, gitleaks 8.30.1, gperf 3.0.3 (OS), python 3.12.13 — all no-sudo under `~/gramdrive-ci`, every download pinned + checksum-verified (`~/gramdrive-ci/provision.sh`).
+
 ## 2026-07-19
 
 ### 2320 — macOS native acceptance harness built (TASK-260715-3oe2nr → to-review)

@@ -80,13 +80,22 @@ jobs:
         # profile for this run; deleted in the always() cleanup step. Kept in
         # RUNNER_TEMP so it never lands in the workspace or a cache. Exported here
         # because the `runner` context is not available in a job-level `env:`.
-        # The original default keychain is recorded now so the cleanup can
-        # restore it — on a persistent runner "whatever it was" still matters
-        # after the run.
+        # The original default keychain AND search list are recorded now so the
+        # cleanup can restore them verbatim — on a persistent runner "whatever
+        # they were" still matters after the run. Verbatim restore, not
+        # filter-out-the-throwaway: `security delete-keychain` leaves a
+        # dangling search-list entry behind (measured on the runner,
+        # TASK-260719-1dwaj8), and `list-keychains -s` with zero paths is a
+        # silent no-op, so a grep-based cleanup can quietly keep the residue.
         run: |
           echo "KEYCHAIN_PATH=$RUNNER_TEMP/gramdrive-signing.keychain-db" >> "$GITHUB_ENV"
           original="$(security default-keychain -d user | sed 's/^[[:space:]]*//;s/"//g')"
           echo "ORIGINAL_DEFAULT_KEYCHAIN=$original" >> "$GITHUB_ENV"
+          {
+            echo "ORIGINAL_KEYCHAIN_SEARCH_LIST<<GRAMDRIVE_KEYCHAIN_EOF"
+            security list-keychains -d user | sed 's/^[[:space:]]*//;s/"//g'
+            echo "GRAMDRIVE_KEYCHAIN_EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Checkout full history and tags
         # Version stamping reads `git describe --tags` (marketing version) and
@@ -261,12 +270,19 @@ jobs:
         run: |
           security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" 2>/dev/null || true
-          # Drop the (now deleted) throwaway from the search list, keeping the
-          # rest of the list as it was; then restore the recorded default.
-          # shellcheck disable=SC2046
-          security list-keychains -d user -s \
-            $(security list-keychains -d user | sed 's/"//g' | grep -v "gramdrive-signing.keychain-db") \
-            2>/dev/null || true
+          # Restore the recorded search list VERBATIM (delete-keychain leaves a
+          # dangling entry and an empty -s is a no-op — see the naming step),
+          # then the recorded default. IFS=newline so a path with spaces stays
+          # one argument; the fallback pins the login keychain rather than
+          # leaving a throwaway entry live if the recording ever comes up empty.
+          if [ -n "${ORIGINAL_KEYCHAIN_SEARCH_LIST:-}" ]; then
+            old_ifs="$IFS"; IFS=$'\n'
+            # shellcheck disable=SC2086
+            security list-keychains -d user -s $ORIGINAL_KEYCHAIN_SEARCH_LIST || true
+            IFS="$old_ifs"
+          else
+            security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db" || true
+          fi
           if [ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
             security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" 2>/dev/null || true
           fi
