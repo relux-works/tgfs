@@ -71,6 +71,32 @@ Every screen state is a deterministic view-model tested via scripted fakes
 states so every one is reachable. The command-channel wiring lands with the
 control-channel story (this story blocks `STORY-260715-2pe5sa`).
 
+## The File Provider domain layer (TASK-260715-3s44pc)
+
+The package also ships `GramDriveFileProvider` (PLAT-MAC-001): the stable
+per-account domain identity, the idempotent domain reconciler, and the
+thin `NSFileProviderReplicatedExtension` skeleton. Thin is the design, not
+a stage (DEC-006): the extension process never hosts TDLib or the engine —
+this target's only dependencies are the support package and the core
+bindings, and it opens shared state read-only as `.provider`.
+
+| Type | Owns |
+|---|---|
+| `DomainIdentity` | The identity rule: a domain identifier is a pure function of the account's stable numeric identity (`account-<id>`) — never of display name, auth state, or namespace epoch — so the same account always maps to the same domain across restarts, reinstalls, and reauthorization. Naming follows POL-7: one account presents as exactly **GramDrive**; several disambiguate with the account's display name (collisions append the identity). Parsing back is strict by round-trip, so a foreign domain identifier can never alias a real account |
+| `DomainReconciler` | The idempotent converge-toward-desired pass behind every acceptance path (first run, restart, duplicate install, reauthorization, multiple accounts): a pure `plan` (adds / renames / keeps / strays) diffed from the durable account rows, applied through the registrar seam. Registered domains no account explains are *reported* as strays, never touched — removal and repair are owned by TASK-260715-gnat2x, and the registrar seam has no remove operation at all, which makes "registration never destroys Finder state" structural |
+| `DomainRegistrar` / `SystemDomainRegistrar` | The narrow seam to the platform registry, so reconciliation is fully testable against fakes. The live implementation wraps `NSFileProviderManager` (`domains()` / upserting `add`); platform constraint: it must run inside the app that embeds the extension — the companion shell calls it at launch — and is proven live by the signing/packaging task (TASK-260715-1dk9ik) |
+| `DomainStartupReconcile` | The launch-time pass the companion app runs off the main thread: resolve container → open shared state as `.provider` → reconcile → report an outcome (`skipped`/`reconciled`/`failed`) for the log. Never throws and never blocks startup; registration is durable in the system, so this pass is what "recovers after app/provider restart" means |
+| `GramDriveFileProviderExtension` | The replicated-extension skeleton: parse the domain identifier, open shared state, resolve the account and its root item identifier (`accountContext()`). Item mapping, enumeration, and content land on top of that context in their own stories (STORY-260715-14k4l9, STORY-260715-14n7wp); until then callbacks answer `CocoaError.featureUnsupported` for a resolvable domain and `NSFileProviderError(.noSuchItem)` for one that maps to no configured account |
+
+The desired domain set derives from `SharedStateStore.accounts()` /
+`account(accountId:)` — the contract-0.3.0 account snapshot reads
+(identity, display name, auth state, namespace epoch, and the account
+root's item identifier; never secret material). The cross-process happy
+path is proven by the shared-state smoke's `domains` step: a separate
+provider process maps the Rust-seeded account to its domain and the real
+extension type resolves that domain back to the same root item the seeder
+reported.
+
 ## The core dependency is a built artifact
 
 `Package.swift` resolves `GramDriveCore` (XCFramework + generated
@@ -103,7 +129,12 @@ consuming a staged or released artifact elsewhere.
   control-channel-unavailable), status/diagnostics projection, settings
   round-trip with the Archive Mode preflight and launch-at-login reconcile,
   repair/removal outcomes, and `AgentSettings` forward/backward decode
-  compatibility.
+  compatibility; and the File Provider domain suites — the identity rule
+  (stability, strict round-trip parsing, POL-7 naming with multi-account
+  disambiguation), the reconcile plan and its idempotence (repeat pass,
+  duplicate install, reauthorization, rename, strays untouched), the
+  startup pass over real shared state, and the extension skeleton's typed
+  refusals over a substitute container.
 - `make smoke-agent-lifecycle` (repo root) — the agent as real processes:
   startup with health over the socket, single-instance refusal of a
   second agent, SIGTERM drain (hosted transfer cancelled through its
@@ -112,9 +143,12 @@ consuming a staged or released artifact elsewhere.
 - `make smoke-shared-state` (repo root) — the real multi-process proof:
   a Rust coordinator process seeds, two concurrent Swift provider
   processes must read byte-identical item metadata through the packaged
-  artifact, and a watcher process must observe the doorbell plus the
-  data-version probe across a foreign commit. The Rust-side stress and
-  SIGKILL crash tests live in `crates/gramdrive-state/tests/multiprocess.rs`.
+  artifact, a provider process runs the File Provider domain chain
+  (seeded account → stable domain → the extension type resolving it back
+  to the seeder's root item), and a watcher process must observe the
+  doorbell plus the data-version probe across a foreign commit. The
+  Rust-side stress and SIGKILL crash tests live in
+  `crates/gramdrive-state/tests/multiprocess.rs`.
 
 ## Substitute containers
 

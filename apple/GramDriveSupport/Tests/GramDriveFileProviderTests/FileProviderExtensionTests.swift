@@ -1,0 +1,97 @@
+import FileProvider
+import Foundation
+import GramDriveCore
+import GramDriveSupport
+import Testing
+
+@testable import GramDriveFileProvider
+
+/// The extension under test, wired to a fresh substitute container. The
+/// happy path over a *seeded* container is proven cross-process by the
+/// shared-state smoke (`make smoke-shared-state`, mode `domains`) —
+/// durable writes are the engine's, so Swift tests cannot seed accounts
+/// (DEC-006's no-writes-over-FFI rule).
+private func makeExtension(
+    domainIdentifier: String,
+    dataRoot: URL
+) -> GramDriveFileProviderExtension {
+    GramDriveFileProviderExtension(
+        domain: NSFileProviderDomain(
+            identifier: NSFileProviderDomainIdentifier(rawValue: domainIdentifier),
+            displayName: "GramDrive"
+        ),
+        dataRoot: { dataRoot }
+    )
+}
+
+private func withSubstituteDataRoot<T>(_ body: (URL) throws -> T) rethrows -> T {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("gramdrive-fpext-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    return try body(root)
+}
+
+@Suite("File Provider extension skeleton")
+struct FileProviderExtensionTests {
+    @Test("A foreign domain identifier is refused typed, never aliased")
+    func foreignIdentifierIsRefused() {
+        withSubstituteDataRoot { dataRoot in
+            let ext = makeExtension(domainIdentifier: "not-an-account", dataRoot: dataRoot)
+            #expect(
+                throws: FileProviderExtensionError.unrecognizedDomainIdentifier("not-an-account")
+            ) {
+                _ = try ext.accountContext()
+            }
+        }
+    }
+
+    @Test("A parseable domain with no configured account reports accountNotConfigured")
+    func missingAccountIsReported() {
+        withSubstituteDataRoot { dataRoot in
+            let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
+            #expect(throws: FileProviderExtensionError.accountNotConfigured(7)) {
+                _ = try ext.accountContext()
+            }
+        }
+    }
+
+    @Test("The provider-role store opens and is reused until invalidate, then reopens")
+    func storeLifecycle() throws {
+        try withSubstituteDataRoot { dataRoot in
+            let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
+            // Two resolutions fail on the missing *account*, not on the
+            // store — proving open succeeded and the container exists.
+            #expect(throws: FileProviderExtensionError.accountNotConfigured(7)) {
+                _ = try ext.accountContext()
+            }
+            let layout = try SharedState.layout(dataRoot: dataRoot)
+            #expect(FileManager.default.fileExists(atPath: layout.databaseFile))
+
+            ext.invalidate()
+            #expect(throws: FileProviderExtensionError.accountNotConfigured(7)) {
+                _ = try ext.accountContext()
+            }
+        }
+    }
+
+    @Test("An unresolvable domain answers the item surface with noSuchItem")
+    func itemSurfaceAnswersNoSuchItem() {
+        withSubstituteDataRoot { dataRoot in
+            let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
+            let error = ext.itemError(for: .rootContainer) as NSError
+            #expect(error.domain == NSFileProviderError.errorDomain)
+            #expect(error.code == NSFileProviderError.Code.noSuchItem.rawValue)
+        }
+    }
+
+    @Test("A broken data root surfaces the storage failure as-is, not as a fake noSuchItem")
+    func storageFailurePassesThrough() throws {
+        try withSubstituteDataRoot { dataRoot in
+            // A file where the data root should be makes the open fail.
+            try Data("not a directory".utf8).write(to: dataRoot)
+            let ext = makeExtension(domainIdentifier: "account-7", dataRoot: dataRoot)
+            let error = ext.itemError(for: .rootContainer) as NSError
+            #expect(error.domain != NSFileProviderError.errorDomain)
+        }
+    }
+}

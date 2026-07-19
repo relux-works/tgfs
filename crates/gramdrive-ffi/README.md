@@ -154,13 +154,17 @@ one durable SQLite database with no shared-memory assumptions
   serialized by the write lock). `role` names the process's rights:
   `Coordinator` (the engine host) may recover from corruption;
   `Provider` (extension, UI) never destroys shared files.
-- **Reads are short snapshots.** `item` / `children` / `child_by_name`
-  each run as one WAL read snapshot: consistent for the call, never
-  blocking the writer, never holding locks between calls. The calls are
-  synchronous and touch disk — call from a background queue. There are
-  **no writes** at this boundary by design: durable state is written by
-  the engine in its host process, and a foreign write surface would
-  invite the extension to mutate state the engine owns (DEC-006).
+- **Reads are short snapshots.** `item` / `children` / `child_by_name` /
+  `accounts` / `account` each run as one WAL read snapshot: consistent
+  for the call, never blocking the writer, never holding locks between
+  calls. The calls are synchronous and touch disk — call from a
+  background queue. The account reads (TASK-260715-3s44pc) carry what a
+  provider host maps File Provider domains from — stable identity,
+  display name, auth state, and the account root's item identifier —
+  and never secret material. There are **no writes** at this boundary by
+  design: durable state is written by the engine in its host process,
+  and a foreign write surface would invite the extension to mutate state
+  the engine owns (DEC-006).
 - **`data_version()`** is the change probe that pairs with the host's
   change doorbell (on Apple, a Darwin notification — see
   `apple/GramDriveSupport`): on a ring or a poll tick, compare against

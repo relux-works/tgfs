@@ -47,8 +47,8 @@ fun main(): Unit = runBlocking {
     // -- Contract version -------------------------------------------------
     val version = contractVersion()
     check(
-        version.major == 0u && version.minor == 2u && version.patch == 0u,
-        "contract version is 0.2.0",
+        version.major == 0u && version.minor == 3u && version.patch == 0u,
+        "contract version is 0.3.0",
     )
 
     // -- Constructor validation error round-trips --------------------------

@@ -17,7 +17,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // 0.2.0: shared durable state (crate::shared_state) — layout, role-based
     // open, item-metadata snapshot reads, data_version change probe, and
     // coordinator-only corruption recovery. Additive, hence minor.
-    minor: 2,
+    // 0.3.0: account snapshot reads (accounts/account with root item
+    // identifiers) — what a provider host maps File Provider domains from.
+    // Additive, hence minor.
+    minor: 3,
     patch: 0,
 };
 

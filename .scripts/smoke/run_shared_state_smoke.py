@@ -11,11 +11,15 @@ to end, in real separate processes, through the *packaged* artifact:
      — enumerate the same container concurrently; their outputs must be
      byte-identical and match what the seeder reported. That is the
      "two processes read consistent item metadata" acceptance proof.
-  3. A Swift watcher process observes the change doorbell (Darwin
+  3. A Swift provider process runs the File Provider domain chain
+     (TASK-260715-3s44pc): seeded accounts -> stable desired domain ->
+     the real replicated-extension type resolving that domain back to the
+     same account root the seeder reported.
+  4. A Swift watcher process observes the change doorbell (Darwin
      notification, posted by a third Swift process) and the dataVersion
      change probe while the Rust seeder commits a mutation from yet another
      process; it must detect both and re-read the updated metadata.
-  4. The two concurrent readers run again and must agree on the mutated
+  5. The two concurrent readers run again and must agree on the mutated
      state.
 
 Requires: the Rust toolchain, Xcode (swift + xcodebuild), and a staged
@@ -163,6 +167,24 @@ def main() -> None:
     expect("initial", first, f"item id={facts['file']}")
     expect("initial", first, "content=c1")
     expect("initial", first, "size=2048")
+
+    # 2b. File Provider domain chain (TASK-260715-3s44pc): a separate
+    #     provider process maps the seeded account to its stable domain and
+    #     the real extension type resolves that domain back to the same
+    #     root item the Rust coordinator reported.
+    domains = run(
+        "domains",
+        [
+            str(smoke_bin), "--container", str(CONTAINER),
+            "--mode", "domains",
+        ],
+    )
+    expect("domains", domains, "accounts_count=1")
+    expect("domains", domains, "account_id=7")
+    expect("domains", domains, f"account_root={facts['root']}")
+    expect("domains", domains, "domain_id=account-7")
+    expect("domains", domains, "domain_name=GramDrive")
+    expect("domains", domains, f"context_root={facts['root']}")
 
     # 3. Change flow: watcher (provider) must see the doorbell AND the
     #    moved data version around a foreign commit, then the new facts.

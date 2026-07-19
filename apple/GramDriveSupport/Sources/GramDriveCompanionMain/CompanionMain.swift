@@ -1,8 +1,10 @@
 import Foundation
 import GramDriveAgentCore
 import GramDriveCompanion
+import GramDriveFileProvider
 import GramDriveSupport
 import SwiftUI
+import os
 
 /// The GramDrive companion shell (PLAT-MAC-005): a menu-bar app over the
 /// engine-hosting agent. It hosts no engine and performs no Telegram
@@ -16,6 +18,35 @@ import SwiftUI
 @main
 struct GramDriveCompanionApp: App {
     @State private var model = CompanionViewModel.live(layout: GramDriveCompanionApp.layout())
+
+    init() {
+        // Launch-time File Provider domain reconcile (TASK-260715-3s44pc):
+        // the shell is the app that embeds the extension, so domain
+        // registration runs here — off the main thread, never blocking or
+        // failing startup. Idempotent: a healthy install logs a settled
+        // no-op pass.
+        Task.detached(priority: .utility) {
+            let logger = Logger(
+                subsystem: "com.reluxworks.gramdrive",
+                category: "file-provider-domains"
+            )
+            switch await DomainStartupReconcile.run() {
+            case .skipped(let reason):
+                logger.info("domain reconcile skipped: \(reason, privacy: .public)")
+            case .failed(let reason):
+                logger.error("domain reconcile failed: \(reason, privacy: .public)")
+            case .reconciled(let outcome):
+                let plan = outcome.plan
+                logger.info(
+                    """
+                    domain reconcile: adds=\(plan.adds.count) \
+                    renames=\(plan.renames.count) keeps=\(plan.keeps.count) \
+                    strays=\(plan.strays.count)
+                    """
+                )
+            }
+        }
+    }
 
     var body: some Scene {
         MenuBarExtra("GramDrive", systemImage: "externaldrive.badge.person.crop") {

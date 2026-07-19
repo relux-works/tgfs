@@ -37,6 +37,13 @@ let package = Package(
         // authorization flow, account/provider status, cache/Archive settings,
         // diagnostics, repair, removal — over the CompanionBackend seam.
         .library(name: "GramDriveCompanion", targets: ["GramDriveCompanion"]),
+        // The File Provider domain layer (TASK-260715-3s44pc): stable
+        // per-account domain identity, the idempotent domain reconciler,
+        // and the thin NSFileProviderReplicatedExtension skeleton over
+        // shared state (no TDLib — DEC-006). The containing app links this
+        // to register domains; the extension target links it as its
+        // principal-class implementation.
+        .library(name: "GramDriveFileProvider", targets: ["GramDriveFileProvider"]),
         // The companion background agent (launch agent) binary itself.
         .executable(name: "gramdrive-agent", targets: ["GramDriveAgentMain"]),
         // The companion shell app (menu-bar).
@@ -78,11 +85,19 @@ let package = Package(
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
             ]
         ),
+        .target(
+            name: "GramDriveFileProvider",
+            dependencies: [
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
         .executableTarget(
             name: "GramDriveCompanionMain",
             dependencies: [
                 "GramDriveCompanion",
                 "GramDriveAgentCore",
+                "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
             ]
@@ -90,6 +105,7 @@ let package = Package(
         .executableTarget(
             name: "SharedStateSmoke",
             dependencies: [
+                "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
             ]
@@ -114,6 +130,14 @@ let package = Package(
             dependencies: [
                 "GramDriveCompanion",
                 "GramDriveAgentCore",
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+        .testTarget(
+            name: "GramDriveFileProviderTests",
+            dependencies: [
+                "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
             ]

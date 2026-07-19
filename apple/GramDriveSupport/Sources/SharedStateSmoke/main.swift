@@ -1,5 +1,5 @@
 // Shared-state smoke process (TASK-260715-gnsa2s), driven by
-// .scripts/smoke/run_shared_state_smoke.py. One binary, three modes:
+// .scripts/smoke/run_shared_state_smoke.py. One binary, four modes:
 //
 //   read    — open the container as a provider and print every item's
 //             metadata as deterministic lines. The harness runs two of
@@ -12,14 +12,22 @@
 //             `signal`); print what the re-read observed.
 //   signal  — ring the change doorbell and exit (the writer host's
 //             post-commit step, isolated).
+//   domains — the File Provider domain chain (TASK-260715-3s44pc): read
+//             the seeded accounts, derive the desired domain set, then
+//             construct the real extension type against its domain and
+//             resolve the account context through shared state — the
+//             cross-process proof that a provider extension process maps
+//             its domain back to the account the Rust coordinator wrote.
 //
 // The container path arrives via --container; the data root is *derived*
 // here through AppGroup.dataRootURL, deliberately — if the Swift-side
 // derivation ever disagrees with the layout the seeder wrote under, every
 // read comes back empty and the smoke fails.
 
+import FileProvider
 import Foundation
 import GramDriveCore
+import GramDriveFileProvider
 import GramDriveSupport
 
 // The harness reads this process through a pipe and synchronizes on
@@ -102,6 +110,44 @@ do {
         guard let rootId else { fail("--root is required for mode read") }
         print("schema_version=\(try store.schemaVersion())")
         try printTree(store: store, rootId: rootId)
+
+    case "domains":
+        // The account list a provider host maps domains from.
+        let accounts = try store.accounts()
+        print("accounts_count=\(accounts.count)")
+        guard let account = accounts.first, accounts.count == 1 else {
+            fail("expected exactly one seeded account")
+        }
+        print("account_id=\(account.accountId)")
+        print("account_name=\(account.displayName)")
+        print("account_root=\(account.rootItemId)")
+
+        let desired = DomainIdentity.desiredDomains(for: accounts)
+        guard let domain = desired.first, desired.count == 1 else {
+            fail("expected exactly one desired domain")
+        }
+        print("domain_id=\(domain.identifier)")
+        print("domain_name=\(domain.displayName)")
+
+        // The real extension type, over the same substitute container:
+        // domain identifier -> account -> root item, all through shared
+        // state, in this separate process.
+        let ext = GramDriveFileProviderExtension(
+            domain: NSFileProviderDomain(
+                identifier: NSFileProviderDomainIdentifier(rawValue: domain.identifier),
+                displayName: domain.displayName
+            ),
+            dataRoot: { dataRoot }
+        )
+        let context = try ext.accountContext()
+        guard let rootItem = try context.store.item(id: context.account.rootItemId) else {
+            fail("extension found no root item for \(context.account.rootItemId)")
+        }
+        guard rootItem.kind == .account, rootItem.parent == nil else {
+            fail("extension root item is not an account root: \(describe(rootItem))")
+        }
+        print("context_root=\(rootItem.id)")
+        print("context_root_name=\(rootItem.safeName)")
 
     case "watch":
         guard let rootId else { fail("--root is required for mode watch") }

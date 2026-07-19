@@ -41,8 +41,8 @@ final class RecordingListener: ProgressListener, @unchecked Sendable {
 
 let version = contractVersion()
 check(
-    version == ContractVersion(major: 0, minor: 2, patch: 0),
-    "contract version is 0.2.0"
+    version == ContractVersion(major: 0, minor: 3, patch: 0),
+    "contract version is 0.3.0"
 )
 
 // -- Constructor validation error round-trips ---------------------------

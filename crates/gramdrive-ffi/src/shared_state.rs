@@ -39,7 +39,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use gramdrive_model::identity::ItemId;
+use gramdrive_model::identity::{AccountId, AccountKey, CanonicalKey, ItemId, ItemKey};
 use gramdrive_state::repo::item_kind;
 use gramdrive_state::{StateError, StateStore};
 
@@ -104,6 +104,41 @@ pub fn shared_state_layout(data_root: String) -> Result<SharedStateLayout, Drive
         state_dir: path_string(state_dir)?,
         data_root,
     })
+}
+
+/// Which source implementation serves an account. Mirrors the state
+/// store's account vocabulary (domain-model § Account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SourceKind {
+    /// A local TDLib session.
+    LocalTdlib,
+    /// A remote HTTP drive service.
+    RemoteHttp,
+}
+
+/// One configured account, as a provider host needs it (domain-model
+/// § Account): identity for a stable File Provider domain, display name
+/// for the user-visible drive, and the account root's item identifier so
+/// the host can start reading the tree without knowing the identifier
+/// derivation scheme. Never carries secret material — the secure-storage
+/// reference stays on the engine's side of the boundary.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccountInfo {
+    /// The account's stable numeric identity (DOM-021).
+    pub account_id: i64,
+    /// Which source implementation serves it.
+    pub source_kind: SourceKind,
+    /// Display name of the account (its root directory's name).
+    pub display_name: String,
+    /// Source-defined authorization state text (never secret material).
+    pub auth_state: String,
+    /// Current identity-namespace epoch (DOM-021). Item identities change
+    /// across a bump; the account identity — and thus a domain derived
+    /// from it — does not.
+    pub namespace_version: u32,
+    /// The account root directory's item identifier (text form) — equals
+    /// [`ItemMetadata::id`] of the root [`ItemKind::Account`] item.
+    pub root_item_id: String,
 }
 
 /// What kind of drive node an item is. Mirrors the state store's provider
@@ -284,6 +319,29 @@ impl SharedStateStore {
         record.map(item_metadata).transpose()
     }
 
+    /// Every configured account in stable identity order — what a
+    /// provider host maps File Provider domains from. An empty list is a
+    /// normal answer (no account configured yet), not an error.
+    pub fn accounts(&self) -> Result<Vec<AccountInfo>, DriveError> {
+        let mut store = self.store()?;
+        let txn = store.read_txn().map_err(map_state_error)?;
+        let records = txn.accounts().map_err(map_state_error)?;
+        Ok(records.into_iter().map(account_info).collect())
+    }
+
+    /// One configured account by its stable identity, or `None` if it is
+    /// not configured — the point read a provider extension resolving its
+    /// domain needs.
+    pub fn account(&self, account_id: i64) -> Result<Option<AccountInfo>, DriveError> {
+        let key = AccountKey {
+            account_id: AccountId(account_id),
+        };
+        let mut store = self.store()?;
+        let txn = store.read_txn().map_err(map_state_error)?;
+        let record = txn.account(key).map_err(map_state_error)?;
+        Ok(record.map(account_info))
+    }
+
     /// The database's connection-relative change stamp.
     ///
     /// The value differs from one previously returned by *this handle*
@@ -392,6 +450,27 @@ fn item_metadata(record: gramdrive_state::repo::ItemRecord) -> Result<ItemMetada
     })
 }
 
+fn account_info(record: gramdrive_state::repo::AccountRecord) -> AccountInfo {
+    AccountInfo {
+        account_id: record.account.account_id.0,
+        source_kind: map_source_kind(record.source_kind),
+        root_item_id: ItemKey::Canonical(CanonicalKey::Account(record.account))
+            .id()
+            .text(),
+        display_name: record.display_name,
+        auth_state: record.auth_state,
+        namespace_version: record.namespace_version.0,
+    }
+}
+
+fn map_source_kind(kind: gramdrive_state::repo::SourceKind) -> SourceKind {
+    use gramdrive_state::repo::SourceKind as Stored;
+    match kind {
+        Stored::LocalTdlib => SourceKind::LocalTdlib,
+        Stored::RemoteHttp => SourceKind::RemoteHttp,
+    }
+}
+
 fn map_kind(kind: gramdrive_state::repo::ItemKind) -> ItemKind {
     use gramdrive_state::repo::ItemKind as Stored;
     match kind {
@@ -456,7 +535,9 @@ mod tests {
         ChatKey, ItemKey, MessageId, MessageKey, NamespaceVersion,
     };
     use gramdrive_model::version::{ContentVersion, MetadataVersion};
-    use gramdrive_state::repo::{AccountRecord, FileFacts, ItemRecord, RetentionMode, SourceKind};
+    use gramdrive_state::repo::{
+        AccountRecord, FileFacts, ItemRecord, RetentionMode, SourceKind as StoredSourceKind,
+    };
 
     /// A unique data root under the OS temp dir, removed on drop.
     struct TempRoot {
@@ -530,7 +611,7 @@ mod tests {
         let txn = store.write_txn().expect("write txn");
         txn.upsert_account(&AccountRecord {
             account: scope().account,
-            source_kind: SourceKind::LocalTdlib,
+            source_kind: StoredSourceKind::LocalTdlib,
             display_name: "Test Account".to_owned(),
             auth_state: "authorized".to_owned(),
             namespace_version: scope().namespace_version,
@@ -654,6 +735,87 @@ mod tests {
         assert_eq!(file.logical_size, Some(2_048));
         assert_eq!(file.content_version.as_deref(), Some("c1"));
         assert_eq!(file.availability, ItemAvailability::Fetchable);
+    }
+
+    #[test]
+    fn accounts_are_empty_on_a_fresh_database() {
+        let root = TempRoot::new();
+        let store =
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider).expect("open");
+        assert_eq!(store.accounts().expect("accounts"), Vec::new());
+        assert_eq!(store.account(7).expect("account"), None);
+    }
+
+    #[test]
+    fn accounts_return_the_seeded_record_with_its_root_item_id() {
+        let root = TempRoot::new();
+        seed(&root);
+        let store =
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider).expect("open");
+
+        let accounts = store.accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        let account = &accounts[0];
+        assert_eq!(account.account_id, 7);
+        assert_eq!(account.source_kind, SourceKind::LocalTdlib);
+        assert_eq!(account.display_name, "Test Account");
+        assert_eq!(account.auth_state, "authorized");
+        assert_eq!(account.namespace_version, 1);
+        assert_eq!(account.root_item_id, root_id().text());
+        // The advertised root resolves through the item read to the
+        // account root item — the two reads can never disagree.
+        let item = store
+            .item(account.root_item_id.clone())
+            .expect("item")
+            .expect("root item exists");
+        assert_eq!(item.kind, ItemKind::Account);
+
+        assert_eq!(
+            store.account(7).expect("account").as_ref(),
+            Some(account),
+            "the point read answers with the same record"
+        );
+        assert_eq!(store.account(8).expect("account"), None);
+    }
+
+    #[test]
+    fn accounts_list_in_stable_identity_order() {
+        let root = TempRoot::new();
+        seed(&root);
+        // A second account, inserted after the first but with a smaller
+        // identity — the list must order by identity, not insertion.
+        let layout = shared_state_layout(root.as_str().to_owned()).expect("layout");
+        let mut writer = StateStore::open(&layout.database_file).expect("open writer");
+        let txn = writer.write_txn().expect("write txn");
+        txn.upsert_account(&AccountRecord {
+            account: AccountKey {
+                account_id: AccountId(3),
+            },
+            source_kind: StoredSourceKind::RemoteHttp,
+            display_name: "Second Account".to_owned(),
+            auth_state: "authorized".to_owned(),
+            namespace_version: NamespaceVersion(2),
+            retention_mode: RetentionMode::Audit,
+            archive_mode: true,
+            secret_ref: None,
+            created_at_ms: 2_000,
+            updated_at_ms: 2_000,
+        })
+        .expect("second account");
+        txn.commit().expect("commit");
+
+        let store =
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider).expect("open");
+        let accounts = store.accounts().expect("accounts");
+        assert_eq!(
+            accounts
+                .iter()
+                .map(|account| account.account_id)
+                .collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert_eq!(accounts[0].source_kind, SourceKind::RemoteHttp);
+        assert_eq!(accounts[0].namespace_version, 2);
     }
 
     #[test]
