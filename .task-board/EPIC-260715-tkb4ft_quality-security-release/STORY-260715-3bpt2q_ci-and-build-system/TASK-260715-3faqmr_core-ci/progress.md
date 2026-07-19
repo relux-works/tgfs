@@ -8,7 +8,7 @@ done
 2026-07-15T00:52:57Z
 
 ## Last Update
-2026-07-19T17:26:13Z
+2026-07-19T19:08:14Z
 
 ## Blocked By
 - TASK-260715-2cn768
@@ -43,6 +43,7 @@ spawn run started: [reviewer] reviewer (claude) (run=RUN-260719-f9afef)
 REVIEW: ACCEPTED -> done. Read-only review, all claims independently re-verified on this host (rust 1.91.0 / gitleaks 8.30.1 / actionlint). AC met: (1) PR-blocking = pull_request trigger + two gate jobs; required-check toggle is the one repo-admin follow-up a workflow file cannot self-grant (documented). (2) cache-cant-alter-results = toolchain/deps/cargo-deny/gitleaks/actions all pinned, rust-cache keyed on toolchain+lockfile. (3) no-secrets-in-logs = no repo secret consumed + gitleaks --redact. Gates reproduced: --suite all 8/8, --suite security 1/1, .scripts/tests 178/178, actionlint exit 0; pinned gitleaks tarball sha256 downloaded + verified against real 8.30.1 release = MATCH (install step will not break CI). Architecture: single-entrypoint contract honored (CI calls run_automated.py --suite <x>, never ad-hoc commands); barycenter per-component-job + provenance-upload pattern faithfully mirrored. Dependency correction (removed stale 26eoqx edge) accepted: remaining hard block 2cn768 is done, corpus not consumed by CI, reversible + flagged for coordinator. Scope calls (conformance/migration/benchmark/doc-check suites deferred until added to SUITES; cargo-deny covers audit+POL-6 license/SBOM) accepted. Verdict evidence: TASK-260715-3faqmr_review-verdict.md.
 agent completed: [reviewer] reviewer (claude) (exit=0)
 spawn run completed: claude (run=RUN-260719-f9afef, pid=73893, exit=0)
+2026-07-19: first real CI runs on GitHub. secret-scan was red on a gitleaks false positive (LOGBOOK.md review prose matched generic-api-key) — suppressed by fingerprint in .gitleaksignore, suite green locally. Separate infra blocker: GitHub Actions billing (macOS minutes) — owner action.
 
 ## Precondition Resources
 - [TASK-260715-3faqmr_ci-barycenter-reference.md](file://TASK-260715-3faqmr/TASK-260715-3faqmr_ci-barycenter-reference.md)

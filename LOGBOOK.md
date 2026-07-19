@@ -5,6 +5,14 @@
 
 ## 2026-07-20
 
+### 0036 — REVIEW: self-hosted runner migration ACCEPTED (TASK-260719-1dwaj8 → done)
+- DECISION: accepted → `done`. Read-only review; every AC re-verified independently, not taken on faith.
+- GATE (reviewer re-verified): GitHub API → runner `relux-gramdrive` **online**, labels self-hosted/macOS/X64/gramdrive-mac; ssh relux → LaunchAgent `actions.runner.relux-works-tgfs.relux-gramdrive` loaded (pid 17646, status 0). All 4 claimed runs re-checked via `gh run view`: CI 29702010556 (d46b203) + 29702440710 (HEAD 99ad6a9) and native-ci 29702010606 (d46b203) + 29702440760 (HEAD) — **all success**, all jobs on relux-gramdrive. `actionlint` re-run locally on all 3 workflows → exit 0.
+- FINDING (AC file(1) evidence, pulled from the actual run log 29702010606, not the results doc): `libtdjson.dylib: Mach-O ... arm64` (tdlib job) + `gramdrive-agent`/`GramDrive`/`GramDriveFileProvider`: `Mach-O 64-bit executable arm64` (apple-package-unsigned) — arm64 proven on the x86_64 runner.
+- FINDING (AC no-residue, measured on relux post-runs): keychain search list + default = `login.keychain-db` only; zero `*gramdrive*` in `~/Library/Keychains`; zero `.p12/.p8/.keychain-db` under `~/actions-runner` and `~/gramdrive-ci`. Verbatim capture/restore cleanup in release.yml correctly closes the measured delete-keychain dangling-entry anomaly (entry 0014).
+- FINDING (architecture fit): barycenter one-entrypoint contract preserved on the new runner (every gate still `run_automated.py --suite <x>`); actions pinned by SHA, gitleaks/tools pinned + checksummed; x86_64-host deviations honestly documented in job comments with arm64 proof delegated to the arch-verify legs. Tag-triggered release reality (v0.1.0 tag pre-dates migration → needs owner re-tag + POL-8 gate) documented as owner action, not forced-fit.
+- NOTE (non-blocking): release.yml:115 still carries `Swatinem/rust-cache` though ci/native-ci dropped hosted-cache as billing-blocked; rust-cache degrades to a warning on cache-service failure so a release run won't break — dead weight, drop on next release.yml touch. Physical reboot not exercised (box hosts unrelated live services; AC required service restart, which was proven).
+
 ### 0014 — Self-hosted runner migration: recon + provisioning findings (TASK-260719-1dwaj8)
 - FINDING: GitHub org billing blocks BOTH hosted macOS and Linux minutes (secret-scan on ubuntu-24.04 failed at start with the billing error, run 29700024728) — so secret-scan moved to the self-hosted mac too, gitleaks darwin_x64 asset, same 8.30.1 pin + sha256.
 - FINDING: local `/Applications/Xcode_26_5.app` is **arm64-only** (Mach-O arm64, LSMinimumSystemVersion 26.2) — the task's rsync-to-Intel fallback is dead on arrival. Resolved without stop-the-line: relux already has `/Applications/Xcode.app` = **Xcode 26.2 (17C52), universal x86_64+arm64, minOS 15.6**; `xcodebuild -showsdks` works via `DEVELOPER_DIR` (runner .env), no license prompt, no sudo.
