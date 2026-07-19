@@ -48,6 +48,13 @@ let package = Package(
         .executable(name: "gramdrive-agent", targets: ["GramDriveAgentMain"]),
         // The companion shell app (menu-bar).
         .executable(name: "gramdrive-companion", targets: ["GramDriveCompanionMain"]),
+        // The File Provider extension's appex binary (TASK-260715-1dk9ik):
+        // an NSExtensionMain entry point over the GramDriveFileProvider
+        // principal class. SwiftPM cannot emit an `.appex`, so packaging
+        // (.scripts/apple-app/build_app_bundle.py) wraps this executable in the
+        // bundle and Info.plist the system loads.
+        .executable(
+            name: "gramdrive-fileprovider", targets: ["GramDriveFileProviderExtensionApp"]),
         // Used by .scripts/smoke/run_shared_state_smoke.py: reader, watcher
         // and doorbell-poster processes for the two-process smoke.
         .executable(name: "gramdrive-shared-state-smoke", targets: ["SharedStateSmoke"]),
@@ -97,6 +104,14 @@ let package = Package(
             dependencies: [
                 "GramDriveCompanion",
                 "GramDriveAgentCore",
+                "GramDriveFileProvider",
+                "GramDriveSupport",
+                .product(name: "GramDriveCore", package: "GramDriveCore"),
+            ]
+        ),
+        .executableTarget(
+            name: "GramDriveFileProviderExtensionApp",
+            dependencies: [
                 "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),

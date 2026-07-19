@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "name": "GramDrive",
+  "product_version": {
+    "short": "0.0.0",
+    "build": "59"
+  },
+  "platform": "macos-arm64",
+  "minimum_system_version": "14.0",
+  "app_group": "262RZ595FP.com.reluxworks.gramdrive",
+  "signing_identity": "Developer ID Application: Relux Works, LLC (262RZ595FP)",
+  "team_id": "262RZ595FP",
+  "binaries": [
+    {
+      "role": "fileprovider",
+      "bundle_id": "com.reluxworks.gramdrive.fileprovider",
+      "entitlements": {
+        "com.apple.security.app-sandbox": true,
+        "com.apple.security.application-groups": [
+          "262RZ595FP.com.reluxworks.gramdrive"
+        ]
+      },
+      "cdhash": "f86232e83cc81bd37a4525b4b10968cc068d8443"
+    },
+    {
+      "role": "agent",
+      "bundle_id": "com.reluxworks.gramdrive.agent",
+      "entitlements": {
+        "com.apple.security.application-groups": [
+          "262RZ595FP.com.reluxworks.gramdrive"
+        ]
+      },
+      "cdhash": "d9003fa83c75cd978253c29a764bad64493cbd65"
+    },
+    {
+      "role": "app",
+      "bundle_id": "com.reluxworks.gramdrive",
+      "entitlements": {
+        "com.apple.security.application-groups": [
+          "262RZ595FP.com.reluxworks.gramdrive"
+        ]
+      },
+      "cdhash": "f931b1b67ccda8cd6821fcbd755e85058fda21da"
+    }
+  ],
+  "core_contract_version": "0.5.0",
+  "git": {
+    "describe": "8f2645f-dirty",
+    "commit": "8f2645f138c27e69e57e541f512ee875f2235026",
+    "worktree_clean": false
+  },
+  "toolchain": {
+    "swift": "Apple Swift version 6.3.2 (swiftlang-6.3.2.1.108 clang-2100.1.1.101)",
+    "xcodebuild": "Xcode 26.5",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)"
+  },
+  "notarization": {
+    "submitted": true,
+    "profile": "gramdrive-notary",
+    "id": "e012f0ae-c535-408d-9192-985d856f4954",
+    "status": "Accepted"
+  },
+  "source_date": "8f2645f138c27e69e57e541f512ee875f2235026",
+  "reproducible": {
+    "byte_identical": false,
+    "attributable": true,
+    "note": "The signed artifact is attributable to a commit, toolchain and core contract version, but not byte-reproducible: Developer ID signing embeds a trusted timestamp that varies per signature by design. NFR-052 asks for attributability, which this manifest and CHECKSUMS.sha256 provide."
+  },
+  "gatekeeper": {
+    "spctl": "accepted",
+    "notarized": true
+  },
+  "sizes": {
+    "app_bytes": 12622400,
+    "dmg_bytes": 5602420
+  },
+  "checksums": {
+    "GramDrive-0.0.0.dmg": "a0869cae1fb88a464d2d168db57502d26dda25c12a9ce137dfc78621fb282d24",
+    "GramDrive.app/Contents/Info.plist": "2ad5e48f03d0b50a4b554e7586f7daa5c8a1eaed662e50cbcf377e922231525d",
+    "GramDrive.app/Contents/Library/LaunchAgents/com.reluxworks.gramdrive.agent.plist": "eeb08ebadf52f15fa73de967a70a62020caf3013e6900099e208ac235a0b1182",
+    "GramDrive.app/Contents/MacOS/GramDrive": "eeef6f6fdbd34331e1f187d16ab9b7b5b43f8deae61718db7d7768dedceabf6a",
+    "GramDrive.app/Contents/MacOS/gramdrive-agent": "8fc3546d386b598c7876ea026f896a6b0da77ba96c4d838623b573b80fe5d067",
+    "GramDrive.app/Contents/PkgInfo": "82502191c9484b04d685374f9879a0066069c49b8acae7a04b01d38d07e8eca0",
+    "GramDrive.app/Contents/PlugIns/GramDriveFileProvider.appex/Contents/Info.plist": "b3ee3a67123440f3f4c5d4dc5e2fd0479ffcfa2b1ec21fa3d95fd3c4d96fee3f",
+    "GramDrive.app/Contents/PlugIns/GramDriveFileProvider.appex/Contents/MacOS/GramDriveFileProvider": "09e6fab76736adf799c98b1567257f91fad925d59e068252a2a477ef1e7ec86d",
+    "GramDrive.app/Contents/PlugIns/GramDriveFileProvider.appex/Contents/_CodeSignature/CodeResources": "6686de10a28a2fe11b36cbb86dcbacc827cfc4ea116b4dabf1845e5aee629e9b",
+    "GramDrive.app/Contents/_CodeSignature/CodeResources": "4539562881ac7d29163845b4e3466cd89a3a9bfdb7537dfd2a8c553b42027448"
+  }
+}

@@ -1,0 +1,1034 @@
+#!/usr/bin/env python3
+"""Assemble, sign, verify, and notarize the GramDrive.app macOS artifact.
+
+One versioned source (the `apple/GramDriveSupport` SwiftPM package over the
+staged Rust core) produces the shipped desktop app. This script owns what
+`make package` does not: turning three SwiftPM executables into a single signed,
+hardened-runtime, notarizable `GramDrive.app` and its `.dmg`, and the provenance
+that makes the result attributable to a commit without embedding any credential
+(NFR-052/NFR-053). Owned by TASK-260715-1dk9ik.
+
+    python3 .scripts/apple-app/build_app_bundle.py
+    python3 .scripts/apple-app/build_app_bundle.py --notarize
+    python3 .scripts/apple-app/build_app_bundle.py --identity 'Developer ID Application: ...'
+
+The bundle it assembles (macOS 14+ arm64, POL-5/DEC-017):
+
+    GramDrive.app/Contents/
+      Info.plist                     com.reluxworks.gramdrive
+      PkgInfo                        APPL????
+      MacOS/GramDrive                the menu-bar companion shell
+      MacOS/gramdrive-agent          the launchd-run engine-hosting agent
+      Library/LaunchAgents/com.reluxworks.gramdrive.agent.plist
+      PlugIns/GramDriveFileProvider.appex/Contents/
+        Info.plist                   com.reluxworks.gramdrive.fileprovider + NSExtension
+        MacOS/GramDriveFileProvider  the NSFileProviderReplicatedExtension host
+
+Three properties this pipeline exists to guarantee, each failing loudly:
+
+  * **Signed and verifiable.** Every Mach-O is Developer ID signed with the
+    hardened runtime and a secure timestamp, signed inside-out (nested code
+    first), and the result is checked with `codesign --verify --deep --strict`
+    and Gatekeeper (`spctl`). The dumped entitlements are parsed and asserted,
+    not assumed.
+  * **Credential-free.** No signing key, notarization key, or Telegram secret
+    is read from or written to the repo. The signing identity is resolved from
+    a keychain already holding it; notarization uses a keychain profile
+    (`gramdrive-notary`) or ASC API-key env, never a key on disk in the tree.
+    The manifest records the identity's *name and team*, never key material.
+  * **Attributable.** A `manifest.json` records the commit, toolchain, core
+    artifact version, per-binary bundle id + entitlements + cdhash, and (when
+    notarized) the submission id and status. `CHECKSUMS.sha256` covers the
+    shipped files. The signed bytes are deliberately not byte-reproducible: a
+    trusted timestamp varies per signature by design, which is the whole point
+    of a trusted timestamp. Attributability, not byte-identity, is what a signed
+    artifact can honestly claim.
+
+Requires: macOS with Xcode (`swift`, `codesign`, `spctl`, `hdiutil`,
+`xcrun notarytool`/`stapler`), the staged core package (`make package`), and a
+keychain holding the Developer ID Application identity. POL-5 makes the Apple
+host the only v1 target; on any other platform the script exits 2.
+
+Exit codes: 0 packaged, 1 a step failed, 2 the run could not start.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_CANNOT_START = 2
+
+OUT_ROOT = Path(".temp") / "app-packaging"
+
+# The SwiftPM package that builds the app's executables, and the staged core it
+# links (make package). Relative to the repo root.
+SUPPORT_PACKAGE = Path("apple") / "GramDriveSupport"
+DEFAULT_CORE_PACKAGE = Path(".temp") / "packaging" / "GramDriveCore"
+
+# Identity and naming, all sourced from .spec/platform-requirements.md and
+# TASK-260716-1jswke, never invented here.
+TEAM_ID = "262RZ595FP"
+# The App Group entitlement form v1 ships: team-ID-prefixed, so a Developer-ID
+# build needs no portal registration and no provisioning profile
+# (platform-requirements.md line 23). group.com.reluxworks.gramdrive is the
+# iOS / macOS 15+ form and is deliberately NOT used here.
+APP_GROUP = f"{TEAM_ID}.com.reluxworks.gramdrive"
+
+APP_BUNDLE_ID = "com.reluxworks.gramdrive"
+FILEPROVIDER_BUNDLE_ID = "com.reluxworks.gramdrive.fileprovider"
+# The agent row the packaging story owns (LOGBOOK note "packaging story should
+# add the agent row to the identifier table"); derived from the namespace.
+AGENT_BUNDLE_ID = "com.reluxworks.gramdrive.agent"
+# The launchd label / plist basename SMAppService resolves against the app
+# bundle (LaunchAtLogin.swift SMAppServiceAgentLoginItem.defaultPlistName).
+AGENT_LAUNCHD_LABEL = "com.reluxworks.gramdrive.agent"
+
+# The Swift-mangled Objective-C runtime name of the extension's principal class,
+# as it is emitted into the appex binary (verified with `nm`); the class is
+# defined in the GramDriveFileProvider module and is not @objc-renamed, so its
+# runtime name is <module>.<class>. NSExtensionMain resolves it by this string.
+FILEPROVIDER_PRINCIPAL_CLASS = "GramDriveFileProvider.GramDriveFileProviderExtension"
+
+# The product name on every user-visible surface (POL-7); never "tgfs".
+PRODUCT_NAME = "GramDrive"
+APP_BUNDLE_NAME = f"{PRODUCT_NAME}.app"
+APPEX_BUNDLE_NAME = "GramDriveFileProvider.appex"
+
+# macOS deployment floor (POL-5/DEC-017), matching Package.swift's .macOS(.v14).
+MINIMUM_SYSTEM_VERSION = "14.0"
+
+# The keychain profile the notarization step uses by default. Created out of
+# band (TASK-260716-1jswke) and validated against Apple; it holds the ASC API
+# key, so the key never lands in the repo or the environment here.
+DEFAULT_NOTARY_PROFILE = "gramdrive-notary"
+
+# The Developer ID Application identity the artifact is signed with. Resolved
+# from a keychain that already holds it; overridable for a different signer.
+DEFAULT_IDENTITY = f"Developer ID Application: Relux Works, LLC ({TEAM_ID})"
+IDENTITY_ENV = "GRAMDRIVE_SIGN_IDENTITY"
+
+
+@dataclass(frozen=True)
+class BinarySpec:
+    """One signed Mach-O in the bundle: what it is built as, where it lands,
+    and how it is signed.
+
+    `product` is the SwiftPM executable product; `install_path` is relative to
+    the `.app` root; `bundle_id` and `entitlements` are what its signature
+    carries. The order these appear in `BINARIES` is the *signing* order —
+    nested code first — because codesign refuses to seal a bundle whose nested
+    code is unsigned or was signed after it.
+    """
+
+    key: str
+    product: str
+    install_path: str
+    bundle_id: str
+    #: True for the outer `.app` (signed last, seals everything below it).
+    is_app_bundle: bool = False
+    #: True for the `.appex` (a nested bundle, signed as a bundle not a file).
+    is_appex_bundle: bool = False
+
+
+# Signing order is inside-out: appex, then agent, then the app that seals them.
+BINARIES: tuple[BinarySpec, ...] = (
+    BinarySpec(
+        key="fileprovider",
+        product="gramdrive-fileprovider",
+        install_path=f"Contents/PlugIns/{APPEX_BUNDLE_NAME}",
+        bundle_id=FILEPROVIDER_BUNDLE_ID,
+        is_appex_bundle=True,
+    ),
+    BinarySpec(
+        key="agent",
+        product="gramdrive-agent",
+        install_path="Contents/MacOS/gramdrive-agent",
+        bundle_id=AGENT_BUNDLE_ID,
+    ),
+    BinarySpec(
+        key="app",
+        product="gramdrive-companion",
+        install_path=".",
+        bundle_id=APP_BUNDLE_ID,
+        is_app_bundle=True,
+    ),
+)
+
+# The main executable's name inside the app bundle (CFBundleExecutable) and the
+# appex's — both read GramDrive*, never the SwiftPM product name.
+APP_EXECUTABLE_NAME = "GramDrive"
+APPEX_EXECUTABLE_NAME = "GramDriveFileProvider"
+
+Runner = Callable[[Sequence[str], Path, "dict[str, str] | None"], "tuple[int, str]"]
+
+
+def default_runner(
+    argv: Sequence[str], cwd: Path, env: dict[str, str] | None = None
+) -> tuple[int, str]:
+    """Run argv in cwd, returning (exit code, combined output)."""
+    try:
+        proc = subprocess.run(
+            list(argv),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except FileNotFoundError:
+        return 127, f"{argv[0]}: not found on PATH\n"
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+class StepFailed(Exception):
+    """A packaging step failed; carries what to print and nothing else."""
+
+
+# -- entitlements and Info.plists (generated, not committed) -----------------
+#
+# Kept in this file rather than as loose plist assets for the same reason
+# build_core_artifacts.py keeps its Package.swift here: one source of truth the
+# self-tests assert against, and the generated files are written into the output
+# and checksummed, so they are as reviewable as a committed file would be.
+
+
+def app_entitlements() -> dict:
+    """The containing app's entitlements.
+
+    App-groups only: the app shares the team-prefixed container with the agent
+    and the extension. Hardened runtime is a codesign flag, not an entitlement,
+    and there is deliberately no `get-task-allow` (SwiftPM's debug default sets
+    it true, which fails notarization) and no App Sandbox — a Developer ID
+    menu-bar shell that registers a launchd agent and File Provider domains runs
+    unsandboxed, and the team-prefixed group needs no provisioning profile.
+    """
+    return {"com.apple.security.application-groups": [APP_GROUP]}
+
+
+def agent_entitlements() -> dict:
+    """The background agent's entitlements: the same shared container.
+
+    Unsandboxed hardened runtime, matching the app. When the agent later links
+    libtdjson (which links brew OpenSSL/zlib), a
+    `com.apple.security.cs.disable-library-validation` exception may be needed;
+    the current agent links only the Rust core staticlib, so v1 stays minimal.
+    That addition belongs to the TDLib-integration/release work, recorded here
+    so it is not silently forgotten.
+    """
+    return {"com.apple.security.application-groups": [APP_GROUP]}
+
+
+def fileprovider_entitlements() -> dict:
+    """The File Provider extension's entitlements.
+
+    Sandboxed (macOS File Provider extensions run in the App Sandbox) plus the
+    shared container: the extension reaches durable state and the agent's
+    hydration socket only through the App Group container, which is exactly what
+    the sandbox grants it. No network entitlement — DEC-006 keeps TDLib and all
+    network out of the extension.
+    """
+    return {
+        "com.apple.security.app-sandbox": True,
+        "com.apple.security.application-groups": [APP_GROUP],
+    }
+
+
+ENTITLEMENTS: dict[str, Callable[[], dict]] = {
+    "app": app_entitlements,
+    "agent": agent_entitlements,
+    "fileprovider": fileprovider_entitlements,
+}
+
+
+def app_info_plist(short_version: str, build_version: str) -> dict:
+    """The containing app's Info.plist.
+
+    LSUIElement: the shell's primary surface is a menu-bar extra, so it runs
+    without a Dock icon. LSMinimumSystemVersion pins the v1 floor.
+    """
+    return {
+        "CFBundleIdentifier": APP_BUNDLE_ID,
+        "CFBundleName": PRODUCT_NAME,
+        "CFBundleDisplayName": PRODUCT_NAME,
+        "CFBundleExecutable": APP_EXECUTABLE_NAME,
+        "CFBundlePackageType": "APPL",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleShortVersionString": short_version,
+        "CFBundleVersion": build_version,
+        "LSMinimumSystemVersion": MINIMUM_SYSTEM_VERSION,
+        "LSUIElement": True,
+        "NSHighResolutionCapable": True,
+        "NSHumanReadableCopyright": "Relux Works, LLC",
+    }
+
+
+def appex_info_plist(short_version: str, build_version: str) -> dict:
+    """The File Provider extension's Info.plist.
+
+    The NSExtension dictionary is what makes this a File Provider extension: the
+    non-UI file-provider point, the principal class the system instantiates by
+    name, the document group it shares state through, and the enumeration
+    capability a replicated extension advertises.
+    """
+    return {
+        "CFBundleIdentifier": FILEPROVIDER_BUNDLE_ID,
+        "CFBundleName": APPEX_EXECUTABLE_NAME,
+        "CFBundleDisplayName": PRODUCT_NAME,
+        "CFBundleExecutable": APPEX_EXECUTABLE_NAME,
+        "CFBundlePackageType": "XPC!",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleShortVersionString": short_version,
+        "CFBundleVersion": build_version,
+        "LSMinimumSystemVersion": MINIMUM_SYSTEM_VERSION,
+        "NSExtension": {
+            "NSExtensionPointIdentifier": "com.apple.fileprovider-nonui",
+            "NSExtensionPrincipalClass": FILEPROVIDER_PRINCIPAL_CLASS,
+            "NSExtensionFileProviderDocumentGroup": APP_GROUP,
+            "NSExtensionFileProviderSupportsEnumeration": True,
+        },
+    }
+
+
+def agent_launchd_plist() -> dict:
+    """The agent's launchd property list, embedded in the app bundle.
+
+    SMAppService.agent(plistName:) resolves this against the app's bundle and
+    registers it as a login item. BundleProgram is the agent binary's path
+    relative to the bundle; AssociatedBundleIdentifiers ties the login item to
+    the app in System Settings; KeepAlive lets launchd restart the coordinator
+    after a crash (the "instant successor after SIGKILL" the lifecycle relies
+    on).
+    """
+    return {
+        "Label": AGENT_LAUNCHD_LABEL,
+        "BundleProgram": "Contents/MacOS/gramdrive-agent",
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Adaptive",
+        "AssociatedBundleIdentifiers": [APP_BUNDLE_ID],
+    }
+
+
+# -- versions ----------------------------------------------------------------
+
+
+def marketing_version(describe: str) -> str:
+    """The CFBundleShortVersionString derived from `git describe`.
+
+    A tag like `v0.1.0` or `v0.1.0-3-gabc` yields `0.1.0`; anything unparseable
+    (no tags yet) yields `0.0.0` rather than a fabricated number. This is the
+    human-facing version, distinct from the build number below.
+    """
+    text = describe.strip()
+    if text.startswith("v"):
+        text = text[1:]
+    # Drop the `-<commits>-g<sha>` and `-dirty` suffixes git appends.
+    head = text.split("-", 1)[0]
+    parts = head.split(".")
+    if head and all(part.isdigit() for part in parts) and parts:
+        return head
+    return "0.0.0"
+
+
+# -- checksums (same shape as build_core_artifacts.py) -----------------------
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def checksum_tree(root: Path) -> dict[str, str]:
+    """sha256 of every file under root, keyed by POSIX path relative to it.
+
+    Sorted so the output is stable across filesystems.
+    """
+    return {
+        str(path.relative_to(root).as_posix()): sha256_file(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def format_checksums(checksums: dict[str, str]) -> str:
+    """Render checksums in `shasum -a 256 -c` format."""
+    return "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items()))
+
+
+def tree_size(root: Path) -> int:
+    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+
+
+# -- codesign / verification argv (pure, tested) -----------------------------
+
+
+def codesign_argv(
+    target: Path,
+    *,
+    identity: str,
+    entitlements: Path | None,
+    timestamp: bool,
+    identifier: str | None = None,
+) -> tuple[str, ...]:
+    """The codesign command for one target.
+
+    `--force` re-signs (SwiftPM leaves a debug ad-hoc signature); `--options
+    runtime` is the hardened runtime notarization requires; `--timestamp` embeds
+    a trusted timestamp (network to Apple's TSA). Entitlements are passed per
+    target so the app, agent, and extension each carry only their own.
+    `--generate-entitlement-der` keeps the modern DER entitlement form current
+    codesign already emits, stated explicitly so a reader sees it is intended.
+    `--identifier` pins the code-signing identifier: a bundle takes it from its
+    Info.plist, but a loose helper Mach-O (the agent) would otherwise default to
+    its file name, so packaging sets it to the agent's bundle id.
+    """
+    argv: list[str] = ["codesign", "--force", "--sign", identity, "--options", "runtime"]
+    if timestamp:
+        argv.append("--timestamp")
+    else:
+        # For a dry/offline signing pass; a release artifact must timestamp.
+        argv.append("--timestamp=none")
+    argv.append("--generate-entitlement-der")
+    if identifier is not None:
+        argv += ["--identifier", identifier]
+    if entitlements is not None:
+        argv += ["--entitlements", str(entitlements)]
+    argv.append(str(target))
+    return tuple(argv)
+
+
+def verify_argv(app: Path) -> tuple[str, ...]:
+    """Strict, deep signature verification of the assembled bundle."""
+    return ("codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app))
+
+
+def entitlements_dump_argv(target: Path) -> tuple[str, ...]:
+    """Dump a signed target's entitlements as a plist on stdout."""
+    return ("codesign", "-d", "--entitlements", ":-", "--xml", str(target))
+
+
+def spctl_exec_argv(app: Path) -> tuple[str, ...]:
+    """Gatekeeper execution assessment. Accepts only a notarized+stapled app;
+    an un-notarized Developer ID app is reported rejected, which is expected
+    until the notarize step runs."""
+    return ("spctl", "--assess", "--type", "exec", "--verbose=2", str(app))
+
+
+def cdhash_probe_argv(target: Path) -> tuple[str, ...]:
+    return ("codesign", "-d", "--verbose=4", str(target))
+
+
+def notarize_submit_argv(dmg: Path, profile: str) -> tuple[str, ...]:
+    """Submit the dmg for notarization and wait, using a keychain profile so no
+    key is read here. `--output-format json` makes the submission id and status
+    machine-readable for the manifest."""
+    return (
+        "xcrun",
+        "notarytool",
+        "submit",
+        str(dmg),
+        "--keychain-profile",
+        profile,
+        "--wait",
+        "--output-format",
+        "json",
+    )
+
+
+def staple_argv(dmg: Path) -> tuple[str, ...]:
+    return ("xcrun", "stapler", "staple", str(dmg))
+
+
+def hdiutil_argv(app_staging: Path, dmg: Path, volname: str) -> tuple[str, ...]:
+    """Build a compressed dmg from a folder holding the .app."""
+    return (
+        "hdiutil",
+        "create",
+        "-volname",
+        volname,
+        "-srcfolder",
+        str(app_staging),
+        "-ov",
+        "-format",
+        "UDZO",
+        str(dmg),
+    )
+
+
+# -- parsing (pure, tested) --------------------------------------------------
+
+
+def parse_entitlements(output: str) -> dict:
+    """Parse codesign's dumped entitlements plist out of its stdout.
+
+    codesign may print a header before the XML, so the plist is located rather
+    than assumed to be the whole output: from the first `<?xml`/`<plist` to the
+    closing `</plist>`. A target with no entitlements yields an empty dict.
+    """
+    start = output.find("<?xml")
+    if start == -1:
+        start = output.find("<plist")
+    end = output.rfind("</plist>")
+    if start == -1 or end == -1:
+        return {}
+    fragment = output[start : end + len("</plist>")]
+    try:
+        parsed = plistlib.loads(fragment.encode("utf-8"))
+    except Exception:  # noqa: BLE001 - a malformed dump is "no entitlements found"
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_cdhash(output: str) -> str | None:
+    """Pull the CDHash out of `codesign -dvvv` output."""
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("CDHash="):
+            return line.removeprefix("CDHash=").strip()
+    return None
+
+
+def parse_notary_submission(output: str) -> dict:
+    """Pull id/status out of `notarytool submit --output-format json`.
+
+    Located rather than assumed to be the whole of stdout: the last line that
+    parses as a JSON object with an `id`. Returns {} if none is found, which the
+    caller treats as a failed submission.
+    """
+    for line in reversed(output.strip().splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and "id" in record:
+            return record
+    return {}
+
+
+# -- the packager ------------------------------------------------------------
+
+
+@dataclass
+class SignedBinary:
+    key: str
+    bundle_id: str
+    entitlements: dict
+    cdhash: str | None = None
+
+
+class AppPackager:
+    """Runs the pipeline. Every subprocess goes through `self.runner`."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        out_dir: Path,
+        *,
+        identity: str,
+        core_package: Path,
+        runner: Runner = default_runner,
+        echo: Callable[[str], None] = print,
+        environ: dict[str, str] | None = None,
+    ):
+        self.repo_root = repo_root
+        self.out_dir = out_dir
+        self.identity = identity
+        self.core_package = core_package
+        self.runner = runner
+        self.echo = echo
+        self.environ = environ
+        self.log_dir = out_dir / "logs"
+
+    def run(self, name: str, argv: Sequence[str], *, cwd: Path | None = None, env=None) -> str:
+        self.echo(f"--- {name}: {' '.join(str(a) for a in argv)}")
+        code, output = self.runner(argv, cwd or self.repo_root, env)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        (self.log_dir / f"{name}.log").write_text(output, encoding="utf-8")
+        if code != 0:
+            raise StepFailed(
+                f"{name} failed (exit {code}); log: {self.log_dir / f'{name}.log'}\n"
+                f"{output[-4000:]}"
+            )
+        return output
+
+    # -- inputs ----------------------------------------------------------
+
+    def build_env(self) -> dict[str, str]:
+        """The environment swift build runs under: the core package by path."""
+        env = dict(self.environ if self.environ is not None else os.environ)
+        env["GRAMDRIVE_CORE_PACKAGE"] = str(self.core_package)
+        env["LC_ALL"] = "C"
+        return env
+
+    def git_info(self) -> dict:
+        code, describe = self.runner(
+            ("git", "describe", "--tags", "--always", "--dirty"), self.repo_root, None
+        )
+        _, commit = self.runner(("git", "rev-parse", "HEAD"), self.repo_root, None)
+        status_code, status = self.runner(("git", "status", "--porcelain"), self.repo_root, None)
+        return {
+            "describe": describe.strip() if code == 0 else "unknown",
+            "commit": commit.strip() or None,
+            "worktree_clean": (status.strip() == "") if status_code == 0 else None,
+        }
+
+    def build_number(self) -> str:
+        """CFBundleVersion: the commit count, monotonic for Sparkle ordering."""
+        code, output = self.runner(("git", "rev-list", "--count", "HEAD"), self.repo_root, None)
+        value = output.strip()
+        return value if code == 0 and value.isdigit() else "0"
+
+    def toolchain_info(self) -> dict:
+        versions: dict[str, str] = {}
+        for name, argv in {
+            "swift": ("swift", "--version"),
+            "xcodebuild": ("xcodebuild", "-version"),
+            "rustc": ("rustc", "--version"),
+        }.items():
+            code, output = self.runner(argv, self.repo_root, None)
+            lines = output.strip().splitlines()
+            versions[name] = lines[0].strip() if code == 0 and lines else "unavailable"
+        return versions
+
+    def core_version(self) -> str:
+        """The staged core's contract version, read from its manifest."""
+        manifest = self.core_package / "gramdrive-core-manifest.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "unavailable"
+        return str(data.get("contract_version", "unavailable"))
+
+    # -- steps -----------------------------------------------------------
+
+    def build_products(self) -> Path:
+        """Build every app executable in release and return the bin directory.
+
+        Built through the same SwiftPM package the smokes use, over the staged
+        core (GRAMDRIVE_CORE_PACKAGE). `swift build --product` takes one product
+        at a time, so each is built in turn; the shared build graph means only
+        the first pays the core-compile cost.
+        """
+        package = self.repo_root / SUPPORT_PACKAGE
+        if not (self.core_package / "Package.swift").is_file():
+            raise StepFailed(
+                f"staged core package not found at {self.core_package}; run "
+                f"`make package` first or pass --core-package"
+            )
+        env = self.build_env()
+        for spec in BINARIES:
+            self.run(
+                f"swift-build-{spec.product}",
+                ("swift", "build", "-c", "release", "--product", spec.product),
+                cwd=package,
+                env=env,
+            )
+        code, output = self.runner(
+            ("swift", "build", "-c", "release", "--show-bin-path"), package, env
+        )
+        if code != 0:
+            raise StepFailed(f"could not resolve swift bin path:\n{output}")
+        bin_dir = Path(output.strip().splitlines()[-1].strip())
+        for spec in BINARIES:
+            if not (bin_dir / spec.product).is_file():
+                raise StepFailed(
+                    f"swift build reported success but {spec.product} is missing "
+                    f"from {bin_dir}"
+                )
+        return bin_dir
+
+    def assemble_bundle(self, bin_dir: Path, versions: tuple[str, str]) -> Path:
+        """Lay out GramDrive.app around the three built executables."""
+        short_version, build_version = versions
+        app = self.out_dir / APP_BUNDLE_NAME
+        if app.exists():
+            shutil.rmtree(app)
+
+        contents = app / "Contents"
+        (contents / "MacOS").mkdir(parents=True)
+        (contents / "Library" / "LaunchAgents").mkdir(parents=True)
+
+        # Main executable and the loose agent helper.
+        shutil.copy2(bin_dir / "gramdrive-companion", contents / "MacOS" / APP_EXECUTABLE_NAME)
+        shutil.copy2(bin_dir / "gramdrive-agent", contents / "MacOS" / "gramdrive-agent")
+
+        # The appex is a nested bundle.
+        appex = contents / "PlugIns" / APPEX_BUNDLE_NAME
+        (appex / "Contents" / "MacOS").mkdir(parents=True)
+        shutil.copy2(
+            bin_dir / "gramdrive-fileprovider",
+            appex / "Contents" / "MacOS" / APPEX_EXECUTABLE_NAME,
+        )
+
+        # Info.plists, PkgInfo, and the agent's launchd plist.
+        write_plist(contents / "Info.plist", app_info_plist(short_version, build_version))
+        (contents / "PkgInfo").write_text("APPL????", encoding="ascii")
+        write_plist(
+            appex / "Contents" / "Info.plist",
+            appex_info_plist(short_version, build_version),
+        )
+        write_plist(
+            contents / "Library" / "LaunchAgents" / f"{AGENT_LAUNCHD_LABEL}.plist",
+            agent_launchd_plist(),
+        )
+        return app
+
+    def write_entitlement_files(self) -> dict[str, Path]:
+        """Write the generated entitlements to disk for signing and provenance.
+
+        They live under the output (not a temp dir) so they are checksummed and
+        reviewable alongside the artifact.
+        """
+        ent_dir = self.out_dir / "entitlements"
+        if ent_dir.exists():
+            shutil.rmtree(ent_dir)
+        ent_dir.mkdir(parents=True)
+        paths: dict[str, Path] = {}
+        for key, builder in ENTITLEMENTS.items():
+            path = ent_dir / f"{key}.entitlements"
+            write_plist(path, builder())
+            paths[key] = path
+        return paths
+
+    def sign(
+        self, app: Path, entitlement_files: dict[str, Path], *, timestamp: bool
+    ) -> list[SignedBinary]:
+        """Sign every Mach-O inside-out, then record what each carries.
+
+        Order is `BINARIES` order (appex, agent, app): codesign refuses to seal
+        a bundle whose nested code is unsigned, so the app is signed last.
+        """
+        signed: list[SignedBinary] = []
+        for spec in BINARIES:
+            target = app if spec.is_app_bundle else app / spec.install_path
+            entitlements = entitlement_files[spec.key]
+            self.run(
+                f"codesign-{spec.key}",
+                codesign_argv(
+                    target,
+                    identity=self.identity,
+                    entitlements=entitlements,
+                    timestamp=timestamp,
+                    identifier=spec.bundle_id,
+                ),
+            )
+            signed.append(
+                SignedBinary(
+                    key=spec.key,
+                    bundle_id=spec.bundle_id,
+                    entitlements=ENTITLEMENTS[spec.key](),
+                )
+            )
+        return signed
+
+    def verify(self, app: Path, signed: list[SignedBinary]) -> None:
+        """Prove the signatures: strict/deep verify, then dump and assert the
+        entitlements of each binary rather than trusting they were applied."""
+        self.run("codesign-verify", verify_argv(app))
+        for spec in BINARIES:
+            target = app if spec.is_app_bundle else app / spec.install_path
+            dumped = parse_entitlements(self.run(f"entitlements-{spec.key}", entitlements_dump_argv(target)))
+            expected = ENTITLEMENTS[spec.key]()
+            assert_entitlements(spec.key, expected, dumped)
+            record = next(b for b in signed if b.key == spec.key)
+            record.cdhash = parse_cdhash(self.run(f"cdhash-{spec.key}", cdhash_probe_argv(target)))
+
+    def assess(self, app: Path) -> str:
+        """Gatekeeper assessment, recorded not gated: an un-notarized Developer
+        ID app is legitimately rejected here, so this reports the verdict and
+        the notarized path is what turns it to accepted."""
+        code, output = self.runner(spctl_exec_argv(app), self.repo_root, None)
+        (self.log_dir / "spctl.log").write_text(output, encoding="utf-8")
+        verdict = "accepted" if code == 0 else "rejected"
+        self.echo(f"    spctl: {verdict} (exit {code})")
+        return verdict
+
+    def build_dmg(self, app: Path, version: str, *, timestamp: bool) -> Path:
+        """Stage the .app alone into a folder and build a signed dmg from it."""
+        staging = self.out_dir / "dmg-staging"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        shutil.copytree(app, staging / APP_BUNDLE_NAME, symlinks=True)
+        dmg = self.out_dir / f"{PRODUCT_NAME}-{version}.dmg"
+        if dmg.exists():
+            dmg.unlink()
+        self.run("hdiutil", hdiutil_argv(staging, dmg, PRODUCT_NAME))
+        self.run(
+            "codesign-dmg",
+            codesign_argv(dmg, identity=self.identity, entitlements=None, timestamp=timestamp),
+        )
+        shutil.rmtree(staging)
+        return dmg
+
+    def notarize(self, dmg: Path, profile: str) -> dict:
+        """Submit, wait, verify accepted, then staple. Returns the record for
+        the manifest (submission id + status), never any credential."""
+        output = self.run("notarize-submit", notarize_submit_argv(dmg, profile))
+        record = parse_notary_submission(output)
+        status = record.get("status")
+        if status != "Accepted":
+            raise StepFailed(
+                f"notarization did not succeed (status={status!r}, "
+                f"id={record.get('id')!r}); see the log and `notarytool log`"
+            )
+        self.run("staple", staple_argv(dmg))
+        return {"submitted": True, "profile": profile, "id": record.get("id"), "status": status}
+
+
+def assert_entitlements(key: str, expected: dict, dumped: dict) -> None:
+    """Fail unless the dumped entitlements match what was meant to be applied.
+
+    Two directions, both load-bearing: every expected key is present with the
+    expected value (the entitlement was actually applied), and `get-task-allow`
+    is absent (SwiftPM's debug default would fail notarization if it leaked
+    through).
+    """
+    for entitlement_key, value in expected.items():
+        if dumped.get(entitlement_key) != value:
+            raise StepFailed(
+                f"{key}: entitlement {entitlement_key!r} is {dumped.get(entitlement_key)!r}, "
+                f"expected {value!r}; the signature did not carry it"
+            )
+    if dumped.get("com.apple.security.get-task-allow"):
+        raise StepFailed(
+            f"{key}: signed with com.apple.security.get-task-allow=true, which fails "
+            f"notarization; the release entitlements must override SwiftPM's debug default"
+        )
+
+
+def write_plist(path: Path, data: dict) -> None:
+    """Write a plist in the XML format codesign and the loader expect."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        plistlib.dump(data, handle, fmt=plistlib.FMT_XML)
+
+
+def build_manifest(
+    *,
+    product_version: dict,
+    identity: str,
+    signed: list[SignedBinary],
+    git: dict,
+    toolchain: dict,
+    core_version: str,
+    notarization: dict,
+    source_date: str,
+) -> dict:
+    """The artifact's identity record.
+
+    No key material: the identity is recorded by name and team, and
+    notarization by submission id and status. The signed bytes are not
+    byte-reproducible (a trusted timestamp varies per signature by design), so
+    the record claims attributability, not byte-identity.
+    """
+    return {
+        "schema": 1,
+        "name": PRODUCT_NAME,
+        "product_version": product_version,
+        "platform": "macos-arm64",
+        "minimum_system_version": MINIMUM_SYSTEM_VERSION,
+        "app_group": APP_GROUP,
+        "signing_identity": identity,
+        "team_id": TEAM_ID,
+        "binaries": [
+            {
+                "role": b.key,
+                "bundle_id": b.bundle_id,
+                "entitlements": b.entitlements,
+                "cdhash": b.cdhash,
+            }
+            for b in signed
+        ],
+        "core_contract_version": core_version,
+        "git": git,
+        "toolchain": toolchain,
+        "notarization": notarization,
+        "source_date": source_date,
+        "reproducible": {
+            "byte_identical": False,
+            "attributable": True,
+            "note": (
+                "The signed artifact is attributable to a commit, toolchain and core "
+                "contract version, but not byte-reproducible: Developer ID signing embeds "
+                "a trusted timestamp that varies per signature by design. NFR-052 asks for "
+                "attributability, which this manifest and CHECKSUMS.sha256 provide."
+            ),
+        },
+    }
+
+
+def source_date(git: dict, environ: dict[str, str]) -> str:
+    """SOURCE_DATE_EPOCH if set, else recorded as the commit — the source's
+    date, not the wall clock."""
+    epoch = environ.get("SOURCE_DATE_EPOCH")
+    if epoch and epoch.strip().isdigit():
+        return datetime.fromtimestamp(int(epoch.strip()), tz=UTC).isoformat()
+    return git.get("commit") or "unknown"
+
+
+def package(
+    repo_root: Path,
+    *,
+    out_dir: Path,
+    identity: str,
+    core_package: Path,
+    notarize: bool = False,
+    notary_profile: str = DEFAULT_NOTARY_PROFILE,
+    timestamp: bool = True,
+    runner: Runner = default_runner,
+    echo: Callable[[str], None] = print,
+    environ: dict[str, str] | None = None,
+) -> dict:
+    """Run the whole pipeline and return the manifest."""
+    packager = AppPackager(
+        repo_root,
+        out_dir,
+        identity=identity,
+        core_package=core_package,
+        runner=runner,
+        echo=echo,
+        environ=environ,
+    )
+    environ = environ if environ is not None else os.environ
+
+    git = packager.git_info()
+    short_version = marketing_version(git["describe"])
+    build_version = packager.build_number()
+
+    bin_dir = packager.build_products()
+    app = packager.assemble_bundle(bin_dir, (short_version, build_version))
+    entitlement_files = packager.write_entitlement_files()
+    signed = packager.sign(app, entitlement_files, timestamp=timestamp)
+    packager.verify(app, signed)
+    spctl_verdict = packager.assess(app)
+    dmg = packager.build_dmg(app, short_version, timestamp=timestamp)
+
+    notarization: dict = {"submitted": False}
+    if notarize:
+        notarization = packager.notarize(dmg, notary_profile)
+        # Re-assess the stapled app: now it must be accepted.
+        spctl_verdict = packager.assess(app)
+
+    manifest = build_manifest(
+        product_version={"short": short_version, "build": build_version},
+        identity=identity,
+        signed=signed,
+        git=git,
+        toolchain=packager.toolchain_info(),
+        core_version=packager.core_version(),
+        notarization=notarization,
+        source_date=source_date(git, dict(environ)),
+    )
+    manifest["gatekeeper"] = {"spctl": spctl_verdict, "notarized": notarization.get("submitted", False)}
+
+    checksums = {
+        f"{PRODUCT_NAME}-{short_version}.dmg": sha256_file(dmg),
+    }
+    # The app bundle's files too, so the manifest covers the whole artifact.
+    for name, digest in checksum_tree(app).items():
+        checksums[f"{APP_BUNDLE_NAME}/{name}"] = digest
+    (out_dir / "CHECKSUMS.sha256").write_text(format_checksums(checksums), encoding="utf-8")
+
+    manifest["sizes"] = {
+        "app_bytes": tree_size(app),
+        "dmg_bytes": dmg.stat().st_size,
+    }
+    manifest["checksums"] = checksums
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    echo("")
+    echo(f"app:          {app}")
+    echo(f"dmg:          {dmg} ({manifest['sizes']['dmg_bytes']:,} bytes)")
+    echo(f"identity:     {identity}")
+    echo(f"spctl:        {spctl_verdict}")
+    echo(f"notarized:    {notarization.get('submitted', False)}")
+    echo(f"version:      {short_version} ({build_version})  commit: {git['describe']}")
+    return manifest
+
+
+def resolve_identity(args_identity: str | None, environ: dict[str, str]) -> str:
+    """The signing identity: --identity, then the env override, then the default."""
+    return args_identity or environ.get(IDENTITY_ENV) or DEFAULT_IDENTITY
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Assemble, sign, and notarize GramDrive.app.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--out-dir", type=Path, default=None, help=f"default: {OUT_ROOT}")
+    parser.add_argument(
+        "--core-package",
+        type=Path,
+        default=None,
+        help=f"staged GramDriveCore package (default: {DEFAULT_CORE_PACKAGE})",
+    )
+    parser.add_argument(
+        "--identity",
+        default=None,
+        help=f"Developer ID Application identity (default: {IDENTITY_ENV} or the Relux Works cert)",
+    )
+    parser.add_argument(
+        "--notarize",
+        action="store_true",
+        help="submit the dmg for notarization and staple it (network; Apple)",
+    )
+    parser.add_argument(
+        "--notary-profile",
+        default=DEFAULT_NOTARY_PROFILE,
+        help=f"notarytool keychain profile (default: {DEFAULT_NOTARY_PROFILE})",
+    )
+    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    repo_root = args.repo_root.resolve()
+    if sys.platform != "darwin":
+        print(
+            "ERROR: the GramDrive.app artifact requires macOS (swift, codesign, "
+            "spctl, hdiutil, notarytool). POL-5 makes macOS arm64 the v1 target.",
+            file=sys.stderr,
+        )
+        return EXIT_CANNOT_START
+
+    out_dir = (args.out_dir or (repo_root / OUT_ROOT)).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    core_package = (args.core_package or (repo_root / DEFAULT_CORE_PACKAGE)).resolve()
+    identity = resolve_identity(args.identity, dict(os.environ))
+
+    try:
+        package(
+            repo_root,
+            out_dir=out_dir,
+            identity=identity,
+            core_package=core_package,
+            notarize=args.notarize,
+            notary_profile=args.notary_profile,
+        )
+    except StepFailed as failure:
+        print(f"\nAPP PACKAGING FAILED\n{failure}", file=sys.stderr)
+        return EXIT_FAILED
+    print("\nAPP PACKAGING PASSED")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -19,11 +19,12 @@ Apple identifiers:
 | Identifier | Use | Registration |
 |---|---|---|
 | `com.reluxworks.gramdrive` | Containing application (macOS, iOS) | Explicit App ID, registered with App Groups capability |
+| `com.reluxworks.gramdrive.agent` | Background agent (macOS launchd LaunchAgent, embedded in the app, registered via `SMAppService`) | Code-signing identifier of a loose helper Mach-O; team-prefixed App Group only, no separate portal registration under Developer ID |
 | `com.reluxworks.gramdrive.fileprovider` | File Provider extension | Explicit App ID, registered with App Groups capability |
 | `262RZ595FP.com.reluxworks.gramdrive` | App Group shared container — **the entitlement form v1 ships** (macOS 14 deployment target) | Team-prefixed; needs no portal registration and no provisioning profile under Developer ID signing |
 | `group.com.reluxworks.gramdrive` | App Group shared container — iOS and macOS 15+ | Registered manually in the portal; future, not used by v1 |
 
-DEC-017 / POL-5 fix the v1 support matrix at macOS 14+, arm64 only, so `262RZ595FP.com.reluxworks.gramdrive` is the App Group that v1 actually ships; `group.com.reluxworks.gramdrive` applies only once iOS or macOS 15+ enters scope. Source: `TASK-260716-1jswke`.
+DEC-017 / POL-5 fix the v1 support matrix at macOS 14+, arm64 only, so `262RZ595FP.com.reluxworks.gramdrive` is the App Group that v1 actually ships; `group.com.reluxworks.gramdrive` applies only once iOS or macOS 15+ enters scope. Sources: `TASK-260716-1jswke` (app, File Provider, App Group identifiers) and `TASK-260715-1dk9ik` (the agent identifier, added when packaging assembled the signed bundle).
 
 Android uses the `com.reluxworks.gramdrive` application ID; Windows and Linux derive sync-root and service identifiers from the same prefix.
 

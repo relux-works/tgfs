@@ -12,6 +12,7 @@ GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo gates fmt build test bindings smoke-bindings \
         smoke-shared-state smoke-agent-lifecycle package package-reproducible \
+        package-app package-app-notarize \
         tdlib tdlib-smoke tdjson-smoke tdlib-verify clean-gates
 
 # check — the pre-push gate: everything CI runs.
@@ -105,6 +106,30 @@ package:
 # the check behind it, and a check that does not vary the path cannot falsify it.
 package-reproducible:
 	python3 .scripts/packaging/build_core_artifacts.py --check-reproducible
+
+# --- macOS app packaging -----------------------------------------------------
+# The signed, notarizable GramDrive.app: the menu-bar shell, the launchd agent,
+# and the File Provider extension appex assembled into one Developer ID bundle
+# and its dmg (TASK-260715-1dk9ik). Same posture as `package`/`tdlib` above —
+# needs Xcode, a signing identity, and the staged core (`make package` first),
+# so it is not a step of `check`; CI runs it as its own job. Like those, it is a
+# reusable script the release workflow (TASK-260715-3bhbkv) invokes, never a
+# second copy of the codesign/notarytool commands. The script writes a
+# purpose-built provenance record (manifest.json: identity, entitlements,
+# cdhashes, checksums; NFR-052), so it runs directly, not through $(GATE).
+# Pipeline and layout: .scripts/apple-app/README.md.
+
+# package-app — build, assemble, and sign GramDrive.app + dmg, then verify
+# (codesign --deep --strict, entitlement dump, Gatekeeper). No notarization.
+# Output: .temp/app-packaging/.
+package-app:
+	python3 .scripts/apple-app/build_app_bundle.py
+
+# package-app-notarize — the full release path: package-app, then submit the dmg
+# to Apple via the gramdrive-notary keychain profile, wait, staple, and re-check
+# Gatekeeper. Needs network and the notary profile / ASC secrets.
+package-app-notarize:
+	python3 .scripts/apple-app/build_app_bundle.py --notarize
 
 # --- TDLib artifact ----------------------------------------------------------
 # The pinned tdjson library GramDrive's local Telegram source links against.

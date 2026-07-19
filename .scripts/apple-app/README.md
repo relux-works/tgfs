@@ -1,0 +1,161 @@
+# macOS app packaging
+
+How the GramDrive desktop app reaches users: one signed, notarizable
+`GramDrive.app` — the menu-bar companion shell, the launchd background agent, and
+the File Provider extension appex — assembled from the `apple/GramDriveSupport`
+SwiftPM package over the staged Rust core, and the provenance that makes the
+result attributable to a commit without embedding any credential.
+
+Owned by TASK-260715-1dk9ik (STORY-260715-2ca0k9, EPIC-260715-3i9uyp). The
+tag-triggered GitHub `release.yml` that *invokes* this script is a separate task
+(TASK-260715-3bhbkv); this directory owns the pipeline, not the CI wiring.
+
+```sh
+make package                 # stage the core first (dependency; .scripts/packaging)
+make package-app             # build + sign + verify the app and dmg (no notarization)
+make package-app-notarize    # the full path: also notarize + staple via gramdrive-notary
+```
+
+Output lands in `.temp/app-packaging/` (gitignored). Artifacts are built, never
+committed: a checked-in signed binary is a binary nobody can attribute to a
+commit, and its signature would be stale the moment the toolchain moved.
+
+## What it produces
+
+```
+.temp/app-packaging/
+  GramDrive.app/                     the signed, hardened-runtime bundle
+    Contents/
+      Info.plist                     com.reluxworks.gramdrive
+      PkgInfo                        APPL????
+      MacOS/GramDrive                the menu-bar companion shell
+      MacOS/gramdrive-agent          the launchd-run engine-hosting agent
+      Library/LaunchAgents/com.reluxworks.gramdrive.agent.plist
+      PlugIns/GramDriveFileProvider.appex/Contents/
+        Info.plist                   com.reluxworks.gramdrive.fileprovider + NSExtension
+        MacOS/GramDriveFileProvider  the NSFileProviderReplicatedExtension host
+  GramDrive-<version>.dmg            signed (+ stapled when notarized)
+  entitlements/                      the generated entitlements, for review + provenance
+  manifest.json                      identity, per-binary entitlements + cdhash, checksums
+  CHECKSUMS.sha256                   sha256 of the dmg and every app-bundle file
+  logs/                              per-step combined output
+```
+
+## The three properties this pipeline exists to guarantee
+
+### Signed and verifiable
+
+Every Mach-O is Developer ID signed with the hardened runtime (`--options
+runtime`) and a trusted timestamp (`--timestamp`), and each carries only its own
+entitlements. Signing is **inside-out** — the appex and the agent, then the app
+that seals them — because codesign refuses to seal a bundle whose nested code is
+unsigned or was signed afterward. The result is checked three ways, none of them
+assumed:
+
+- `codesign --verify --deep --strict` — the signatures are structurally valid;
+- the entitlements of each binary are **dumped and parsed**, then asserted
+  against what was meant to be applied (and asserted to lack `get-task-allow`);
+- Gatekeeper (`spctl --assess --type exec`) — recorded, not gated: an
+  un-notarized Developer ID app is legitimately *rejected* here, and only the
+  notarized+stapled artifact turns it to *accepted*, which the notarize run
+  re-checks.
+
+Measured on the current build: `codesign --verify --deep --strict` passes,
+`flags=0x10000(runtime)` on all three binaries, `TeamIdentifier=262RZ595FP`.
+
+### Credential-free
+
+No signing key, notarization key, or Telegram secret is read from or written to
+the repository tree (SEC-001, NFR-053). The signing identity is resolved from a
+keychain that already holds it — default `Developer ID Application: Relux Works,
+LLC (262RZ595FP)`, overridable with `--identity` or `GRAMDRIVE_SIGN_IDENTITY`.
+Notarization uses the `gramdrive-notary` notarytool keychain profile (which holds
+the ASC API key out of band, TASK-260716-1jswke), or ASC API-key env in CI. The
+manifest records the identity's **name and team**, and notarization by
+**submission id and status** — never any key material. The self-tests assert the
+manifest carries none of the words a leak would (`PRIVATE KEY`, `p12`,
+`password`, `AuthKey`, …).
+
+### Attributable
+
+`manifest.json` records the commit, toolchain (Xcode/Swift/rustc), the staged
+core's contract version, each binary's bundle id + entitlements + cdhash, and —
+when notarized — the submission id and status. `CHECKSUMS.sha256` covers the dmg
+and every file in the bundle.
+
+The signed bytes are **deliberately not byte-reproducible**: Developer ID signing
+embeds a trusted timestamp that varies per signature *by design* — that is the
+whole point of a trusted timestamp. NFR-052 asks that a release artifact be
+reproducibly *attributable* to a commit, which the manifest and checksums
+provide; it does not ask a signature to be byte-identical, which it cannot be.
+The manifest states this rather than claiming a property it does not have
+(`reproducible.byte_identical: false`, `attributable: true`).
+
+## Identifiers and entitlements
+
+Sourced from `.spec/platform-requirements.md` and TASK-260716-1jswke, never
+invented here (macOS 14+ arm64, POL-5/DEC-017):
+
+| Binary | Bundle id | Entitlements |
+|---|---|---|
+| App (menu-bar shell) | `com.reluxworks.gramdrive` | app-groups; hardened runtime; unsandboxed |
+| Agent (launchd) | `com.reluxworks.gramdrive.agent` | app-groups; hardened runtime; unsandboxed |
+| File Provider (appex) | `com.reluxworks.gramdrive.fileprovider` | app-sandbox **+** app-groups; hardened runtime |
+
+- **App Group `262RZ595FP.com.reluxworks.gramdrive`** — the team-ID-prefixed
+  form is the one v1 ships: under Developer ID it needs no portal registration
+  and no provisioning profile. `group.com.reluxworks.gramdrive` is the iOS /
+  macOS 15+ form and is deliberately not used.
+- **No `get-task-allow`.** SwiftPM's debug build stamps every executable with a
+  `com.apple.security.get-task-allow=true` entitlement, which fails
+  notarization. The pipeline re-signs with its own release entitlements, and the
+  verify step asserts the leaked entitlement is gone.
+- **App Sandbox only on the extension.** macOS File Provider extensions run in
+  the App Sandbox; the App Group is exactly what lets a sandboxed extension reach
+  durable state and the agent's hydration socket. The unsandboxed Developer ID
+  shell and agent need no sandbox to register domains, run a launchd item, or
+  host TDLib.
+
+## The appex entry point (why there is an executable target)
+
+SwiftPM cannot emit an `.appex` or an `NSExtensionMain` entry point. The
+`GramDriveFileProviderExtensionApp` executable target
+(`apple/GramDriveSupport/Sources/GramDriveFileProviderExtensionApp/main.swift`)
+is that missing entry point: it calls `NSExtensionMain` (exported from
+Foundation) and touches the principal class's metatype so the linker keeps it in
+the image. Packaging wraps the built binary in the `.appex` bundle and the
+Info.plist whose `NSExtension` dictionary names the principal class
+`GramDriveFileProvider.GramDriveFileProviderExtension` — the Swift-mangled
+Objective-C runtime name the system resolves by string. Verified with `nm`: the
+binary references `_NSExtensionMain` and keeps
+`_OBJC_CLASS_$__TtC21GramDriveFileProvider30GramDriveFileProviderExtension`.
+
+## Requirements
+
+macOS with Xcode (`swift`, `codesign`, `spctl`, `hdiutil`, `xcrun
+notarytool`/`stapler`), a keychain holding the Developer ID Application identity,
+and the staged core package (`make package`, resolved by default at
+`.temp/packaging/GramDriveCore`; override with `--core-package` or
+`GRAMDRIVE_CORE_PACKAGE`). POL-5 makes the Apple host the only v1 target; on any
+other platform the script exits 2 with that reason rather than a partial
+artifact.
+
+## Not in scope here (recorded so it is not silently forgotten)
+
+- **TDLib in the agent.** The current `gramdrive-agent` links only the Rust core
+  staticlib. When it later links `libtdjson.dylib` (which links brew
+  OpenSSL/zlib via absolute install names), the agent will need the dylib
+  embedded with a fixed rpath and likely
+  `com.apple.security.cs.disable-library-validation`. That belongs to the
+  TDLib-integration/release work (LOGBOOK; TASK-260715-3bhbkv).
+- **The release workflow.** Importing the cert from `MACOS_CERT_P12` into a temp
+  keychain, tag-triggering, GitHub attestations, SBOM, and rollback metadata are
+  TASK-260715-3bhbkv. This script is what that workflow runs.
+
+## Self-tests
+
+`.scripts/tests/test_build_app_bundle.py`, run by the `repo` gate suite. They
+fake every subprocess, so they cover what the real pipeline cannot be asked to
+stage on demand — the exact entitlements, the inside-out signing order, a leaked
+`get-task-allow`, a notarization rejection, a missing core package — and they run
+on a machine without Xcode, a signing identity, or network.
