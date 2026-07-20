@@ -50,19 +50,33 @@ public final class CompanionViewModel {
     public let settings: CompanionSettingsViewModel
     public let repair: RepairViewModel
     public let removal: AccountRemovalViewModel
+    /// The first-launch onboarding flow, over the same live sub-view models so
+    /// sign-in and defaults chosen during onboarding are the shell's own.
+    public let onboarding: OnboardingViewModel
 
     public init(
         backend: any CompanionBackend,
         loginItemService: (any LoginItemService)? = nil,
         diskProbe: any DiskSpaceProbe,
-        accountLabel: String
+        accountLabel: String,
+        driveLocation: any DriveLocationProviding = CloudStorageDriveLocation(),
+        onboardingStore: any OnboardingCompletionStore = UserDefaultsOnboardingCompletionStore()
     ) {
-        self.status = CompanionStatusViewModel(backend: backend)
-        self.authorization = AuthorizationViewModel(backend: backend)
-        self.settings = CompanionSettingsViewModel(
+        let status = CompanionStatusViewModel(backend: backend)
+        let authorization = AuthorizationViewModel(backend: backend)
+        let settings = CompanionSettingsViewModel(
             backend: backend, loginItemService: loginItemService, diskProbe: diskProbe)
+        self.status = status
+        self.authorization = authorization
+        self.settings = settings
         self.repair = RepairViewModel(backend: backend)
         self.removal = AccountRemovalViewModel(backend: backend, accountLabel: accountLabel)
+        self.onboarding = OnboardingViewModel(
+            authorization: authorization,
+            settings: settings,
+            status: status,
+            driveLocation: driveLocation,
+            completionStore: onboardingStore)
     }
 
     /// Refreshes status and reloads settings — the shell's on-appear pass.

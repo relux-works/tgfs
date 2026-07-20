@@ -71,14 +71,37 @@ struct GramDriveCompanionApp: App {
         }
     }
 
+    /// The full-shell window id.
+    static let mainWindowID = "gramdrive-main"
+    /// The first-launch Welcome window id.
+    static let onboardingWindowID = "gramdrive-onboarding"
+
     var body: some Scene {
-        MenuBarExtra("GramDrive", systemImage: "externaldrive.badge.person.crop") {
-            CompanionRootView(model: model)
+        // The menu-bar item, present from first launch. Its click surface is
+        // the compact status panel; the always-present label additionally
+        // presents onboarding once on a clean machine (TASK-260720-31nw0w).
+        MenuBarExtra {
+            MenuBarStatusView(
+                model: model,
+                mainWindowID: GramDriveCompanionApp.mainWindowID,
+                onboardingWindowID: GramDriveCompanionApp.onboardingWindowID)
+        } label: {
+            MenuBarLaunchLabel(
+                systemImage: "externaldrive.badge.person.crop",
+                shouldPresentOnboarding: { model.onboarding.isPresented },
+                onboardingWindowID: GramDriveCompanionApp.onboardingWindowID)
         }
         .menuBarExtraStyle(.window)
 
+        // The first-launch Welcome window (shown once; re-runnable from Help).
+        Window("Welcome to GramDrive", id: GramDriveCompanionApp.onboardingWindowID) {
+            OnboardingView(model: model.onboarding)
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+
         // The same surface in a resizable window, for the full settings view.
-        Window("GramDrive", id: "gramdrive-main") {
+        Window("GramDrive", id: GramDriveCompanionApp.mainWindowID) {
             CompanionRootView(model: model)
         }
         .commands {
@@ -88,6 +111,12 @@ struct GramDriveCompanionApp: App {
                 Button("Repair File Provider Domains…") {
                     GramDriveCompanionApp.repairFileProviderDomains()
                 }
+            }
+            // Onboarding is re-runnable on demand from Help.
+            CommandGroup(replacing: .help) {
+                SetupGuideCommand(
+                    windowID: GramDriveCompanionApp.onboardingWindowID,
+                    onSelect: { model.onboarding.restart() })
             }
         }
     }
@@ -145,5 +174,47 @@ struct GramDriveCompanionApp: App {
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
                 .appendingPathComponent("GramDrive", isDirectory: true)
         return AgentRuntimeLayout(dataRoot: fallback)
+    }
+}
+
+/// The always-present menu-bar label. Beyond drawing the status glyph, it is
+/// the app's one reliably-instantiated view at launch in a menu-bar-only
+/// (`LSUIElement`) shell, so it hosts the first-launch onboarding trigger:
+/// once per process, if onboarding has not been completed, it opens the
+/// Welcome window and brings the app forward. Manual entry points (the
+/// compact panel's "Setup Guide…" and Help ▸ GramDrive Setup Guide) cover the
+/// re-run and any case where the launch trigger does not fire.
+private struct MenuBarLaunchLabel: View {
+    let systemImage: String
+    let shouldPresentOnboarding: () -> Bool
+    let onboardingWindowID: String
+    @Environment(\.openWindow) private var openWindow
+    @State private var didAttemptLaunchPresentation = false
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .task {
+                guard !didAttemptLaunchPresentation else { return }
+                didAttemptLaunchPresentation = true
+                guard shouldPresentOnboarding() else { return }
+                openWindow(id: onboardingWindowID)
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            }
+    }
+}
+
+/// The Help ▸ Setup Guide command: restarts the onboarding flow and opens its
+/// window. A small view so it can read the `openWindow` environment action.
+private struct SetupGuideCommand: View {
+    let windowID: String
+    let onSelect: () -> Void
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("GramDrive Setup Guide…") {
+            onSelect()
+            openWindow(id: windowID)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
     }
 }
