@@ -413,15 +413,27 @@ class SourceDateTest(unittest.TestCase):
 
 class ArtifactPackageSwiftTest(unittest.TestCase):
     def test_exports_only_the_swift_module(self):
-        source = packaging.ARTIFACT_PACKAGE_SWIFT
-        self.assertIn('.library(name: "GramDriveCore", targets: ["GramDriveCore"])', source)
-        self.assertIn('.binaryTarget(name: "GramDriveCoreFFI", path: "GramDriveCore.xcframework")', source)
-        # The raw C module must not be a product: it is an implementation detail
-        # and a consumer importing it would bypass the contract.
-        self.assertNotIn('.library(name: "GramDriveCoreFFI"', source)
+        for tdjson in (False, True):
+            source = packaging.artifact_package_swift(tdjson=tdjson)
+            self.assertIn('.library(name: "GramDriveCore", targets: ["GramDriveCore"])', source)
+            self.assertIn(
+                '.binaryTarget(name: "GramDriveCoreFFI", path: "GramDriveCore.xcframework")',
+                source,
+            )
+            # The raw C module must not be a product: it is an implementation
+            # detail and a consumer importing it would bypass the contract.
+            self.assertNotIn('.library(name: "GramDriveCoreFFI"', source)
 
     def test_declares_the_v1_platform_floor(self):
-        self.assertIn(".macOS(.v14)", packaging.ARTIFACT_PACKAGE_SWIFT)
+        self.assertIn(".macOS(.v14)", packaging.artifact_package_swift(tdjson=False))
+
+    def test_tdjson_staging_declares_the_runtime_library(self):
+        # The hermetic artifact must not name tdjson at all; the env-gated
+        # staging must, so consumers link `-ltdjson` without unsafe flags.
+        self.assertNotIn("tdjson", packaging.artifact_package_swift(tdjson=False))
+        self.assertIn(
+            '.linkedLibrary("tdjson")', packaging.artifact_package_swift(tdjson=True)
+        )
 
 
 class PrepareConsumerTest(unittest.TestCase):

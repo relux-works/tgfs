@@ -41,6 +41,12 @@ public struct AgentRuntimeLayout: Equatable, Sendable {
         HydrationContract.socketURL(dataRoot: dataRoot)
     }
 
+    /// The control endpoint's UNIX socket: `<root>/agent/control.sock`.
+    /// The path rule lives in ``ControlContract``.
+    public var controlSocket: URL {
+        ControlContract.socketURL(dataRoot: dataRoot)
+    }
+
     /// The agent settings document: `<root>/agent/settings.json`.
     public var settingsFile: URL {
         agentDirectory.appendingPathComponent("settings.json", isDirectory: false)

@@ -1,0 +1,556 @@
+import Darwin
+import Dispatch
+import Foundation
+import GramDriveCore
+import GramDriveSupport
+
+/// One hosted sign-in session behind the control channel — the seam between
+/// the server (wire concerns) and the engine's authorization flow (the FFI
+/// `AuthSession` in production, a scripted session in tests).
+///
+/// `states` yields every flow state in order and finishes when the session
+/// is over (complete, failed, closed, or the host tore it down). `submit`
+/// answers every input — channel-level failures are reported as the
+/// `session-ended` rejection, so the caller always gets a typed answer.
+public protocol AgentAuthSessionHosting: Sendable {
+    var states: AsyncStream<ControlAuthState> { get }
+    func submit(_ input: ControlAuthInput) async -> AgentAuthSubmitAnswer
+    func close()
+}
+
+/// The seam's answer to one input: the wire outcome minus the sequence
+/// number, which the server stamps from the frame it is answering.
+public struct AgentAuthSubmitAnswer: Equatable, Sendable {
+    /// `accepted`, `rejected`, or `invalid-for-state`.
+    public var outcome: String
+    /// The classified rejection, present exactly for `rejected`.
+    public var rejection: ControlAuthRejection?
+
+    public init(outcome: String, rejection: ControlAuthRejection? = nil) {
+        self.outcome = outcome
+        self.rejection = rejection
+    }
+
+    public static let accepted = AgentAuthSubmitAnswer(outcome: "accepted")
+    public static let invalidForState = AgentAuthSubmitAnswer(outcome: "invalid-for-state")
+    public static func rejected(_ rejection: ControlAuthRejection) -> AgentAuthSubmitAnswer {
+        AgentAuthSubmitAnswer(outcome: "rejected", rejection: rejection)
+    }
+}
+
+/// Opens sign-in sessions for the control channel. Throwing refuses the
+/// upgrade with a classified failure (`DriveError`s are mapped; anything
+/// else is internal).
+public protocol AgentAuthorizing: Sendable {
+    func makeSession() throws -> any AgentAuthSessionHosting
+}
+
+/// Runs the engine half of the SEC-004 account removal.
+public protocol AgentAccountRemoving: Sendable {
+    func remove(_ request: ControlRemovalRequest) async -> ControlCommandOutcome
+}
+
+/// Runs the agent-side repair pass.
+public protocol AgentRepairing: Sendable {
+    func repair() async -> ControlCommandOutcome
+}
+
+/// A command's outcome, as the seams report it.
+public enum ControlCommandOutcome: Equatable, Sendable {
+    case completed
+    case failed(ControlCommandFailure)
+}
+
+/// What the control server serves with: the always-present lifecycle reads
+/// (status, settings) and the engine-backed command seams. A `nil` seam
+/// answers its command with a truthful `sourceUnavailable` — the shipped
+/// agent wires all three (`AgentMain`), so that state is reachable only in
+/// partial test assemblies.
+public struct ControlServerHandlers: Sendable {
+    public var status: @Sendable () -> AgentHealthSnapshot
+    public var reloadSettings: @Sendable () throws -> AgentSettings
+    public var authorizer: (any AgentAuthorizing)?
+    public var remover: (any AgentAccountRemoving)?
+    public var repairer: (any AgentRepairing)?
+
+    public init(
+        status: @escaping @Sendable () -> AgentHealthSnapshot,
+        reloadSettings: @escaping @Sendable () throws -> AgentSettings,
+        authorizer: (any AgentAuthorizing)? = nil,
+        remover: (any AgentAccountRemoving)? = nil,
+        repairer: (any AgentRepairing)? = nil
+    ) {
+        self.status = status
+        self.reloadSettings = reloadSettings
+        self.authorizer = authorizer
+        self.remover = remover
+        self.repairer = repairer
+    }
+}
+
+/// Tunables of one control endpoint.
+public struct ControlServerConfiguration: Sendable {
+    /// Concurrent connection bound; beyond it new connections are refused
+    /// rather than queued.
+    public var maxConcurrentConnections: Int
+    /// Cap on waiting for the request line of an accepted connection.
+    public var requestTimeout: Duration
+
+    public init(
+        maxConcurrentConnections: Int = 8,
+        requestTimeout: Duration = .seconds(5)
+    ) {
+        self.maxConcurrentConnections = maxConcurrentConnections
+        self.requestTimeout = requestTimeout
+    }
+}
+
+/// The agent's control endpoint: the serving side of ``ControlContract``
+/// (BUG-260720-3i74u1).
+///
+/// Commands answer with one terminal event and close. An auth connection
+/// upgrades: the request-line timeout is lifted (a sign-in legitimately
+/// idles while the user types), a writer pumps the session's states out,
+/// and a reader loop turns input frames into seam submissions with
+/// sequence-correlated answers. Either side closing the connection ends
+/// the session.
+public final class ControlServer: @unchecked Sendable {
+    private let lock = NSLock()
+    private let acceptQueue: DispatchQueue
+    private let workQueue: DispatchQueue
+    private let socketPath: String
+    private let handlers: ControlServerHandlers
+    private let configuration: ControlServerConfiguration
+
+    private var listener: Int32?
+    private var acceptSource: (any DispatchSourceRead)?
+    private var connections: [ObjectIdentifier: ControlConnection] = [:]
+
+    /// Binds, listens, and starts serving. A stale socket file (from a
+    /// killed predecessor) is removed first — safe under the agent's
+    /// single-instance lock.
+    public static func start(
+        socketURL: URL,
+        handlers: ControlServerHandlers,
+        configuration: ControlServerConfiguration = ControlServerConfiguration()
+    ) throws -> ControlServer {
+        let path = socketURL.path
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw UnixSocketError.failed(operation: "socket", code: errno)
+        }
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+        unlink(path)
+        do {
+            try UnixSocketAddress.bind(descriptor: fd, path: path)
+        } catch {
+            close(fd)
+            throw error
+        }
+        guard listen(fd, 16) == 0 else {
+            let code = errno
+            close(fd)
+            unlink(path)
+            throw UnixSocketError.failed(operation: "listen", code: code)
+        }
+        let server = ControlServer(
+            listener: fd,
+            socketPath: path,
+            handlers: handlers,
+            configuration: configuration)
+        server.startAccepting()
+        return server
+    }
+
+    private init(
+        listener: Int32,
+        socketPath: String,
+        handlers: ControlServerHandlers,
+        configuration: ControlServerConfiguration
+    ) {
+        self.listener = listener
+        self.socketPath = socketPath
+        self.handlers = handlers
+        self.configuration = configuration
+        self.acceptQueue = DispatchQueue(label: "com.reluxworks.gramdrive.agent.control")
+        self.workQueue = DispatchQueue(
+            label: "com.reluxworks.gramdrive.agent.control.work",
+            qos: .utility,
+            attributes: .concurrent)
+    }
+
+    /// Connections currently being served.
+    public var activeConnectionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return connections.count
+    }
+
+    /// Stops accepting, tears down the socket file, and ends every active
+    /// connection (closing any hosted sign-in session). Idempotent; also
+    /// runs on deallocation.
+    public func stop() {
+        lock.lock()
+        acceptSource?.cancel()
+        acceptSource = nil
+        let listener = self.listener
+        self.listener = nil
+        let active = Array(connections.values)
+        lock.unlock()
+        if let listener {
+            close(listener)
+            unlink(socketPath)
+        }
+        for connection in active {
+            connection.teardown()
+        }
+    }
+
+    deinit {
+        stop()
+    }
+
+    // MARK: - Accepting
+
+    private func startAccepting() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let fd = listener else { return }
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: acceptQueue)
+        source.setEventHandler { [weak self] in
+            self?.acceptOne()
+        }
+        source.resume()
+        acceptSource = source
+    }
+
+    private func acceptOne() {
+        lock.lock()
+        let fd = listener
+        lock.unlock()
+        guard let fd else { return }
+        let conn = accept(fd, nil, nil)
+        guard conn >= 0 else { return }
+        _ = fcntl(conn, F_SETFD, FD_CLOEXEC)
+        var noSigpipe: Int32 = 1
+        _ = setsockopt(
+            conn, SOL_SOCKET, SO_NOSIGPIPE,
+            &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+        var sendTimeout = timeval(tv_sec: 5, tv_usec: 0)
+        _ = setsockopt(
+            conn, SOL_SOCKET, SO_SNDTIMEO,
+            &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
+        let receiveSeconds = max(1, Int(configuration.requestTimeout.components.seconds))
+        var receiveTimeout = timeval(tv_sec: receiveSeconds, tv_usec: 0)
+        _ = setsockopt(
+            conn, SOL_SOCKET, SO_RCVTIMEO,
+            &receiveTimeout, socklen_t(MemoryLayout<timeval>.size))
+
+        let connection = ControlConnection(descriptor: conn)
+        // The accept queue must never block; everything past accept runs on
+        // the concurrent work queue.
+        workQueue.async { [weak self] in
+            self?.serve(connection)
+        }
+    }
+
+    // MARK: - Per-connection lifecycle
+
+    private func serve(_ connection: ControlConnection) {
+        guard admit(connection) else {
+            connection.refuse(
+                ControlCommandFailure(
+                    category: .sourceUnavailable,
+                    detail: "concurrent control connection bound reached"))
+            return
+        }
+
+        let request: ControlRequest
+        do {
+            request = try connection.readLine(
+                ControlRequest.self, cap: ControlContract.maxRequestLineBytes)
+        } catch {
+            connection.refuse(
+                ControlCommandFailure(category: .invalidArgument, detail: "unreadable request"))
+            remove(connection)
+            return
+        }
+
+        guard request.protocolVersion == ControlContract.protocolVersion else {
+            connection.refuse(
+                ControlCommandFailure(
+                    category: .invalidArgument,
+                    detail: "protocol version mismatch: agent speaks "
+                        + "\(ControlContract.protocolVersion)"))
+            remove(connection)
+            return
+        }
+
+        switch request.operation {
+        case .status:
+            connection.writeEvent(.status(handlers.status()))
+            connection.finish()
+            remove(connection)
+        case .reloadSettings:
+            do {
+                connection.writeEvent(.settings(try handlers.reloadSettings()))
+                connection.finish()
+            } catch {
+                connection.refuse(
+                    ControlCommandFailure(
+                        category: .storage, detail: "settings could not be reloaded"))
+            }
+            remove(connection)
+        case .repair:
+            runCommand(on: connection, seam: handlers.repairer, name: "repair") { repairer in
+                await repairer.repair()
+            }
+        case .removeAccount:
+            guard let removal = request.removal else {
+                connection.refuse(
+                    ControlCommandFailure(
+                        category: .invalidArgument, detail: "removal parameters missing"))
+                remove(connection)
+                return
+            }
+            runCommand(on: connection, seam: handlers.remover, name: "account removal") {
+                remover in
+                await remover.remove(removal)
+            }
+        case .authStart:
+            serveAuth(on: connection)
+        }
+    }
+
+    /// Runs one engine-backed command through its seam, answering with the
+    /// terminal event. A missing seam is a truthful `sourceUnavailable`.
+    private func runCommand<Seam: Sendable>(
+        on connection: ControlConnection,
+        seam: Seam?,
+        name: String,
+        run: @escaping @Sendable (Seam) async -> ControlCommandOutcome
+    ) {
+        guard let seam else {
+            connection.refuse(
+                ControlCommandFailure(
+                    category: .sourceUnavailable,
+                    detail: "\(name) is not hosted in this build"))
+            remove(connection)
+            return
+        }
+        Task { [weak self] in
+            switch await run(seam) {
+            case .completed:
+                connection.writeEvent(.commandDone)
+            case .failed(let failure):
+                connection.writeEvent(.commandFailed(failure))
+            }
+            connection.finish()
+            self?.remove(connection)
+        }
+    }
+
+    /// Upgrades the connection to a sign-in session: unbounded reads (the
+    /// user types at human speed), a state-pumping writer, and the input
+    /// reader loop.
+    private func serveAuth(on connection: ControlConnection) {
+        guard let authorizer = handlers.authorizer else {
+            connection.refuse(
+                ControlCommandFailure(
+                    category: .sourceUnavailable,
+                    detail: "sign-in is not hosted in this build"))
+            remove(connection)
+            return
+        }
+        let session: any AgentAuthSessionHosting
+        do {
+            session = try authorizer.makeSession()
+        } catch {
+            connection.refuse(Self.failure(from: error))
+            remove(connection)
+            return
+        }
+        connection.adopt(session: session)
+
+        // A sign-in idles while the user reads and types; only the
+        // handshake had a deadline.
+        var unbounded = timeval(tv_sec: 0, tv_usec: 0)
+        _ = setsockopt(
+            connection.descriptor, SOL_SOCKET, SO_RCVTIMEO,
+            &unbounded, socklen_t(MemoryLayout<timeval>.size))
+
+        // Writer: the session's states, in order; the stream finishing is
+        // the session being over, which ends the connection.
+        Task { [weak self] in
+            for await state in session.states {
+                connection.writeEvent(.authState(state))
+            }
+            connection.teardown()
+            self?.remove(connection)
+        }
+
+        // Reader: one input frame per line until EOF or protocol breach.
+        workQueue.async { [weak self] in
+            while true {
+                let frame: ControlAuthInputFrame
+                do {
+                    frame = try connection.readLine(
+                        ControlAuthInputFrame.self,
+                        cap: ControlContract.maxRequestLineBytes)
+                } catch {
+                    connection.teardown()
+                    self?.remove(connection)
+                    return
+                }
+                Task {
+                    let answer = await session.submit(frame.input)
+                    connection.writeEvent(
+                        .authSubmitResult(
+                            ControlAuthSubmitResult(
+                                seq: frame.seq,
+                                outcome: answer.outcome,
+                                rejection: answer.rejection)))
+                }
+            }
+        }
+    }
+
+    /// Admits the connection into the bounded active set.
+    private func admit(_ connection: ControlConnection) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard connections.count < configuration.maxConcurrentConnections else {
+            return false
+        }
+        connections[ObjectIdentifier(connection)] = connection
+        return true
+    }
+
+    private func remove(_ connection: ControlConnection) {
+        lock.lock()
+        connections.removeValue(forKey: ObjectIdentifier(connection))
+        lock.unlock()
+    }
+
+    /// Maps a seam error onto the wire categories (NFR-030 alignment);
+    /// anything that is not a classified `DriveError` is internal.
+    static func failure(from error: Error) -> ControlCommandFailure {
+        guard let driveError = error as? DriveError else {
+            return ControlCommandFailure(category: .internalError, detail: "internal failure")
+        }
+        switch driveError {
+        case .InvalidArgument:
+            return ControlCommandFailure(category: .invalidArgument, detail: "invalid argument")
+        case .NotFound:
+            return ControlCommandFailure(category: .notFound, detail: "not found")
+        case .AuthRequired:
+            return ControlCommandFailure(
+                category: .authRequired, detail: "authorization required")
+        case .RateLimited(_, let retryAfterMs):
+            return ControlCommandFailure(
+                category: .rateLimited, detail: "rate limited", retryAfterMs: retryAfterMs)
+        case .SourceUnavailable:
+            return ControlCommandFailure(
+                category: .sourceUnavailable, detail: "source unavailable")
+        case .Storage:
+            return ControlCommandFailure(category: .storage, detail: "storage failure")
+        case .Integrity:
+            return ControlCommandFailure(category: .integrity, detail: "integrity failure")
+        case .Cancelled:
+            return ControlCommandFailure(category: .cancelled, detail: "cancelled")
+        case .Internal:
+            return ControlCommandFailure(category: .internalError, detail: "internal failure")
+        }
+    }
+}
+
+/// One accepted control connection: the descriptor, the serialized writer,
+/// the buffered line reader, and (for auth) the hosted session.
+private final class ControlConnection: @unchecked Sendable {
+    let descriptor: Int32
+
+    private let lock = NSLock()
+    private var closed = false
+    private var readBuffer = Data()
+    private var session: (any AgentAuthSessionHosting)?
+
+    init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    func adopt(session: any AgentAuthSessionHosting) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.session = session
+    }
+
+    /// Reads one `\n`-terminated line (leftovers persist for the next
+    /// call), under `cap` and the socket's receive timeout.
+    func readLine<T: Decodable>(_ type: T.Type, cap: Int) throws -> T {
+        var chunk = [UInt8](repeating: 0, count: 4 * 1024)
+        while true {
+            if let lineEnd = readBuffer.firstIndex(of: 0x0A) {
+                let line = readBuffer.subdata(in: readBuffer.startIndex..<lineEnd)
+                readBuffer.removeSubrange(readBuffer.startIndex...lineEnd)
+                return try HydrationWire.decodeLine(type, from: line)
+            }
+            guard readBuffer.count <= cap else {
+                throw UnixSocketError.failed(operation: "read", code: EMSGSIZE)
+            }
+            let count = read(descriptor, &chunk, chunk.count)
+            guard count > 0 else {
+                throw UnixSocketError.failed(operation: "read", code: count == 0 ? 0 : errno)
+            }
+            readBuffer.append(contentsOf: chunk[0..<count])
+        }
+    }
+
+    /// Writes one event line; serialized, best-effort (a peer that hung up
+    /// makes writes fail, which is fine — its EOF ends the flow).
+    func writeEvent(_ event: ControlEvent) {
+        guard let data = try? HydrationWire.encodeLine(event) else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            var offset = 0
+            while offset < bytes.count {
+                let written = write(descriptor, bytes.baseAddress! + offset, bytes.count - offset)
+                guard written > 0 else { return }
+                offset += written
+            }
+        }
+    }
+
+    /// Terminal refusal for connections that never reached a seam.
+    func refuse(_ failure: ControlCommandFailure) {
+        writeEvent(.commandFailed(failure))
+        finish()
+    }
+
+    /// Ends the connection and any hosted session; the entry point both
+    /// the reader (EOF) and the writer (session over) converge on.
+    func teardown() {
+        lock.lock()
+        let hosted = session
+        session = nil
+        lock.unlock()
+        hosted?.close()
+        finish()
+    }
+
+    /// Closes exactly once.
+    func finish() {
+        lock.lock()
+        let wasClosed = closed
+        closed = true
+        lock.unlock()
+        if !wasClosed {
+            close(descriptor)
+        }
+    }
+
+    deinit {
+        teardown()
+    }
+}

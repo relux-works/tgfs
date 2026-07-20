@@ -750,3 +750,32 @@ fn attachment_refresh_never_detaches_verified_bytes() {
         vec![key]
     );
 }
+
+#[test]
+fn purge_account_removes_every_scoped_row_and_reruns_as_a_no_op() {
+    let mut store = store();
+    let root = common::account_root_id();
+    let chat_dir = common::canonical_chat_id(CHAT);
+    let tx = store.write_txn().expect("write");
+    tx.upsert_chat(&chat_record(CHAT)).expect("chat");
+    tx.upsert_item(&dir_item(&root, None, "Test Account"))
+        .expect("root item");
+    tx.upsert_item(&dir_item(&chat_dir, Some(&root), "Chat 100"))
+        .expect("chat item");
+    tx.commit().expect("commit");
+
+    let tx = store.write_txn().expect("write");
+    assert!(tx.purge_account(scope().account.account_id).expect("purge"));
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    assert_eq!(read.accounts().expect("accounts"), vec![]);
+    assert_eq!(read.item(&root).expect("root"), None, "items cascade");
+    assert_eq!(read.item(&chat_dir).expect("chat"), None, "items cascade");
+    drop(read);
+
+    // Re-running a completed purge is a no-op success, not an error.
+    let tx = store.write_txn().expect("write");
+    assert!(!tx.purge_account(scope().account.account_id).expect("purge"));
+    tx.commit().expect("commit");
+}

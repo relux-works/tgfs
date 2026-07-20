@@ -177,6 +177,19 @@ def main() -> None:
     )
     print("--- single-instance: second agent refused (exit 2), first serving")
 
+    # 2b. SIGPIPE immunity (BUG-260720-3i74u1): sockets inside libtdjson
+    # carry the process's SIGPIPE disposition, so the agent must ignore it
+    # process-wide — a dead peer mid-write must never kill the agent.
+    first.send_signal(signal.SIGPIPE)
+    time.sleep(0.5)
+    expect(first.poll() is None, "the agent must survive SIGPIPE")
+    health = fetch_health(agent_bin)
+    expect(
+        health is not None and health["pid"] == first.pid,
+        "health must still answer after SIGPIPE",
+    )
+    print("--- sigpipe: ignored, agent alive and serving")
+
     # 3. Clean shutdown: SIGTERM drains the hosted transfer through its
     # cancellation token and exits 0; the endpoint is gone afterwards.
     first.send_signal(signal.SIGTERM)

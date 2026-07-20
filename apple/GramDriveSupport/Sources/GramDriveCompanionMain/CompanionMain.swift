@@ -17,7 +17,20 @@ import os
 /// process has none.
 @main
 struct GramDriveCompanionApp: App {
-    @State private var model = CompanionViewModel.live(layout: GramDriveCompanionApp.layout())
+    @State private var model = CompanionViewModel.live(
+        layout: GramDriveCompanionApp.layout(),
+        // The app half of the SEC-004 removal: after the agent's engine
+        // half completes, deregister the account's File Provider domain —
+        // domain management can only run in the app embedding the
+        // extension. The trace-free disposition matches the removal's
+        // irreversible contract.
+        accountDomainCleanup: { accountId in
+            _ = try? await DomainRemoval.removeAccountDomain(
+                accountId: accountId,
+                disposition: .deleteLocalData,
+                registrar: SystemDomainRegistrar(),
+                remover: SystemDomainRemover())
+        })
 
     init() {
         // Launch-time File Provider domain reconcile (TASK-260715-3s44pc

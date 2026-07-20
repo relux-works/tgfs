@@ -11,7 +11,8 @@
 GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo check-security check-apple gates fmt build test bindings \
-        smoke-bindings smoke-shared-state smoke-agent-lifecycle package package-host-test \
+        smoke-bindings smoke-shared-state smoke-agent-lifecycle smoke-control-auth \
+        package package-host-test \
         package-reproducible package-app package-app-unsigned package-app-notarize \
         release-provenance tdlib tdlib-smoke tdlib-smoke-link tdjson-smoke tdlib-verify \
         clean-gates accept-macos accept-macos-runsheet
@@ -87,6 +88,20 @@ smoke-bindings:
 # (see .scripts/smoke/run_shared_state_smoke.py).
 smoke-shared-state:
 	python3 .scripts/smoke/run_shared_state_smoke.py
+
+# smoke-control-auth — the control channel's real sign-in against Telegram's
+# TEST data centers, through the packaged app bundle's agent binary
+# (BUG-260720-3i74u1): auth end to end over the control socket, the durable
+# account row, and the stored session surviving an agent restart. Needs the
+# packaged bundle (`make package-app` over a tdjson-linked core), keychain
+# api credentials readable by the packaged agent (one-time:
+# `python3 .scripts/keychain/provision_telegram_credentials.py`), network to
+# the test DC, and — since Telegram retired the shared-test-number auto-code
+# (tdlib/td#3361) — a dedicated test-DC account driven interactively via
+# `--phone` — so it is not a step of `check`
+# (see .scripts/smoke/run_control_auth_smoke.py).
+smoke-control-auth:
+	python3 .scripts/smoke/run_control_auth_smoke.py
 
 # smoke-agent-lifecycle — the companion agent as real processes: startup with
 # health over the bounded IPC channel, single-instance refusal of a second

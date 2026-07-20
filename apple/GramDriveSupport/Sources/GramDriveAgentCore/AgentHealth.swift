@@ -71,6 +71,11 @@ public struct AgentHealthSnapshot: Codable, Equatable, Sendable {
     /// construction: fixed vocabulary composed by the agent, never user
     /// data, paths, or account material (NFR-032).
     public var recentEvents: [String]
+    /// The container's configured accounts as durable state reports them
+    /// (identity, display name, auth state — never secret material). `nil`
+    /// when the snapshot predates this field or the state is not open;
+    /// an empty array is a real "no accounts configured" reading.
+    public var accounts: [AccountHealthSummary]?
 
     /// Public memberwise initializer so consumers of the payload (the app
     /// shell) and their tests can construct a snapshot; in production the
@@ -92,7 +97,8 @@ public struct AgentHealthSnapshot: Codable, Equatable, Sendable {
         providerRegistrationState: String?,
         lastSleepMs: Int64?,
         lastWakeMs: Int64?,
-        recentEvents: [String]
+        recentEvents: [String],
+        accounts: [AccountHealthSummary]? = nil
     ) {
         self.payloadVersion = payloadVersion
         self.agentVersion = agentVersion
@@ -111,5 +117,23 @@ public struct AgentHealthSnapshot: Codable, Equatable, Sendable {
         self.lastSleepMs = lastSleepMs
         self.lastWakeMs = lastWakeMs
         self.recentEvents = recentEvents
+        self.accounts = accounts
+    }
+}
+
+/// One account as health reports it — the status projection of the durable
+/// account row (never secret material, NFR-032).
+public struct AccountHealthSummary: Codable, Equatable, Sendable {
+    /// The account's stable Telegram identity.
+    public var accountId: Int64
+    /// The account's display name.
+    public var displayName: String
+    /// The durable auth-state marker (`authorized`, …).
+    public var authState: String
+
+    public init(accountId: Int64, displayName: String, authState: String) {
+        self.accountId = accountId
+        self.displayName = displayName
+        self.authState = authState
     }
 }

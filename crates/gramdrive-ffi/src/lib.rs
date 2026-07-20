@@ -26,6 +26,8 @@
 uniffi::setup_scaffolding!("gramdrive");
 
 pub mod api;
+pub mod auth;
+pub mod removal;
 pub mod shared_state;
 
 pub use gramdrive_engine as engine;

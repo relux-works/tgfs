@@ -22,19 +22,45 @@ public struct AgentConfiguration {
     /// means the endpoint is not offered at all: a fetching extension gets
     /// "agent unavailable" rather than an answer nobody can honor.
     public var hydrator: (any ContentHydrating)?
+    /// The engine-backed seams behind the control endpoint (sign-in,
+    /// removal, repair). The endpoint itself always runs — status and
+    /// settings are lifecycle-owned — and a missing seam answers its
+    /// command with a truthful `sourceUnavailable`; the shipped agent
+    /// wires all three (`AgentMain`).
+    public var controlSeams: AgentControlSeams
 
     public init(
         dataRoot: URL,
         drainGracePeriod: Duration = .seconds(10),
         drainCancelWait: Duration = .seconds(5),
         powerEvents: (any PowerEventSource)? = nil,
-        hydrator: (any ContentHydrating)? = nil
+        hydrator: (any ContentHydrating)? = nil,
+        controlSeams: AgentControlSeams = AgentControlSeams()
     ) {
         self.dataRoot = dataRoot
         self.drainGracePeriod = drainGracePeriod
         self.drainCancelWait = drainCancelWait
         self.powerEvents = powerEvents
         self.hydrator = hydrator
+        self.controlSeams = controlSeams
+    }
+}
+
+/// The engine-backed command seams the agent host composes into its
+/// control endpoint.
+public struct AgentControlSeams: Sendable {
+    public var authorizer: (any AgentAuthorizing)?
+    public var remover: (any AgentAccountRemoving)?
+    public var repairer: (any AgentRepairing)?
+
+    public init(
+        authorizer: (any AgentAuthorizing)? = nil,
+        remover: (any AgentAccountRemoving)? = nil,
+        repairer: (any AgentRepairing)? = nil
+    ) {
+        self.authorizer = authorizer
+        self.remover = remover
+        self.repairer = repairer
     }
 }
 
@@ -64,6 +90,8 @@ public enum AgentStartError: Error {
     case healthEndpoint(underlying: Error)
     /// The hydration endpoint could not be established.
     case hydrationEndpoint(underlying: Error)
+    /// The control endpoint could not be established.
+    case controlEndpoint(underlying: Error)
 }
 
 /// The companion agent's lifecycle: the one coordinator process per shared
@@ -103,6 +131,7 @@ public final class AgentLifecycle: @unchecked Sendable {
     private var instanceLock: SingleInstanceLock?
     private var healthServer: AgentHealthServer?
     private var hydrationServer: HydrationServer?
+    private var controlServer: ControlServer?
     private var powerObservation: PowerEventObservation?
     private var settings: AgentSettings?
     private var events: [String] = []
@@ -209,6 +238,30 @@ public final class AgentLifecycle: @unchecked Sendable {
             throw AgentStartError.healthEndpoint(underlying: error)
         }
 
+        // The control endpoint runs unconditionally: status and settings
+        // are lifecycle-owned, and each engine-backed seam answers its own
+        // absence truthfully (BUG-260720-3i74u1).
+        do {
+            let seams = configuration.controlSeams
+            let server = try ControlServer.start(
+                socketURL: layout.controlSocket,
+                handlers: ControlServerHandlers(
+                    status: { [weak self] in
+                        self?.healthSnapshot() ?? Self.placeholderSnapshot()
+                    },
+                    reloadSettings: { [weak self] in
+                        guard let self else { return AgentSettings() }
+                        return try self.reloadSettings()
+                    },
+                    authorizer: seams.authorizer,
+                    remover: seams.remover,
+                    repairer: seams.repairer))
+            setLocked { self.controlServer = server }
+        } catch {
+            teardownAfterFailedStart()
+            throw AgentStartError.controlEndpoint(underlying: error)
+        }
+
         if let hydrator = configuration.hydrator {
             do {
                 let server = try HydrationServer.start(
@@ -254,13 +307,24 @@ public final class AgentLifecycle: @unchecked Sendable {
             record("drain-abandoned:\(outcome.abandoned)")
         }
 
-        let (observation, server, hydration, instance) = releaseResourcesAndStop()
+        let (observation, server, hydration, control, instance) = releaseResourcesAndStop()
         observation?.cancel()
+        control?.stop()
         hydration?.stop()
         server?.stop()
         instance?.release()
         record("stopped:\(reason.rawValue)")
         return outcome
+    }
+
+    /// Re-reads the durable settings document and applies it to the
+    /// running agent — the control channel's settings-reload command, so a
+    /// companion save takes effect without an agent restart.
+    public func reloadSettings() throws -> AgentSettings {
+        let loaded = try AgentSettingsStore(fileURL: layout.settingsFile).load()
+        setLocked { self.settings = loaded }
+        record("settings-reloaded")
+        return loaded
     }
 
     /// The current health/status report (NFR-032 shape; see
@@ -293,7 +357,15 @@ public final class AgentLifecycle: @unchecked Sendable {
             providerRegistrationState: nil,
             lastSleepMs: lastSleepMs,
             lastWakeMs: lastWakeMs,
-            recentEvents: events)
+            recentEvents: events,
+            accounts: store.flatMap { store in
+                (try? store.accounts())?.map { account in
+                    AccountHealthSummary(
+                        accountId: account.accountId,
+                        displayName: account.displayName,
+                        authState: account.authState)
+                }
+            })
     }
 
     // MARK: - Internals
@@ -302,14 +374,18 @@ public final class AgentLifecycle: @unchecked Sendable {
     /// `NSLock` may not be taken from an async context, so the locked
     /// extraction lives in this sync helper.
     private func releaseResourcesAndStop() -> (
-        PowerEventObservation?, AgentHealthServer?, HydrationServer?, SingleInstanceLock?
+        PowerEventObservation?, AgentHealthServer?, HydrationServer?, ControlServer?,
+        SingleInstanceLock?
     ) {
         lock.lock()
         defer { lock.unlock() }
-        let resources = (powerObservation, healthServer, hydrationServer, instanceLock)
+        let resources = (
+            powerObservation, healthServer, hydrationServer, controlServer, instanceLock
+        )
         powerObservation = nil
         healthServer = nil
         hydrationServer = nil
+        controlServer = nil
         instanceLock = nil
         store = nil
         core = nil
@@ -444,14 +520,17 @@ public final class AgentLifecycle: @unchecked Sendable {
         lock.lock()
         let server = healthServer
         let hydration = hydrationServer
+        let control = controlServer
         let instance = instanceLock
         healthServer = nil
         hydrationServer = nil
+        controlServer = nil
         instanceLock = nil
         store = nil
         core = nil
         state = .stopped
         lock.unlock()
+        control?.stop()
         hydration?.stop()
         server?.stop()
         instance?.release()

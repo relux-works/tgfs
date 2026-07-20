@@ -22,6 +22,17 @@ let corePackagePath =
     ProcessInfo.processInfo.environment["GRAMDRIVE_CORE_PACKAGE"]
     ?? "../../.temp/packaging/GramDriveCore"
 
+// A tdjson-linked core (staged with GRAMDRIVE_TDLIB_ARTIFACT_DIR set;
+// BUG-260720-3i74u1) declares `-ltdjson`, and the runtime library sits in
+// the artifact's `lib/`. Every link-producing target gets that directory as
+// a search path so `swift build`/`swift test` work against either staging;
+// with a hermetic core the directory simply does not exist and the flag is
+// inert. Root-package-only linker flags are fine here: this package is
+// always built as the root (the app packaging pipeline included).
+let coreLinkerSettings: [LinkerSetting] = [
+    .unsafeFlags(["-L\(corePackagePath)/lib"])
+]
+
 let package = Package(
     name: "GramDriveSupport",
     // POL-5 / DEC-017: macOS 14+ arm64 is the v1 support matrix.
@@ -90,7 +101,8 @@ let package = Package(
                 "GramDriveAgentCore",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
         .target(
             name: "GramDriveFileProvider",
@@ -107,7 +119,8 @@ let package = Package(
                 "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
         .executableTarget(
             name: "GramDriveFileProviderExtensionApp",
@@ -115,7 +128,8 @@ let package = Package(
                 "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
         .executableTarget(
             name: "SharedStateSmoke",
@@ -123,14 +137,16 @@ let package = Package(
                 "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
         .testTarget(
             name: "GramDriveSupportTests",
             dependencies: [
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
         .testTarget(
             name: "GramDriveAgentCoreTests",
@@ -138,7 +154,8 @@ let package = Package(
                 "GramDriveAgentCore",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
         .testTarget(
             name: "GramDriveCompanionTests",
@@ -147,7 +164,8 @@ let package = Package(
                 "GramDriveAgentCore",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
         .testTarget(
             name: "GramDriveFileProviderTests",
@@ -155,7 +173,8 @@ let package = Package(
                 "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
-            ]
+            ],
+            linkerSettings: coreLinkerSettings
         ),
     ]
 )

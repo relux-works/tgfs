@@ -74,13 +74,18 @@ public final class CompanionViewModel {
     /// The product wiring: a shell over the ``LiveCompanionBackend`` for one
     /// agent runtime layout, with the real login-item service and volume disk
     /// probe. The App Group container is resolved by the same rule every
-    /// GramDrive process follows.
+    /// GramDrive process follows. `accountDomainCleanup` is the app half of
+    /// an account removal (File Provider domain deregistration), injected by
+    /// the executable because only the app embedding the extension may run
+    /// it.
     public static func live(
         layout: AgentRuntimeLayout,
-        accountLabel: String = "This account"
+        accountLabel: String = "This account",
+        accountDomainCleanup: (@Sendable (Int64) async -> Void)? = nil
     ) -> CompanionViewModel {
         CompanionViewModel(
-            backend: LiveCompanionBackend(layout: layout),
+            backend: LiveCompanionBackend(
+                layout: layout, accountDomainCleanup: accountDomainCleanup),
             loginItemService: SMAppServiceAgentLoginItem(),
             diskProbe: VolumeDiskSpaceProbe(url: layout.dataRoot),
             accountLabel: accountLabel)

@@ -42,6 +42,10 @@ public enum CompanionAuthState: Equatable, Sendable {
     /// gates, registration) or newer than the core. Only ``CompanionAuthInput/cancel``
     /// is accepted here. Mirror of `AuthState::Unsupported`.
     case unsupported(kind: String)
+    /// The sign-in authorized but could not be persisted (the agent's
+    /// finalization failed); the session is over and a fresh sign-in is
+    /// required. `detail` is a stable redacted code, diagnostic only.
+    case failed(detail: String)
 
     /// A stable diagnostic name, matching `AuthState::kind`.
     public var kind: String {
@@ -58,6 +62,7 @@ public enum CompanionAuthState: Equatable, Sendable {
         case .closing: return "closing"
         case .closed: return "closed"
         case .unsupported: return "unsupported"
+        case .failed: return "failed"
         }
     }
 
@@ -68,7 +73,7 @@ public enum CompanionAuthState: Equatable, Sendable {
         case .waitPhoneNumber, .waitCode, .waitQrConfirmation, .waitPassword:
             return true
         case .idle, .starting, .configuring, .ready, .loggingOut, .closing,
-            .closed, .unsupported:
+            .closed, .unsupported, .failed:
             return false
         }
     }
@@ -259,5 +264,28 @@ public protocol AuthorizationSession: Sendable {
 extension AuthorizationSession {
     public func cancel() async {
         _ = await submit(.cancel)
+    }
+}
+
+/// An authorization session that has no channel to drive: `start` reports
+/// the reason, its state stream is empty, and every input is unavailable.
+/// Preview- and test-support material for the unavailable screen states —
+/// the live backend produces real sessions (``LiveAuthorizationSession``)
+/// and reports `agentNotRunning` through them instead.
+public struct UnavailableAuthorizationSession: AuthorizationSession {
+    private let reason: ControlChannelUnavailable
+
+    public init(reason: ControlChannelUnavailable) {
+        self.reason = reason
+    }
+
+    public var states: AsyncStream<CompanionAuthState> {
+        AsyncStream { $0.finish() }
+    }
+
+    public func start() async -> AuthStartResult { .unavailable(reason) }
+
+    public func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult {
+        .unavailable(reason)
     }
 }

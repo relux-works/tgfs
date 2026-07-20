@@ -599,11 +599,28 @@ class AppPackager:
     # -- inputs ----------------------------------------------------------
 
     def build_env(self) -> dict[str, str]:
-        """The environment swift build runs under: the core package by path."""
+        """The environment swift build runs under: the core package by path.
+
+        A tdjson-linked core (BUG-260720-3i74u1) declares `-ltdjson` in its
+        Package.swift; the library search path reaches ld64 through
+        LIBRARY_PATH, pointing at the staged runtime library inside the core
+        artifact.
+        """
         env = dict(self.environ if self.environ is not None else os.environ)
         env["GRAMDRIVE_CORE_PACKAGE"] = str(self.core_package)
+        if self.core_tdjson_linked():
+            env["LIBRARY_PATH"] = str(self.core_package / "lib")
         env["LC_ALL"] = "C"
         return env
+
+    def core_tdjson_linked(self) -> bool:
+        """Whether the staged core links the real tdjson (its manifest says)."""
+        manifest = self.core_package / "gramdrive-core-manifest.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return bool(data.get("tdjson", {}).get("linked", False))
 
     def git_info(self) -> dict:
         code, describe = self.runner(
@@ -744,6 +761,135 @@ class AppPackager:
         )
         return app
 
+    # -- runtime libraries (tdjson) --------------------------------------
+
+    #: Where Homebrew-built dependencies live; anything a bundled library
+    #: references under these prefixes must itself be bundled, or the app
+    #: only runs on machines with that Homebrew tree.
+    BREW_PREFIXES = ("/opt/homebrew/", "/usr/local/opt/", "/usr/local/Cellar/")
+
+    def dylib_dependencies(self, path: Path) -> list[str]:
+        """The install names `path` links against, as recorded (otool -L)."""
+        code, output = self.runner(("otool", "-L", str(path)), self.repo_root, None)
+        if code != 0:
+            raise StepFailed(f"otool -L failed for {path}:\n{output[-2000:]}")
+        deps: list[str] = []
+        for line in output.splitlines()[1:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            deps.append(stripped.split(" (")[0].strip())
+        return deps
+
+    def embed_runtime_libraries(self, app: Path) -> list[str]:
+        """Embed libtdjson (and its Homebrew dependency closure) into
+        `Contents/Frameworks`, rewriting every reference to `@rpath`.
+
+        No-op for a hermetic (non-tdjson) core. The staged library carries an
+        absolute install name (its own staged path — what local consumers
+        load); here every copy gets `@rpath/<name>` as its id, inter-library
+        references are rewritten, and each executable gets the rpath to the
+        app's Frameworks directory plus the staged-path→@rpath change. Only
+        the agent ever *calls* the library (DEC-006: the extension hosts no
+        Telegram client); the extension merely links the shared core.
+        """
+        if not self.core_tdjson_linked():
+            return []
+        staged = self.core_package / "lib" / "libtdjson.dylib"
+        if not staged.is_file():
+            raise StepFailed(
+                f"the core manifest claims tdjson linkage but {staged} is missing"
+            )
+        frameworks = app / "Contents" / "Frameworks"
+        frameworks.mkdir(parents=True, exist_ok=True)
+
+        # Copy the dependency closure: the staged library plus everything it
+        # (transitively) pulls from a Homebrew tree.
+        pending: list[Path] = [staged]
+        bundled: dict[str, Path] = {}
+        while pending:
+            source = pending.pop()
+            if source.name in bundled:
+                continue
+            copy = frameworks / source.name
+            shutil.copy2(source, copy)
+            copy.chmod(0o644)
+            bundled[source.name] = copy
+            for dep in self.dylib_dependencies(source):
+                if dep.startswith(self.BREW_PREFIXES):
+                    resolved = Path(dep).resolve()
+                    if not resolved.is_file():
+                        raise StepFailed(f"{source.name} links {dep}, which does not exist")
+                    pending.append(resolved)
+
+        # Rewrite each copy: its own id, and its references to siblings.
+        for name, copy in sorted(bundled.items()):
+            argv: list[str] = ["install_name_tool", "-id", f"@rpath/{name}"]
+            for dep in self.dylib_dependencies(copy):
+                if dep.startswith(self.BREW_PREFIXES) or dep == str(staged):
+                    argv += ["-change", dep, f"@rpath/{Path(dep).name}"]
+            argv.append(str(copy))
+            self.run(f"fixup-{name}", tuple(argv))
+
+        # Point every executable at the bundle's Frameworks directory.
+        executables = (
+            (app / "Contents" / "MacOS" / APP_EXECUTABLE_NAME, "@executable_path/../Frameworks"),
+            (app / "Contents" / "MacOS" / "gramdrive-agent", "@executable_path/../Frameworks"),
+            (
+                app / "Contents" / "PlugIns" / APPEX_BUNDLE_NAME / "Contents" / "MacOS"
+                / APPEX_EXECUTABLE_NAME,
+                "@executable_path/../../../../Frameworks",
+            ),
+        )
+        for executable, rpath in executables:
+            self.run(
+                f"fixup-{executable.name}",
+                (
+                    "install_name_tool",
+                    "-change",
+                    str(staged),
+                    "@rpath/libtdjson.dylib",
+                    "-add_rpath",
+                    rpath,
+                    str(executable),
+                ),
+            )
+        self.assert_no_absolute_runtime_refs(app, sorted(bundled))
+        return sorted(bundled)
+
+    def assert_no_absolute_runtime_refs(self, app: Path, bundled: list[str]) -> None:
+        """Read the shipped Mach-Os back and fail if any still loads a runtime
+        library by an absolute staged or Homebrew path.
+
+        `install_name_tool -change OLD NEW` silently no-ops when OLD no longer
+        matches a recorded load command (e.g. the core artifact was relocated
+        after staging, so the executable's LC_LOAD_DYLIB names a different
+        absolute path). The fixup exit code is 0 either way, so the rewrite
+        succeeding is not proof the result is portable — only reading the bytes
+        back is. Anything under a Homebrew prefix or the staged core tree would
+        make the bundle run on this build machine and fail everywhere else.
+        """
+        frameworks = app / "Contents" / "Frameworks"
+        machos = [
+            app / "Contents" / "MacOS" / APP_EXECUTABLE_NAME,
+            app / "Contents" / "MacOS" / "gramdrive-agent",
+            app / "Contents" / "PlugIns" / APPEX_BUNDLE_NAME / "Contents" / "MacOS"
+            / APPEX_EXECUTABLE_NAME,
+        ]
+        machos += [frameworks / name for name in bundled]
+        staged_root = str(self.core_package)
+        offenders: list[str] = []
+        for macho in machos:
+            for dep in self.dylib_dependencies(macho):
+                if dep.startswith(self.BREW_PREFIXES) or dep.startswith(staged_root):
+                    offenders.append(f"{macho.name}: {dep}")
+        if offenders:
+            raise StepFailed(
+                "shipped Mach-Os still load runtime libraries by absolute "
+                "staged/Homebrew paths (the bundle would only run on this build "
+                "machine):\n  " + "\n  ".join(offenders)
+            )
+
     def write_entitlement_files(self) -> dict[str, Path]:
         """Write the generated entitlements to disk for signing and provenance.
 
@@ -770,6 +916,22 @@ class AppPackager:
         a bundle whose nested code is unsigned, so the app is signed last.
         """
         signed: list[SignedBinary] = []
+        # Embedded runtime libraries first — they are nested code of
+        # everything above them. Same identity and hardened runtime; no
+        # entitlements (libraries carry none), and library validation admits
+        # them because the team matches.
+        frameworks = app / "Contents" / "Frameworks"
+        if frameworks.is_dir():
+            for dylib in sorted(frameworks.glob("*.dylib")):
+                self.run(
+                    f"codesign-frameworks-{dylib.name}",
+                    codesign_argv(
+                        dylib,
+                        identity=self.identity,
+                        entitlements=None,
+                        timestamp=timestamp,
+                    ),
+                )
         for spec in BINARIES:
             target = app if spec.is_app_bundle else app / spec.install_path
             entitlements = entitlement_files[spec.key]
@@ -1044,6 +1206,7 @@ def package(
 
     bin_dir = packager.build_products()
     app = packager.assemble_bundle(bin_dir, (short_version, build_version))
+    embedded_libraries = packager.embed_runtime_libraries(app)
     entitlement_files = packager.write_entitlement_files()
 
     notarization: dict = {"submitted": False}
@@ -1088,6 +1251,10 @@ def package(
         is_signed=not unsigned,
     )
     manifest["gatekeeper"] = {"spctl": spctl_verdict, "notarized": notarization.get("submitted", False)}
+    manifest["tdjson"] = {
+        "linked": packager.core_tdjson_linked(),
+        "embedded_libraries": embedded_libraries,
+    }
 
     checksums: dict[str, str] = {}
     if dmg is not None:

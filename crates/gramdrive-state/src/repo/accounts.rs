@@ -318,6 +318,23 @@ impl WriteTxn<'_> {
         }
     }
 
+    /// Removes an account and every row scoped to it — the `PurgeState`
+    /// step of the SEC-004 removal sequence.
+    ///
+    /// One `DELETE` on `accounts`: every account-scoped table reaches
+    /// `accounts` through `ON DELETE CASCADE` (directly, or via `chats` /
+    /// `items` / `messages`), so the schema — not a hand-maintained table
+    /// list — guarantees nothing account-scoped survives. Returns whether
+    /// the account existed; purging an absent account is a no-op success,
+    /// so an interrupted removal re-runs into a completed one.
+    pub fn purge_account(&self, account_id: AccountId) -> Result<bool, StateError> {
+        let removed = self
+            .conn()
+            .prepare_cached("DELETE FROM accounts WHERE account_id = ?1")?
+            .execute(params![account_id.0])?;
+        Ok(removed > 0)
+    }
+
     /// Changes an account's POL-3 retention mode, applying the consequences
     /// atomically (DEC-015).
     ///

@@ -334,7 +334,9 @@ version = "0.1.0"
 dependencies = [
  "gramdrive-engine",
  "gramdrive-model",
+ "gramdrive-source-tdjson",
  "gramdrive-state",
+ "serde_json",
  "tokio",
  "uniffi",
 ]

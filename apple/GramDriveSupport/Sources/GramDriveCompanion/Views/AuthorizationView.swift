@@ -111,6 +111,14 @@ public struct AuthorizationView: View {
                     systemImage: "questionmark.circle")
                 .foregroundStyle(.secondary)
             }
+        case .failed(let detail):
+            Section {
+                Label(
+                    "Signing in succeeded but the account could not be saved "
+                        + "(\(detail)). Please try signing in again.",
+                    systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+            }
         }
     }
 

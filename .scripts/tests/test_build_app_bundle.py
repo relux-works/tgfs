@@ -624,6 +624,164 @@ class PipelineTest(unittest.TestCase):
             self.assertTrue(manifest["reproducible"]["attributable"])
 
 
+class RuntimeEmbeddingTest(unittest.TestCase):
+    """The tdjson-linked packaging path — core_tdjson_linked,
+    embed_runtime_libraries, its portability assertion, and the Frameworks
+    signing loop — which the default (hermetic-core) PipelineTest never reaches.
+    """
+
+    def _core(self, base: Path, *, linked: bool) -> Path:
+        base.mkdir(parents=True, exist_ok=True)
+        core = base / "core"
+        (core / "lib").mkdir(parents=True)
+        (core / "lib" / "libtdjson.dylib").write_bytes(b"\xcf\xfa\xed\xfe dylib")
+        manifest = {"contract_version": "0.5.0"}
+        if linked:
+            manifest["tdjson"] = {"linked": True}
+        (core / "gramdrive-core-manifest.json").write_text(json.dumps(manifest))
+        return core
+
+    def _packager(self, base: Path, run):
+        repo = base / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        out = base / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        return app.AppPackager(
+            repo,
+            out,
+            identity="Developer ID Application: T (262RZ595FP)",
+            core_package=base / "core",
+            runner=run,
+            echo=lambda _: None,
+            environ={},
+        )
+
+    def _app(self, base: Path) -> Path:
+        appdir = base / "GramDrive.app"
+        (appdir / "Contents" / "MacOS").mkdir(parents=True)
+        (appdir / "Contents" / "PlugIns" / app.APPEX_BUNDLE_NAME / "Contents" / "MacOS").mkdir(
+            parents=True
+        )
+        return appdir
+
+    def otool_runner(self, deps_for):
+        """A runner that answers `otool -L` from `deps_for(target)` and no-ops
+        install_name_tool, so an embed can run without Mach-O tooling."""
+
+        def run(argv, cwd, env=None):
+            argv = tuple(str(a) for a in argv)
+            if argv[:2] == ("otool", "-L"):
+                target = argv[2]
+                lines = [f"{target}:"]
+                for dep in deps_for(target):
+                    lines.append(f"\t{dep} (compatibility version 1.0.0, current version 1.0.0)")
+                return 0, "\n".join(lines) + "\n"
+            return 0, ""
+
+        return run
+
+    def test_core_tdjson_linked_reads_the_manifest_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._core(tmp / "linked", linked=True)
+            self._core(tmp / "hermetic", linked=False)
+            run = self.otool_runner(lambda _t: [])
+            self.assertTrue(self._packager(tmp / "linked", run).core_tdjson_linked())
+            self.assertFalse(self._packager(tmp / "hermetic", run).core_tdjson_linked())
+
+    def test_hermetic_core_skips_embedding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._core(tmp, linked=False)
+            pk = self._packager(tmp, self.otool_runner(lambda _t: []))
+            appdir = self._app(tmp)
+            self.assertEqual(pk.embed_runtime_libraries(appdir), [])
+            self.assertFalse((appdir / "Contents" / "Frameworks").exists())
+
+    def test_embed_rewrites_to_rpath_and_passes_the_assertion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._core(tmp, linked=True)
+
+            def clean_deps(target):
+                if target.endswith("libtdjson.dylib"):
+                    return ["/usr/lib/libSystem.B.dylib"]
+                return ["@rpath/libtdjson.dylib", "/usr/lib/libSystem.B.dylib"]
+
+            pk = self._packager(tmp, self.otool_runner(clean_deps))
+            appdir = self._app(tmp)
+            embedded = pk.embed_runtime_libraries(appdir)
+            self.assertEqual(embedded, ["libtdjson.dylib"])
+            self.assertTrue((appdir / "Contents" / "Frameworks" / "libtdjson.dylib").is_file())
+
+    def test_a_surviving_absolute_reference_fails_the_build(self):
+        # The fixup's `-change` silently no-ops when its target no longer
+        # matches; reading the shipped bytes back is what catches an absolute
+        # staged path that the fixup left behind.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            core = self._core(tmp, linked=True)
+            staged = str(core / "lib" / "libtdjson.dylib")
+
+            def dirty_deps(target):
+                if target.endswith("libtdjson.dylib"):
+                    return ["/usr/lib/libSystem.B.dylib"]
+                if target.endswith("gramdrive-agent"):
+                    return [staged, "/usr/lib/libSystem.B.dylib"]
+                return ["@rpath/libtdjson.dylib", "/usr/lib/libSystem.B.dylib"]
+
+            pk = self._packager(tmp, self.otool_runner(dirty_deps))
+            appdir = self._app(tmp)
+            with self.assertRaises(app.StepFailed) as caught:
+                pk.embed_runtime_libraries(appdir)
+            self.assertIn("gramdrive-agent", str(caught.exception))
+
+    def test_a_homebrew_reference_also_fails_the_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._core(tmp, linked=True)
+
+            def brew_dep(target):
+                if target.endswith("libtdjson.dylib"):
+                    return ["/usr/lib/libSystem.B.dylib"]
+                if target.endswith("GramDriveFileProvider"):
+                    return ["/opt/homebrew/opt/openssl@3/lib/libssl.dylib"]
+                return ["@rpath/libtdjson.dylib"]
+
+            pk = self._packager(tmp, self.otool_runner(brew_dep))
+            appdir = self._app(tmp)
+            with self.assertRaises(app.StepFailed) as caught:
+                pk.embed_runtime_libraries(appdir)
+            self.assertIn("homebrew", str(caught.exception).lower())
+
+    def test_frameworks_dylibs_are_signed_before_the_binaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._core(tmp, linked=True)
+            calls: list[tuple[str, ...]] = []
+
+            def run(argv, cwd, env=None):
+                argv = tuple(str(a) for a in argv)
+                calls.append(argv)
+                return 0, ""
+
+            pk = self._packager(tmp, run)
+            appdir = self._app(tmp)
+            frameworks = appdir / "Contents" / "Frameworks"
+            frameworks.mkdir(parents=True)
+            (frameworks / "libtdjson.dylib").write_bytes(b"\xcf\xfa\xed\xfe")
+            entitlements = pk.write_entitlement_files()
+            pk.sign(appdir, entitlements, timestamp=False)
+            codesigns = [
+                c[-1] for c in calls if c and c[0] == "codesign" and "--force" in c and "-d" not in c
+            ]
+            dylib_idx = next(i for i, t in enumerate(codesigns) if t.endswith("libtdjson.dylib"))
+            agent_idx = next(i for i, t in enumerate(codesigns) if t.endswith("gramdrive-agent"))
+            app_idx = next(i for i, t in enumerate(codesigns) if t.endswith("GramDrive.app"))
+            self.assertLess(dylib_idx, agent_idx)
+            self.assertLess(dylib_idx, app_idx)
+
+
 class PlatformGuardTest(unittest.TestCase):
     def test_non_macos_cannot_start(self):
         # POL-5: the app artifact is macOS-only; a non-Apple host must exit 2

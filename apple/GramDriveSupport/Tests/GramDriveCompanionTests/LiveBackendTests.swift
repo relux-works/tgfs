@@ -51,14 +51,28 @@ private func withTempRootAsync<T>(_ body: (URL) async throws -> T) async throws 
         }
     }
 
-    @Test func commandsReportControlChannelNotWired() async {
-        let backend = LiveCompanionBackend(layout: AgentRuntimeLayout(dataRoot: URL(fileURLWithPath: "/tmp/x")))
-        #expect(await backend.requestRepair() == .unavailable(.notWired))
-        let confirmation = RemovalConfirmation(
-            accountLabel: "A", typedConfirmation: "A", acknowledgedIrreversible: true)
-        #expect(await backend.removeAccount(confirmation) == .unavailable(.notWired))
-        let start = await backend.makeAuthorizationSession().start()
-        #expect(start == .unavailable(.notWired))
+    /// The control channel is wired (BUG-260720-3i74u1): with no agent and
+    /// no way to start one, commands report `agentNotRunning` — an honest
+    /// runtime condition. `notWired` is no longer a state the live backend
+    /// can produce.
+    @Test func commandsReportAgentNotRunningWhenNoAgentCanBeStarted() async throws {
+        try await withTempRootAsync { root in
+            struct NoAgent: Error {}
+            struct FailingStarter: AgentStarting {
+                func startAgent(loginItemPreferred: Bool) throws { throw NoAgent() }
+            }
+            let backend = LiveCompanionBackend(
+                layout: AgentRuntimeLayout(dataRoot: root),
+                healthTimeout: .seconds(1),
+                starter: FailingStarter(),
+                startupTimeout: .milliseconds(100))
+            #expect(await backend.requestRepair() == .unavailable(.agentNotRunning))
+            let confirmation = RemovalConfirmation(
+                accountLabel: "A", typedConfirmation: "A", acknowledgedIrreversible: true)
+            #expect(await backend.removeAccount(confirmation) == .unavailable(.agentNotRunning))
+            let start = await backend.makeAuthorizationSession().start()
+            #expect(start == .unavailable(.agentNotRunning))
+        }
     }
 }
 

@@ -34,8 +34,17 @@ bindgen = ["uniffi/cli"]
 gramdrive-engine = { workspace = true }
 gramdrive-model = { workspace = true }
 # Shared durable state across host processes (src/shared_state.rs): the FFI
-# opens the store and serves the provider extension's snapshot reads.
+# opens the store and serves the provider extension's snapshot reads. The
+# auth surface (src/auth.rs) also writes the account row on a completed
+# sign-in — the coordinator process's in-process write path.
 gramdrive-state = { workspace = true }
+# The local Telegram source: the authorization machine, the tdjson runtime,
+# and the account storage/config layer behind the exported auth surface
+# (src/auth.rs). The exported vocabulary stays provider-neutral (DEC-003);
+# this dependency is the engine-host wiring behind it, and the real tdjson
+# linkage stays behind the same env gate as the crate's own (`build.rs`).
+gramdrive-source-tdjson = { workspace = true }
+serde_json = { workspace = true }
 # `tokio` feature: exported async fns are wrapped so tokio-backed primitives
 # (timers, I/O) work regardless of which thread polls the future. The
 # threading model is documented in README.md.

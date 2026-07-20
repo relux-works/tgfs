@@ -27,7 +27,12 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // PinOrigin) — what a provider host maps to keep-offline vs evictable
     // content policy (POL-2, SYNC-051..053). A new defaulted record field,
     // hence additive and minor.
-    minor: 5,
+    // 0.6.0: the authorization surface (crate::auth) — AuthSession over the
+    // engine host's Telegram runtime (phases, inputs, rejections), the
+    // SecretVault keychain seam, probe_authorization for stored-session
+    // status — and the SEC-004 account removal driver (crate::removal).
+    // Additive, hence minor.
+    minor: 6,
     patch: 0,
 };
 

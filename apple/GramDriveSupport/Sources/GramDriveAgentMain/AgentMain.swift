@@ -61,13 +61,45 @@ enum AgentMain {
     // MARK: - run
 
     private static func runAgent(dataRoot: URL, options: [String: String]) {
+        // The agent's own IPC channels set SO_NOSIGPIPE per socket, but the
+        // engine's network sockets live inside libtdjson and carry the
+        // process default: a peer resetting mid-write would kill the whole
+        // agent. Ignored process-wide before any engine work starts, so a
+        // dead peer surfaces as EPIPE to the writer that hit it.
+        signal(SIGPIPE, SIG_IGN)
+        // The engine-backed control seams (BUG-260720-3i74u1): sign-in,
+        // removal, and repair over the FFI's authorization surface, with
+        // secrets from the OS keychain. Test-DC selection exists for the
+        // acceptance smoke only (`--telegram-test-dc true` or the
+        // GRAMDRIVE_TELEGRAM_TEST_DC env), never in a user-facing launch.
+        let useTestDc =
+            boolOption(options, "telegram-test-dc")
+            ?? (ProcessInfo.processInfo.environment["GRAMDRIVE_TELEGRAM_TEST_DC"] == "1")
+        let vault = KeychainSecretVault()
+        let authConfiguration = CoreAuthConfiguration(dataRoot: dataRoot, useTestDc: useTestDc)
+        let lifecycleRef = LifecycleRef()
+        let seams = AgentControlSeams(
+            authorizer: CoreAuthorizer(configuration: authConfiguration, vault: vault),
+            remover: CoreAccountRemover(configuration: authConfiguration, vault: vault),
+            repairer: CoreRepairRunner(
+                configuration: authConfiguration,
+                vault: vault,
+                accounts: {
+                    guard let accounts = lifecycleRef.lifecycle?.healthSnapshot().accounts
+                    else {
+                        throw AgentStartError.storage(detail: "durable state is not open")
+                    }
+                    return accounts
+                }))
         let configuration = AgentConfiguration(
             dataRoot: dataRoot,
             drainGracePeriod: .milliseconds(integerOption(options, "drain-grace-ms") ?? 10_000),
             drainCancelWait: .milliseconds(
                 integerOption(options, "drain-cancel-wait-ms") ?? 5_000),
-            powerEvents: WorkspacePowerEventSource())
+            powerEvents: WorkspacePowerEventSource(),
+            controlSeams: seams)
         let lifecycle = AgentLifecycle(configuration: configuration)
+        lifecycleRef.lifecycle = lifecycle
         do {
             try lifecycle.start()
         } catch AgentStartError.alreadyRunning {
@@ -200,6 +232,12 @@ enum AgentMain {
         options[key].flatMap(Int.init)
     }
 
+    private static func boolOption(_ options: [String: String], _ key: String) -> Bool? {
+        options[key].map { value in
+            value == "1" || value.lowercased() == "true"
+        }
+    }
+
     private static func emit(_ line: String) {
         print(line)
         fflush(stdout)
@@ -227,4 +265,11 @@ enum AgentMain {
 /// is being drainable, not being watched.
 private final class SilentProgressListener: ProgressListener {
     func onProgress(progress: TransferProgress) {}
+}
+
+/// Breaks the seam/lifecycle construction cycle: the repair seam needs the
+/// lifecycle's account projection, and the lifecycle needs the seams at
+/// construction. Filled once, right after the lifecycle exists.
+private final class LifecycleRef: @unchecked Sendable {
+    weak var lifecycle: AgentLifecycle?
 }

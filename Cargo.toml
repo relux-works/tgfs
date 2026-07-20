@@ -18,6 +18,7 @@ publish = false
 [workspace.dependencies]
 gramdrive-model = { path = "crates/gramdrive-model" }
 gramdrive-source = { path = "crates/gramdrive-source" }
+gramdrive-source-tdjson = { path = "crates/gramdrive-source-tdjson" }
 gramdrive-state = { path = "crates/gramdrive-state" }
 gramdrive-render = { path = "crates/gramdrive-render" }
 gramdrive-engine = { path = "crates/gramdrive-engine" }
