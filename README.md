@@ -79,6 +79,7 @@ cannot be run before pushing, and drifts the first time either side is edited.
 make check          # pre-push gate: the core suite plus the repo suite
 make check-core     # Rust core only: toolchain, format, lint, test, architecture, supply chain
 make check-security # gitleaks secret scan of committed history (needs gitleaks)
+make check-live-content # combined synthetic Rust/Swift date-first acceptance
 make gates          # print every suite and the exact command behind each step
 make fmt            # apply rustfmt (the gate only checks formatting)
 ```
@@ -258,11 +259,28 @@ Kotlin) and **iOS** slices are deferred until those platforms enter scope
 rots. Full rationale, the measured reproducibility and size numbers, and the
 crate-type and debug-info decisions: [`.scripts/packaging/README.md`](.scripts/packaging/README.md).
 
+## License and public repository policy
+
+GramDrive is licensed under the [Apache License 2.0](LICENSE). Attribution and
+notice obligations are collected in [NOTICE](NOTICE). Contributions are accepted
+under that license; see [CONTRIBUTING.md](CONTRIBUTING.md), the
+[Code of Conduct](CODE_OF_CONDUCT.md), and [SECURITY.md](SECURITY.md) for the
+contribution, community, and private-vulnerability-reporting policies.
+
+The repository's private-to-public conversion is controlled by
+[the public-readiness checklist](docs/PUBLIC_REPOSITORY_READINESS.md). In
+particular, public release and Sparkle-feed publication require reviewer
+acceptance; private-era `v0.1.0` and `v0.1.1` are retained as GitHub drafts
+(with their tags and assets preserved) and are excluded from all feeds.
+
 Available utilities:
 
 | Tool | Purpose | Run | Output |
 |---|---|---|---|
 | `.scripts/acceptance/run_automated.py` | The single gate entrypoint: runs a named suite, records provenance. Used identically by `make` and by CI | `python3 .scripts/acceptance/run_automated.py --suite core --run-id local-core`; `--list` prints suites and steps | Exit 0 pass / 1 failed step / 2 could not start; `.temp/acceptance/<run-id>/` with `summary.json` + per-step logs |
+| `.scripts/acceptance/run_live_content.py` | Privacy-safe pre-install acceptance matrix composing the focused Rust history/render/fidelity/hydration/story/retention suites with the full Swift package/provider regressions. Child output is discarded; evidence is allow-listed and bounded | `make check-live-content`, or through `run_automated.py --suite live-content --run-id local-live-content` after staging `make package` | Exit 0 all matrix legs passed / 1 one or more failed; `.temp/acceptance/<run-id>/live-content.json` contains only fixed labels, counts, booleans, timings, versions, and bounds |
+| `.scripts/acceptance/run_installed_index_metadata.py` | Installed authorized-profile probe for the historical chat index (BUG-260728-2qfzbd): how much of the listed backlog background history work can actually reach, whether every chat/month directory publishes a size rollup equal to its indexed descendants, whether any directory is still *undated* (the state Finder renders as 1 Jan 1970) as distinct from faithfully *epoch-dated*, and whether every cursor window stayed monotonic across an app + agent relaunch. The rollup and date checks are scoped to the kinds that own a rollup — chat, month, `Active Stories` — because a chat list or folder catalog is deliberately left NULL. Opens no content and downloads nothing | `python3 .scripts/acceptance/run_installed_index_metadata.py {before\|after\|relaunch} --output <file.json> --private <dir> --now-ms <ms>` | Exit 0 all acceptance booleans true / 1 any false; the JSON output holds counts, booleans, and byte totals only, while salted cursor digests stay under `--private`. A phase that asserts nothing (`before`) reports `"passed": null`, not `true` |
+| `.scripts/acceptance/run_installed_foreground_demand.py` | Installed authorized-profile probe for the foreground-demand path (BUG-260728-2qfzbd): whether *using* a chat in Finder buys it a history turn, with no control-socket hint anywhere. It picks the reachable incomplete chat the background rotation will reach last, watches it for one window untouched, performs one gesture, then watches it again — so a turn the rotation would have handed out regardless fails the probe instead of passing it. `--gesture read` (default) reads one generated document inside the chat, which is the interaction that reliably reaches the extension; `--gesture open` only lists the folder, which macOS usually answers from its own replica without calling the extension at all. It also reads the agent's hint counters either side of the gesture. Downloads no Telegram payload bytes | `python3 .scripts/acceptance/run_installed_foreground_demand.py --output <file.json> --private <file.json> [--gesture read\|open] [--window <seconds>] [--socket <path>]` | Exit 0 when the gesture's boolean (`content_read_granted_a_turn` / `foreground_open_granted_a_turn`) is true, 1 when false; the JSON output holds counts, booleans, seconds, and message deltas only, while the chosen chat's id, folder, document, and raw cursor readings stay in `--private` |
 | `.scripts/acceptance/run_native_macos.py` | The macOS **native manual acceptance** harness (TASK-260715-3oe2nr): the ten File Provider Finder flows the release gate requires (register, enumerate, hydrate, cancel, pin, update, restart, repair, upgrade, remove). One scenario catalog drives the run-sheet, the evidence form, and the machine probes. Human-in-the-loop by necessity — it preflights the host, captures evidence, and **never reports a scenario passed**; a person runs Finder and signs off. Pipeline: `.scripts/acceptance/README.md` | `make accept-macos`, `make accept-macos-runsheet`, or `python3 .scripts/acceptance/run_native_macos.py --run-id accept-YYYY-MM-DD [--app-path …] [--require-ready]`; `--list` prints the catalog | Exit 0 prepared (not a pass) / 2 could not start / 3 `--require-ready` host off-matrix; `.temp/acceptance/<run-id>/` with `runsheet.md`, `evidence-template.md`, `summary.json` + per-probe evidence logs |
 | `make` | Shorthand for the entrypoint plus the non-gate inner loop (`fmt`, `build`, `test`) | `make check`, `make check-core`, `make check-repo`, `make gates` | Delegates to the entrypoint; never re-defines a gate command |
 | `cargo` (pinned to Rust 1.91.0 by `rust-toolchain.toml`, edition 2024) | Build and test the shared core workspace | `cargo build --workspace` / `cargo test --workspace` (repo root); per-crate commands in each `crates/*/README.md` | Binaries/test results under `target/` (gitignored) |

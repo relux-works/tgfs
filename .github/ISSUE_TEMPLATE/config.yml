@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/relux-works/tgfs/security/advisories/new
+    about: Do not disclose vulnerabilities, credentials, Telegram data, or personal data in a public issue.
+  - name: Contributor and community guidance
+    url: https://github.com/relux-works/tgfs/blob/main/CONTRIBUTING.md
+    about: Read the contribution process and data-handling restrictions before opening an issue.

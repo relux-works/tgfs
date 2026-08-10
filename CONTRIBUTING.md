@@ -18,7 +18,15 @@ This repository is in specification and decomposition phase. Product implementat
 4. Keep research in `.research/{YYMMDD}-{topic}.md` and attach it to its board task as an outcome resource.
 5. Use small, conventional commits and keep generated/local runtime state out of Git.
 6. Never commit credentials, Telegram sessions, user content, diagnostic archives, or local databases.
+7. Contributions are submitted under the [Apache License 2.0](LICENSE). Keep
+   copyright, license, and third-party notices intact, and add any required
+   notices for new third-party material.
 
 ## Current boundary
 
 The board may contain future implementation tasks, but this repository currently authorizes documentation, planning, research, and spikes only when explicitly approved. No product implementation is part of the current setup/decomposition request.
+
+## Reporting security issues
+
+Do not use an issue or pull request for a vulnerability report. Follow
+[SECURITY.md](SECURITY.md) and use a private GitHub Security Advisory instead.
