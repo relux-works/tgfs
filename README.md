@@ -280,10 +280,16 @@ particular, public release and Sparkle-feed publication require reviewer
 acceptance; private-era `v0.1.0` and `v0.1.1` are retained as GitHub drafts
 (with their tags and assets preserved) and are excluded from all feeds.
 
+Update credential bootstrap, independent rotation/revocation, versioned-feed
+bridges, emergency freeze, and forward recovery are documented in
+[the update operations runbook](docs/UPDATE_OPERATIONS.md). It lists secret
+names only and includes a value-free inventory preflight.
+
 Available utilities:
 
 | Tool | Purpose | Run | Output |
 |---|---|---|---|
+| `.scripts/release/check_update_secret_inventory.py` | Value-free bootstrap preflight for the seven update-delivery environment-secret names; it prints and optionally verifies names only, and never accepts, reads, or writes secret values | `make updates-secret-inventory`, or `make updates-secret-inventory CHECK_GITHUB=1` after `gh` administrator authentication | Exit 0 when the public name inventory is printed/matches; exit 1 on missing/unexpected names or an unavailable/invalid `gh` response; no artifacts |
 | `.scripts/acceptance/run_automated.py` | The single gate entrypoint: runs a named suite, records provenance. Used identically by `make` and by CI | `python3 .scripts/acceptance/run_automated.py --suite core --run-id local-core`; `--list` prints suites and steps | Exit 0 pass / 1 failed step / 2 could not start; `.temp/acceptance/<run-id>/` with `summary.json` + per-step logs |
 | `.scripts/acceptance/run_live_content.py` | Privacy-safe pre-install acceptance matrix composing the focused Rust history/render/fidelity/hydration/story/retention suites with the full Swift package/provider regressions. Child output is discarded; evidence is allow-listed and bounded | `make check-live-content`, or through `run_automated.py --suite live-content --run-id local-live-content` after staging `make package` | Exit 0 all matrix legs passed / 1 one or more failed; `.temp/acceptance/<run-id>/live-content.json` contains only fixed labels, counts, booleans, timings, versions, and bounds |
 | `.scripts/acceptance/run_installed_index_metadata.py` | Installed authorized-profile probe for the historical chat index (BUG-260728-2qfzbd): how much of the listed backlog background history work can actually reach, whether every chat/month directory publishes a size rollup equal to its indexed descendants, whether any directory is still *undated* (the state Finder renders as 1 Jan 1970) as distinct from faithfully *epoch-dated*, and whether every cursor window stayed monotonic across an app + agent relaunch. The rollup and date checks are scoped to the kinds that own a rollup — chat, month, `Active Stories` — because a chat list or folder catalog is deliberately left NULL. Opens no content and downloads nothing | `python3 .scripts/acceptance/run_installed_index_metadata.py {before\|after\|relaunch} --output <file.json> --private <dir> --now-ms <ms>` | Exit 0 all acceptance booleans true / 1 any false; the JSON output holds counts, booleans, and byte totals only, while salted cursor digests stay under `--private`. A phase that asserts nothing (`before`) reports `"passed": null`, not `true` |
