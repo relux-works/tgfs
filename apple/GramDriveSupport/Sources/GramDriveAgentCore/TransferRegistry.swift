@@ -72,6 +72,14 @@ public final class TransferRegistry: @unchecked Sendable {
         return entries.count
     }
 
+    /// Whether a drain has started and the registry is refusing new work.
+    /// This remains true for the rest of the registry's lifetime.
+    public var isDraining: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return draining
+    }
+
     /// Drains the registry: refuses new work, waits `gracePeriod` for
     /// in-flight operations to end, cancels the remainder, then waits
     /// `cancelWait` for the cancellations to land.
