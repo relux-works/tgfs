@@ -1,6 +1,6 @@
 //! The folder-catalog discovery machine: TDLib's `updateChatFolders` becomes a
 //! deterministic, provider-neutral normalized change stream for the custom
-//! Telegram folders (chat filters) that populate the "Telegram Folders/"
+//! Telegram folders (chat filters) that populate the "Folders/"
 //! catalog (TASK-260715-54nopz, SYNC-026).
 //!
 //! # Where it sits
@@ -161,6 +161,9 @@ struct FolderState {
 /// authorized account's client (module docs).
 #[derive(Debug, Default)]
 pub struct FolderCatalogMachine {
+    /// Distinguishes an observed empty catalog from startup before TDLib has
+    /// sent its complete `updateChatFolders` value.
+    observed: bool,
     /// The catalog as of the last [`FolderCatalogMachine::take_batch`] — the
     /// committed baseline every diff is taken against.
     committed: BTreeMap<i32, FolderState>,
@@ -178,6 +181,23 @@ impl FolderCatalogMachine {
     /// cheap check before opening a write transaction.
     pub fn has_pending(&self) -> bool {
         self.current != self.committed
+    }
+
+    /// Whether TDLib has supplied the complete catalog, including the valid
+    /// empty-catalog case.
+    pub fn has_observed_catalog(&self) -> bool {
+        self.observed
+    }
+
+    /// The complete current catalog in Telegram order.
+    pub fn definitions(&self) -> Vec<FolderDefinition> {
+        let mut definitions: Vec<_> = self
+            .current
+            .iter()
+            .map(|(&id, state)| definition(id, state))
+            .collect();
+        definitions.sort_by_key(|folder| (folder.position, folder.id.0));
+        definitions
     }
 
     /// The current folder set in catalog order (by position, then id) — the
@@ -207,6 +227,7 @@ impl FolderCatalogMachine {
         let Some(folders) = update.get("chat_folders").and_then(Value::as_array) else {
             return;
         };
+        self.observed = true;
         let mut next = BTreeMap::new();
         for (index, folder) in folders.iter().enumerate() {
             let Some(id) = folder

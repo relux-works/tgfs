@@ -10,8 +10,11 @@
 //! namespace epoch (DOM-021); its epoch column is read from the account row
 //! at upsert time.
 
-use gramdrive_model::identity::{AccountScope, CanonicalKey, ChatListKind, ItemId, ItemKey};
-use gramdrive_model::version::{ContentVersion, MetadataVersion};
+use gramdrive_model::identity::{
+    AccountScope, AppearanceKey, CanonicalKey, ChatKey, ChatListKey, ChatListKind,
+    FolderCatalogKey, ItemId, ItemKey, StoryAppearanceLocation,
+};
+use gramdrive_model::version::{ContentVersion, MetadataVersion, directory_metadata_version};
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::error::StateError;
@@ -34,12 +37,20 @@ pub enum ItemKind {
     FolderCatalog,
     /// A chat directory.
     Chat,
+    /// The fixed `Active Stories` directory.
+    ActiveStories,
+    /// A direct `YYYY-MM` timeline directory.
+    MonthDir,
     /// A calendar-year directory of a chat's export.
     YearDir,
     /// The media directory of one chat-export year.
     MediaDir,
     /// A downloadable attachment file.
     Attachment,
+    /// Canonical story bytes (not enumerated directly).
+    CanonicalStory,
+    /// Active or persistent appearance of canonical story bytes.
+    StoryAppearance,
     /// A generated NDJSON/Markdown/JSON document.
     GeneratedDoc,
     /// The `order.json` ordering-metadata document of a list root.
@@ -53,9 +64,13 @@ impl ItemKind {
             Self::ChatList => "chat_list",
             Self::FolderCatalog => "folder_catalog",
             Self::Chat => "chat",
+            Self::ActiveStories => "active_stories",
+            Self::MonthDir => "month_dir",
             Self::YearDir => "year_dir",
             Self::MediaDir => "media_dir",
             Self::Attachment => "attachment",
+            Self::CanonicalStory => "canonical_story",
+            Self::StoryAppearance => "story_appearance",
             Self::GeneratedDoc => "generated_doc",
             Self::OrderDoc => "order_doc",
         }
@@ -70,6 +85,8 @@ impl ItemKind {
                 | Self::ChatList
                 | Self::FolderCatalog
                 | Self::Chat
+                | Self::ActiveStories
+                | Self::MonthDir
                 | Self::YearDir
                 | Self::MediaDir
         )
@@ -142,6 +159,17 @@ pub struct ItemRecord {
     pub metadata_version: MetadataVersion,
     /// Content facts; files only.
     pub content: Option<FileFacts>,
+    /// Exact logical size of the node's indexed descendants; directories
+    /// only, and `None` until a reconciliation pass has rolled it up
+    /// (BUG-260728-2qfzbd).
+    ///
+    /// Deliberately separate from [`FileFacts::logical_size`]: that field
+    /// stays "this file's own bytes", so a directory can never claim file
+    /// content facts and a file can never claim a subtree rollup. The value
+    /// is the sum of the *known* logical sizes below the node — a descendant
+    /// whose size is not indexed yet contributes nothing rather than an
+    /// estimate (SYNC-032 keeps exact size a source fact, never a guess).
+    pub aggregate_size: Option<u64>,
     /// Content availability (POL-4).
     pub availability: ItemAvailability,
     /// Creation time, if known (ms since the Unix epoch).
@@ -150,6 +178,42 @@ pub struct ItemRecord {
     pub modified_at_ms: Option<i64>,
     /// POL-3 tombstone: when the node's deletion was observed.
     pub deleted_at_ms: Option<i64>,
+}
+
+/// The durable policy pass that first observed an item tombstone.
+///
+/// This is a fixed vocabulary, not diagnostic text: it cannot carry a name,
+/// identifier, source error, or any other user-derived detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneProvenance {
+    /// Projection reconciliation removed a stale branch.
+    Reconcile,
+    /// A retention-mode transition removed local availability.
+    Retention,
+    /// A policy decision invalidated the item.
+    Policy,
+}
+
+impl TombstoneProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconcile => "reconcile",
+            Self::Retention => "retention",
+            Self::Policy => "policy",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StateError> {
+        match value {
+            "reconcile" => Ok(Self::Reconcile),
+            "retention" => Ok(Self::Retention),
+            "policy" => Ok(Self::Policy),
+            _ => Err(StateError::CorruptRow {
+                table: "items",
+                detail: "unknown tombstone provenance".to_owned(),
+            }),
+        }
+    }
 }
 
 /// The provider-node kind encoded in an item id.
@@ -169,6 +233,7 @@ pub fn item_kind(id: &ItemId) -> Result<ItemKind, StateError> {
             }
             Ok(kind)
         }
+        ItemKey::StoryAppearance(_) => Ok(ItemKind::StoryAppearance),
     }
 }
 
@@ -178,9 +243,12 @@ fn canonical_kind(key: &CanonicalKey) -> Result<ItemKind, StateError> {
         CanonicalKey::ChatList(_) => Ok(ItemKind::ChatList),
         CanonicalKey::FolderCatalog(_) => Ok(ItemKind::FolderCatalog),
         CanonicalKey::Chat(_) => Ok(ItemKind::Chat),
+        CanonicalKey::ActiveStories(_) => Ok(ItemKind::ActiveStories),
+        CanonicalKey::MonthDir(_) => Ok(ItemKind::MonthDir),
         CanonicalKey::YearDir(_) => Ok(ItemKind::YearDir),
         CanonicalKey::MediaDir(_) => Ok(ItemKind::MediaDir),
         CanonicalKey::Attachment(_) => Ok(ItemKind::Attachment),
+        CanonicalKey::Story(_) => Ok(ItemKind::CanonicalStory),
         CanonicalKey::GeneratedDoc(_) => Ok(ItemKind::GeneratedDoc),
         CanonicalKey::OrderDoc(_) => Ok(ItemKind::OrderDoc),
         CanonicalKey::Message(_) => Err(StateError::InvalidArgument {
@@ -200,10 +268,13 @@ fn canonical_scope(key: &CanonicalKey) -> Option<AccountScope> {
         CanonicalKey::ChatList(k) => Some(k.scope),
         CanonicalKey::FolderCatalog(k) => Some(k.scope),
         CanonicalKey::Chat(k) => Some(k.scope),
+        CanonicalKey::ActiveStories(k) => Some(k.chat.scope),
+        CanonicalKey::MonthDir(k) => Some(k.chat.scope),
         CanonicalKey::YearDir(k) => Some(k.chat.scope),
         CanonicalKey::MediaDir(k) => Some(k.chat.scope),
         CanonicalKey::Message(k) => Some(k.chat.scope),
         CanonicalKey::Attachment(k) => Some(k.message.chat.scope),
+        CanonicalKey::Story(k) => Some(k.poster.scope),
         CanonicalKey::GeneratedDoc(k) => Some(k.chat.scope),
         CanonicalKey::OrderDoc(k) => Some(k.list.scope),
     }
@@ -214,6 +285,7 @@ fn view_columns(view: ChatListKind) -> Result<(&'static str, Option<i64>), State
     match view {
         ChatListKind::Main => Ok(("main", None)),
         ChatListKind::Archive => Ok(("archive", None)),
+        ChatListKind::Stories => Ok(("stories", None)),
         ChatListKind::Folder(folder) => {
             if folder.0 == 0 {
                 Err(StateError::InvalidArgument {
@@ -278,13 +350,24 @@ fn derive_identity(id: &ItemId) -> Result<DerivedIdentity, StateError> {
                 view: Some(view_columns(appearance.view)?),
             })
         }
+        ItemKey::StoryAppearance(appearance) => Ok(DerivedIdentity {
+            kind: ItemKind::StoryAppearance,
+            scope: ScopeSource::Carried(appearance.story.poster.scope),
+            canonical_item_id: Some(
+                ItemKey::Canonical(CanonicalKey::Story(appearance.story))
+                    .id()
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            view: Some(view_columns(appearance.view)?),
+        }),
     }
 }
 
 /// The columns every item read selects, in [`read_item`]'s order.
 const ITEM_COLUMNS: &str = "item_id, parent_item_id, display_name, safe_name, metadata_version,
      mime_type, logical_size, content_version, availability,
-     created_at_ms, modified_at_ms, deleted_at_ms";
+     created_at_ms, modified_at_ms, deleted_at_ms, aggregate_size";
 
 struct RawItem {
     item_id: Vec<u8>,
@@ -299,6 +382,7 @@ struct RawItem {
     created_at_ms: Option<i64>,
     modified_at_ms: Option<i64>,
     deleted_at_ms: Option<i64>,
+    aggregate_size: Option<i64>,
 }
 
 fn read_item(row: &Row<'_>) -> Result<RawItem, rusqlite::Error> {
@@ -315,12 +399,20 @@ fn read_item(row: &Row<'_>) -> Result<RawItem, rusqlite::Error> {
         created_at_ms: row.get(9)?,
         modified_at_ms: row.get(10)?,
         deleted_at_ms: row.get(11)?,
+        aggregate_size: row.get(12)?,
     })
 }
 
 fn finish_item(raw: RawItem) -> Result<ItemRecord, StateError> {
     let id = item_id_from_column("items", &raw.item_id)?;
     let kind = item_kind(&id)?;
+    let aggregate_size = if kind.is_directory() {
+        raw.aggregate_size
+            .map(|size| size_from_column("items", size))
+            .transpose()?
+    } else {
+        None
+    };
     let content = if kind.is_directory() {
         None
     } else {
@@ -356,6 +448,7 @@ fn finish_item(raw: RawItem) -> Result<ItemRecord, StateError> {
             }
         })?,
         content,
+        aggregate_size,
         availability: ItemAvailability::parse(&raw.availability)?,
         created_at_ms: raw.created_at_ms,
         modified_at_ms: raw.modified_at_ms,
@@ -364,6 +457,42 @@ fn finish_item(raw: RawItem) -> Result<ItemRecord, StateError> {
 }
 
 impl ReadTxn<'_> {
+    /// The immutable provenance of an item's first tombstone, when present.
+    /// Schema v18 backfills every installed tombstone and enforces the
+    /// deleted/provenance invariant for future writes.
+    pub fn tombstone_provenance(
+        &self,
+        id: &ItemId,
+    ) -> Result<Option<TombstoneProvenance>, StateError> {
+        self.conn()
+            .prepare_cached("SELECT tombstone_provenance FROM items WHERE item_id = ?1")?
+            .query_row(params![id.as_bytes()], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten()
+            .map(|value| TombstoneProvenance::parse(&value))
+            .transpose()
+    }
+
+    /// Every currently live stored child in identity order, without applying
+    /// source-specific presentation ordering. Projection reconciliation uses
+    /// this to find stale rows that no longer have a folder or membership
+    /// join and therefore cannot appear through `children_page`.
+    pub fn stored_children(&self, parent: &ItemId) -> Result<Vec<ItemRecord>, StateError> {
+        let mut statement = self.conn().prepare_cached(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items
+             WHERE parent_item_id = ?1 AND deleted_at_ms IS NULL
+             ORDER BY item_id"
+        ))?;
+        let rows = statement.query_map(params![parent.as_bytes()], read_item)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(finish_item(row?)?);
+        }
+        Ok(items)
+    }
+
     /// One provider node by its stable identity (DOM-024).
     pub fn item(&self, id: &ItemId) -> Result<Option<ItemRecord>, StateError> {
         let raw = self
@@ -384,6 +513,116 @@ impl ReadTxn<'_> {
         after: Option<&ItemId>,
         limit: u32,
     ) -> Result<Vec<ItemRecord>, StateError> {
+        match parent.key() {
+            ItemKey::Canonical(CanonicalKey::Account(account)) => {
+                let account_record = self
+                    .account(account)?
+                    .ok_or(StateError::RowNotFound { entity: "account" })?;
+                let scope = account_record.scope();
+                let ids = [
+                    ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                        scope,
+                        kind: ChatListKind::Main,
+                    }))
+                    .id(),
+                    ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                        scope,
+                        kind: ChatListKind::Archive,
+                    }))
+                    .id(),
+                    ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                        scope,
+                        kind: ChatListKind::Stories,
+                    }))
+                    .id(),
+                    ItemKey::Canonical(CanonicalKey::FolderCatalog(FolderCatalogKey { scope }))
+                        .id(),
+                ];
+                // The exact Telegram root contract applies once the owned
+                // lifecycle has installed all four fixed roots. Before that,
+                // retain the generic store behavior used by migrations and
+                // source-free callers that may have arbitrary account-root
+                // children.
+                let fixed_roots_ready = ids.iter().try_fold(true, |ready, id| {
+                    Ok::<_, StateError>(
+                        ready
+                            && self
+                                .item(id)?
+                                .is_some_and(|item| item.deleted_at_ms.is_none()),
+                    )
+                })?;
+                if fixed_roots_ready {
+                    return self.item_id_page(&ids, after, limit);
+                }
+                return self.stored_children_page(parent, after, limit);
+            }
+            ItemKey::Canonical(CanonicalKey::FolderCatalog(catalog)) => {
+                let ids: Vec<ItemId> = self
+                    .folders(catalog.scope)?
+                    .into_iter()
+                    .map(|folder| {
+                        ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                            scope: catalog.scope,
+                            kind: ChatListKind::Folder(folder.folder_id),
+                        }))
+                        .id()
+                    })
+                    .collect();
+                return self.item_id_page(&ids, after, limit);
+            }
+            ItemKey::Canonical(CanonicalKey::ChatList(list)) => {
+                // Legacy/source-free callers may store arbitrary children
+                // under a list root without normalized membership rows. Keep
+                // the generic item-id contract for that shape; a composed
+                // namespace always has membership rows and takes the ordered
+                // path below.
+                if self.chat_list(&list)?.is_empty() {
+                    return self.stored_children_page(parent, after, limit);
+                }
+                let after_chat = match after.map(ItemId::key) {
+                    None => None,
+                    Some(ItemKey::Appearance(AppearanceKey {
+                        view,
+                        item: CanonicalKey::Chat(chat),
+                    })) if view == list.kind && chat.scope == list.scope => Some(chat.chat_id),
+                    Some(_) => {
+                        return Err(StateError::InvalidArgument {
+                            what: "chat-list page anchor is not a child appearance",
+                        });
+                    }
+                };
+                let entries = self.chat_list_page(&list, after_chat, limit)?;
+                let mut items = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let id = ItemKey::Appearance(AppearanceKey {
+                        view: list.kind,
+                        item: CanonicalKey::Chat(ChatKey {
+                            scope: list.scope,
+                            chat_id: entry.chat_id,
+                        }),
+                    })
+                    .id();
+                    let item = self.item(&id)?.ok_or(StateError::RowNotFound {
+                        entity: "chat appearance item",
+                    })?;
+                    if item.deleted_at_ms.is_none() {
+                        items.push(item);
+                    }
+                }
+                return Ok(items);
+            }
+            _ => {}
+        }
+
+        self.stored_children_page(parent, after, limit)
+    }
+
+    fn stored_children_page(
+        &self,
+        parent: &ItemId,
+        after: Option<&ItemId>,
+        limit: u32,
+    ) -> Result<Vec<ItemRecord>, StateError> {
         // Every stored id is non-empty (schema CHECK), so the empty blob is
         // a universal "before everything" anchor.
         let anchor: &[u8] = after.map_or(&[], ItemId::as_bytes);
@@ -399,6 +638,34 @@ impl ReadTxn<'_> {
         let mut items = Vec::new();
         for row in rows {
             items.push(finish_item(row?)?);
+        }
+        Ok(items)
+    }
+
+    fn item_id_page(
+        &self,
+        ids: &[ItemId],
+        after: Option<&ItemId>,
+        limit: u32,
+    ) -> Result<Vec<ItemRecord>, StateError> {
+        let start = match after {
+            None => 0,
+            Some(anchor) => {
+                ids.iter()
+                    .position(|id| id == anchor)
+                    .ok_or(StateError::RowNotFound {
+                        entity: "item page anchor",
+                    })?
+                    + 1
+            }
+        };
+        let mut items = Vec::new();
+        for id in ids.iter().skip(start).take(limit as usize) {
+            if let Some(item) = self.item(id)?
+                && item.deleted_at_ms.is_none()
+            {
+                items.push(item);
+            }
         }
         Ok(items)
     }
@@ -452,6 +719,7 @@ type ProviderVisibleRow = (
     Option<i64>,     // created_at_ms
     Option<i64>,     // modified_at_ms
     Option<i64>,     // deleted_at_ms
+    Option<i64>,     // aggregate_size
 );
 
 /// The columns `update_item_content` compares and rewrites, in SELECT
@@ -463,6 +731,15 @@ type StoredContentRow = (
     Option<i64>,    // logical_size
     String,         // metadata_version
     Option<i64>,    // modified_at_ms
+);
+
+/// Archive lifecycle inputs joined from one item and its account.
+type ArchivePinState = (
+    bool,           // account archive_mode
+    i64,            // account policy update time
+    String,         // item availability
+    Option<String>, // item content version
+    Option<i64>,    // item deletion time
 );
 
 fn provider_visible_row(row: &Row<'_>) -> rusqlite::Result<ProviderVisibleRow> {
@@ -478,6 +755,7 @@ fn provider_visible_row(row: &Row<'_>) -> rusqlite::Result<ProviderVisibleRow> {
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -490,6 +768,13 @@ impl WriteTxn<'_> {
     /// errors, not CHECK failures.
     pub fn upsert_item(&self, record: &ItemRecord) -> Result<(), StateError> {
         let derived = derive_identity(&record.id)?;
+        if matches!(derived.kind, ItemKind::YearDir | ItemKind::MediaDir)
+            && record.deleted_at_ms.is_none()
+        {
+            return Err(StateError::InvalidArgument {
+                what: "legacy year and media directory kinds are tombstones only",
+            });
+        }
         if record.safe_name.is_empty() {
             return Err(StateError::InvalidArgument {
                 what: "item safe_name must not be empty",
@@ -503,6 +788,11 @@ impl WriteTxn<'_> {
         if derived.kind.is_directory() && record.content.is_some() {
             return Err(StateError::InvalidArgument {
                 what: "directories carry no content facts",
+            });
+        }
+        if !derived.kind.is_directory() && record.aggregate_size.is_some() {
+            return Err(StateError::InvalidArgument {
+                what: "only directories carry a descendant size rollup",
             });
         }
         let (account_id, namespace) = match derived.scope {
@@ -519,6 +809,7 @@ impl WriteTxn<'_> {
         };
         let content = record.content.clone().unwrap_or_default();
         let logical_size = content.logical_size.map(size_to_column).transpose()?;
+        let aggregate_size = record.aggregate_size.map(size_to_column).transpose()?;
         let (view_kind, view_folder_id) = match derived.view {
             Some((kind, folder)) => (Some(kind), folder),
             None => (None, None),
@@ -534,7 +825,7 @@ impl WriteTxn<'_> {
             .prepare_cached(
                 "SELECT parent_item_id, display_name, safe_name, mime_type, logical_size,
                         metadata_version, content_version, availability, created_at_ms,
-                        modified_at_ms, deleted_at_ms
+                        modified_at_ms, deleted_at_ms, aggregate_size
                  FROM items WHERE item_id = ?1",
             )?
             .query_row(params![record.id.as_bytes()], provider_visible_row)
@@ -554,8 +845,10 @@ impl WriteTxn<'_> {
             record.created_at_ms,
             record.modified_at_ms,
             record.deleted_at_ms,
+            aggregate_size,
         );
         if stored.as_ref() == Some(&incoming) {
+            self.sync_archive_pin(&record.id)?;
             return Ok(());
         }
         self.conn()
@@ -565,9 +858,10 @@ impl WriteTxn<'_> {
                                     view_folder_id, display_name, safe_name, is_directory,
                                     mime_type, logical_size, metadata_version,
                                     content_version, availability, created_at_ms,
-                                    modified_at_ms, deleted_at_ms)
+                                    modified_at_ms, deleted_at_ms, aggregate_size,
+                                    tombstone_provenance)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17, ?18, ?19)
+                         ?16, ?17, ?18, ?19, ?20, ?21)
                  ON CONFLICT (item_id) DO UPDATE SET
                      parent_item_id = excluded.parent_item_id,
                      display_name = excluded.display_name,
@@ -579,7 +873,9 @@ impl WriteTxn<'_> {
                      availability = excluded.availability,
                      created_at_ms = excluded.created_at_ms,
                      modified_at_ms = excluded.modified_at_ms,
-                     deleted_at_ms = excluded.deleted_at_ms",
+                     deleted_at_ms = excluded.deleted_at_ms,
+                     aggregate_size = excluded.aggregate_size,
+                     tombstone_provenance = excluded.tombstone_provenance",
             )?
             .execute(params![
                 record.id.as_bytes(),
@@ -601,8 +897,13 @@ impl WriteTxn<'_> {
                 record.created_at_ms,
                 record.modified_at_ms,
                 record.deleted_at_ms,
+                aggregate_size,
+                record
+                    .deleted_at_ms
+                    .map(|_| TombstoneProvenance::Reconcile.as_str()),
             ])?;
         self.journal_item_change(&record.id)?;
+        self.sync_archive_pin(&record.id)?;
         Ok(())
     }
 
@@ -680,7 +981,145 @@ impl WriteTxn<'_> {
                 modified_at_ms,
             ])?;
         self.journal_item_change(id)?;
+        self.sync_archive_pin(id)?;
         Ok(())
+    }
+
+    /// Recomputes the descendant size rollup of every directory ancestor of
+    /// `id`, up to and including the chat it lives under (BUG-260728-2qfzbd).
+    ///
+    /// Publishing a generated document changes its logical size, and that
+    /// size is a term of its month's rollup and of its chat's. The namespace
+    /// projection also computes these, but a full chat reconciliation
+    /// re-reads every message instant and every attachment projection in the
+    /// chat — far too much work to run after each publication, and measured
+    /// at over 80% sustained agent CPU when it did. This walk is bounded by
+    /// the tree's depth and by each ancestor's own child count.
+    ///
+    /// The metadata version is composed from the same inputs, through the
+    /// same shared helper, that the projection uses. Both owners therefore
+    /// write the identical token for identical state, so neither can undo
+    /// the other and a quiet republication never reaches the provider.
+    ///
+    /// Ancestors above the chat (chat lists, the account root) are left
+    /// alone: they are not correspondence, their child counts are unbounded,
+    /// and no product surface asks for their size.
+    pub fn refresh_ancestor_rollups(&self, id: &ItemId) -> Result<(), StateError> {
+        let mut current = self.parent_of(id)?;
+        while let Some(ancestor) = current {
+            let kind = item_kind(&ancestor)?;
+            if !matches!(
+                kind,
+                ItemKind::Chat | ItemKind::MonthDir | ItemKind::ActiveStories
+            ) {
+                break;
+            }
+            let reached_chat = kind == ItemKind::Chat;
+            self.rewrite_rollup(&ancestor)?;
+            if reached_chat {
+                break;
+            }
+            current = self.parent_of(&ancestor)?;
+        }
+        Ok(())
+    }
+
+    fn parent_of(&self, id: &ItemId) -> Result<Option<ItemId>, StateError> {
+        let raw: Option<Option<Vec<u8>>> = self
+            .conn()
+            .prepare_cached("SELECT parent_item_id FROM items WHERE item_id = ?1")?
+            .query_row(params![id.as_bytes()], |row| row.get(0))
+            .optional()?;
+        match raw.flatten() {
+            Some(bytes) => Ok(Some(item_id_from_column("items", &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Rewrites one directory's rollup and version, journalling only when
+    /// something a provider can see actually moved.
+    fn rewrite_rollup(&self, directory: &ItemId) -> Result<(), StateError> {
+        type RollupRow = (String, String, Option<i64>, Option<i64>, Option<i64>);
+        let stored: Option<RollupRow> = self
+            .conn()
+            .prepare_cached(
+                "SELECT display_name, metadata_version, created_at_ms, modified_at_ms,
+                        aggregate_size
+                 FROM items WHERE item_id = ?1 AND deleted_at_ms IS NULL",
+            )?
+            .query_row(params![directory.as_bytes()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((display_name, stored_version, created_at_ms, modified_at_ms, stored_size)) =
+            stored
+        else {
+            return Ok(());
+        };
+        let total: i64 = self
+            .conn()
+            .prepare_cached(
+                "SELECT COALESCE(sum(COALESCE(aggregate_size, logical_size)), 0)
+                 FROM items WHERE parent_item_id = ?1 AND deleted_at_ms IS NULL",
+            )?
+            .query_row(params![directory.as_bytes()], |row| row.get(0))?;
+        let aggregate = u64::try_from(total).map_err(|_| StateError::CorruptRow {
+            table: "items",
+            detail: "descendant size rollup is negative".to_owned(),
+        })?;
+        // The chat directory's version base is the chat's own metadata
+        // version, exactly as the projection composes it; every other
+        // directory bases on its display name.
+        let base = match directory.key() {
+            ItemKey::Appearance(AppearanceKey {
+                item: CanonicalKey::Chat(chat),
+                ..
+            }) => self.chat_metadata_version(&chat)?.unwrap_or(display_name),
+            _ => display_name,
+        };
+        // This walk only ever reaches chat, month and `Active Stories`
+        // directories (see `refresh_ancestor_rollups`), every one of which
+        // owns a rollup — so the size is always present here, and the
+        // absent case belongs to the kinds this walk stops before.
+        let version =
+            directory_metadata_version(&base, created_at_ms, modified_at_ms, Some(aggregate))
+                .map_err(|error| StateError::CorruptRow {
+                    table: "items",
+                    detail: format!("directory metadata version: {error}"),
+                })?;
+        // Republishing identical facts under an identical version is
+        // provider-invisible and must not advance the item's change sequence,
+        // or every quiet publication tick would wake the provider.
+        if stored_size == Some(total) && stored_version == version.as_str() {
+            return Ok(());
+        }
+        self.conn()
+            .prepare_cached(
+                "UPDATE items SET aggregate_size = ?2, metadata_version = ?3
+                 WHERE item_id = ?1",
+            )?
+            .execute(params![directory.as_bytes(), total, version.as_str()])?;
+        self.journal_item_change(directory)
+    }
+
+    fn chat_metadata_version(&self, chat: &ChatKey) -> Result<Option<String>, StateError> {
+        let (account_id, namespace) = scope_columns(&chat.scope);
+        Ok(self
+            .conn()
+            .prepare_cached(
+                "SELECT metadata_version FROM chats
+                 WHERE account_id = ?1 AND namespace_version = ?2 AND chat_id = ?3",
+            )?
+            .query_row(params![account_id, namespace, chat.chat_id.0], |row| {
+                row.get(0)
+            })
+            .optional()?)
     }
 
     /// Tombstones a node per POL-3: the row stays, keeps its name history,
@@ -694,16 +1133,35 @@ impl WriteTxn<'_> {
         deleted_at_ms: i64,
         new_metadata_version: &MetadataVersion,
     ) -> Result<(), StateError> {
+        self.tombstone_item_with_provenance(
+            id,
+            deleted_at_ms,
+            new_metadata_version,
+            TombstoneProvenance::Reconcile,
+        )
+    }
+
+    /// Tombstones an item with the fixed policy pass that caused it. The
+    /// first tombstone wins, matching `deleted_at_ms` idempotence.
+    pub fn tombstone_item_with_provenance(
+        &self,
+        id: &ItemId,
+        deleted_at_ms: i64,
+        new_metadata_version: &MetadataVersion,
+        provenance: TombstoneProvenance,
+    ) -> Result<(), StateError> {
         let changed = self
             .conn()
             .prepare_cached(
-                "UPDATE items SET deleted_at_ms = ?2, metadata_version = ?3
+                "UPDATE items SET deleted_at_ms = ?2, metadata_version = ?3,
+                                  tombstone_provenance = ?4
                  WHERE item_id = ?1 AND deleted_at_ms IS NULL",
             )?
             .execute(params![
                 id.as_bytes(),
                 deleted_at_ms,
                 new_metadata_version.as_str(),
+                provenance.as_str(),
             ])?;
         if changed == 0 {
             let exists: Option<i64> = self
@@ -716,9 +1174,87 @@ impl WriteTxn<'_> {
             }
             // Already tombstoned: the idempotent re-observation changed
             // nothing provider-visible, so the journal stays quiet.
+            self.sync_archive_pin(id)?;
             return Ok(());
         }
         self.journal_item_change(id)?;
+        self.sync_archive_pin(id)?;
+        Ok(())
+    }
+
+    /// Keeps Archive-Mode byte intent coupled to the current provider
+    /// projection. This runs on live item insert/update/tombstone so content
+    /// observed after Archive Mode was enabled is covered without another
+    /// toggle, while protection/unavailability immediately releases only the
+    /// Archive-owned pin. Explicit user intent is never overwritten.
+    fn sync_archive_pin(&self, id: &ItemId) -> Result<(), StateError> {
+        let state: Option<ArchivePinState> = self
+            .conn()
+            .prepare_cached(
+                "SELECT a.archive_mode, a.updated_at_ms, i.availability,
+                        i.content_version, i.deleted_at_ms
+                 FROM items i JOIN accounts a ON a.account_id = i.account_id
+                 WHERE i.item_id = ?1",
+            )?
+            .query_row(params![id.as_bytes()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((archive_mode, policy_at_ms, availability, content_version, deleted_at_ms)) =
+            state
+        else {
+            return Err(StateError::RowNotFound { entity: "item" });
+        };
+        let persistent_content = match id.key() {
+            ItemKey::Canonical(CanonicalKey::Attachment(_)) => true,
+            ItemKey::Appearance(AppearanceKey {
+                item: CanonicalKey::Attachment(_),
+                ..
+            }) => true,
+            ItemKey::StoryAppearance(appearance) => {
+                appearance.location != StoryAppearanceLocation::Active
+            }
+            _ => false,
+        };
+        let eligible = archive_mode
+            && persistent_content
+            && availability == "fetchable"
+            && content_version.is_some()
+            && deleted_at_ms.is_none();
+        if eligible {
+            self.conn()
+                .prepare_cached(
+                    "INSERT INTO pins (item_id, origin, created_at_ms)
+                     VALUES (?1, 'archive_mode', ?2)
+                     ON CONFLICT (item_id) DO NOTHING",
+                )?
+                .execute(params![id.as_bytes(), policy_at_ms])?;
+            self.conn()
+                .prepare_cached(
+                    "UPDATE cache_entries
+                     SET pinned = 1,
+                         pin_origin = CASE
+                             WHEN pin_origin = 'user' THEN 'user' ELSE 'archive_mode' END
+                     WHERE item_id = ?1",
+                )?
+                .execute(params![id.as_bytes()])?;
+        } else {
+            self.conn()
+                .prepare_cached("DELETE FROM pins WHERE item_id = ?1 AND origin = 'archive_mode'")?
+                .execute(params![id.as_bytes()])?;
+            self.conn()
+                .prepare_cached(
+                    "UPDATE cache_entries SET pinned = 0, pin_origin = NULL
+                     WHERE item_id = ?1 AND pin_origin = 'archive_mode'",
+                )?
+                .execute(params![id.as_bytes()])?;
+        }
         Ok(())
     }
 }

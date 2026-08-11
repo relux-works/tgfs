@@ -1,23 +1,43 @@
+import FileProvider
 import Foundation
+import GramDriveCore
 import Testing
 
 @testable import GramDriveFileProvider
 
 /// Records working-set signals instead of talking to the file provider
 /// daemon.
-private final class RecordingSignaling: WorkingSetSignaling, @unchecked Sendable {
+private final class RecordingSignaling: ProviderChangeSignaling, @unchecked Sendable {
     private let lock = NSLock()
-    private var count = 0
+    private var requests: [Bool] = []
+    private var containers: [[String]] = []
 
     var signalCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return count
+        return requests.count
     }
 
-    func signalWorkingSet(completionHandler: @escaping @Sendable ((any Error)?) -> Void) {
+    var includeRootRequests: [Bool] {
         lock.lock()
-        count += 1
+        defer { lock.unlock() }
+        return requests
+    }
+
+    var changedContainerRequests: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return containers
+    }
+
+    func signalChanges(
+        includeRoot: Bool,
+        changedContainers: [NSFileProviderItemIdentifier],
+        completionHandler: @escaping @Sendable ((any Error)?) -> Void
+    ) {
+        lock.lock()
+        requests.append(includeRoot)
+        containers.append(changedContainers.map(\.rawValue))
         lock.unlock()
         completionHandler(nil)
     }
@@ -72,6 +92,7 @@ struct ChangeSignalRelayTests {
         let token = RecordingToken()
         try relay.start(observe: { _ in token })
         #expect(signaling.signalCount == 1, "the first probe always differs from 'never probed'")
+        #expect(signaling.includeRootRequests == [true])
     }
 
     @Test("A ring with an unmoved stamp stays quiet; movement signals")
@@ -91,6 +112,84 @@ struct ChangeSignalRelayTests {
 
         ring?()  // a real foreign commit moved the stamp
         #expect(signaling.signalCount == 2)
+        #expect(
+            signaling.includeRootRequests == [true, false],
+            "history/render commits signal only the working-set change feed")
+    }
+
+    @Test("A moved journal signals every changed item's parent container")
+    func movementSignalsChangedContainers() throws {
+        let signaling = RecordingSignaling()
+        let probe = ScriptedProbe([.success(1), .success(2)])
+        let snapshots = LockedSnapshots([
+            ProviderContainerChanges(
+                journal: ChangeJournalState(instanceId: "life", latestSequence: 10),
+                containers: []),
+            ProviderContainerChanges(
+                journal: ChangeJournalState(instanceId: "life", latestSequence: 12),
+                containers: [
+                    NSFileProviderItemIdentifier("chat-parent"),
+                    NSFileProviderItemIdentifier("month-parent"),
+                ]),
+        ])
+        let relay = ChangeSignalRelay(
+            probe: { try probe.next() },
+            containerProbe: { _ in snapshots.next() },
+            signaling: signaling)
+        var ring: (@Sendable () -> Void)?
+        try relay.start(observe: { handler in
+            ring = handler
+            return RecordingToken()
+        })
+        ring?()
+
+        #expect(signaling.changedContainerRequests == [
+            [],
+            ["chat-parent", "month-parent"],
+        ])
+    }
+
+    @Test("Journal deltas resolve generated metadata to its parent container")
+    func journalDeltaResolvesParent() throws {
+        let account = AccountInfo(
+            accountId: 7,
+            sourceKind: .localTdlib,
+            displayName: "Account",
+            authState: "authorized",
+            namespaceVersion: 1,
+            displayTimezone: "UTC",
+            rootItemId: "root")
+        let store = ScriptedStore(account: account)
+        store.apply(
+            ItemMetadata(
+                contractVersion: 1,
+                id: "chat-json",
+                parent: "chat-parent",
+                kind: .generatedDoc,
+                isDirectory: false,
+                displayName: ".chat.json",
+                safeName: ".chat.json",
+                metadataVersion: "m1",
+                mimeType: "application/json",
+                logicalSize: 3,
+                attachmentLogicalKind: nil,
+                attachmentRepresentation: nil,
+                attachmentFidelity: nil,
+                attachmentSourceName: nil,
+                attachmentExactSize: nil,
+                contentVersion: "v1",
+                availability: .fetchable,
+                createdAtMs: 1,
+                modifiedAtMs: 2,
+                deletedAtMs: nil))
+
+        let changes = try ProviderContainerChangeResolver.changes(
+            store: store,
+            account: account,
+            after: ChangeJournalState(instanceId: "life-1", latestSequence: 0))
+
+        #expect(changes.journal.latestSequence == 1)
+        #expect(changes.containers.map { $0.rawValue } == ["chat-parent"])
     }
 
     @Test("A failing probe signals nothing; the next successful ring recovers")
@@ -117,5 +216,39 @@ struct ChangeSignalRelayTests {
         #expect(!token.cancelled)
         relay.stop()
         #expect(token.cancelled)
+    }
+
+    @Test("Agent replacement re-signals root even without a new state stamp")
+    func replacementSignalsEnumerators() {
+        let signaling = RecordingSignaling()
+        let relay = ChangeSignalRelay(
+            probe: { 1 },
+            containerProbe: { _ in
+                ProviderContainerChanges(
+                    journal: ChangeJournalState(instanceId: "life", latestSequence: 4),
+                    containers: [NSFileProviderItemIdentifier("chat-parent")])
+            },
+            signaling: signaling)
+
+        relay.signalEnumeratorsAfterAgentReplacement()
+
+        #expect(signaling.includeRootRequests == [true])
+        #expect(signaling.changedContainerRequests == [["chat-parent"]])
+    }
+}
+
+private final class LockedSnapshots: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshots: [ProviderContainerChanges]
+
+    init(_ snapshots: [ProviderContainerChanges]) {
+        self.snapshots = snapshots
+    }
+
+    func next() -> ProviderContainerChanges {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(!snapshots.isEmpty)
+        return snapshots.removeFirst()
     }
 }

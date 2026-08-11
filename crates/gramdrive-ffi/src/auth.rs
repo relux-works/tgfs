@@ -66,7 +66,7 @@ use gramdrive_state::repo::{
 use serde_json::{Value, json};
 
 use crate::api::DriveError;
-use crate::shared_state::shared_state_layout;
+use crate::shared_state::{shared_state_layout, upsert_fixed_root_structure};
 
 /// The provisional account id a sign-in runs under until the account's real
 /// Telegram identity is known. No real Telegram account carries id 0.
@@ -462,7 +462,7 @@ fn backend(error: DriveError) -> SecretError {
     }
 }
 
-fn td_to_drive_error(error: TdError) -> DriveError {
+pub(crate) fn td_to_drive_error(error: TdError) -> DriveError {
     match error {
         TdError::Td { code, message } => DriveError::SourceUnavailable {
             detail: format!("TDLib error {code}: {message}"),
@@ -629,6 +629,10 @@ struct SessionShared {
     config: AuthSessionConfig,
     database_key: Vec<u8>,
     closed: AtomicBool,
+    /// True only after the auth pump has returned and released its
+    /// `ScopeGuard`. `closed` means a close was requested or observed;
+    /// `pump_finished` is the stronger replacement-session barrier.
+    pump_finished: tokio::sync::watch::Sender<bool>,
     // The runtime must outlive the session: dropping the last handle shuts
     // the receive loop down (production's process-wide static also keeps
     // it, but the session must be correct on its own).
@@ -654,14 +658,14 @@ impl std::fmt::Debug for AuthSession {
 }
 
 // Defense in depth (Swift call sites do close today): a host that drops the
-// session handle without `close()` would otherwise strand the pump thread
+// session handle without `shutdown()` would otherwise strand the pump thread
 // spinning on `recv_timeout` and hold the sign-in slot `ScopeGuard`
-// forever, blocking every future sign-in in the process. `close()` is
+// forever, blocking every future sign-in in the process. `shutdown()` is
 // idempotent and closes the client, which ends the update stream and
 // unwinds the pump — releasing the slot scope the pump owns.
 impl Drop for AuthSession {
     fn drop(&mut self) {
-        self.close();
+        self.shutdown();
     }
 }
 
@@ -739,13 +743,29 @@ impl AuthSession {
 
     /// Abandons the flow: closes the client (TDLib confirms with `Closing`
     /// then `Closed`, which the listener still receives). Idempotent.
-    pub fn close(&self) {
+    pub fn shutdown(&self) {
         if self.shared.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         // Runtime-level close: valid regardless of the machine's position.
         // Dropping the handle is fine — the close request is already sent.
         drop(self.shared.client.close());
+    }
+
+    /// Waits until the auth pump has exited and released the single-sign-in
+    /// scope. A `Closed` listener callback happens immediately before that
+    /// release, so callers replacing a session must use this stronger
+    /// barrier instead of treating the callback as proof the slot is free.
+    pub async fn wait_closed(&self) {
+        let mut finished = self.shared.pump_finished.subscribe();
+        if *finished.borrow() {
+            return;
+        }
+        while finished.changed().await.is_ok() {
+            if *finished.borrow() {
+                return;
+            }
+        }
     }
 }
 
@@ -790,6 +810,7 @@ impl AuthSession {
 
         let (client, updates) = runtime.create_client().map_err(td_to_drive_error)?;
 
+        let (pump_finished, _) = tokio::sync::watch::channel(false);
         let shared = Arc::new(SessionShared {
             machine: Mutex::new(AuthMachine::new(tdlib_config)),
             client: client.clone(),
@@ -798,6 +819,7 @@ impl AuthSession {
             config,
             database_key,
             closed: AtomicBool::new(false),
+            pump_finished,
             _runtime: runtime,
         });
 
@@ -813,8 +835,13 @@ impl AuthSession {
         std::thread::Builder::new()
             .name("gramdrive-auth-pump".to_owned())
             .spawn(move || {
-                let _guard = guard;
-                pump(&pump_shared, &updates);
+                {
+                    let _guard = guard;
+                    pump(&pump_shared, &updates);
+                }
+                // Publish completion only after `_guard` has dropped. This
+                // ordering is the contract used by replacement sign-ins.
+                pump_shared.pump_finished.send_replace(true);
             })
             .map_err(|error| DriveError::Internal {
                 detail: format!("could not spawn the auth pump: {error}"),
@@ -1043,6 +1070,7 @@ fn write_account_row(
         display_name: display_name.to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope.namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -1051,7 +1079,7 @@ fn write_account_row(
     })
     .map_err(storage_error)?;
     txn.upsert_item(&ItemRecord {
-        id: root_id,
+        id: root_id.clone(),
         parent: None,
         display_name: display_name.to_owned(),
         safe_name: display_name.to_owned(),
@@ -1059,12 +1087,14 @@ fn write_account_row(
             detail: format!("metadata version: {error}"),
         })?,
         content: None,
+        aggregate_size: None,
         availability: ItemAvailability::Fetchable,
         created_at_ms: Some(now),
         modified_at_ms: Some(now),
         deleted_at_ms: None,
     })
     .map_err(storage_error)?;
+    upsert_fixed_root_structure(&txn, scope, root_id, now)?;
     txn.commit().map_err(storage_error)?;
     Ok(())
 }
@@ -1597,6 +1627,18 @@ mod tests {
             .item(accounts[0].root_item_id.clone())
             .expect("root read");
         assert!(root_item.is_some(), "root item exists");
+        let children = store
+            .children(accounts[0].root_item_id.clone(), None, 10)
+            .expect("fixed root structure");
+        let names: Vec<_> = children
+            .iter()
+            .map(|item| item.display_name.as_str())
+            .collect();
+        assert_eq!(children.len(), 4);
+        assert!(names.contains(&"Chats"));
+        assert!(names.contains(&"Archive"));
+        assert!(names.contains(&"Stories"));
+        assert!(names.contains(&"Folders"));
     }
 
     #[tokio::test]
@@ -1717,7 +1759,7 @@ mod tests {
         fixture
             .listener
             .wait_for(|p| *p == AuthPhase::WaitPhoneNumber);
-        fixture.session.close();
+        fixture.session.shutdown();
         fixture.listener.wait_for(|p| *p == AuthPhase::Closed);
         let error = fixture
             .session
@@ -1778,8 +1820,8 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_session_without_close_frees_the_sign_in_slot() {
-        // A host that drops the handle without close() must not strand the
-        // pump thread or hold the slot scope: Drop→close() unwinds the pump,
+        // A host that drops the handle without shutdown() must not strand the
+        // pump thread or hold the slot scope: Drop→shutdown() unwinds the pump,
         // and a fresh sign-in over the same root then succeeds.
         let root = TempRoot::new();
         let (runtime, handle) = start_runtime();
@@ -1796,7 +1838,7 @@ mod tests {
         kick(&handle, client_id);
         listener.wait_for(|p| *p == AuthPhase::WaitPhoneNumber);
 
-        // Drop without close(); the scope release is asynchronous (the pump
+        // Drop without shutdown(); the scope release is asynchronous (the pump
         // must observe the client's close), so poll the reacquire.
         drop(session);
         let deadline = Instant::now() + GUARD;
@@ -1818,7 +1860,31 @@ mod tests {
                 Err(other) => panic!("unexpected start error: {other:?}"),
             }
         };
-        reacquired.close();
+        reacquired.shutdown();
+    }
+
+    #[tokio::test]
+    async fn wait_closed_returns_only_after_the_sign_in_slot_is_free() {
+        let fixture = start_session();
+        fixture
+            .listener
+            .wait_for(|p| *p == AuthPhase::WaitPhoneNumber);
+
+        fixture.session.shutdown();
+        fixture.session.wait_closed().await;
+
+        // No polling or retry is needed after the explicit barrier: the
+        // pump-owned ScopeGuard has already dropped.
+        let (runtime, handle) = start_runtime();
+        handle.set_responder(sign_in_responder());
+        let replacement = AuthSession::start_over(
+            runtime,
+            config(&fixture.root),
+            Arc::new(FakeVault::default()) as Arc<dyn SecretVault>,
+            Arc::new(RecordingListener::default()) as Arc<dyn AuthStateListener>,
+        )
+        .expect("replacement starts after wait_closed");
+        replacement.shutdown();
     }
 
     #[tokio::test]

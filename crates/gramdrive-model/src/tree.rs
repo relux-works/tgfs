@@ -5,16 +5,17 @@
 //!
 //! ```text
 //! Account/
-//!   Main/
+//!   Chats/
 //!     order.json
 //!     Chat/
-//!       chat.json
-//!       messages.ndjson
-//!       2026/
-//!         07.md
-//!         media/
+//!       .chat.json
+//!       Active Stories/
+//!       2026-07/
+//!         Messages.md
+//!         Messages.ndjson
+//!         <attachments and persistent stories>
 //!   Archive/
-//!   Telegram Folders/
+//!   Folders/
 //! ```
 //!
 //! # Appearances over shared canonical records (SYNC-010, PRD-013)
@@ -63,26 +64,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use crate::identity::{
-    AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
-    CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
-    FolderCatalogKey, FolderId, GeneratedDocKey, ItemId, ItemKey, MediaDirKey, MessageId,
-    MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
+    AccountId, AccountKey, AccountScope, ActiveStoriesKey, AppearanceKey, AttachmentIndex,
+    AttachmentKey, BlobKey, CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash,
+    DocFormat, DocPartition, FolderCatalogKey, FolderId, GeneratedDocKey, ItemId, ItemKey,
+    MessageId, MessageKey, MonthDirKey, NamespaceVersion, OrderDocKey, SchemaFamily,
+    StoryAppearanceKey, StoryAppearanceLocation, StoryId, StoryKey,
 };
 use crate::naming::chat_folder_name;
 use crate::ordering::ORDER_FILE_NAME;
 
-/// Display name of the Main chat-list root.
-const MAIN_NAME: &str = "Main";
+/// Display name of the Telegram main (non-archived) chat-list root.
+const MAIN_NAME: &str = "Chats";
 /// Display name of the Archive chat-list root.
 const ARCHIVE_NAME: &str = "Archive";
+/// Display name of the Telegram story-list root.
+const STORIES_NAME: &str = "Stories";
 /// Display name of the custom-folder catalog.
-const FOLDER_CATALOG_NAME: &str = "Telegram Folders";
-/// Display name of the per-year media directory.
-const MEDIA_DIR_NAME: &str = "media";
+const FOLDER_CATALOG_NAME: &str = "Folders";
+/// Display name of the ephemeral story directory.
+const ACTIVE_STORIES_NAME: &str = "Active Stories";
 /// Display name of the chat metadata document.
-const CHAT_JSON_NAME: &str = "chat.json";
-/// Display name of the whole-chat NDJSON document.
-const MESSAGES_NDJSON_NAME: &str = "messages.ndjson";
+const CHAT_JSON_NAME: &str = ".chat.json";
+const MESSAGES_MARKDOWN_NAME: &str = "Messages.md";
+const MESSAGES_NDJSON_NAME: &str = "Messages.ndjson";
 
 /// Calendar month stamp — the partition a message or attachment falls into.
 ///
@@ -133,11 +137,13 @@ pub struct ChatRecord {
     /// Chat-list views the chat currently appears in. Duplicates are
     /// harmless and collapse; order never matters.
     pub memberships: Vec<ChatListKind>,
-    /// Months with at least one observed message — each becomes a `MM.md`
-    /// partition under its year directory.
+    /// Months with at least one observed message — each becomes a direct
+    /// `YYYY-MM` partition containing both generated documents.
     pub message_months: Vec<MonthStamp>,
     /// Downloadable attachments of the chat's messages.
     pub attachments: Vec<AttachmentRecord>,
+    /// Active and persistent profile-page story appearances.
+    pub stories: Vec<StoryRecord>,
 }
 
 /// Normalized facts about one downloadable attachment.
@@ -147,7 +153,7 @@ pub struct AttachmentRecord {
     pub message_id: MessageId,
     /// Ordinal within that message's attachments.
     pub index: AttachmentIndex,
-    /// Month of the owning message — places the file under `YYYY/media/`.
+    /// Month of the owning message — places the file directly under `YYYY-MM/`.
     pub month: MonthStamp,
     /// Raw file display name.
     pub display_name: String,
@@ -158,6 +164,21 @@ pub struct AttachmentRecord {
     pub content: Option<ContentHash>,
 }
 
+/// One canonical story and its current presentation in the chat tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryRecord {
+    /// Telegram story id; canonical identity is `(chat_id, story_id)`.
+    pub story_id: StoryId,
+    /// Active or persistent monthly placement.
+    pub location: StoryAppearanceLocation,
+    /// Truthful generated display name for the appearance.
+    pub display_name: String,
+    /// Exact size when Telegram reports it.
+    pub size: Option<u64>,
+    /// Shared canonical bytes, absent for restricted/unavailable stories.
+    pub content: Option<ContentHash>,
+}
+
 /// Schema families of the generated documents the tree publishes (DOM-023).
 ///
 /// Family numbers are assigned by the rendering layer
@@ -165,11 +186,11 @@ pub struct AttachmentRecord {
 /// generated-document identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocSchemas {
-    /// Family of the `chat.json` metadata document.
+    /// Family of the `.chat.json` metadata document.
     pub chat_json: SchemaFamily,
-    /// Family of the whole-chat `messages.ndjson` document.
+    /// Family of each monthly `Messages.ndjson` document.
     pub messages_ndjson: SchemaFamily,
-    /// Family of the monthly `MM.md` Markdown documents.
+    /// Family of the monthly `Messages.md` documents.
     pub month_markdown: SchemaFamily,
     /// Family of the per-list `order.json` ordering document (POL-1).
     pub order_json: SchemaFamily,
@@ -240,20 +261,31 @@ pub enum NodeKind {
     FolderCatalog,
     /// One appearance of a chat as a folder.
     Chat,
-    /// A calendar-year directory of a chat's export.
+    /// Legacy calendar-year directory, parsed for migration compatibility
+    /// but never emitted by the date-first projection.
     Year,
-    /// The media directory of one chat-export year.
+    /// Legacy media directory, parsed for migration compatibility but never
+    /// emitted by the date-first projection.
     Media,
-    /// A generated document: `chat.json`, `messages.ndjson`, or `MM.md`.
+    /// The ephemeral `Active Stories` directory.
+    ActiveStories,
+    /// A direct `YYYY-MM` timeline directory.
+    Month,
+    /// A generated document: `.chat.json`, `Messages.ndjson`, or `Messages.md`.
     GeneratedDoc,
     /// A downloadable attachment file.
     Attachment,
+    /// One appearance of canonical story bytes.
+    StoryAppearance,
 }
 
 impl NodeKind {
     /// Whether nodes of this kind are directories.
     pub fn is_directory(self) -> bool {
-        !matches!(self, Self::GeneratedDoc | Self::Attachment)
+        !matches!(
+            self,
+            Self::GeneratedDoc | Self::Attachment | Self::StoryAppearance
+        )
     }
 }
 
@@ -328,6 +360,13 @@ pub enum TreeInputError {
         /// The duplicated ordinal.
         index: AttachmentIndex,
     },
+    /// Two story records share one canonical `(poster_chat_id, story_id)`.
+    DuplicateStory {
+        /// The chat carrying the story.
+        chat: ChatId,
+        /// The duplicated story id.
+        story: StoryId,
+    },
 }
 
 impl std::fmt::Display for TreeInputError {
@@ -358,6 +397,9 @@ impl std::fmt::Display for TreeInputError {
                 "chat {} has duplicate attachment (message {}, index {})",
                 chat.0, message.0, index.0
             ),
+            Self::DuplicateStory { chat, story } => {
+                write!(f, "chat {} has duplicate story {}", chat.0, story.0)
+            }
         }
     }
 }
@@ -397,7 +439,8 @@ fn view_rank(view: ChatListKind) -> (u8, i32) {
     match view {
         ChatListKind::Main => (0, 0),
         ChatListKind::Archive => (1, 0),
-        ChatListKind::Folder(FolderId(id)) => (2, id),
+        ChatListKind::Stories => (2, 0),
+        ChatListKind::Folder(FolderId(id)) => (3, id),
     }
 }
 
@@ -406,23 +449,35 @@ fn view_rank(view: ChatListKind) -> (u8, i32) {
 struct ChatState {
     title: String,
     username: Option<String>,
-    /// Export years, each with its month partitions and media set.
-    years: BTreeMap<u16, YearState>,
+    /// Direct timeline months and their flat content namespace.
+    months: BTreeMap<MonthStamp, MonthState>,
     /// Attachment metadata by (message ID, ordinal), for direct resolution.
     attachments: BTreeMap<(i64, u32), AttachmentState>,
+    /// Story metadata by canonical story id.
+    stories: BTreeMap<i64, StoryState>,
+    /// Canonical stories currently presented under `Active Stories`.
+    active_stories: BTreeSet<i64>,
 }
 
 #[derive(Debug, Default)]
-struct YearState {
-    /// Months (1–12) with a `MM.md` partition.
-    months: BTreeSet<u8>,
-    /// Attachments of this year, in (message ID, ordinal) order.
-    media: BTreeSet<(i64, u32)>,
+struct MonthState {
+    /// Attachments of this month, in (message ID, ordinal) order.
+    attachments: BTreeSet<(i64, u32)>,
+    /// Persistent profile-page story appearances in story-id order.
+    stories: BTreeSet<i64>,
 }
 
 #[derive(Debug)]
 struct AttachmentState {
     month: MonthStamp,
+    display_name: String,
+    size: Option<u64>,
+    content: Option<ContentHash>,
+}
+
+#[derive(Debug)]
+struct StoryState {
+    location: StoryAppearanceLocation,
     display_name: String,
     size: Option<u64>,
     content: Option<ContentHash>,
@@ -483,6 +538,7 @@ impl TreeProjection {
         let mut members: BTreeMap<(u8, i32), BTreeSet<i64>> = BTreeMap::new();
         members.insert(view_rank(ChatListKind::Main), BTreeSet::new());
         members.insert(view_rank(ChatListKind::Archive), BTreeSet::new());
+        members.insert(view_rank(ChatListKind::Stories), BTreeSet::new());
         for folder_id in folder_map.keys() {
             members.insert(
                 view_rank(ChatListKind::Folder(FolderId(*folder_id))),
@@ -496,14 +552,10 @@ impl TreeProjection {
                 return Err(TreeInputError::DuplicateChat { chat: chat.chat_id });
             }
 
-            let mut years: BTreeMap<u16, YearState> = BTreeMap::new();
+            let mut months: BTreeMap<MonthStamp, MonthState> = BTreeMap::new();
             for stamp in &chat.message_months {
                 validate_month(chat.chat_id, *stamp)?;
-                years
-                    .entry(stamp.year)
-                    .or_default()
-                    .months
-                    .insert(stamp.month);
+                months.entry(*stamp).or_default();
             }
 
             let mut attachments = BTreeMap::new();
@@ -523,11 +575,45 @@ impl TreeProjection {
                         index: attachment.index,
                     });
                 }
-                years
-                    .entry(attachment.month.year)
+                months
+                    .entry(attachment.month)
                     .or_default()
-                    .media
+                    .attachments
                     .insert(ordinal);
+            }
+
+            let mut stories = BTreeMap::new();
+            let mut active_stories = BTreeSet::new();
+            for story in chat.stories {
+                if let StoryAppearanceLocation::Month { year, month } = story.location {
+                    let stamp = MonthStamp { year, month };
+                    validate_month(chat.chat_id, stamp)?;
+                    months
+                        .entry(stamp)
+                        .or_default()
+                        .stories
+                        .insert(story.story_id.0);
+                } else {
+                    active_stories.insert(story.story_id.0);
+                }
+                let story_id = story.story_id;
+                if stories
+                    .insert(
+                        story_id.0,
+                        StoryState {
+                            location: story.location,
+                            display_name: story.display_name,
+                            size: story.size,
+                            content: story.content,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(TreeInputError::DuplicateStory {
+                        chat: chat.chat_id,
+                        story: story_id,
+                    });
+                }
             }
 
             for membership in &chat.memberships {
@@ -549,8 +635,10 @@ impl TreeProjection {
                 ChatState {
                     title: chat.title,
                     username: chat.username,
-                    years,
+                    months,
                     attachments,
+                    stories,
+                    active_stories,
                 },
             );
         }
@@ -659,6 +747,10 @@ impl TreeProjection {
                     scope: self.scope,
                     kind: ChatListKind::Archive,
                 })),
+                ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                    scope: self.scope,
+                    kind: ChatListKind::Stories,
+                })),
                 ItemKey::Canonical(CanonicalKey::FolderCatalog(FolderCatalogKey {
                     scope: self.scope,
                 })),
@@ -699,6 +791,7 @@ impl TreeProjection {
             ItemKey::Appearance(AppearanceKey { view, item }) => {
                 self.appearance_child_keys(*view, item)
             }
+            ItemKey::StoryAppearance(_) => Vec::new(),
             _ => Vec::new(),
         }
     }
@@ -710,79 +803,100 @@ impl TreeProjection {
                 let Some(state) = self.chats.get(&chat.chat_id.0) else {
                     return Vec::new();
                 };
-                let mut keys = vec![
-                    appearance(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+                let mut keys = vec![appearance(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+                    chat: *chat,
+                    partition: DocPartition::Chat,
+                    format: DocFormat::Json,
+                    schema_family: self.schemas.chat_json,
+                }))];
+                if !state.active_stories.is_empty() {
+                    keys.push(appearance(CanonicalKey::ActiveStories(ActiveStoriesKey {
                         chat: *chat,
-                        partition: DocPartition::Chat,
-                        format: DocFormat::Json,
-                        schema_family: self.schemas.chat_json,
-                    })),
-                    appearance(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+                    })));
+                }
+                keys.extend(state.months.keys().map(|stamp| {
+                    appearance(CanonicalKey::MonthDir(MonthDirKey {
                         chat: *chat,
-                        partition: DocPartition::Chat,
-                        format: DocFormat::Ndjson,
-                        schema_family: self.schemas.messages_ndjson,
-                    })),
-                ];
-                keys.extend(state.years.keys().map(|year| {
-                    appearance(CanonicalKey::YearDir(YearDirKey {
-                        chat: *chat,
-                        year: *year,
+                        year: stamp.year,
+                        month: stamp.month,
                     }))
                 }));
                 keys
             }
-            CanonicalKey::YearDir(dir) => {
-                let Some(year) = self
-                    .chats
-                    .get(&dir.chat.chat_id.0)
-                    .and_then(|state| state.years.get(&dir.year))
-                else {
+            CanonicalKey::ActiveStories(dir) => {
+                let Some(state) = self.chats.get(&dir.chat.chat_id.0) else {
                     return Vec::new();
                 };
-                let mut keys: Vec<ItemKey> = year
-                    .months
+                state
+                    .active_stories
                     .iter()
-                    .map(|month| {
-                        appearance(CanonicalKey::GeneratedDoc(GeneratedDocKey {
-                            chat: dir.chat,
-                            partition: DocPartition::Month {
-                                year: dir.year,
-                                month: *month,
+                    .map(|story_id| {
+                        ItemKey::StoryAppearance(StoryAppearanceKey {
+                            story: StoryKey {
+                                poster: dir.chat,
+                                story_id: StoryId(*story_id),
                             },
-                            format: DocFormat::Markdown,
-                            schema_family: self.schemas.month_markdown,
-                        }))
-                    })
-                    .collect();
-                if !year.media.is_empty() {
-                    keys.push(appearance(CanonicalKey::MediaDir(MediaDirKey {
-                        chat: dir.chat,
-                        year: dir.year,
-                    })));
-                }
-                keys
-            }
-            CanonicalKey::MediaDir(dir) => {
-                let Some(year) = self
-                    .chats
-                    .get(&dir.chat.chat_id.0)
-                    .and_then(|state| state.years.get(&dir.year))
-                else {
-                    return Vec::new();
-                };
-                year.media
-                    .iter()
-                    .map(|(message_id, index)| {
-                        appearance(CanonicalKey::Attachment(AttachmentKey {
-                            message: MessageKey {
-                                chat: dir.chat,
-                                message_id: MessageId(*message_id),
-                            },
-                            index: AttachmentIndex(*index),
-                        }))
+                            view,
+                            location: StoryAppearanceLocation::Active,
+                        })
                     })
                     .collect()
+            }
+            CanonicalKey::MonthDir(dir) => {
+                let stamp = MonthStamp {
+                    year: dir.year,
+                    month: dir.month,
+                };
+                let Some(month) = self
+                    .chats
+                    .get(&dir.chat.chat_id.0)
+                    .and_then(|state| state.months.get(&stamp))
+                else {
+                    return Vec::new();
+                };
+                let mut keys = vec![
+                    appearance(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+                        chat: dir.chat,
+                        partition: DocPartition::Month {
+                            year: dir.year,
+                            month: dir.month,
+                        },
+                        format: DocFormat::Markdown,
+                        schema_family: self.schemas.month_markdown,
+                    })),
+                    appearance(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+                        chat: dir.chat,
+                        partition: DocPartition::Month {
+                            year: dir.year,
+                            month: dir.month,
+                        },
+                        format: DocFormat::Ndjson,
+                        schema_family: self.schemas.messages_ndjson,
+                    })),
+                ];
+                keys.extend(month.attachments.iter().map(|(message_id, index)| {
+                    appearance(CanonicalKey::Attachment(AttachmentKey {
+                        message: MessageKey {
+                            chat: dir.chat,
+                            message_id: MessageId(*message_id),
+                        },
+                        index: AttachmentIndex(*index),
+                    }))
+                }));
+                keys.extend(month.stories.iter().map(|story_id| {
+                    ItemKey::StoryAppearance(StoryAppearanceKey {
+                        story: StoryKey {
+                            poster: dir.chat,
+                            story_id: StoryId(*story_id),
+                        },
+                        view,
+                        location: StoryAppearanceLocation::Month {
+                            year: dir.year,
+                            month: dir.month,
+                        },
+                    })
+                }));
+                keys
             }
             _ => Vec::new(),
         }
@@ -798,10 +912,11 @@ impl TreeProjection {
             ItemKey::Appearance(AppearanceKey { view, item }) => {
                 self.resolve_appearance(*view, item)
             }
+            ItemKey::StoryAppearance(appearance) => self.resolve_story_appearance(*appearance),
         }
     }
 
-    /// Canonical tree positions: the account root, the three fixed roots,
+    /// Canonical tree positions: the account root, the four fixed roots,
     /// and custom-folder view roots. Every other canonical key is a record
     /// referenced by the tree, not a position in it.
     fn resolve_canonical(&self, key: &CanonicalKey) -> Option<TreeNode> {
@@ -811,6 +926,7 @@ impl TreeProjection {
                 let (name, parent) = match list.kind {
                     ChatListKind::Main => (MAIN_NAME.to_string(), self.root_id()),
                     ChatListKind::Archive => (ARCHIVE_NAME.to_string(), self.root_id()),
+                    ChatListKind::Stories => (STORIES_NAME.to_string(), self.root_id()),
                     ChatListKind::Folder(folder) => (
                         self.folders.get(&folder.0)?.clone(),
                         ItemKey::Canonical(CanonicalKey::FolderCatalog(FolderCatalogKey {
@@ -878,34 +994,30 @@ impl TreeProjection {
                     ),
                 )
             }
-            CanonicalKey::YearDir(dir) => {
+            CanonicalKey::ActiveStories(dir) => {
                 let state = self.member_chat_state(view, &dir.chat)?;
-                state.years.get(&dir.year)?;
+                if state.active_stories.is_empty() {
+                    return None;
+                }
                 Some(self.directory_node(
                     appearance(*item),
                     appearance(CanonicalKey::Chat(dir.chat)).id(),
-                    NodeKind::Year,
-                    format!("{:04}", dir.year),
+                    NodeKind::ActiveStories,
+                    ACTIVE_STORIES_NAME.to_string(),
                 ))
             }
-            CanonicalKey::MediaDir(dir) => {
+            CanonicalKey::MonthDir(dir) => {
                 let state = self.member_chat_state(view, &dir.chat)?;
-                let year = state.years.get(&dir.year)?;
-                if year.media.is_empty() {
-                    return None;
-                }
-                Some(
-                    self.directory_node(
-                        appearance(*item),
-                        appearance(CanonicalKey::YearDir(YearDirKey {
-                            chat: dir.chat,
-                            year: dir.year,
-                        }))
-                        .id(),
-                        NodeKind::Media,
-                        MEDIA_DIR_NAME.to_string(),
-                    ),
-                )
+                state.months.get(&MonthStamp {
+                    year: dir.year,
+                    month: dir.month,
+                })?;
+                Some(self.directory_node(
+                    appearance(*item),
+                    appearance(CanonicalKey::Chat(dir.chat)).id(),
+                    NodeKind::Month,
+                    format!("{:04}-{:02}", dir.year, dir.month),
+                ))
             }
             CanonicalKey::GeneratedDoc(doc) => {
                 let state = self.member_chat_state(view, &doc.chat)?;
@@ -918,26 +1030,30 @@ impl TreeProjection {
                             appearance(CanonicalKey::Chat(doc.chat)).id(),
                         )
                     }
-                    (DocPartition::Chat, DocFormat::Ndjson)
-                        if doc.schema_family == self.schemas.messages_ndjson =>
+                    (DocPartition::Month { year, month }, DocFormat::Markdown)
+                        if doc.schema_family == self.schemas.month_markdown
+                            && state.months.contains_key(&MonthStamp { year, month }) =>
+                    {
+                        (
+                            MESSAGES_MARKDOWN_NAME.to_string(),
+                            appearance(CanonicalKey::MonthDir(MonthDirKey {
+                                chat: doc.chat,
+                                year,
+                                month,
+                            }))
+                            .id(),
+                        )
+                    }
+                    (DocPartition::Month { year, month }, DocFormat::Ndjson)
+                        if doc.schema_family == self.schemas.messages_ndjson
+                            && state.months.contains_key(&MonthStamp { year, month }) =>
                     {
                         (
                             MESSAGES_NDJSON_NAME.to_string(),
-                            appearance(CanonicalKey::Chat(doc.chat)).id(),
-                        )
-                    }
-                    (DocPartition::Month { year, month }, DocFormat::Markdown)
-                        if doc.schema_family == self.schemas.month_markdown
-                            && state
-                                .years
-                                .get(&year)
-                                .is_some_and(|state| state.months.contains(&month)) =>
-                    {
-                        (
-                            format!("{month:02}.md"),
-                            appearance(CanonicalKey::YearDir(YearDirKey {
+                            appearance(CanonicalKey::MonthDir(MonthDirKey {
                                 chat: doc.chat,
                                 year,
+                                month,
                             }))
                             .id(),
                         )
@@ -962,9 +1078,10 @@ impl TreeProjection {
                 Some(TreeNode {
                     id: appearance(*item).id(),
                     parent: Some(
-                        appearance(CanonicalKey::MediaDir(MediaDirKey {
+                        appearance(CanonicalKey::MonthDir(MonthDirKey {
                             chat: attachment.message.chat,
                             year: record.month.year,
+                            month: record.month.month,
                         }))
                         .id(),
                     ),
@@ -986,6 +1103,45 @@ impl TreeProjection {
         }
     }
 
+    fn resolve_story_appearance(&self, appearance: StoryAppearanceKey) -> Option<TreeNode> {
+        let state = self.member_chat_state(appearance.view, &appearance.story.poster)?;
+        let record = state.stories.get(&appearance.story.story_id.0)?;
+        if record.location != appearance.location {
+            return None;
+        }
+        let parent = match appearance.location {
+            StoryAppearanceLocation::Active => ItemKey::Appearance(AppearanceKey {
+                view: appearance.view,
+                item: CanonicalKey::ActiveStories(ActiveStoriesKey {
+                    chat: appearance.story.poster,
+                }),
+            })
+            .id(),
+            StoryAppearanceLocation::Month { year, month } => ItemKey::Appearance(AppearanceKey {
+                view: appearance.view,
+                item: CanonicalKey::MonthDir(MonthDirKey {
+                    chat: appearance.story.poster,
+                    year,
+                    month,
+                }),
+            })
+            .id(),
+        };
+        Some(TreeNode {
+            id: ItemKey::StoryAppearance(appearance).id(),
+            parent: Some(parent),
+            kind: NodeKind::StoryAppearance,
+            display_name: record.display_name.clone(),
+            canonical: CanonicalKey::Story(appearance.story),
+            capabilities: Capabilities::read_only_file(),
+            size: record.size,
+            content: record.content.map(|hash| BlobKey {
+                account: self.scope.account,
+                hash,
+            }),
+        })
+    }
+
     /// The canonical state of `chat`, provided the chat is a member of
     /// `view` — the check that makes non-member appearances unresolvable.
     fn member_chat_state(&self, view: ChatListKind, chat: &ChatKey) -> Option<&ChatState> {
@@ -1004,7 +1160,7 @@ impl TreeProjection {
 
     fn view_exists(&self, view: ChatListKind) -> bool {
         match view {
-            ChatListKind::Main | ChatListKind::Archive => true,
+            ChatListKind::Main | ChatListKind::Archive | ChatListKind::Stories => true,
             ChatListKind::Folder(folder) => self.folders.contains_key(&folder.0),
         }
     }
@@ -1026,6 +1182,7 @@ impl TreeProjection {
         let canonical = match key {
             ItemKey::Canonical(canonical) => canonical,
             ItemKey::Appearance(AppearanceKey { item, .. }) => item,
+            ItemKey::StoryAppearance(appearance) => CanonicalKey::Story(appearance.story),
         };
         TreeNode {
             id: key.id(),

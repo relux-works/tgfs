@@ -27,15 +27,15 @@ use gramdrive_model::identity::{
 use gramdrive_model::version::MetadataVersion;
 use gramdrive_source_tdjson::SnapshotChatKind;
 use gramdrive_source_tdjson::folders::{
-    FolderCatalogBatch, FolderCatalogMachine, FolderDefinition, FolderInvalidation,
+    FolderCatalogMachine, FolderDefinition, FolderInvalidation,
 };
 use gramdrive_source_tdjson::updates::{
     ChatMetadata, MembershipChange, UpdateBatch, UpdateMachine,
 };
-use gramdrive_state::StateStore;
 use gramdrive_state::repo::{
-    AccountRecord, ChatListEntry, ChatRecord, ChatType, RetentionMode, SourceKind,
+    AccountRecord, ChatListEntry, ChatRecord, ChatType, FolderRecord, RetentionMode, SourceKind,
 };
+use gramdrive_state::{StateError, StateStore};
 
 const ACCOUNT_ID: i64 = 7;
 const NAMESPACE: u32 = 1;
@@ -62,6 +62,7 @@ fn list_json(list: ChatListKind) -> Value {
     match list {
         ChatListKind::Main => json!({"@type": "chatListMain"}),
         ChatListKind::Archive => json!({"@type": "chatListArchive"}),
+        ChatListKind::Stories => panic!("Stories is derived from storyListMain"),
         ChatListKind::Folder(id) => json!({"@type": "chatListFolder", "chat_folder_id": id.0}),
     }
 }
@@ -124,6 +125,7 @@ fn store_with_account() -> StateStore {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -217,24 +219,27 @@ fn apply_chat_batch(store: &mut StateStore, batch: &UpdateBatch) {
     tx.commit().expect("commit chat batch");
 }
 
-/// Apply a folder-catalog batch's removals as a composing caller must: a
-/// deleted folder's appearances are cleared with an empty membership replace,
-/// which drops only that folder's `chat_list_entries` (SYNC-026). Folder
-/// definition upserts have no persistence target in this schema version, so the
-/// caller here consumes them but the suites assert them from the batch.
-fn apply_folder_removals(store: &mut StateStore, batch: &FolderCatalogBatch) {
+/// Persist the complete folder catalog as the composing caller does. A removed
+/// catalog definition is the positive witness that authorizes deleting only
+/// that folder's appearances; it is distinct from a chat departure and must
+/// not be routed through whole-list snapshot replacement.
+fn apply_folder_catalog(store: &mut StateStore, catalog: &FolderCatalogMachine) -> Vec<FolderId> {
+    let folders: Vec<_> = catalog
+        .definitions()
+        .into_iter()
+        .map(|folder| FolderRecord {
+            scope: scope(),
+            folder_id: folder.id,
+            title: folder.title,
+            position: folder.position,
+        })
+        .collect();
     let tx = store.write_txn().expect("write txn");
-    for &id in &batch.removed {
-        tx.replace_chat_list(
-            &ChatListKey {
-                scope: scope(),
-                kind: ChatListKind::Folder(id),
-            },
-            &[],
-        )
-        .expect("clear deleted folder membership");
-    }
-    tx.commit().expect("commit folder removals");
+    let removed = tx
+        .replace_folders(scope(), &folders)
+        .expect("persist folder catalog");
+    tx.commit().expect("commit folder catalog");
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +308,10 @@ fn a_chat_in_two_folders_is_one_canonical_record_with_three_appearances() {
     catalog.on_update(&folders_update(&[(4, "Work"), (7, "Family")]));
     let catalog_batch = catalog.take_batch();
     assert_eq!(
+        apply_folder_catalog(&mut store, &catalog),
+        Vec::<FolderId>::new()
+    );
+    assert_eq!(
         catalog.folders(),
         vec![FolderId(4), FolderId(7)],
         "the folder set feeds the snapshot plan in tab order"
@@ -355,6 +364,10 @@ fn deleting_a_folder_removes_appearances_only() {
 
     catalog.on_update(&folders_update(&[(4, "Work"), (7, "Family")]));
     let _ = catalog.take_batch();
+    assert_eq!(
+        apply_folder_catalog(&mut store, &catalog),
+        Vec::<FolderId>::new()
+    );
 
     updates.on_update(&new_private_chat(
         101,
@@ -385,7 +398,7 @@ fn deleting_a_folder_removes_appearances_only() {
             .contains(&FolderInvalidation::Removed { id: FolderId(7) }),
         "the deletion is reported"
     );
-    apply_folder_removals(&mut store, &batch);
+    assert_eq!(apply_folder_catalog(&mut store, &catalog), batch.removed);
 
     // Family's appearances are gone; nothing else is.
     assert_eq!(
@@ -419,6 +432,10 @@ fn renaming_a_folder_preserves_memberships_and_canonical_data() {
 
     catalog.on_update(&folders_update(&[(4, "Work")]));
     let _ = catalog.take_batch();
+    assert_eq!(
+        apply_folder_catalog(&mut store, &catalog),
+        Vec::<FolderId>::new()
+    );
     updates.on_update(&new_private_chat(
         101,
         1101,
@@ -445,7 +462,10 @@ fn renaming_a_folder_preserves_memberships_and_canonical_data() {
     );
     // A rename carries no membership or removal work.
     assert!(batch.removed.is_empty());
-    apply_folder_removals(&mut store, &batch);
+    assert_eq!(
+        apply_folder_catalog(&mut store, &catalog),
+        Vec::<FolderId>::new()
+    );
     assert_eq!(
         list_members(&mut store, folder(4)),
         before,
@@ -463,6 +483,10 @@ fn reordering_the_catalog_is_ordering_only() {
 
     catalog.on_update(&folders_update(&[(4, "Work"), (7, "Family")]));
     let _ = catalog.take_batch();
+    assert_eq!(
+        apply_folder_catalog(&mut store, &catalog),
+        Vec::<FolderId>::new()
+    );
     updates.on_update(&new_private_chat(
         101,
         1101,
@@ -480,7 +504,10 @@ fn reordering_the_catalog_is_ordering_only() {
         "a reorder is content, never a rename (POL-1)"
     );
     assert!(batch.removed.is_empty());
-    apply_folder_removals(&mut store, &batch);
+    assert_eq!(
+        apply_folder_catalog(&mut store, &catalog),
+        Vec::<FolderId>::new()
+    );
     assert_eq!(
         list_members(&mut store, folder(4)),
         before,
@@ -512,6 +539,10 @@ fn creating_a_folder_adds_appearances_incrementally() {
     catalog.on_update(&folders_update(&[(4, "Work")]));
     let catalog_batch = catalog.take_batch();
     assert_eq!(
+        apply_folder_catalog(&mut store, &catalog),
+        Vec::<FolderId>::new()
+    );
+    assert_eq!(
         catalog_batch.invalidations,
         vec![
             FolderInvalidation::Created { id: FolderId(4) },
@@ -533,4 +564,76 @@ fn creating_a_folder_adds_appearances_incrementally() {
         "the folder membership is a second appearance of the same chat"
     );
     assert_eq!(list_members(&mut store, folder(4)), vec![101]);
+}
+
+/// A strict-subset whole-list replacement without a chat departure witness is
+/// rejected and preserves the previous membership. Folder-catalog deletion is
+/// deliberately not modeled by this path; its catalog witness is persisted by
+/// [`apply_folder_catalog`].
+#[test]
+fn unwitnessed_strict_subset_folder_membership_shrink_fails_closed() {
+    let mut store = store_with_account();
+    let list = ChatListKey {
+        scope: scope(),
+        kind: folder(4),
+    };
+    let tx = store.write_txn().expect("write baseline");
+    for chat_id in [101, 102] {
+        tx.upsert_chat(&ChatRecord {
+            key: ChatKey {
+                scope: scope(),
+                chat_id: ChatId(chat_id),
+            },
+            chat_type: ChatType::Private,
+            title: format!("Chat {chat_id}"),
+            username: None,
+            is_protected: false,
+            archive_mode: false,
+            metadata_version: MetadataVersion::new(format!("v{chat_id}")).expect("version"),
+            left_at_ms: None,
+            deleted_at_ms: None,
+            last_update_at_ms: Some(NOW_MS),
+        })
+        .expect("chat");
+    }
+    tx.replace_chat_list(
+        &list,
+        &[
+            ChatListEntry {
+                chat_id: ChatId(101),
+                sort_order: 2_000,
+                pinned: false,
+            },
+            ChatListEntry {
+                chat_id: ChatId(102),
+                sort_order: 1_000,
+                pinned: false,
+            },
+        ],
+    )
+    .expect("baseline membership");
+    tx.commit().expect("commit baseline");
+
+    let tx = store.write_txn().expect("attempt strict subset");
+    let error = tx
+        .replace_chat_list(
+            &list,
+            &[ChatListEntry {
+                chat_id: ChatId(101),
+                sort_order: 2_000,
+                pinned: false,
+            }],
+        )
+        .expect_err("unwitnessed shrink must fail closed");
+    assert!(matches!(
+        error,
+        StateError::UnsafeChatListShrink {
+            before_count: 2,
+            after_count: 1,
+            uncorroborated_removals: 1,
+        }
+    ));
+    tx.commit().expect("rejected attempt changes nothing");
+
+    assert_eq!(list_members(&mut store, folder(4)), vec![101, 102]);
 }

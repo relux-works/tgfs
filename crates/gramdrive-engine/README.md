@@ -18,15 +18,16 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
   and two-phase cancellation. Crash-resume composes with
   `StateStore::reconcile`: reconcile first, then claim.
 - `fetch` — the ranged fetch coordinator (TASK-260715-22fh09;
-  SYNC-041/043/044/045/046). `FetchCoordinator` drives a `DriveSource`
-  through the machine's claims: readers coalesce onto live transfers and
-  stream from staged bytes, sub-fetches align to a chunk grid with bounded
-  fanout per item, stale locators refresh in-attempt with identity
-  unchanged, every other failure classifies through the machine's retry
-  taxonomy, and cancellation is prompt both by dropped future and by
-  durable two-phase cancel. Runtime-agnostic and clock-free: the host
-  supplies a `Clock` and a `StagingHost`, and tests drive it on the
-  testkit's deterministic executor.
+  SYNC-041/043/044/045/046). `FetchCoordinator` drives a `ContentSource`
+  through the machine's claims: ranged readers coalesce onto live transfers
+  and stream from staged bytes, while sink-less on-demand subscribers join
+  the same close count so one caller cannot cancel work another still owns.
+  Sub-fetches align to a chunk grid with bounded fanout per item, stale
+  locators refresh in-attempt with identity unchanged, every other failure
+  classifies through the machine's retry taxonomy, and cancellation is prompt
+  both by dropped future and by durable two-phase cancel. Runtime-agnostic and
+  clock-free: the host supplies a `Clock` and a `StagingHost`, and tests drive
+  it on the testkit's deterministic executor.
 - `cache` — integrity verification and atomic promotion (TASK-260715-3s6cpe;
   SYNC-042, SYNC-050..053). `Promoter` layers over the machine's
   `CompleteOutcome::Promoted`: it hashes the whole staged object with a
@@ -55,19 +56,19 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
 - `render_plan` — the incremental render planner (TASK-260715-22l8zy;
   SYNC-024, SYNC-030..033, DOM-006, DOM-023). From the send instants of a
   normalized-change batch and the frozen renderer/schema versions, it computes
-  which generated documents went stale: the whole-chat `messages.ndjson`
-  (always) and the transcript of each touched calendar month (only), keyed by a
+  which generated documents went stale: the bounded `Messages.md` and
+  `Messages.ndjson` pair in each touched direct `YYYY-MM` partition (only), keyed by a
   `catalog` of document classes that read their identities, versions, and
   content-version tokens straight from `gramdrive-render`. Months come from the
-  renderer's own `civil` calendar, so a message never plans into a month the
-  renderer would not group it under. `dirty_affected` records the stale set on
+  renderer's own IANA-aware `civil` calendar, so a message never plans into a
+  month the renderer would not group it under. `dirty_affected` records the stale set on
   the durable dirty worklist in the change's own transaction (SYNC-022);
   `plan_for_changes` and `plan_worklist` turn stale documents into `RenderJob`s
   against the chat's current event watermark, skipping anything already current
-  (idempotent re-planning). The planner never renders or publishes — atomic,
-  resumable publication is `gramdrive-state`'s `publish_render` watermark
-  protocol, so an interrupted regeneration leaves the previous version readable
-  and the work on the worklist (SYNC-033).
+  (idempotent re-planning). `render_pipeline` composes the pair from one pinned
+  snapshot, promotes one immutable version directory, and publishes item facts,
+  cache locators, watermarks, and provider change signals in one transaction
+  (SYNC-033).
 
 - `backfill` — the metadata-first local backfill scheduler
   (TASK-260715-mua1ng; POL-2/DEC-014, SYNC-020/021, SEC-031, NFR-033,
@@ -77,8 +78,11 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
   and the source failure taxonomy. `BackfillScheduler::plan_next` yields one
   history action per call, ordered by visible-item priority — a chat on
   screen, then a chat opened into, then the least-recently-synced tail of
-  `backfill_backlog` — and never a media action: media is not mirrored
-  eagerly (SYNC-020). Foreground work runs even on a metered/power-saving
+  `backfill_backlog`. That tail contains only chats with a current Main,
+  Archive, or custom-folder membership; canonical metadata outside the
+  provider namespace cannot consume background quanta. It never returns a
+  media action: media is not mirrored eagerly (SYNC-020). Foreground work runs
+  even on a metered/power-saving
   device; only background metadata yields to those constraints. An
   account-global pacer (`pace`) spaces requests and honors Telegram flood
   waits against a durable deadline that survives restart, so a crash resumes

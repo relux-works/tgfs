@@ -302,3 +302,13 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn truncation_that_exposes_a_short_dot_tail_is_a_sanitize_fixed_point() {
+    let raw = format!("{}..b{}", "a".repeat(250), "x".repeat(20));
+
+    let once = sanitize(&raw, NameKind::File);
+    let twice = sanitize(once.as_str(), NameKind::File);
+
+    assert_eq!(once, twice);
+}

@@ -1,3 +1,4 @@
+import Darwin
 import FileProvider
 import Foundation
 import GramDriveCore
@@ -19,6 +20,7 @@ final class ScriptedHydration: HydrationRequesting, @unchecked Sendable {
     private let lock = NSLock()
     private var steps: [Step] = []
     private(set) var recordedRequests: [HydrationRequest] = []
+    private var recordedPriorities: [TaskPriority] = []
     /// High-water mark of concurrently running steps — what the bounded
     /// gate is measured by.
     private(set) var concurrentHighWater = 0
@@ -28,6 +30,12 @@ final class ScriptedHydration: HydrationRequesting, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return recordedRequests
+    }
+
+    var priorities: [TaskPriority] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedPriorities
     }
 
     func enqueue(_ step: @escaping Step) {
@@ -79,6 +87,7 @@ final class ScriptedHydration: HydrationRequesting, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         recordedRequests.append(request)
+        recordedPriorities.append(Task.currentPriority)
         running += 1
         concurrentHighWater = max(concurrentHighWater, running)
         return steps.isEmpty ? nil : steps.removeFirst()
@@ -200,6 +209,12 @@ final class ArrivalCounter: @unchecked Sendable {
             waiters.append((target, continuation))
             lock.unlock()
         }
+    }
+
+    var observedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
     }
 }
 

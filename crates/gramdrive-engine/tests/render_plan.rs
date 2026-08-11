@@ -1,113 +1,92 @@
-//! Incremental render planning (TASK-260715-22l8zy; SYNC-024, SYNC-030..033).
-//!
-//! The planner turns a batch of normalized changes into exactly the set of
-//! generated documents that went stale — the whole-chat NDJSON and only the
-//! transcripts of the touched months — and into a plan against the current
-//! event watermark that skips anything already current. These tests pin the
-//! affected-partition mapping, the timezone-correct month boundaries, the
-//! staleness verdicts (new, version bump, dirty, watermark behind), and the
-//! interrupt/resume behaviour the planner inherits from the watermark protocol:
-//! a regeneration that never publishes leaves the previous version readable and
-//! the work on the durable worklist.
+//! Date-first monthly render planning and invalidation.
 
-// clippy.toml exempts test code on the grounds that a panicking test is just a
-// failing test. That exemption keys on `#[test]` functions, and the shared
-// fixture helpers below sit at module level in an integration-test binary. The
-// rationale still applies in full — this file links into no product artifact —
-// so the exemption is restated here, matching the established test-suite pattern.
 #![allow(clippy::expect_used, clippy::panic)]
 
 use gramdrive_engine::model::identity::{
-    AccountId, AccountKey, AccountScope, ChatId, ChatKey, ContentHash, DocFormat, DocPartition,
-    GeneratedDocKey, ItemId, NamespaceVersion, SchemaFamily,
+    AccountId, AccountKey, AccountScope, AppearanceKey, CanonicalKey, ChatId, ChatKey, ChatListKey,
+    ChatListKind, ContentHash, DocFormat, DocPartition, GeneratedDocKey, ItemId, ItemKey,
+    MessageId, MonthDirKey, NamespaceVersion, SchemaFamily,
 };
 use gramdrive_engine::model::version::{ContentVersion, MetadataVersion};
-use gramdrive_engine::render::markdown::UtcOffset;
+use gramdrive_engine::render::markdown::{DisplayTimeZone, UtcOffset};
 use gramdrive_engine::render_plan::{
     DocClass, RenderReason, affected_documents, dirty_affected, plan_for_changes, plan_worklist,
 };
 use gramdrive_engine::state::repo::{
     AccountRecord, ChatRecord, ChatType, FileFacts, ItemAvailability, ItemRecord, MessageChange,
-    MessageRevision, RenderOutput, RenderStateRecord, RetentionMode, SourceKind,
+    MessageRevision, RenderOutput, RetentionMode, SourceKind,
 };
 use gramdrive_engine::state::{StateStore, WriteTxn};
 
-const ACCOUNT_ID: i64 = 7;
-const NAMESPACE: u32 = 1;
-const CHAT: i64 = 100;
-
-// Fixed instants, each with an independently known civil month (UTC).
-const JULY_15: i64 = 1_784_116_800_000; // 2026-07-15 12:00Z
-const JULY_1: i64 = 1_782_907_200_000; // 2026-07-01 12:00Z
-const AUGUST_3: i64 = 1_785_758_400_000; // 2026-08-03 12:00Z
-const DECEMBER_31: i64 = 1_798_718_400_000; // 2026-12-31 12:00Z
-const FEB_2025: i64 = 1_739_188_800_000; // 2025-02-10 12:00Z
-const JULY_END_2330Z: i64 = 1_785_540_600_000; // 2026-07-31 23:30Z
-const JUNE_END_2230Z: i64 = 1_782_858_600_000; // 2026-06-30 22:30Z
+const JULY_15: i64 = 1_784_116_800_000;
+const AUGUST_3: i64 = 1_785_758_400_000;
+const JULY_END_2330Z: i64 = 1_785_540_600_000;
 
 fn scope() -> AccountScope {
     AccountScope {
         account: AccountKey {
-            account_id: AccountId(ACCOUNT_ID),
+            account_id: AccountId(7),
         },
-        namespace_version: NamespaceVersion(NAMESPACE),
+        namespace_version: NamespaceVersion(1),
     }
 }
 
-fn chat_key() -> ChatKey {
+fn chat() -> ChatKey {
     ChatKey {
         scope: scope(),
-        chat_id: ChatId(CHAT),
+        chat_id: ChatId(100),
     }
 }
 
-fn ndjson_key() -> GeneratedDocKey {
-    DocClass::Ndjson.document_key(chat_key(), DocPartition::Chat)
+fn utc() -> DisplayTimeZone {
+    DisplayTimeZone::fixed(UtcOffset::UTC)
 }
 
-fn month_key(year: u16, month: u8) -> GeneratedDocKey {
-    DocClass::MarkdownMonth.document_key(chat_key(), DocPartition::Month { year, month })
+fn partition(year: u16, month: u8) -> DocPartition {
+    DocPartition::Month { year, month }
 }
 
-fn ndjson_id() -> ItemId {
-    DocClass::Ndjson.document_id(chat_key(), DocPartition::Chat)
+fn key(class: DocClass, year: u16, month: u8) -> GeneratedDocKey {
+    class.document_key(chat(), partition(year, month))
 }
 
-fn month_id(year: u16, month: u8) -> ItemId {
-    DocClass::MarkdownMonth.document_id(chat_key(), DocPartition::Month { year, month })
+fn id(class: DocClass, year: u16, month: u8) -> ItemId {
+    class.document_id(chat(), partition(year, month))
 }
 
-fn account_root_id() -> ItemId {
-    use gramdrive_engine::model::identity::{CanonicalKey, ItemKey};
-    ItemKey::Canonical(CanonicalKey::Account(scope().account)).id()
+fn appearance_id(view: ChatListKind, class: DocClass, year: u16, month: u8) -> ItemId {
+    ItemKey::Appearance(AppearanceKey {
+        view,
+        item: CanonicalKey::GeneratedDoc(key(class, year, month)),
+    })
+    .id()
 }
 
 fn metadata(text: &str) -> MetadataVersion {
-    MetadataVersion::new(text).expect("valid metadata version")
+    MetadataVersion::new(text).expect("metadata")
 }
 
-/// Seeds the account, chat, and account-root item — enough for the change log
-/// and watermark reads; generated-document items are projected per test.
-fn base_store() -> StateStore {
+fn store() -> StateStore {
     let mut store = StateStore::open_in_memory().expect("open");
     let tx = store.write_txn().expect("write");
     tx.upsert_account(&AccountRecord {
         account: scope().account,
         source_kind: SourceKind::LocalTdlib,
-        display_name: "Test Account".to_owned(),
+        display_name: "Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
-        created_at_ms: 1_000,
-        updated_at_ms: 1_000,
+        created_at_ms: 1,
+        updated_at_ms: 1,
     })
     .expect("account");
     tx.upsert_chat(&ChatRecord {
-        key: chat_key(),
+        key: chat(),
         chat_type: ChatType::Private,
-        title: format!("Chat {CHAT}"),
+        title: "Chat".to_owned(),
         username: None,
         is_protected: false,
         archive_mode: false,
@@ -118,10 +97,11 @@ fn base_store() -> StateStore {
     })
     .expect("chat");
     tx.upsert_item(&ItemRecord {
-        id: account_root_id(),
+        aggregate_size: None,
+        id: ItemKey::Canonical(CanonicalKey::Account(scope().account)).id(),
         parent: None,
-        display_name: "Root".to_owned(),
-        safe_name: "Root".to_owned(),
+        display_name: "Account".to_owned(),
+        safe_name: "Account".to_owned(),
         metadata_version: metadata("m1"),
         content: None,
         availability: ItemAvailability::Fetchable,
@@ -134,15 +114,32 @@ fn base_store() -> StateStore {
     store
 }
 
-/// Projects a generated-document item under the account root, so its render
-/// state can be created (the item foreign key) — the tree builder's job in the
-/// real system.
-fn project_doc(tx: &WriteTxn<'_>, id: &ItemId, name: &str) {
+fn project(tx: &WriteTxn<'_>, view: ChatListKind, class: DocClass, year: u16, month: u8) {
+    let month_id = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: CanonicalKey::MonthDir(MonthDirKey {
+            chat: chat(),
+            year,
+            month,
+        }),
+    })
+    .id();
     tx.upsert_item(&ItemRecord {
-        id: id.clone(),
-        parent: Some(account_root_id()),
-        display_name: name.to_owned(),
-        safe_name: name.to_owned(),
+        aggregate_size: None,
+        id: appearance_id(view, class, year, month),
+        parent: Some(month_id),
+        display_name: match class {
+            DocClass::ChatJson => ".chat.json",
+            DocClass::MarkdownMonth => "Messages.md",
+            DocClass::NdjsonMonth => "Messages.ndjson",
+        }
+        .to_owned(),
+        safe_name: match class {
+            DocClass::ChatJson => ".chat.json",
+            DocClass::MarkdownMonth => "Messages.md",
+            DocClass::NdjsonMonth => "Messages.ndjson",
+        }
+        .to_owned(),
         metadata_version: metadata("m1"),
         content: Some(FileFacts::default()),
         availability: ItemAvailability::Fetchable,
@@ -150,575 +147,363 @@ fn project_doc(tx: &WriteTxn<'_>, id: &ItemId, name: &str) {
         modified_at_ms: None,
         deleted_at_ms: None,
     })
-    .expect("project doc");
+    .expect("doc");
 }
 
-fn observe(message: i64, sent_at_ms: i64) -> MessageChange {
+fn project_month_in(tx: &WriteTxn<'_>, view: ChatListKind, year: u16, month: u8) {
+    let root = ItemKey::Canonical(CanonicalKey::Account(scope().account)).id();
+    let list = ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+        scope: scope(),
+        kind: view,
+    }))
+    .id();
+    let chat_item = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: CanonicalKey::Chat(chat()),
+    })
+    .id();
+    let month_id = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: CanonicalKey::MonthDir(MonthDirKey {
+            chat: chat(),
+            year,
+            month,
+        }),
+    })
+    .id();
+    tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
+        id: list.clone(),
+        parent: Some(root),
+        display_name: format!("{view:?}"),
+        safe_name: format!("{view:?}"),
+        metadata_version: metadata("m1"),
+        content: None,
+        availability: ItemAvailability::Fetchable,
+        created_at_ms: None,
+        modified_at_ms: None,
+        deleted_at_ms: None,
+    })
+    .expect("list");
+    tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
+        id: chat_item.clone(),
+        parent: Some(list),
+        display_name: "Chat".to_owned(),
+        safe_name: "Chat".to_owned(),
+        metadata_version: metadata("m1"),
+        content: None,
+        availability: ItemAvailability::Fetchable,
+        created_at_ms: None,
+        modified_at_ms: None,
+        deleted_at_ms: None,
+    })
+    .expect("chat appearance");
+    tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
+        id: month_id,
+        parent: Some(chat_item),
+        display_name: format!("{year:04}-{month:02}"),
+        safe_name: format!("{year:04}-{month:02}"),
+        metadata_version: metadata("m1"),
+        content: None,
+        availability: ItemAvailability::Fetchable,
+        created_at_ms: None,
+        modified_at_ms: None,
+        deleted_at_ms: None,
+    })
+    .expect("month");
+    project(tx, view, DocClass::MarkdownMonth, year, month);
+    project(tx, view, DocClass::NdjsonMonth, year, month);
+}
+
+fn project_month(tx: &WriteTxn<'_>, year: u16, month: u8) {
+    project_month_in(tx, ChatListKind::Main, year, month);
+}
+
+fn project_chat_json(tx: &WriteTxn<'_>) -> ItemId {
+    let view = ChatListKind::Main;
+    let chat_item = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: CanonicalKey::Chat(chat()),
+    })
+    .id();
+    let document = DocClass::ChatJson.document_key(chat(), DocPartition::Chat);
+    let item = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: CanonicalKey::GeneratedDoc(document),
+    })
+    .id();
+    tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
+        id: item.clone(),
+        parent: Some(chat_item),
+        display_name: ".chat.json".to_owned(),
+        safe_name: ".chat.json".to_owned(),
+        metadata_version: metadata("m1"),
+        content: Some(FileFacts::default()),
+        availability: ItemAvailability::Fetchable,
+        created_at_ms: None,
+        modified_at_ms: None,
+        deleted_at_ms: None,
+    })
+    .expect("chat JSON");
+    tx.ensure_render_state(
+        &item,
+        DocClass::ChatJson.renderer_version(),
+        DocClass::ChatJson.schema_version(),
+    )
+    .expect("render state");
+    item
+}
+
+fn observe(message_id: i64, sent_at_ms: i64, suffix: &str) -> MessageChange {
     MessageChange::Observed(MessageRevision {
-        message_id: gramdrive_engine::model::identity::MessageId(message),
+        message_id: MessageId(message_id),
         sender_id: Some(500),
         sent_at_ms,
-        edited_at_ms: None,
-        observed_at_ms: sent_at_ms + 5,
+        edited_at_ms: (!suffix.is_empty()).then_some(sent_at_ms + 1_000),
+        observed_at_ms: sent_at_ms + 2_000,
         payload_schema: SchemaFamily(1),
-        payload: format!("payload-{message}").into_bytes(),
+        payload: format!("message-{message_id}{suffix}").into_bytes(),
     })
 }
 
-fn edit(message: i64, sent_at_ms: i64, edited_at_ms: i64) -> MessageChange {
-    MessageChange::Observed(MessageRevision {
-        message_id: gramdrive_engine::model::identity::MessageId(message),
-        sender_id: Some(500),
-        sent_at_ms,
-        edited_at_ms: Some(edited_at_ms),
-        observed_at_ms: edited_at_ms + 5,
-        payload_schema: SchemaFamily(1),
-        payload: format!("payload-{message}-edit").into_bytes(),
-    })
-}
-
-fn delete(message: i64, observed_at_ms: i64) -> MessageChange {
-    MessageChange::Deleted {
-        message_id: gramdrive_engine::model::identity::MessageId(message),
-        observed_at_ms,
-    }
-}
-
-/// Applies a change batch to the chat's event log in its own transaction and
-/// returns the resulting watermark.
 fn apply(store: &mut StateStore, changes: &[MessageChange]) -> i64 {
     let tx = store.write_txn().expect("write");
-    tx.apply_message_changes(&chat_key(), changes)
-        .expect("apply changes");
-    let watermark = tx.read().latest_event_seq(&chat_key()).expect("watermark");
+    tx.apply_message_changes(&chat(), changes).expect("changes");
+    let watermark = tx.read().latest_event_seq(&chat()).expect("watermark");
     tx.commit().expect("commit");
     watermark
 }
 
-/// The chat's current event watermark.
-fn watermark(store: &mut StateStore) -> i64 {
-    let tx = store.read_txn().expect("read");
-    tx.latest_event_seq(&chat_key()).expect("watermark")
-}
-
-/// Publishes a complete render output for a document at `watermark`, as a real
-/// renderer would after building the bytes — returns whether it landed clean.
-fn publish(store: &mut StateStore, id: &ItemId, watermark: i64, token: &str) -> bool {
+fn publish(store: &mut StateStore, item: &ItemId, watermark: i64) {
     let tx = store.write_txn().expect("write");
-    let outcome = tx
-        .publish_render(
-            id,
-            &chat_key(),
-            watermark,
-            &RenderOutput {
-                content_version: ContentVersion::new(token).expect("valid token"),
-                content_hash: Some(ContentHash::Sha256([1u8; 32])),
-                logical_size: 128,
-            },
-            10_000 + watermark,
-        )
-        .expect("publish");
+    tx.publish_render(
+        item,
+        &chat(),
+        watermark,
+        &RenderOutput {
+            content_version: ContentVersion::new(format!("render-w{watermark}")).expect("version"),
+            content_hash: Some(ContentHash::Sha256([1; 32])),
+            logical_size: 1,
+        },
+        watermark,
+    )
+    .expect("publish");
     tx.commit().expect("commit");
-    outcome.clean
 }
-
-fn render_state(store: &mut StateStore, id: &ItemId) -> Option<RenderStateRecord> {
-    let tx = store.read_txn().expect("read");
-    tx.render_state(id).expect("render state")
-}
-
-/// Documents as an order-independent set of their opaque bytes — the worklist's
-/// drain order is unspecified, so membership is what tests assert.
-fn doc_set(ids: &[ItemId]) -> std::collections::BTreeSet<Vec<u8>> {
-    ids.iter().map(|id| id.as_bytes().to_vec()).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Affected-document mapping — the pure "only affected partitions" core.
-// ---------------------------------------------------------------------------
 
 #[test]
-fn a_change_batch_maps_to_the_whole_chat_ndjson_and_its_months() {
-    let chat = chat_key();
-
-    // No changes regenerate nothing.
-    assert!(affected_documents(chat, &[], UtcOffset::UTC).is_empty());
-
-    // One July message: the lossless NDJSON plus the July transcript, only.
+fn changes_map_to_both_documents_of_only_their_months() {
+    assert!(affected_documents(chat(), &[], &utc()).is_empty());
     assert_eq!(
-        affected_documents(chat, &[JULY_15], UtcOffset::UTC),
-        vec![ndjson_key(), month_key(2026, 7)],
-    );
-
-    // Two messages in the same month collapse to one transcript.
-    assert_eq!(
-        affected_documents(chat, &[JULY_15, JULY_1], UtcOffset::UTC),
-        vec![ndjson_key(), month_key(2026, 7)],
-    );
-
-    // Distinct months each get their own transcript, in ascending order, and
-    // the NDJSON appears exactly once regardless of how many months moved.
-    assert_eq!(
-        affected_documents(chat, &[AUGUST_3, JULY_15, DECEMBER_31], UtcOffset::UTC),
+        affected_documents(chat(), &[JULY_15], &utc()),
         vec![
-            ndjson_key(),
-            month_key(2026, 7),
-            month_key(2026, 8),
-            month_key(2026, 12),
-        ],
+            key(DocClass::MarkdownMonth, 2026, 7),
+            key(DocClass::NdjsonMonth, 2026, 7),
+        ]
     );
-
-    // Ascending order holds across years.
     assert_eq!(
-        affected_documents(chat, &[DECEMBER_31, FEB_2025], UtcOffset::UTC),
-        vec![ndjson_key(), month_key(2025, 2), month_key(2026, 12)],
+        affected_documents(chat(), &[AUGUST_3, JULY_15, JULY_15], &utc()),
+        vec![
+            key(DocClass::MarkdownMonth, 2026, 7),
+            key(DocClass::NdjsonMonth, 2026, 7),
+            key(DocClass::MarkdownMonth, 2026, 8),
+            key(DocClass::NdjsonMonth, 2026, 8),
+        ]
     );
 }
 
 #[test]
-fn month_boundaries_follow_the_render_timezone() {
-    let chat = chat_key();
-    let plus3 = UtcOffset::from_seconds(3 * 3_600).expect("offset");
-
-    // 2026-07-31 23:30Z is July at UTC, but +03:00 tips it into August — the
-    // planner picks the transcript the renderer would group it under.
+fn persisted_iana_timezone_controls_the_partition_boundary() {
+    let tbilisi = DisplayTimeZone::named("Asia/Tbilisi").expect("IANA zone");
     assert_eq!(
-        affected_documents(chat, &[JULY_END_2330Z], UtcOffset::UTC),
-        vec![ndjson_key(), month_key(2026, 7)],
+        affected_documents(chat(), &[JULY_END_2330Z], &utc()),
+        vec![
+            key(DocClass::MarkdownMonth, 2026, 7),
+            key(DocClass::NdjsonMonth, 2026, 7),
+        ]
     );
     assert_eq!(
-        affected_documents(chat, &[JULY_END_2330Z], plus3),
-        vec![ndjson_key(), month_key(2026, 8)],
-    );
-
-    // 2026-06-30 22:30Z is June at UTC, July at +03:00.
-    assert_eq!(
-        affected_documents(chat, &[JUNE_END_2230Z], UtcOffset::UTC),
-        vec![ndjson_key(), month_key(2026, 6)],
-    );
-    assert_eq!(
-        affected_documents(chat, &[JUNE_END_2230Z], plus3),
-        vec![ndjson_key(), month_key(2026, 7)],
+        affected_documents(chat(), &[JULY_END_2330Z], &tbilisi),
+        vec![
+            key(DocClass::MarkdownMonth, 2026, 8),
+            key(DocClass::NdjsonMonth, 2026, 8),
+        ]
     );
 }
 
-// ---------------------------------------------------------------------------
-// Planning against real state.
-// ---------------------------------------------------------------------------
-
 #[test]
-fn plan_for_changes_reports_only_affected_partitions_as_new() {
-    let mut store = base_store();
-    let watermark = apply(&mut store, &[observe(1, JULY_15)]);
-
-    let tx = store.read_txn().expect("read");
-    let plan = plan_for_changes(&tx, chat_key(), &[JULY_15], UtcOffset::UTC).expect("plan");
-    drop(tx);
-
-    // Exactly the two affected documents, both never rendered, at the current
-    // watermark — and no unrelated month.
-    assert_eq!(plan.len(), 2);
-    let ndjson = &plan.jobs[0];
-    assert_eq!(ndjson.document, ndjson_id());
-    assert_eq!(ndjson.format, DocFormat::Ndjson);
-    assert_eq!(ndjson.partition, DocPartition::Chat);
-    assert_eq!(ndjson.reason, RenderReason::New);
-    assert_eq!(ndjson.target_watermark_seq, watermark);
-
-    let july = &plan.jobs[1];
-    assert_eq!(july.document, month_id(2026, 7));
-    assert_eq!(july.format, DocFormat::Markdown);
-    assert_eq!(
-        july.partition,
-        DocPartition::Month {
-            year: 2026,
-            month: 7
-        }
+fn insert_edit_and_delete_dirty_only_the_affected_month_pair() {
+    let mut state = store();
+    apply(
+        &mut state,
+        &[observe(1, JULY_15, ""), observe(2, AUGUST_3, "")],
     );
-    assert_eq!(july.reason, RenderReason::New);
-
-    // The content version each job carries is the format's token at the target
-    // watermark — what the published bytes will bear.
-    assert_eq!(
-        ndjson.content_version.as_str(),
-        gramdrive_engine::render::ndjson::content_version_token(watermark),
-    );
-    assert_eq!(
-        july.content_version.as_str(),
-        gramdrive_engine::render::markdown::content_version_token(watermark),
-    );
-
-    assert!(plan.jobs.iter().all(|job| job.partition
-        != DocPartition::Month {
-            year: 2026,
-            month: 8
-        }));
-}
-
-#[test]
-fn dirty_affected_feeds_the_worklist_and_a_clean_publish_converges() {
-    let mut store = base_store();
-    let watermark = apply(&mut store, &[observe(1, JULY_15)]);
-
-    // Project the two affected documents and mark them, as the applier would in
-    // the same transaction as the change.
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &ndjson_id(), "messages.ndjson");
-    project_doc(&tx, &month_id(2026, 7), "07.md");
-    let marked = dirty_affected(&tx, chat_key(), &[JULY_15], UtcOffset::UTC).expect("mark");
+    let tx = state.write_txn().expect("write");
+    project_month(&tx, 2026, 7);
+    project_month(&tx, 2026, 8);
+    dirty_affected(&tx, chat(), &[JULY_15, AUGUST_3], &utc()).expect("dirty");
     tx.commit().expect("commit");
-    assert_eq!(marked, vec![ndjson_id(), month_id(2026, 7)]);
+    let initial = {
+        let tx = state.read_txn().expect("read");
+        tx.latest_event_seq(&chat()).expect("watermark")
+    };
+    for month in [7, 8] {
+        for class in [DocClass::MarkdownMonth, DocClass::NdjsonMonth] {
+            publish(
+                &mut state,
+                &appearance_id(ChatListKind::Main, class, 2026, month),
+                initial,
+            );
+        }
+    }
 
-    // The worklist drains to exactly those documents at the current watermark.
-    let tx = store.read_txn().expect("read");
-    let plan = plan_worklist(&tx, 100).expect("plan");
+    let before_edit = initial;
+    let after_edit = apply(&mut state, &[observe(1, JULY_15, "-edit")]);
+    let tx = state.write_txn().expect("write");
+    let instants = tx
+        .read()
+        .affected_message_instants(&chat(), before_edit, after_edit)
+        .expect("affected");
+    let dirty = dirty_affected(&tx, chat(), &instants, &utc()).expect("dirty");
+    tx.commit().expect("commit");
+    assert_eq!(
+        dirty,
+        vec![
+            appearance_id(ChatListKind::Main, DocClass::MarkdownMonth, 2026, 7),
+            appearance_id(ChatListKind::Main, DocClass::NdjsonMonth, 2026, 7),
+        ]
+    );
+
+    for class in [DocClass::MarkdownMonth, DocClass::NdjsonMonth] {
+        publish(
+            &mut state,
+            &appearance_id(ChatListKind::Main, class, 2026, 7),
+            after_edit,
+        );
+    }
+    let before_delete = after_edit;
+    let after_delete = apply(
+        &mut state,
+        &[MessageChange::Deleted {
+            message_id: MessageId(2),
+            observed_at_ms: AUGUST_3 + 3_000,
+        }],
+    );
+    let tx = state.write_txn().expect("write");
+    let instants = tx
+        .read()
+        .affected_message_instants(&chat(), before_delete, after_delete)
+        .expect("affected");
+    let dirty = dirty_affected(&tx, chat(), &instants, &utc()).expect("dirty");
+    tx.commit().expect("commit");
+    assert_eq!(
+        dirty,
+        vec![
+            appearance_id(ChatListKind::Main, DocClass::MarkdownMonth, 2026, 8),
+            appearance_id(ChatListKind::Main, DocClass::NdjsonMonth, 2026, 8),
+        ]
+    );
+}
+
+#[test]
+fn planning_is_deterministic_and_converges_after_publication() {
+    let mut state = store();
+    let watermark = apply(&mut state, &[observe(1, JULY_15, "")]);
+    let tx = state.write_txn().expect("write");
+    project_month(&tx, 2026, 7);
+    let marked = dirty_affected(&tx, chat(), &[JULY_15], &utc()).expect("dirty");
+    tx.commit().expect("commit");
+    assert_eq!(
+        marked,
+        vec![
+            appearance_id(ChatListKind::Main, DocClass::MarkdownMonth, 2026, 7),
+            appearance_id(ChatListKind::Main, DocClass::NdjsonMonth, 2026, 7),
+        ]
+    );
+    let tx = state.read_txn().expect("read");
+    let first = plan_worklist(&tx, 10).expect("plan");
+    let replay = plan_worklist(&tx, 10).expect("plan replay");
     drop(tx);
-    assert_eq!(plan.len(), 2);
+    assert_eq!(first, replay);
+    assert_eq!(first.len(), 2);
     assert!(
-        plan.jobs
+        first
+            .jobs
             .iter()
             .all(|job| job.reason == RenderReason::Dirty)
     );
-    assert!(
-        plan.jobs
-            .iter()
-            .all(|job| job.target_watermark_seq == watermark)
-    );
-
-    // Rendering and publishing each job at its watermark lands clean and clears
-    // the worklist — re-planning converges to nothing.
-    for job in &plan.jobs {
-        assert!(publish(
-            &mut store,
-            &job.document,
-            job.target_watermark_seq,
-            job.content_version.as_str(),
-        ));
+    for job in first.jobs {
+        publish(
+            &mut state,
+            &appearance_id(ChatListKind::Main, job.class, 2026, 7),
+            watermark,
+        );
     }
-    let tx = store.read_txn().expect("read");
-    assert!(plan_worklist(&tx, 100).expect("plan").is_empty());
+    let tx = state.read_txn().expect("read");
+    assert!(plan_worklist(&tx, 10).expect("worklist").is_empty());
     assert!(
-        plan_for_changes(&tx, chat_key(), &[JULY_15], UtcOffset::UTC)
+        plan_for_changes(&tx, chat(), &[JULY_15], &utc())
             .expect("plan")
             .is_empty()
     );
 }
 
 #[test]
-fn edits_and_deletes_regenerate_only_their_month() {
-    let mut store = base_store();
-    // Two messages in different months, both rendered current.
-    apply(&mut store, &[observe(1, JULY_15), observe(2, AUGUST_3)]);
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &ndjson_id(), "messages.ndjson");
-    project_doc(&tx, &month_id(2026, 7), "07.md");
-    project_doc(&tx, &month_id(2026, 8), "08.md");
-    dirty_affected(&tx, chat_key(), &[JULY_15, AUGUST_3], UtcOffset::UTC).expect("mark");
-    tx.commit().expect("commit");
-    let seeded = watermark(&mut store);
-    for id in [&ndjson_id(), &month_id(2026, 7), &month_id(2026, 8)] {
-        publish(&mut store, id, seeded, "seed");
-    }
-
-    // Editing the July message dirties only July's transcript (and the
-    // whole-chat NDJSON); August is untouched.
-    let after_edit = apply(&mut store, &[edit(1, JULY_15, JULY_15 + 1_000)]);
-    let tx = store.write_txn().expect("write");
-    let marked = dirty_affected(&tx, chat_key(), &[JULY_15], UtcOffset::UTC).expect("mark");
-    tx.commit().expect("commit");
-    assert_eq!(marked, vec![ndjson_id(), month_id(2026, 7)]);
-    assert!(
-        render_state(&mut store, &month_id(2026, 7))
-            .expect("state")
-            .dirty
-    );
-    assert!(
-        !render_state(&mut store, &month_id(2026, 8))
-            .expect("state")
-            .dirty
-    );
-
-    let tx = store.read_txn().expect("read");
-    let plan = plan_worklist(&tx, 100).expect("plan");
-    drop(tx);
-    let planned = doc_set(
-        &plan
-            .jobs
-            .iter()
-            .map(|job| job.document.clone())
-            .collect::<Vec<_>>(),
-    );
-    assert_eq!(planned, doc_set(&[ndjson_id(), month_id(2026, 7)]));
-    assert!(
-        plan.jobs
-            .iter()
-            .all(|job| job.target_watermark_seq == after_edit)
-    );
-
-    // Re-publish July, then delete the August message: now only August moves.
-    publish(&mut store, &ndjson_id(), after_edit, "ndjson-2");
-    publish(&mut store, &month_id(2026, 7), after_edit, "july-2");
-    apply(&mut store, &[delete(2, AUGUST_3 + 2_000)]);
-    let tx = store.write_txn().expect("write");
-    let marked = dirty_affected(&tx, chat_key(), &[AUGUST_3], UtcOffset::UTC).expect("mark");
-    tx.commit().expect("commit");
-    assert_eq!(marked, vec![ndjson_id(), month_id(2026, 8)]);
-    assert!(
-        !render_state(&mut store, &month_id(2026, 7))
-            .expect("state")
-            .dirty
-    );
-    assert!(
-        render_state(&mut store, &month_id(2026, 8))
-            .expect("state")
-            .dirty
-    );
-}
-
-#[test]
-fn a_new_month_is_added_without_disturbing_existing_months() {
-    let mut store = base_store();
-    apply(&mut store, &[observe(1, JULY_15)]);
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &ndjson_id(), "messages.ndjson");
-    project_doc(&tx, &month_id(2026, 7), "07.md");
-    dirty_affected(&tx, chat_key(), &[JULY_15], UtcOffset::UTC).expect("mark");
+fn chat_json_is_planned_from_metadata_without_following_message_watermarks() {
+    let mut state = store();
+    let tx = state.write_txn().expect("write");
+    project_month(&tx, 2026, 7);
+    let item = project_chat_json(&tx);
     tx.commit().expect("commit");
 
-    // July rendered current.
-    let target = watermark(&mut store);
-    publish(&mut store, &ndjson_id(), target, "ndjson-1");
-    publish(&mut store, &month_id(2026, 7), target, "july-1");
-    assert!(
-        !render_state(&mut store, &month_id(2026, 7))
-            .expect("state")
-            .dirty
-    );
+    let plan = plan_worklist(&state.read_txn().expect("read"), 10).expect("plan");
+    assert_eq!(plan.jobs.len(), 1);
+    let job = &plan.jobs[0];
+    assert_eq!(job.class, DocClass::ChatJson);
+    assert_eq!(job.partition, DocPartition::Chat);
+    assert_eq!(job.target_watermark_seq, 0);
+    assert_eq!(job.reason, RenderReason::Dirty);
 
-    // A message in a brand-new month: its transcript is created dirty (a
-    // partition change), July's render state is untouched.
-    apply(&mut store, &[observe(2, AUGUST_3)]);
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &month_id(2026, 8), "08.md");
-    let marked = dirty_affected(&tx, chat_key(), &[AUGUST_3], UtcOffset::UTC).expect("mark");
-    tx.commit().expect("commit");
-    assert_eq!(marked, vec![ndjson_id(), month_id(2026, 8)]);
-
-    // August exists and is dirty; July stays clean at its old watermark.
-    let august = render_state(&mut store, &month_id(2026, 8)).expect("state");
-    assert!(august.dirty);
-    let july = render_state(&mut store, &month_id(2026, 7)).expect("state");
-    assert!(!july.dirty);
-    assert_eq!(july.input_watermark_seq, target);
-}
-
-#[test]
-fn a_stale_renderer_version_replans_the_document() {
-    let mut store = base_store();
-    let watermark = apply(&mut store, &[observe(1, JULY_15)]);
-
-    // A document last rendered by an older renderer (version 0), published clean.
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &ndjson_id(), "messages.ndjson");
-    tx.ensure_render_state(&ndjson_id(), 0, DocClass::Ndjson.schema_version())
-        .expect("ensure");
-    tx.commit().expect("commit");
-    publish(&mut store, &ndjson_id(), watermark, "old-renderer");
-    assert!(!render_state(&mut store, &ndjson_id()).expect("state").dirty);
-
-    // Even though it is clean and at the current watermark, the version gap
-    // makes it stale — the planner re-plans it as a renderer upgrade.
-    let tx = store.read_txn().expect("read");
-    let plan = plan_for_changes(&tx, chat_key(), &[JULY_15], UtcOffset::UTC).expect("plan");
-    drop(tx);
-    let ndjson = plan
-        .jobs
-        .iter()
-        .find(|job| job.document == ndjson_id())
-        .expect("ndjson job");
-    assert_eq!(ndjson.reason, RenderReason::RendererUpgrade);
-}
-
-#[test]
-fn a_change_beyond_the_published_watermark_replans_the_document() {
-    let mut store = base_store();
-    let first = apply(&mut store, &[observe(1, JULY_15)]);
-
-    // Publish the NDJSON current as of the first change, clean, at v1 versions.
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &ndjson_id(), "messages.ndjson");
-    tx.ensure_render_state(
-        &ndjson_id(),
-        DocClass::Ndjson.renderer_version(),
-        DocClass::Ndjson.schema_version(),
+    let tx = state.write_txn().expect("write");
+    tx.publish_static_render(
+        &item,
+        &RenderOutput {
+            content_version: job.content_version.clone(),
+            content_hash: Some(ContentHash::Sha256([2; 32])),
+            logical_size: 2,
+        },
+        5,
     )
-    .expect("ensure");
+    .expect("publish");
     tx.commit().expect("commit");
-    publish(&mut store, &ndjson_id(), first, "ndjson-w1");
-    assert!(!render_state(&mut store, &ndjson_id()).expect("state").dirty);
-
-    // A later change advances the chat watermark. The document's bytes reflect
-    // an older watermark, so the change-driven plan flags it even without the
-    // dirty bit having been set.
-    let second = apply(&mut store, &[observe(2, JULY_1)]);
-    assert!(second > first);
-    let tx = store.read_txn().expect("read");
-    let plan = plan_for_changes(&tx, chat_key(), &[JULY_1], UtcOffset::UTC).expect("plan");
-    drop(tx);
-    let ndjson = plan
-        .jobs
-        .iter()
-        .find(|job| job.document == ndjson_id())
-        .expect("ndjson job");
-    assert_eq!(ndjson.reason, RenderReason::WatermarkBehind);
-    assert_eq!(ndjson.target_watermark_seq, second);
-}
-
-#[test]
-fn an_interrupted_regeneration_keeps_the_previous_version_and_resumes() {
-    let mut store = base_store();
-    let first = apply(&mut store, &[observe(1, JULY_15)]);
-
-    // First render published clean: a complete, valid file at watermark `first`.
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &ndjson_id(), "messages.ndjson");
-    project_doc(&tx, &month_id(2026, 7), "07.md");
-    dirty_affected(&tx, chat_key(), &[JULY_15], UtcOffset::UTC).expect("mark");
-    tx.commit().expect("commit");
-    let v1 = gramdrive_engine::render::ndjson::content_version_token(first);
-    publish(&mut store, &ndjson_id(), first, &v1);
-
-    // A new change arrives and the document is marked dirty again; its published
-    // bytes still reflect the first watermark.
-    let second = apply(&mut store, &[observe(2, JULY_1)]);
-    let tx = store.write_txn().expect("write");
-    dirty_affected(&tx, chat_key(), &[JULY_1], UtcOffset::UTC).expect("mark");
-    tx.commit().expect("commit");
-
-    // The planner names the resume job at the new watermark.
-    let tx = store.read_txn().expect("read");
-    let job = plan_worklist(&tx, 100)
-        .expect("plan")
-        .jobs
-        .into_iter()
-        .find(|job| job.document == ndjson_id())
-        .expect("ndjson job");
-    drop(tx);
-    assert_eq!(job.target_watermark_seq, second);
-
-    // Simulate a crash during regeneration: the renderer never publishes. The
-    // previous valid version is still what a reader sees, and the work is still
-    // on the durable worklist.
-    let state = render_state(&mut store, &ndjson_id()).expect("state");
-    assert_eq!(
-        state.content_version.as_ref().map(ContentVersion::as_str),
-        Some(v1.as_str()),
-        "the previous version stays readable after an interrupted render",
-    );
-    assert_eq!(state.input_watermark_seq, first);
-    assert!(state.dirty, "the resume job stays on the worklist");
-
-    // Resume: re-plan, render, publish at the target watermark. It lands clean
-    // and the document converges to the new version.
-    let tx = store.read_txn().expect("read");
-    let resumed = plan_worklist(&tx, 100)
-        .expect("plan")
-        .jobs
-        .into_iter()
-        .find(|job| job.document == ndjson_id())
-        .expect("ndjson job");
-    drop(tx);
-    let v2 = resumed.content_version.as_str().to_owned();
-    assert!(publish(
-        &mut store,
-        &ndjson_id(),
-        resumed.target_watermark_seq,
-        &v2
-    ));
-    let state = render_state(&mut store, &ndjson_id()).expect("state");
-    assert!(!state.dirty);
-    assert_eq!(
-        state.content_version.as_ref().map(ContentVersion::as_str),
-        Some(v2.as_str()),
-    );
-    // The resumed document has converged and left the worklist (the July
-    // transcript that shares its months is a separate, still-pending job).
-    let tx = store.read_txn().expect("read");
+    apply(&mut state, &[observe(1, JULY_15, "")]);
     assert!(
-        plan_worklist(&tx, 100)
-            .expect("plan")
-            .jobs
-            .iter()
-            .all(|job| job.document != ndjson_id()),
+        plan_worklist(&state.read_txn().expect("read"), 10)
+            .expect("replan")
+            .is_empty(),
+        "message events do not invalidate metadata-only JSON"
     );
 }
 
 #[test]
-fn a_render_that_races_newer_events_stays_on_the_worklist() {
-    let mut store = base_store();
-    let first = apply(&mut store, &[observe(1, JULY_15)]);
-    let tx = store.write_txn().expect("write");
-    project_doc(&tx, &ndjson_id(), "messages.ndjson");
-    project_doc(&tx, &month_id(2026, 7), "07.md");
-    dirty_affected(&tx, chat_key(), &[JULY_15], UtcOffset::UTC).expect("mark");
-    tx.commit().expect("commit");
-
-    // A second change lands while the renderer is working from `first`.
-    let second = apply(&mut store, &[observe(2, JULY_1)]);
-
-    // Publishing at the stale watermark is accepted but does not clear the dirty
-    // bit: events beyond it exist, so the document is re-planned at the newer
-    // watermark rather than silently claiming to reflect them (SYNC-024).
-    let clean = publish(
-        &mut store,
-        &ndjson_id(),
-        first,
-        &gramdrive_engine::render::ndjson::content_version_token(first),
-    );
-    assert!(!clean, "a raced publish must not land clean");
-    let tx = store.read_txn().expect("read");
-    let job = plan_worklist(&tx, 100)
-        .expect("plan")
-        .jobs
-        .into_iter()
-        .find(|job| job.document == ndjson_id())
-        .expect("ndjson job");
-    drop(tx);
-    assert_eq!(job.target_watermark_seq, second);
-}
-
-#[test]
-fn the_catalog_ids_match_the_renderers() {
-    // The planner's document ids must be byte-identical to the renderers' own,
-    // or a plan would target a different item than the one it renders.
+fn catalog_ids_match_bounded_renderers() {
+    let month = partition(2026, 7);
     assert_eq!(
-        DocClass::Ndjson
-            .document_id(chat_key(), DocPartition::Chat)
-            .as_bytes(),
-        gramdrive_engine::render::ndjson::document_id(chat_key(), DocPartition::Chat).as_bytes(),
+        id(DocClass::MarkdownMonth, 2026, 7).as_bytes(),
+        gramdrive_engine::render::markdown::document_id(chat(), month).as_bytes()
     );
-    let month = DocPartition::Month {
-        year: 2026,
-        month: 7,
-    };
     assert_eq!(
-        DocClass::MarkdownMonth
-            .document_id(chat_key(), month)
-            .as_bytes(),
-        gramdrive_engine::render::markdown::document_id(chat_key(), month).as_bytes(),
+        id(DocClass::NdjsonMonth, 2026, 7).as_bytes(),
+        gramdrive_engine::render::ndjson::document_id(chat(), month).as_bytes()
     );
-
-    // A format the planner has no renderer for (chat.json) is not planned.
-    let json = GeneratedDocKey {
-        chat: chat_key(),
+    let legacy = GeneratedDocKey {
+        chat: chat(),
         partition: DocPartition::Chat,
-        format: DocFormat::Json,
+        format: DocFormat::Ndjson,
         schema_family: SchemaFamily(1),
     };
-    assert!(DocClass::for_key(&json).is_none());
-    assert_eq!(DocClass::for_key(&ndjson_key()), Some(DocClass::Ndjson));
-    assert_eq!(
-        DocClass::for_key(&month_key(2026, 7)),
-        Some(DocClass::MarkdownMonth),
-    );
+    assert!(DocClass::for_key(&legacy).is_none());
 }

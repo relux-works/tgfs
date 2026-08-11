@@ -63,12 +63,12 @@ import Testing
         #expect(location.resolveDriveURL()?.lastPathComponent == "GramDrive — Alice")
     }
 
-    @Test func fallsBackToTheContainerBeforeAnyProviderFolderExists() {
+    @Test func doesNotTreatTheContainerAsARegisteredDrive() {
         let tree = TempTree()
         defer { tree.cleanup() }
         let location = CloudStorageDriveLocation(
             baseDirectory: tree.root, revealer: { _ in true })
-        #expect(location.resolveDriveURL() == tree.root)
+        #expect(location.resolveDriveURL() == nil)
     }
 
     @Test func resolvesNilWhenTheContainerIsMissing() {

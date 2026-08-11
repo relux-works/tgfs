@@ -209,7 +209,7 @@ fn document_descriptor_carries_original_metadata() {
     };
     assert_eq!(caption, plain_text("the report"));
     assert_eq!(attachment.kind, AttachmentKind::Document);
-    assert_eq!(attachment.file_id, 517);
+    assert_eq!(attachment.file_id, Some(517));
     assert_eq!(attachment.remote_id.as_deref(), Some("BQACAgIAAx0"));
     assert_eq!(attachment.remote_unique_id.as_deref(), Some("AgADdoc"));
     assert_eq!(attachment.file_name.as_deref(), Some("report.pdf"));
@@ -616,10 +616,21 @@ fn save_restricted_media_is_a_restricted_placeholder() {
     message.as_object_mut().unwrap().remove("can_be_saved");
     let record = normalized(&message);
     assert!(!record.can_be_saved);
-    let MessageContent::Photo { attachment, .. } = record.content else {
+    let MessageContent::Photo {
+        caption,
+        attachment,
+    } = record.content
+    else {
         panic!("expected photo content");
     };
+    assert_eq!(caption.text, "");
+    assert!(caption.entities.is_empty());
     assert_eq!(attachment.availability, AttachmentAvailability::Restricted);
+    assert_eq!(attachment.file_id, None);
+    assert_eq!(attachment.remote_id, None);
+    assert_eq!(attachment.remote_unique_id, None);
+    assert_eq!(attachment.thumbnail, None);
+    assert_eq!(attachment.minithumbnail, None);
 }
 
 #[test]
@@ -661,10 +672,18 @@ fn self_destructing_media_is_view_once_even_when_saveable() {
     );
     for record in [timer, immediate, unknown] {
         assert!(record.can_be_saved, "fixture allows saving");
-        let MessageContent::Photo { attachment, .. } = record.content else {
+        let MessageContent::Photo {
+            caption,
+            attachment,
+        } = record.content
+        else {
             panic!("expected photo content");
         };
+        assert_eq!(caption.text, "");
         assert_eq!(attachment.availability, AttachmentAvailability::ViewOnce);
+        assert_eq!(attachment.file_id, None);
+        assert_eq!(attachment.remote_id, None);
+        assert_eq!(attachment.remote_unique_id, None);
     }
 }
 
@@ -679,7 +698,16 @@ fn expired_media_is_explicitly_unavailable() {
     ];
     for (raw_type, kind) in cases {
         let record = normalized(&wire_message(62, json!({"@type": raw_type})));
-        assert_eq!(record.content, MessageContent::Expired { kind });
+        let MessageContent::Expired {
+            kind: actual_kind,
+            attachment,
+        } = record.content
+        else {
+            panic!("expected expired attachment placeholder");
+        };
+        assert_eq!(actual_kind, kind);
+        assert_eq!(attachment.file_id, None);
+        assert_eq!(attachment.availability, AttachmentAvailability::Unavailable);
     }
 }
 

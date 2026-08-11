@@ -20,8 +20,9 @@ use serde_json::{Value, json};
 
 use gramdrive_model::identity::{AccountId, AccountKey, AccountScope, NamespaceVersion};
 use gramdrive_source_tdjson::{
-    AttachmentAvailability, AttachmentKind, MappedAttachment, ThumbnailFormat,
-    map_message_attachments, normalize_message,
+    AttachmentAvailability, AttachmentFidelity, AttachmentKind, AttachmentLogicalKind,
+    MappedAttachment, TelegramRepresentation, ThumbnailFormat, map_message_attachments,
+    normalize_message,
 };
 
 const CHAT: i64 = -1_001_234_567_890;
@@ -115,12 +116,19 @@ fn document_preserves_original_metadata_and_locator() {
     assert_eq!(descriptor.file_name.as_deref(), Some("Q3 report.pdf"));
     assert_eq!(descriptor.mime_type.as_deref(), Some("application/pdf"));
     assert_eq!(descriptor.size, Some(2_048_576));
-    assert_eq!(descriptor.file_id, 517);
+    assert_eq!(descriptor.file_id, Some(517));
     assert_eq!(descriptor.remote_unique_id.as_deref(), Some("doc-unique"));
 
     // Safe name derived from the original; spaces are legal, the extension is
     // kept.
     assert_eq!(mapped.safe_name.as_str(), "Q3 report.pdf");
+    assert_eq!(mapped.logical_kind, AttachmentLogicalKind::Document);
+    assert_eq!(
+        mapped.telegram_representation,
+        TelegramRepresentation::OriginalDocument
+    );
+    assert_eq!(mapped.fidelity, AttachmentFidelity::Original);
+    assert_eq!(mapped.source_name.as_deref(), Some("Q3 report.pdf"));
 
     // Fetchable, so both previews come through.
     assert_eq!(descriptor.availability, AttachmentAvailability::Fetchable);
@@ -168,7 +176,7 @@ fn every_downloadable_kind_maps_with_identity_and_safe_name() {
                 }
             }),
             kind: AttachmentKind::Video,
-            safe_name: "trip.mov",
+            safe_name: "video.mov",
         },
         Case {
             content: json!({
@@ -253,6 +261,85 @@ fn every_downloadable_kind_maps_with_identity_and_safe_name() {
             AttachmentAvailability::Fetchable,
             "availability for {id}"
         );
+        if case.kind != AttachmentKind::Document {
+            assert_eq!(mapped.source_name, None, "source name for {id}");
+            assert_eq!(
+                mapped.fidelity,
+                AttachmentFidelity::TelegramVariant,
+                "fidelity for {id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn image_and_video_mime_documents_remain_original_document_representations() {
+    for (offset, mime, name, logical_kind) in [
+        (0, "image/png", "diagram.png", AttachmentLogicalKind::Photo),
+        (1, "video/mp4", "master.mp4", AttachmentLogicalKind::Video),
+    ] {
+        let content = json!({
+            "@type": "messageDocument",
+            "document": {
+                "file_name": name,
+                "mime_type": mime,
+                "document": file(600 + offset, 42_000, &format!("doc-{offset}"))
+            }
+        });
+        let mapped = map_single(&wire_message(2_500 + offset, json!({}), content));
+        assert_eq!(mapped.logical_kind, logical_kind);
+        assert_eq!(
+            mapped.telegram_representation,
+            TelegramRepresentation::OriginalDocument
+        );
+        assert_eq!(mapped.fidelity, AttachmentFidelity::Original);
+        assert_eq!(mapped.source_name.as_deref(), Some(name));
+        assert_eq!(mapped.safe_name.as_str(), name);
+    }
+}
+
+#[test]
+fn expected_size_is_not_persisted_as_an_exact_size_claim() {
+    let content = json!({
+        "@type": "messageDocument",
+        "document": {
+            "file_name": "estimate.bin",
+            "mime_type": "application/octet-stream",
+            "document": {
+                "id": 700,
+                "size": 0,
+                "expected_size": 9_999,
+                "remote": {"id": "remote-700", "unique_id": "expected-only"}
+            }
+        }
+    });
+    let mapped = map_single(&wire_message(2_600, json!({}), content));
+    assert_eq!(mapped.descriptor.size, None);
+    assert_eq!(mapped.descriptor.file_id, Some(700));
+    assert_eq!(mapped.fidelity, AttachmentFidelity::Original);
+}
+
+#[test]
+fn expired_and_locatorless_media_map_to_metadata_only_placeholders() {
+    let expired = map_single(&wire_message(
+        2_700,
+        json!({}),
+        json!({"@type": "messageExpiredPhoto"}),
+    ));
+    let locatorless = map_single(&wire_message(
+        2_701,
+        json!({}),
+        json!({"@type": "messagePhoto", "photo": {"sizes": []}}),
+    ));
+    for mapped in [expired, locatorless] {
+        assert_eq!(mapped.descriptor.file_id, None);
+        assert_eq!(
+            mapped.descriptor.availability,
+            AttachmentAvailability::Unavailable
+        );
+        assert_eq!(mapped.fidelity, AttachmentFidelity::MetadataOnly);
+        assert_eq!(mapped.source_name, None);
+        assert_eq!(mapped.safe_name.as_str(), "photo.jpg");
     }
 }
 

@@ -54,6 +54,7 @@ PROVENANCE_ROOT = Path(".temp") / "acceptance"
 # A run id names a directory under .temp/acceptance/ and appears in artifact
 # names. Anchored, no separators: "../../etc" must never become a write path.
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+RUN_ID_TOKEN = "{run_id}"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -178,6 +179,15 @@ def build_steps() -> dict[str, Step]:
                 argv=("swift", "test", "--package-path", "apple/GramDriveSupport"),
                 purpose="apple/GramDriveSupport unit tests: File Provider, agent, companion, shared state",
             ),
+            Step(
+                name="live-content-matrix",
+                argv=_python(
+                    ".scripts/acceptance/run_live_content.py",
+                    "--output",
+                    f".temp/acceptance/{RUN_ID_TOKEN}/live-content.json",
+                ),
+                purpose="privacy-safe synthetic Rust/Swift live date-first acceptance matrix",
+            ),
             # git mode, not the working tree: a secret that was committed and
             # later deleted still ships in every clone's history. --redact keeps
             # the matched value out of the provenance log (the AC is "logs
@@ -225,6 +235,9 @@ SUITES: dict[str, tuple[str, ...]] = {
         "swift-build",
         "swift-test",
     ),
+    # Combined pre-install live-content acceptance over focused Rust
+    # integration/conformance tests and the full Swift package regression gate.
+    "live-content": ("live-content-matrix",),
     # Secret scanning. Its own suite, deliberately NOT folded into `all`: it is
     # the only gate that needs gitleaks on PATH (a third tool footprint after
     # core's Rust and repo's Python) and it is a merge-boundary check, so the
@@ -375,9 +388,10 @@ def run_suite(
 
     results: list[StepResult] = []
     for step in steps:
-        echo(f"==> {step.name}: {' '.join(step.argv)}")
+        argv = tuple(arg.replace(RUN_ID_TOKEN, run_id) for arg in step.argv)
+        echo(f"==> {step.name}: {' '.join(argv)}")
         began = time.monotonic()
-        code, output = runner(step.argv, repo_root)
+        code, output = runner(argv, repo_root)
         duration = time.monotonic() - began
 
         log_name = f"{step.name}.log"
@@ -389,7 +403,7 @@ def run_suite(
             {
                 "name": step.name,
                 "purpose": step.purpose,
-                "command": list(step.argv),
+                "command": list(argv),
                 "exit_code": code,
                 "duration_seconds": round(duration, 3),
                 "log": log_name,

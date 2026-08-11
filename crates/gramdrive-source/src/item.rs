@@ -65,7 +65,7 @@ impl DirectoryKind {
 /// Structural kind of a file item — the file half of [`NodeKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
-    /// A generated document: `chat.json`, `messages.ndjson`, `MM.md`, or
+    /// A generated document: `.chat.json`, `messages.ndjson`, `MM.md`, or
     /// `order.json`.
     GeneratedDoc,
     /// A downloadable attachment file.

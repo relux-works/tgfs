@@ -33,6 +33,7 @@ bindgen = ["uniffi/cli"]
 [dependencies]
 gramdrive-engine = { workspace = true }
 gramdrive-model = { workspace = true }
+gramdrive-source = { workspace = true }
 # Shared durable state across host processes (src/shared_state.rs): the FFI
 # opens the store and serves the provider extension's snapshot reads. The
 # auth surface (src/auth.rs) also writes the account row on a completed
@@ -49,10 +50,10 @@ serde_json = { workspace = true }
 # (timers, I/O) work regardless of which thread polls the future. The
 # threading model is documented in README.md.
 uniffi = { workspace = true, features = ["tokio"] }
-tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
 
 [lints]
 # Shared lint set: Cargo.toml [workspace.lints].

@@ -23,6 +23,23 @@ import Testing
         #expect(CompanionStatusViewModel.accountStatus(from: .timedOut) == .agentUnavailable)
     }
 
+    @Test func accountStatusProjectsDurableAuthorizationWithoutIdentityData() {
+        let authorized = AccountHealthSummary(
+            accountId: 7, displayName: "Private", authState: "authorized")
+        #expect(
+            CompanionStatusViewModel.accountStatus(
+                from: .running(previewSnapshot(accounts: [authorized]))) == .authorized)
+        #expect(
+            CompanionStatusViewModel.accountStatus(
+                from: .running(previewSnapshot(accounts: []))) == .notConfigured)
+        let signedOut = AccountHealthSummary(
+            accountId: 7, displayName: "Private", authState: "signed_out")
+        #expect(
+            CompanionStatusViewModel.accountStatus(
+                from: .running(previewSnapshot(accounts: [signedOut])))
+                == .authorizationRequired)
+    }
+
     @Test func providerStatusProjectsTheRegistrationField() {
         #expect(
             CompanionStatusViewModel.providerStatus(
@@ -73,5 +90,12 @@ import Testing
         await model.refresh()
         #expect(model.agentPresence == .running(.running))
         #expect(model.diagnostics?.pid == 4242)
+    }
+
+    @Test func appOwnedProviderResultOverridesAnUnwiredHealthField() {
+        let backend = InMemoryCompanionBackend(health: .running(previewSnapshot()))
+        let model = CompanionStatusViewModel(backend: backend)
+        model.reportProviderStatus(.registered)
+        #expect(model.providerStatus == .registered)
     }
 }

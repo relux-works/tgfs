@@ -74,6 +74,169 @@ private func settle(_ model: AuthorizationViewModel) async {
         await settle(model)
         #expect(model.isAuthorized)
     }
+
+    @Test func repeatedQrRestartCoalescesUntilTheExistingSessionCloses() async {
+        let first = DelayedClosingAuthorizationSession(
+            initialState: .waitQrConfirmation(link: "tg://login?token=synthetic-first"))
+        let second = RecordingAuthorizationSession(states: [.waitPhoneNumber])
+        let unexpectedThird = RecordingAuthorizationSession(states: [.waitPhoneNumber])
+        let sessions = SessionSequence([first, second, unexpectedThird])
+        let backend = InMemoryCompanionBackend(session: { sessions.next() })
+        let model = AuthorizationViewModel(backend: backend)
+
+        await model.begin()
+        for _ in 0..<100 {
+            if model.state.kind == "wait-qr-confirmation" { break }
+            await Task.yield()
+        }
+        #expect(model.state.kind == "wait-qr-confirmation")
+
+        var acknowledgements = first.cancelAcknowledgements.makeAsyncIterator()
+        let restart = Task { @MainActor in await model.begin() }
+        _ = await acknowledgements.next()
+        #expect(model.isSubmitting)
+        #expect(sessions.creationCount == 1)
+
+        // A second keyboard or mouse activation while the close barrier is
+        // pending is coalesced by the model, even if a caller bypasses the
+        // view's disabled button state.
+        await model.begin()
+        #expect(model.isSubmitting)
+        #expect(sessions.creationCount == 1)
+
+        first.releaseAfterClose()
+        await restart.value
+        await model.waitForCompletion()
+        #expect(sessions.creationCount == 2)
+        #expect(second.startCount == 1)
+        #expect(unexpectedThird.startCount == 0)
+        #expect(!model.isSubmitting)
+        #expect(model.state == .waitPhoneNumber)
+    }
+}
+
+private final class SessionSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessions: [any AuthorizationSession]
+
+    init(_ sessions: [any AuthorizationSession]) {
+        self.sessions = sessions
+    }
+
+    func next() -> any AuthorizationSession {
+        lock.lock()
+        defer { lock.unlock() }
+        creationCountStorage += 1
+        return sessions.removeFirst()
+    }
+
+    private var creationCountStorage = 0
+
+    var creationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return creationCountStorage
+    }
+}
+
+private final class DelayedClosingAuthorizationSession: AuthorizationSession, @unchecked Sendable {
+    let states: AsyncStream<CompanionAuthState>
+    let cancelAcknowledgements: AsyncStream<Void>
+
+    private let stateContinuation: AsyncStream<CompanionAuthState>.Continuation
+    private let acknowledgementContinuation: AsyncStream<Void>.Continuation
+    private let lock = NSLock()
+    private var closeWaiter: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    init(initialState: CompanionAuthState) {
+        (states, stateContinuation) = AsyncStream.makeStream(of: CompanionAuthState.self)
+        (cancelAcknowledgements, acknowledgementContinuation) =
+            AsyncStream.makeStream(of: Void.self)
+        stateContinuation.yield(initialState)
+    }
+
+    func start() async -> AuthStartResult { .started }
+
+    func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult { .accepted }
+
+    func cancel() async {
+        // Models the production ordering: TDLib accepts cancel first, then
+        // reports terminal closure after the auth pump releases its slot.
+        acknowledgementContinuation.yield(())
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if released {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                closeWaiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    func releaseAfterClose() {
+        stateContinuation.yield(.closed)
+        stateContinuation.finish()
+        acknowledgementContinuation.finish()
+        lock.lock()
+        released = true
+        let waiter = closeWaiter
+        closeWaiter = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+}
+
+private final class RecordingAuthorizationSession: AuthorizationSession, @unchecked Sendable {
+    let states: AsyncStream<CompanionAuthState>
+    private let lock = NSLock()
+    private var inputKinds: [String] = []
+    private var startCountStorage = 0
+
+    init(states: [CompanionAuthState]) {
+        self.states = AsyncStream { continuation in
+            for state in states { continuation.yield(state) }
+            continuation.finish()
+        }
+    }
+
+    func start() async -> AuthStartResult {
+        recordStart()
+        return .started
+    }
+
+    func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult {
+        record(input.kind)
+        return .accepted
+    }
+
+    func cancel() async {}
+
+    private func recordStart() {
+        lock.lock()
+        startCountStorage += 1
+        lock.unlock()
+    }
+
+    private func record(_ kind: String) {
+        lock.lock()
+        inputKinds.append(kind)
+        lock.unlock()
+    }
+
+    var submittedInputKinds: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return inputKinds
+    }
+
+    var startCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return startCountStorage
+    }
 }
 
 @MainActor

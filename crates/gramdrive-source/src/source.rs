@@ -43,6 +43,21 @@ use crate::page::{ChangePage, ItemPage, PageRequest};
 /// A boxed, sendable future resolving to a contract result.
 pub type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SourceError>> + Send + 'a>>;
 
+/// The content-only subset consumed by the transfer engine.
+///
+/// A local source may compose metadata discovery and content fetching from
+/// different adapters while still owning one provider session. Keeping this
+/// port narrower than [`DriveSource`] lets the TDLib downloader participate in
+/// hydration without inventing enumeration methods it does not own.
+pub trait ContentSource: Send + Sync {
+    /// Delivers one pinned byte range into `sink`.
+    fn fetch<'a>(
+        &'a self,
+        request: FetchRequest,
+        sink: &'a mut dyn ContentSink,
+    ) -> SourceFuture<'a, ()>;
+}
+
 /// The provider-neutral drive backend contract (DEC-003).
 ///
 /// Implementations live in separate crates — `gramdrive-source-tdjson`,
@@ -97,6 +112,19 @@ pub trait DriveSource: Send + Sync {
     /// answer, not an error; restricted content fails with
     /// [`SourceError::Restricted`] like any other content access (POL-4).
     fn thumbnail(&self, item: ItemId, spec: ThumbnailSpec) -> SourceFuture<'_, Option<Thumbnail>>;
+}
+
+impl<T> ContentSource for T
+where
+    T: DriveSource + ?Sized,
+{
+    fn fetch<'a>(
+        &'a self,
+        request: FetchRequest,
+        sink: &'a mut dyn ContentSink,
+    ) -> SourceFuture<'a, ()> {
+        DriveSource::fetch(self, request, sink)
+    }
 }
 
 #[cfg(test)]

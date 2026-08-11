@@ -11,8 +11,8 @@ use gramdrive_model::identity::{
     MessageKey, SchemaFamily,
 };
 use gramdrive_render::ndjson::{
-    self, Attachment, Availability, Deletion, MediaKind, MessageBody, MessageHistory, Revision,
-    Sender, ServiceAction,
+    self, Attachment, AttachmentFidelity, Availability, Deletion, MediaKind, MessageBody,
+    MessageHistory, Revision, Sender, ServiceAction, TelegramRepresentation,
 };
 use support::{JsonValue, corpus, fixture_chat, parse, parse_lines};
 
@@ -86,7 +86,9 @@ const HEADER_FIELD_ORDER: &[&str] = &[
     "chat_id",
     "partition",
     "retention_mode",
+    "display_timezone",
     "input_watermark_seq",
+    "render_generation",
     "content_version",
 ];
 
@@ -97,18 +99,20 @@ fn header_and_record_are_byte_exact() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
         input_watermark_seq: 1,
+        render_generation: 0,
         messages: &messages,
     };
     let document = ndjson::render_messages(&input);
 
     let doc_id = ndjson::document_id(fixture_chat(), DocPartition::Chat).text();
     let expected_header = format!(
-        "{{\"type\":\"header\",\"schema\":\"gramdrive.messages\",\"schema_version\":1,\
-\"renderer_version\":1,\"schema_family\":1,\"document_id\":\"{doc_id}\",\"account_id\":7,\
+        "{{\"type\":\"header\",\"schema\":\"gramdrive.messages\",\"schema_version\":3,\
+\"renderer_version\":4,\"schema_family\":1,\"document_id\":\"{doc_id}\",\"account_id\":7,\
 \"namespace_version\":2,\"chat_id\":-1001234567890,\"partition\":{{\"kind\":\"chat\"}},\
-\"retention_mode\":\"mirror\",\"input_watermark_seq\":1,\
-\"content_version\":\"gramdrive.messages/s1/r1/w1\"}}"
+\"retention_mode\":\"mirror\",\"display_timezone\":\"UTC\",\"input_watermark_seq\":1,\
+\"render_generation\":0,\"content_version\":\"gramdrive.messages/s3/r4/w1/g0/retention-mirror/tz-UTC\"}}"
     );
     let expected_message = "{\"type\":\"message\",\"message_id\":1,\"state\":\"present\",\
 \"revision\":0,\"sender\":{\"id\":42},\"date_ms\":1000,\"edited_ms\":null,\"observed_ms\":1000,\
@@ -130,7 +134,9 @@ fn header_declares_frozen_schema_versions() {
             month: 7,
         },
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 99,
+        render_generation: 0,
         messages: &messages,
     };
     let document = ndjson::render_messages(&input);
@@ -155,10 +161,12 @@ fn header_declares_frozen_schema_versions() {
         Some(i64::from(ndjson::MESSAGES_SCHEMA_FAMILY.0))
     );
     assert_eq!(header.field("retention_mode").as_str(), Some("audit"));
+    assert_eq!(header.field("display_timezone").as_str(), Some("UTC"));
     assert_eq!(header.field("input_watermark_seq").as_i64(), Some(99));
+    assert_eq!(header.field("render_generation").as_i64(), Some(0));
     assert_eq!(
         header.field("content_version").as_str(),
-        Some(ndjson::content_version_token(99).as_str())
+        Some(ndjson::content_version_token(99, 0, RetentionMode::Audit, "UTC").as_str())
     );
     // Month partition round-trips into the header.
     let partition = header.field("partition");
@@ -168,13 +176,105 @@ fn header_declares_frozen_schema_versions() {
 }
 
 #[test]
+fn protected_latest_revision_suppresses_all_current_and_audit_plaintext() {
+    let mut historical = empty_body();
+    historical.text = Some("audit-secret-before-protection".to_owned());
+    historical.service = Some(ServiceAction::Other {
+        kind: "audit-secret-service".to_owned(),
+    });
+    let mut protected = empty_body();
+    protected.protected = true;
+    protected.text = Some("current-secret".to_owned());
+    protected.reply_to = Some(MessageId(99));
+    protected.topic_id = Some(77);
+    protected.album_id = Some(88);
+    protected.attachments = vec![Attachment {
+        index: AttachmentIndex(0),
+        media_kind: MediaKind::Document,
+        telegram_representation: TelegramRepresentation::OriginalDocument,
+        fidelity: AttachmentFidelity::Original,
+        source_name: Some("secret-filename.pdf".to_owned()),
+        mime_type: Some("secret/mime".to_owned()),
+        exact_size: Some(42),
+        availability: Availability::Restricted,
+        content_hash: None,
+        media_name: Some("secret-media-name.pdf".to_owned()),
+    }];
+    protected.service = Some(ServiceAction::Other {
+        kind: "current-secret-service".to_owned(),
+    });
+    let messages = vec![MessageHistory {
+        message_id: MessageId(7),
+        sender: Some(Sender { id: 42 }),
+        sent_at_ms: 1_000,
+        revisions: vec![
+            Revision {
+                event_seq: 1,
+                edited_at_ms: None,
+                observed_at_ms: 1_000,
+                payload_schema: SchemaFamily(1),
+                body: historical,
+            },
+            Revision {
+                event_seq: 2,
+                edited_at_ms: Some(2_000),
+                observed_at_ms: 2_000,
+                payload_schema: SchemaFamily(1),
+                body: protected,
+            },
+        ],
+        deletion: None,
+    }];
+    let document = ndjson::render_messages(&MessagesInput {
+        chat: fixture_chat(),
+        partition: DocPartition::Chat,
+        retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
+        input_watermark_seq: 2,
+        render_generation: 0,
+        messages: &messages,
+    });
+
+    assert_eq!(document.lines().count(), 2, "header plus one placeholder");
+    for secret in [
+        "audit-secret-before-protection",
+        "audit-secret-service",
+        "current-secret",
+        "secret-filename.pdf",
+        "secret/mime",
+        "secret-media-name.pdf",
+        "current-secret-service",
+    ] {
+        assert!(!document.contains(secret), "leaked {secret}");
+    }
+    let record = parse_lines(&document).pop().expect("protected record");
+    assert_eq!(record.field("protected").as_bool(), Some(true));
+    assert!(record.field("text").is_null());
+    assert!(
+        record
+            .field("entities")
+            .as_array()
+            .is_some_and(|values| values.is_empty())
+    );
+    assert!(
+        record
+            .field("attachments")
+            .as_array()
+            .is_some_and(|values| values.is_empty())
+    );
+    assert!(record.field("service").is_null());
+}
+
+#[test]
 fn every_message_record_carries_the_full_field_set() {
     let messages = corpus();
     let input = MessagesInput {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let document = ndjson::render_messages(&input);
@@ -193,7 +293,9 @@ fn mirror_shows_current_state_and_purges_deletions() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let records: Vec<JsonValue> = parse_lines(&ndjson::render_messages(&input))
@@ -230,7 +332,9 @@ fn audit_keeps_every_revision_and_a_content_preserving_tombstone() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let records: Vec<JsonValue> = parse_lines(&ndjson::render_messages(&input))
@@ -282,7 +386,9 @@ fn missing_sender_renders_null() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let records = parse_lines(&ndjson::render_messages(&input));
@@ -300,9 +406,11 @@ fn attachment_states_are_explicit_and_content_is_gated_on_availability() {
         Attachment {
             index: AttachmentIndex(0),
             media_kind: MediaKind::Photo,
-            name: Some("ok.jpg".to_owned()),
+            telegram_representation: TelegramRepresentation::OriginalDocument,
+            fidelity: AttachmentFidelity::Original,
+            source_name: Some("ok.jpg".to_owned()),
             mime_type: Some("image/jpeg".to_owned()),
-            size: Some(10),
+            exact_size: Some(10),
             availability: Availability::Fetchable,
             content_hash: Some(ContentHash::Sha256([0x01; 32])),
             media_name: Some("ok.jpg".to_owned()),
@@ -310,9 +418,11 @@ fn attachment_states_are_explicit_and_content_is_gated_on_availability() {
         Attachment {
             index: AttachmentIndex(1),
             media_kind: MediaKind::Document,
-            name: None,
+            telegram_representation: TelegramRepresentation::OriginalDocument,
+            fidelity: AttachmentFidelity::MetadataOnly,
+            source_name: None,
             mime_type: None,
-            size: None,
+            exact_size: None,
             availability: Availability::Restricted,
             content_hash: None,
             media_name: None,
@@ -335,7 +445,9 @@ fn attachment_states_are_explicit_and_content_is_gated_on_availability() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
         input_watermark_seq: 1,
+        render_generation: 0,
         messages: &messages,
     };
     let records = parse_lines(&ndjson::render_messages(&input));
@@ -378,13 +490,45 @@ fn attachment_states_are_explicit_and_content_is_gated_on_availability() {
 }
 
 #[test]
+fn malformed_processed_attachment_is_rejected_before_ndjson_output() {
+    let mut messages = corpus();
+    let attachment = messages
+        .iter_mut()
+        .flat_map(|message| &mut message.revisions)
+        .flat_map(|revision| &mut revision.body.attachments)
+        .next()
+        .expect("fixture attachment");
+    attachment.telegram_representation = TelegramRepresentation::Photo;
+    attachment.fidelity = AttachmentFidelity::Original;
+    attachment.source_name = Some("claimed-original.jpg".to_owned());
+    let input = MessagesInput {
+        chat: fixture_chat(),
+        partition: DocPartition::Month {
+            year: 2023,
+            month: 11,
+        },
+        retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
+        input_watermark_seq: 13,
+        render_generation: 0,
+        messages: &messages,
+    };
+    let mut document = String::new();
+    assert!(ndjson::write_messages(&mut document, &input).is_err());
+    assert!(document.is_empty());
+    assert!(ndjson::render_messages(&input).is_empty());
+}
+
+#[test]
 fn service_action_with_a_list_renders() {
     let messages = corpus();
     let input = MessagesInput {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let records = parse_lines(&ndjson::render_messages(&input));
@@ -411,7 +555,9 @@ fn identical_input_is_byte_identical() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     assert_eq!(
@@ -458,14 +604,18 @@ fn revision_input_order_does_not_change_output() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 9,
+        render_generation: 0,
         messages: &ascending,
     });
     let shuffled_doc = ndjson::render_messages(&MessagesInput {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 9,
+        render_generation: 0,
         messages: &shuffled,
     });
     assert_eq!(ascending_doc, shuffled_doc);
@@ -478,7 +628,9 @@ fn streaming_matches_the_string_form() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let mut streamed = String::new();
@@ -493,13 +645,17 @@ fn unknown_kinds_preserve_their_raw_tag() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let document = ndjson::render_messages(&input);
     // The forward-compat escape hatches keep the record lossless.
     assert!(document.contains("\"raw_kind\":\"future_entity\""));
-    assert!(document.contains("\"media_kind\":\"other\",\"media_kind_raw\":\"giveaway\""));
+    assert!(document.contains("\"media_kind\":\"other\""));
+    assert!(document.contains("\"media_kind_raw\":\"giveaway\""));
+    assert!(document.contains("\"telegram_representation_raw\":\"giveaway\""));
     assert!(document.contains("\"raw_action\":\"boost_applied\""));
     // And the whole thing is still valid NDJSON.
     for line in document.lines() {
@@ -516,7 +672,9 @@ fn control_characters_in_text_never_split_a_record() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
         input_watermark_seq: 1,
+        render_generation: 0,
         messages: &messages,
     };
     let document = ndjson::render_messages(&input);

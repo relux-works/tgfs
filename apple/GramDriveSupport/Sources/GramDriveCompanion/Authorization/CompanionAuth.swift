@@ -257,14 +257,9 @@ public protocol AuthorizationSession: Sendable {
     func start() async -> AuthStartResult
     /// Submits one user action.
     func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult
-    /// Abandons the flow locally (`cancel`); convenience for `submit(.cancel)`.
+    /// Abandons the flow and returns only after ``states`` has finished and
+    /// the session's resources are safe for a replacement session to acquire.
     func cancel() async
-}
-
-extension AuthorizationSession {
-    public func cancel() async {
-        _ = await submit(.cancel)
-    }
 }
 
 /// An authorization session that has no channel to drive: `start` reports
@@ -288,4 +283,6 @@ public struct UnavailableAuthorizationSession: AuthorizationSession {
     public func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult {
         .unavailable(reason)
     }
+
+    public func cancel() async {}
 }

@@ -12,8 +12,9 @@ import GramDriveSupport
 /// startup. The contract the server holds it to:
 ///
 /// - the returned ``HydratedContent/stagedPath`` names a fully verified
-///   file in the shared container, promoted atomically (SYNC-042), valid at
-///   least until the request's connection closes;
+///   file in the shared container, promoted atomically (SYNC-042). For a
+///   generated document, the server transfers an already-open descriptor and
+///   retains its render-generation lease until normal peer close;
 /// - `progress` is called from any background thread, monotonically, and
 ///   never after the call returns;
 /// - `token` is honored promptly (SYNC-043): after `cancel()` the call
@@ -27,6 +28,89 @@ public protocol ContentHydrating: Sendable {
         progress: @escaping @Sendable (HydrationProgress) -> Void,
         token: CancellationToken
     ) async throws -> HydratedContent
+
+    /// Releases a generated-document hand-off after the peer has cloned it
+    /// and closed its side of the socket. Ordinary attachments and test
+    /// hydrators have no lease, so the default is intentionally a no-op.
+    func release(_ content: HydratedContent)
+}
+
+public extension ContentHydrating {
+    func release(_ content: HydratedContent) {}
+}
+
+/// Production bridge from the agent IPC contract to the core's durable
+/// hydration composition.
+public final class CoreContentHydrator: ContentHydrating, @unchecked Sendable {
+    private let hydrator: Hydrator
+
+    public init(hydrator: Hydrator) {
+        self.hydrator = hydrator
+    }
+
+    public func hydrate(
+        _ request: HydrationRequest,
+        progress: @escaping @Sendable (HydrationProgress) -> Void,
+        token: CancellationToken
+    ) async throws -> HydratedContent {
+        if request.purpose == .thumbnail {
+            guard let width = request.maxWidthPx, let height = request.maxHeightPx,
+                width > 0, height > 0
+            else {
+                throw HydrationFailure(
+                    category: .internalError, detail: "thumbnail bounds are missing")
+            }
+            let thumbnail = try await hydrator.thumbnail(
+                accountId: request.accountId,
+                itemId: request.itemId,
+                contentVersion: request.contentVersion,
+                maxWidthPx: width,
+                maxHeightPx: height,
+                token: token)
+            guard let thumbnail else {
+                return HydratedContent(
+                    stagedPath: "", contentVersion: request.contentVersion,
+                    byteCount: 0, isAvailable: false)
+            }
+            return HydratedContent(
+                stagedPath: thumbnail.path,
+                contentVersion: thumbnail.contentVersion,
+                byteCount: thumbnail.byteCount,
+                mimeType: thumbnail.mimeType)
+        }
+        let relay = CoreHydrationProgressRelay(callback: progress)
+        let materialized = try await hydrator.hydrate(
+            accountId: request.accountId,
+            itemId: request.itemId,
+            contentVersion: request.contentVersion,
+            listener: relay,
+            token: token)
+        return HydratedContent(
+            stagedPath: materialized.path,
+            contentVersion: materialized.contentVersion,
+            byteCount: materialized.byteCount,
+            leaseID: materialized.leaseId)
+    }
+
+    public func release(_ content: HydratedContent) {
+        guard let leaseID = content.leaseID else { return }
+        try? hydrator.releaseHydrationLease(leaseId: leaseID)
+    }
+}
+
+private final class CoreHydrationProgressRelay: ProgressListener, @unchecked Sendable {
+    private let callback: @Sendable (HydrationProgress) -> Void
+
+    init(callback: @escaping @Sendable (HydrationProgress) -> Void) {
+        self.callback = callback
+    }
+
+    func onProgress(progress: TransferProgress) {
+        callback(
+            HydrationProgress(
+                bytesTransferred: progress.bytesTransferred,
+                bytesTotal: progress.bytesTotal))
+    }
 }
 
 /// The agent's pre-hydration gate: everything about a request that durable
@@ -48,7 +132,6 @@ public struct HydrationServerConfiguration: Sendable {
     public var maxConcurrentHydrations: Int
     /// Cap on waiting for the request line of an accepted connection.
     public var requestTimeout: Duration
-
     public init(
         maxConcurrentHydrations: Int = 8,
         requestTimeout: Duration = .seconds(5)
@@ -84,6 +167,8 @@ public final class HydrationServer: @unchecked Sendable {
     private var listener: Int32?
     private var acceptSource: (any DispatchSourceRead)?
     private var connections: [ObjectIdentifier: Connection] = [:]
+    private var stopping = false
+    private var drainedWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Binds, listens, and starts serving. A stale socket file (from a
     /// killed predecessor) is removed first — safe because the caller holds
@@ -142,7 +227,7 @@ public final class HydrationServer: @unchecked Sendable {
         self.acceptQueue = DispatchQueue(label: "com.reluxworks.gramdrive.agent.hydration")
         self.workQueue = DispatchQueue(
             label: "com.reluxworks.gramdrive.agent.hydration.work",
-            qos: .utility,
+            qos: .userInitiated,
             attributes: .concurrent)
     }
 
@@ -153,11 +238,13 @@ public final class HydrationServer: @unchecked Sendable {
         return connections.count
     }
 
-    /// Stops accepting, tears down the socket file, and unwinds every
-    /// in-flight hydration through its cancellation token. Idempotent; also
-    /// runs on deallocation.
+    /// Stops accepting, tears down the socket file, and cancels unfinished
+    /// work. A successful generated terminal event has already transferred
+    /// an independent descriptor to File Provider, so it neither depends on
+    /// this connection nor delays server shutdown.
     public func stop() {
         lock.lock()
+        stopping = true
         acceptSource?.cancel()
         acceptSource = nil
         let listener = self.listener
@@ -170,8 +257,29 @@ public final class HydrationServer: @unchecked Sendable {
         }
         for connection in active {
             connection.token.cancel()
-            connection.shutdownWire()
         }
+    }
+
+    /// Gracefully stops and drains active work. With a bounded timeout, a
+    /// wedged peer is force-closed after the deadline; an already-transferred
+    /// generated descriptor remains valid in File Provider even then.
+    public func stopAndDrain(timeout: Duration? = nil) async {
+        stop()
+        guard let timeout else {
+            await waitForConnectionsToClose()
+            return
+        }
+        let deadline = Task { [weak self] in
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.forceCloseConnections()
+        }
+        await waitForConnectionsToClose()
+        deadline.cancel()
     }
 
     deinit {
@@ -274,15 +382,59 @@ public final class HydrationServer: @unchecked Sendable {
 
         let hydrator = self.hydrator
         let registry = self.registry
-        Task { [weak self] in
+        let workQueue = self.workQueue
+        workQueue.async { [weak self] in
             do {
-                let content = try await hydrator.hydrate(
-                    request,
-                    progress: { [weak connection] progress in
-                        connection?.writeEvent(.progress(progress))
-                    },
-                    token: connection.token)
-                connection.writeEvent(.done(content))
+                // The GCD queue is the native demand execution boundary. The
+                // small detached task only drives the async UniFFI wrapper;
+                // the Rust hydrator owns actual work on its dedicated runtime.
+                // Waiting here therefore never occupies a Swift cooperative
+                // executor thread, while the user-initiated queue preserves
+                // the foreground scheduling contract through terminal I/O and
+                // synchronous lease reclamation.
+                let content = try Self.awaitOffCooperativeExecutor {
+                    try await hydrator.hydrate(
+                        request,
+                        progress: { [weak connection] progress in
+                            connection?.writeEvent(.progress(progress))
+                        },
+                        token: connection.token)
+                }
+                // A failure while publishing the terminal event (including a
+                // client disconnect) must release the Rust hand-off lease as
+                // well; otherwise a generated inode remains pinned until the
+                // agent exits.
+                defer { hydrator.release(content) }
+                if let leaseID = content.leaseID {
+                    // This is the process boundary: `SCM_RIGHTS` gives File
+                    // Provider an independent open reference before the old
+                    // pathname can be reclaimed. A successor may therefore
+                    // reconcile/reclaim immediately after this write without
+                    // invalidating a paused `copyItem` in the extension.
+                    let descriptor = open(content.stagedPath, O_RDONLY | O_CLOEXEC)
+                    guard descriptor >= 0 else {
+                        throw HydrationFailure(
+                            category: .storage, detail: "could not open generated hand-off")
+                    }
+                    defer { close(descriptor) }
+                    try connection.writeEvent(
+                        .done(content), transferringFileDescriptor: descriptor)
+                    _ = leaseID
+                    // Keep the original immutable pathname leased through a
+                    // normal File Provider materialization. The client closes
+                    // only after its synchronous clone returns; the received
+                    // descriptor separately makes that clone crash-safe if
+                    // this process is terminated before EOF.
+                    try Self.awaitOffCooperativeExecutor {
+                        await connection.waitForDisconnect()
+                    }
+                } else {
+                    connection.writeEvent(.done(content))
+                }
+                // EOF after normal materialization, disconnect, or the
+                // lifecycle's bounded force-close releases the Rust lease and
+                // ticket. A receiver-held descriptor stays valid if that
+                // close races a still-running File Provider clone.
             } catch let failure as HydrationFailure {
                 connection.writeEvent(.failure(failure))
             } catch is CancellationError {
@@ -302,11 +454,32 @@ public final class HydrationServer: @unchecked Sendable {
         }
     }
 
+    /// Blocks only the server's user-initiated dispatch worker while an async
+    /// boundary completes. This deliberately must not be called from a Swift
+    /// task: it keeps both the async UniFFI poll and the generated-document
+    /// descriptor/lease cleanup out of Swift's cooperative executor.
+    private static func awaitOffCooperativeExecutor<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) throws -> T {
+        let result = AsyncOperationResult<T>()
+        let settled = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            do {
+                result.store(.success(try await operation()))
+            } catch {
+                result.store(.failure(error))
+            }
+            settled.signal()
+        }
+        settled.wait()
+        return try result.take()
+    }
+
     /// Admits the connection into the bounded active set.
     private func admit(_ connection: Connection) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard connections.count < configuration.maxConcurrentHydrations else {
+        guard !stopping, connections.count < configuration.maxConcurrentHydrations else {
             return false
         }
         connections[ObjectIdentifier(connection)] = connection
@@ -316,7 +489,39 @@ public final class HydrationServer: @unchecked Sendable {
     private func remove(_ connection: Connection) {
         lock.lock()
         connections.removeValue(forKey: ObjectIdentifier(connection))
+        let waiters = connections.isEmpty ? drainedWaiters : []
+        if connections.isEmpty {
+            drainedWaiters = []
+        }
         lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    /// Breaks only server-side ownership after a lifecycle drain deadline.
+    /// Generated File Provider clients have already received independent
+    /// descriptors, so this cannot invalidate their current clone.
+    private func forceCloseConnections() {
+        lock.lock()
+        let active = Array(connections.values)
+        lock.unlock()
+        for connection in active {
+            connection.finish()
+        }
+    }
+
+    private func waitForConnectionsToClose() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if connections.isEmpty {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            drainedWaiters.append(continuation)
+            lock.unlock()
+        }
     }
 
     /// Reads the single request line, under the size cap and the socket's
@@ -355,11 +560,39 @@ public final class HydrationServer: @unchecked Sendable {
             return HydrationFailure(category: .storage, detail: "storage failure")
         case .Integrity:
             return HydrationFailure(category: .integrity, detail: "integrity failure")
+        case .Restricted:
+            return HydrationFailure(category: .restricted, detail: "restricted")
+        case .VersionConflict:
+            return HydrationFailure(category: .versionConflict, detail: "version conflict")
         case .Cancelled:
             return HydrationFailure(category: .cancelled, detail: "cancelled")
         case .InvalidArgument, .Internal:
             return HydrationFailure(category: .internalError, detail: "internal failure")
         }
+    }
+}
+
+/// Synchronously retrieves an async operation's result from the dedicated
+/// dispatch worker. The lock is intentionally confined to this bridge; its
+/// task never waits while holding it.
+private final class AsyncOperationResult<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Value, Error>?
+
+    func store(_ result: Result<Value, Error>) {
+        lock.lock()
+        self.result = result
+        lock.unlock()
+    }
+
+    func take() throws -> Value {
+        lock.lock()
+        let result = self.result
+        lock.unlock()
+        guard let result else {
+            preconditionFailure("async operation signalled without a result")
+        }
+        return try result.get()
     }
 }
 
@@ -371,7 +604,9 @@ private final class Connection: @unchecked Sendable {
 
     private let lock = NSLock()
     private var closed = false
+    private var disconnected = false
     private var monitor: (any DispatchSourceRead)?
+    private var disconnectWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(descriptor: Int32) {
         self.descriptor = descriptor
@@ -394,6 +629,18 @@ private final class Connection: @unchecked Sendable {
         }
     }
 
+    /// Writes a terminal event and atomically passes an open source
+    /// descriptor to the peer. The fd itself remains caller-owned.
+    func writeEvent(_ event: HydrationEvent, transferringFileDescriptor descriptor: Int32) throws {
+        let data = try HydrationWire.encodeLine(event)
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else {
+            throw UnixSocketError.failed(operation: "sendmsg", code: EPIPE)
+        }
+        try UnixFileDescriptorTransfer.send(data, fileDescriptor: descriptor, on: self.descriptor)
+    }
+
     /// Installs the EOF monitor: any readable event after the request line
     /// means the client closed (its cancel) or broke protocol — either way
     /// the hydration stops.
@@ -405,8 +652,7 @@ private final class Connection: @unchecked Sendable {
             _ = read(self.descriptor, &probe, probe.count)
             // EOF, error, or unexpected bytes: nothing legal arrives here,
             // so every firing is a reason to stop.
-            self.token.cancel()
-            self.cancelMonitor()
+            self.markDisconnected()
         }
         lock.lock()
         if closed {
@@ -424,13 +670,23 @@ private final class Connection: @unchecked Sendable {
         finish()
     }
 
-    /// Half-closes the wire from the server side (used by `stop()`); the
-    /// owning flow still runs `finish()` for the actual close.
-    func shutdownWire() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !closed else { return }
-        shutdown(descriptor, SHUT_RDWR)
+    /// Waits for the peer's close after a successful `done`. A connected peer
+    /// may still be inside its synchronous File Provider clone, so elapsed
+    /// time is never evidence that its generated source can be reclaimed.
+    /// A client crash, cancellation, and normal completion all close the
+    /// socket, which resumes this waiter and bounds the server-side ticket and
+    /// generation lease without putting an upper bound on `copyItem`.
+    func waitForDisconnect() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if disconnected || closed {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            disconnectWaiters.append(continuation)
+            lock.unlock()
+        }
     }
 
     /// Closes exactly once; cancels the monitor first so no source watches
@@ -441,10 +697,15 @@ private final class Connection: @unchecked Sendable {
         closed = true
         let source = monitor
         monitor = nil
+        let waiters = disconnectWaiters
+        disconnectWaiters = []
         lock.unlock()
         source?.cancel()
         if !wasClosed {
             close(descriptor)
+        }
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
@@ -454,6 +715,23 @@ private final class Connection: @unchecked Sendable {
         monitor = nil
         lock.unlock()
         source?.cancel()
+    }
+
+    private func markDisconnected() {
+        lock.lock()
+        if disconnected {
+            lock.unlock()
+            return
+        }
+        disconnected = true
+        let waiters = disconnectWaiters
+        disconnectWaiters = []
+        lock.unlock()
+        token.cancel()
+        cancelMonitor()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     deinit {

@@ -24,11 +24,14 @@ use std::sync::{Arc, Mutex};
 
 use gramdrive_engine::cache::{self, CacheAccounting, EvictionRequest, Evictor};
 use gramdrive_engine::model::ByteRange;
-use gramdrive_engine::model::identity::{ContentHash, ItemId};
+use gramdrive_engine::model::identity::{
+    AppearanceKey, CanonicalKey, ChatId, ChatKey, ChatListKind, ContentHash, DocFormat,
+    DocPartition, GeneratedDocKey, ItemId, ItemKey, SchemaFamily,
+};
 use gramdrive_engine::model::version::{ContentVersion, MetadataVersion};
 use gramdrive_engine::state::repo::{
     AccountRecord, CacheEntryRecord, CacheKind, CacheVerification, ChatRecord, ChatType,
-    ItemRecord, PinOrigin, RetentionMode, SourceKind,
+    ItemRecord, PinOrigin, RenderOutput, RetentionMode, SourceKind,
 };
 use gramdrive_engine::state::repo::{FileFacts, ItemAvailability};
 use gramdrive_engine::state::{LocalStorage, StateStore, StorageError, StoredObject};
@@ -69,6 +72,7 @@ fn seed_base(store: &mut StateStore) {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -77,9 +81,9 @@ fn seed_base(store: &mut StateStore) {
     })
     .expect("account");
     tx.upsert_chat(&ChatRecord {
-        key: gramdrive_engine::model::identity::ChatKey {
+        key: ChatKey {
             scope: scope(),
-            chat_id: gramdrive_engine::model::identity::ChatId(CHAT),
+            chat_id: ChatId(CHAT),
         },
         chat_type: ChatType::Private,
         title: format!("Chat {CHAT}"),
@@ -93,6 +97,7 @@ fn seed_base(store: &mut StateStore) {
     })
     .expect("chat");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: fixture::account_root_id(scope()),
         parent: None,
         display_name: "Root".to_owned(),
@@ -115,6 +120,7 @@ fn seed_item(store: &mut StateStore, message: i64) -> ItemId {
     let id = fixture::attachment_id(scope(), CHAT, message, 0);
     let tx = store.write_txn().expect("write");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: id.clone(),
         parent: Some(fixture::account_root_id(scope())),
         display_name: format!("file-{message}.bin"),
@@ -211,6 +217,84 @@ fn seed_entry(store: &mut StateStore, host: &MemoryHost, seed: &Seed) -> ItemId 
     tx.commit().expect("commit");
 
     host.put_object(&reference, seed.size);
+    item
+}
+
+/// One clean, published generated document with matching item facts, render
+/// state, cache ownership, and host bytes. This mirrors the render pipeline's
+/// post-publication state closely enough for the quota walk to exercise the
+/// production invariant rather than a cache-only fixture.
+fn seed_published_generated_document(store: &mut StateStore, host: &MemoryHost) -> ItemId {
+    let chat = ChatKey {
+        scope: scope(),
+        chat_id: ChatId(CHAT),
+    };
+    let item = ItemKey::Appearance(AppearanceKey {
+        view: ChatListKind::Main,
+        item: CanonicalKey::GeneratedDoc(GeneratedDocKey {
+            chat,
+            partition: DocPartition::Month {
+                year: 2026,
+                month: 7,
+            },
+            format: DocFormat::Ndjson,
+            schema_family: SchemaFamily(1),
+        }),
+    })
+    .id();
+    let reference = "generated-document-2026";
+    let size = 64;
+
+    let tx = store.write_txn().expect("write");
+    tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
+        id: item.clone(),
+        parent: Some(fixture::account_root_id(scope())),
+        display_name: "Messages.ndjson".to_owned(),
+        safe_name: "Messages.ndjson".to_owned(),
+        metadata_version: metadata("m1"),
+        content: Some(FileFacts {
+            mime_type: Some("application/x-ndjson".to_owned()),
+            logical_size: Some(size),
+            content_version: Some(version("generated-v1")),
+        }),
+        availability: ItemAvailability::Fetchable,
+        created_at_ms: None,
+        modified_at_ms: Some(1_000),
+        deleted_at_ms: None,
+    })
+    .expect("generated document");
+    tx.ensure_render_state(&item, 1, 1).expect("render state");
+    let publish = tx
+        .publish_render(
+            &item,
+            &chat,
+            0,
+            &RenderOutput {
+                content_version: version("generated-v1"),
+                content_hash: Some(ContentHash::Sha256([7; 32])),
+                logical_size: size,
+            },
+            1_000,
+        )
+        .expect("publish render");
+    assert!(publish.clean);
+    tx.upsert_cache_entry(&CacheEntryRecord {
+        item: item.clone(),
+        account: scope().account,
+        content_version: version("generated-v1"),
+        kind: CacheKind::GeneratedDoc,
+        size,
+        blob_hash: None,
+        verification: CacheVerification::Verified,
+        pin: None,
+        last_access_at_ms: 1_000,
+        materialized_at_ms: 1_000,
+        materialization_ref: Some(reference.to_owned()),
+    })
+    .expect("cache entry");
+    tx.commit().expect("commit");
+    host.put_object(reference, size);
     item
 }
 
@@ -334,21 +418,58 @@ fn accounting_separates_categories_and_splits_pins() {
     // Categories counted separately (SYNC-050).
     assert_eq!(a.blob_bytes, 100 + 200 + 400);
     assert_eq!(a.generated_doc_bytes, 50);
+    assert_eq!(a.generated_doc_exempt_bytes, 50);
     assert_eq!(a.thumbnail_bytes, 40);
     assert_eq!(a.partial_transfer_bytes, 32);
 
     // Totals and the pin/verification splits the quota reads.
     assert_eq!(a.total_cache_bytes, 100 + 200 + 50 + 40 + 400);
     assert_eq!(a.pinned_bytes, 200);
-    assert_eq!(a.unpinned_bytes, 100 + 50 + 40 + 400);
+    assert_eq!(a.unpinned_bytes, 100 + 40 + 400);
     // Evictable excludes the pinned entry and the unverified one.
-    assert_eq!(a.evictable_bytes, 100 + 50 + 40);
-    // Invariant: total splits exactly into pinned + unpinned, and into
-    // the three materialized categories.
-    assert_eq!(a.total_cache_bytes, a.pinned_bytes + a.unpinned_bytes);
+    assert_eq!(a.evictable_bytes, 100 + 40);
+    // Materialization categories partition the physical total. Pin and
+    // exemption fields are policy slices, intentionally not an alternative
+    // total (a pinned generated document appears in both slices).
     assert_eq!(
         a.total_cache_bytes,
         a.blob_bytes + a.generated_doc_bytes + a.thumbnail_bytes
+    );
+}
+
+#[test]
+fn pinned_generated_document_accounting_keeps_policy_slices_overlapping() {
+    let mut store = open_store();
+    seed_base(&mut store);
+    let host = MemoryHost::default();
+    seed_entry(
+        &mut store,
+        &host,
+        &Seed::new(7, 64, 1_000)
+            .kind(CacheKind::GeneratedDoc)
+            .pinned(PinOrigin::User),
+    );
+
+    let accounting = Evictor::default()
+        .accounting(&mut store)
+        .expect("accounting");
+
+    // Categories partition actual disk use, but the generated-document
+    // exemption is a policy reason that overlaps the pin reason.
+    assert_eq!(accounting.total_cache_bytes, 64);
+    assert_eq!(accounting.generated_doc_bytes, 64);
+    assert_eq!(accounting.generated_doc_exempt_bytes, 64);
+    assert_eq!(accounting.pinned_bytes, 64);
+    assert_eq!(accounting.unpinned_bytes, 0);
+    assert_eq!(accounting.evictable_bytes, 0);
+    assert_eq!(
+        accounting.total_cache_bytes,
+        accounting.blob_bytes + accounting.generated_doc_bytes + accounting.thumbnail_bytes
+    );
+    assert_eq!(
+        accounting.pinned_bytes + accounting.generated_doc_exempt_bytes,
+        128,
+        "policy slices overlap rather than forming a second total"
     );
 }
 
@@ -467,6 +588,68 @@ fn enforce_within_quota_evicts_nothing() {
     assert_eq!(report.reclaimed_bytes, 0);
     assert!(report.assessment.within_quota());
     assert_eq!(host.object_refs().len(), 2);
+}
+
+#[test]
+fn quota_walk_keeps_published_generated_documents_exempt_and_accounted() {
+    let mut store = open_store();
+    seed_base(&mut store);
+    let host = MemoryHost::default();
+    let item = seed_published_generated_document(&mut store, &host);
+    let quota_managed = seed_entry(
+        &mut store,
+        &host,
+        &Seed::new(99, 64, 2_000).kind(CacheKind::Thumbnail),
+    );
+
+    // Generated bytes remain a first-class visible accounting category before
+    // the quota walk, including the explicit exemption from destructive LRU.
+    let accounting = Evictor::default()
+        .accounting(&mut store)
+        .expect("accounting");
+    assert_eq!(accounting.generated_doc_bytes, 64);
+    assert_eq!(accounting.generated_doc_exempt_bytes, 64);
+    assert_eq!(accounting.thumbnail_bytes, 64);
+    assert_eq!(accounting.total_cache_bytes, 128);
+
+    // A zero quota deterministically walks an over-quota cache where the
+    // published generated document is older than the ordinary thumbnail. The
+    // thumbnail is the only LRU victim: if the generated document ever
+    // re-enters the candidate query, it is selected first and this invariant
+    // fails.
+    let report = Evictor::with_limit(0)
+        .enforce(&mut store, &host, &EvictionRequest::none())
+        .expect("enforce");
+    assert_eq!(report.evicted, vec![quota_managed]);
+    assert_eq!(report.objects_deleted, vec!["cache-object-99".to_owned()]);
+    assert_eq!(report.reclaimed_bytes, 64);
+    assert!(report.assessment.within_quota());
+    assert!(host.has_object("generated-document-2026"));
+
+    let read = store.read_txn().expect("read");
+    assert!(read.cache_entry(&item).expect("cache entry").is_some());
+    let facts = read
+        .item(&item)
+        .expect("item")
+        .expect("generated document")
+        .content
+        .expect("published facts");
+    assert_eq!(facts.logical_size, Some(64));
+    assert_eq!(
+        facts.content_version.as_ref().map(ContentVersion::as_str),
+        Some("generated-v1")
+    );
+    assert!(
+        !read
+            .render_state(&item)
+            .expect("render state")
+            .expect("published render state")
+            .dirty
+    );
+    assert_eq!(
+        read.dirty_render_items(10).expect("dirty worklist"),
+        Vec::<ItemId>::new()
+    );
 }
 
 // ---------------------------------------------------------------------------

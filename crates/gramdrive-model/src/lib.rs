@@ -16,6 +16,7 @@
 
 mod base32;
 
+pub mod attachment;
 pub mod cursor;
 pub mod hash;
 pub mod identity;

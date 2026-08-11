@@ -65,6 +65,14 @@ public final class TransferRegistry: @unchecked Sendable {
         entries.removeValue(forKey: ticket.id)
     }
 
+    /// Reopens new-work admission when a bounded shutdown is cancelled.
+    /// Existing cancellation tickets remain valid and continue to drain.
+    public func resumeAdmission() {
+        lock.lock()
+        draining = false
+        lock.unlock()
+    }
+
     /// Operations currently in flight.
     public var pendingCount: Int {
         lock.lock()
@@ -72,12 +80,21 @@ public final class TransferRegistry: @unchecked Sendable {
         return entries.count
     }
 
-    /// Whether a drain has started and the registry is refusing new work.
-    /// This remains true for the rest of the registry's lifetime.
+    /// Whether a drain is currently refusing new work. This returns to false
+    /// only when a cancelled shutdown explicitly reopens admission.
     public var isDraining: Bool {
         lock.lock()
         defer { lock.unlock() }
         return draining
+    }
+
+    /// Whether the registry is currently admitting new transfers. This is a
+    /// health-only serving proof used after a cancelled termination: a live
+    /// socket alone must not be mistaken for a recovered File Provider agent.
+    public var isAcceptingNewWork: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !draining
     }
 
     /// Drains the registry: refuses new work, waits `gracePeriod` for

@@ -24,7 +24,9 @@ use std::fmt::Write as _;
 
 use common::{ACCOUNT_ID, NAMESPACE, account_root_id, appearance_id};
 use gramdrive_state::StateStore;
-use gramdrive_state::model::identity::{ChatListKind, DocFormat, DocPartition, ItemId};
+use gramdrive_state::model::identity::{
+    CanonicalKey, ChatListKind, DocFormat, DocPartition, ItemId, MonthDirKey,
+};
 use gramdrive_testkit::synthetic::{
     self, SyntheticAccount, SyntheticChat, SyntheticSpec, partition_of,
 };
@@ -94,6 +96,19 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
               ORDER BY event_seq",
     },
     RequiredQuery {
+        name: "affected_render_instants",
+        serves: "month-only invalidation from an event watermark interval (SYNC-024)",
+        sql: "SELECT m.sent_at_ms
+              FROM message_events e
+              JOIN messages m
+                ON m.account_id = e.account_id
+               AND m.namespace_version = e.namespace_version
+               AND m.chat_id = e.chat_id
+               AND m.message_id = e.message_id
+              WHERE e.account_id = ?1 AND e.namespace_version = ?2 AND e.chat_id = ?3
+                AND e.event_seq > ?4 AND e.event_seq <= ?5",
+    },
+    RequiredQuery {
         name: "message_event_history",
         serves: "Audit-mode revision history of one message (POL-3)",
         sql: "SELECT event_seq, event_kind FROM message_events
@@ -146,10 +161,32 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
     },
     RequiredQuery {
         name: "backfill_backlog",
-        serves: "which chats still need history, least-recently synced first (SYNC-021)",
-        sql: "SELECT chat_id FROM chat_sync_state
-              WHERE account_id = ?1 AND namespace_version = ?2 AND history_complete = 0
-              ORDER BY last_sync_at_ms LIMIT 32",
+        serves: "bounded runnable listed chats including never-anchored eligible rows (SYNC-021)",
+        sql: "SELECT s.chat_id
+              FROM chat_sync_state s
+              JOIN chats c
+                ON c.account_id = s.account_id
+               AND c.namespace_version = s.namespace_version
+               AND c.chat_id = s.chat_id
+              LEFT JOIN chat_content_progress p
+                ON p.account_id = s.account_id
+               AND p.namespace_version = s.namespace_version
+               AND p.chat_id = s.chat_id
+              WHERE s.account_id = ?1 AND s.namespace_version = ?2
+                AND s.history_complete = 0
+                AND c.deleted_at_ms IS NULL
+                AND c.is_protected = 0
+                AND EXISTS (
+                    SELECT 1 FROM chat_list_entries e
+                    WHERE e.account_id = s.account_id
+                      AND e.namespace_version = s.namespace_version
+                      AND e.chat_id = s.chat_id
+                )
+                AND (p.chat_id IS NULL
+                     OR p.phase IN ('pending', 'syncing', 'cancelled')
+                     OR (p.phase = 'degraded'
+                         AND (p.retry_at_ms IS NULL OR p.retry_at_ms <= ?4)))
+              ORDER BY s.last_backfill_at_ms, s.chat_id LIMIT 32",
     },
     RequiredQuery {
         name: "backfill_control_lookup",
@@ -162,6 +199,26 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
         name: "dirty_render_docs",
         serves: "the re-render worklist (SYNC-024)",
         sql: "SELECT item_id FROM render_state WHERE dirty = 1",
+    },
+    RequiredQuery {
+        name: "monthly_render_catalog",
+        serves: "bounded Markdown/NDJSON appearance catalog for one direct month (SYNC-033)",
+        sql: "SELECT child.item_id
+              FROM items AS month
+              JOIN items AS child ON child.parent_item_id = month.item_id
+              WHERE month.canonical_item_id = ?1
+                AND month.kind = 'month_dir' AND month.deleted_at_ms IS NULL
+                AND child.kind = 'generated_doc' AND child.deleted_at_ms IS NULL",
+    },
+    RequiredQuery {
+        name: "chat_render_catalog",
+        serves: "bounded .chat.json appearance catalog for one chat (SYNC-033)",
+        sql: "SELECT child.item_id
+              FROM items AS chat
+              JOIN items AS child ON child.parent_item_id = chat.item_id
+              WHERE chat.canonical_item_id = ?1
+                AND chat.kind = 'chat' AND chat.deleted_at_ms IS NULL
+                AND child.kind = 'generated_doc' AND child.deleted_at_ms IS NULL",
     },
 ];
 
@@ -247,8 +304,8 @@ fn required_queries_return_real_rows_from_the_fixture() {
     load_account(&mut store, &account);
     let conn = store.connection();
 
-    // Root enumeration sees the three fixed roots (Main, Archive, the
-    // folder catalog).
+    // Root enumeration sees the four fixed roots (Main, Archive, Stories,
+    // and the folder catalog).
     let children: i64 = conn
         .query_row(
             "SELECT count(*) FROM items WHERE parent_item_id = ?1 AND deleted_at_ms IS NULL",
@@ -256,7 +313,7 @@ fn required_queries_return_real_rows_from_the_fixture() {
             |r| r.get(0),
         )
         .expect("children");
-    assert_eq!(children, 3);
+    assert_eq!(children, 4);
 
     // The busiest chat's messages come back id-ordered from the PK path.
     let busiest = account
@@ -326,6 +383,34 @@ fn required_queries_return_real_rows_from_the_fixture() {
         )
         .expect("count");
     assert!(dirty > 0, "dirty documents exist");
+
+    // The repository catalog has the same direct .chat.json appearances the
+    // projection created, and keeps their previous stable ItemId order.
+    let target = account
+        .chats
+        .iter()
+        .max_by_key(|chat| chat.list_entries.len())
+        .expect("chats exist");
+    let mut expected: Vec<_> = target
+        .list_entries
+        .iter()
+        .map(|entry| {
+            appearance_id(
+                entry.list,
+                common::doc_key(target.chat_id.0, DocPartition::Chat, DocFormat::Json),
+            )
+        })
+        .collect();
+    expected.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let read = store.read_txn().expect("read");
+    let catalog = read
+        .chat_render_catalog(common::chat_key(target.chat_id.0))
+        .expect("chat catalog");
+    let actual: Vec<_> = catalog.into_iter().map(|entry| entry.item).collect();
+    assert_eq!(
+        actual, expected,
+        "catalog entries and ItemId order are stable"
+    );
 }
 
 fn explain(conn: &Connection, sql: &str) -> Vec<String> {
@@ -420,17 +505,18 @@ fn insert_structure_items(tx: &Transaction<'_>, account: &SyntheticAccount) {
 
     let main = common::chat_list_id(ChatListKind::Main);
     let archive = common::chat_list_id(ChatListKind::Archive);
+    let stories = common::chat_list_id(ChatListKind::Stories);
     insert_dir(tx, &main, Some(&root), "chat_list", "Main");
     insert_dir(tx, &archive, Some(&root), "chat_list", "Archive");
+    insert_dir(tx, &stories, Some(&root), "chat_list", "Stories");
     insert_order_doc(tx, &main, ChatListKind::Main);
     insert_order_doc(tx, &archive, ChatListKind::Archive);
+    insert_order_doc(tx, &stories, ChatListKind::Stories);
 
     let catalog = gramdrive_state::model::identity::ItemKey::Canonical(
-        gramdrive_state::model::identity::CanonicalKey::FolderCatalog(
-            gramdrive_state::model::identity::FolderCatalogKey {
-                scope: common::scope(),
-            },
-        ),
+        CanonicalKey::FolderCatalog(gramdrive_state::model::identity::FolderCatalogKey {
+            scope: common::scope(),
+        }),
     )
     .id();
     insert_dir(
@@ -491,6 +577,7 @@ fn insert_chat_facts(tx: &Transaction<'_>, chat: &SyntheticChat) {
         let (list_kind, folder_id) = match entry.list {
             ChatListKind::Main => ("main", 0),
             ChatListKind::Archive => ("archive", 0),
+            ChatListKind::Stories => ("stories", 0),
             ChatListKind::Folder(id) => ("folder", id.0),
         };
         tx.execute(
@@ -559,7 +646,7 @@ fn insert_chat_facts(tx: &Transaction<'_>, chat: &SyntheticChat) {
     if let (Some(first), Some(last)) = (chat.messages.first(), chat.messages.last()) {
         let complete = !chat.messages.len().is_multiple_of(5);
         tx.execute(
-            "INSERT INTO chat_sync_state (account_id, namespace_version, chat_id,
+            "INSERT OR REPLACE INTO chat_sync_state (account_id, namespace_version, chat_id,
                                           oldest_loaded_message_id, newest_loaded_message_id,
                                           history_complete, last_sync_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -606,8 +693,8 @@ fn append_event(
 }
 
 /// One full provider subtree per list membership (DOM-022): the chat
-/// directory appearance, chat.json / messages.ndjson, year and media
-/// directories, monthly documents, attachment files — plus, for the first
+/// directory appearance, .chat.json, direct month directories, monthly
+/// documents, attachment files — plus, for the first
 /// (primary) membership only, the engine state hung off those items.
 fn insert_chat_projection(
     tx: &Transaction<'_>,
@@ -630,75 +717,66 @@ fn insert_chat_projection(
             &chat.title,
         );
 
-        // chat.json and messages.ndjson under the chat directory.
-        for (format, name, mime) in [
-            (DocFormat::Json, "chat.json", "application/json"),
-            (DocFormat::Ndjson, "messages.ndjson", "application/x-ndjson"),
-        ] {
-            let key = common::doc_key(chat.chat_id.0, DocPartition::Chat, format);
-            let doc = appearance_id(view, key);
-            insert_doc_appearance(tx, &doc, &chat_dir, view, key, name, mime, chat, primary);
-        }
+        // .chat.json is the only generated file directly under a chat.
+        let key = common::doc_key(chat.chat_id.0, DocPartition::Chat, DocFormat::Json);
+        let doc = appearance_id(view, key);
+        insert_doc_appearance(
+            tx,
+            &doc,
+            &chat_dir,
+            view,
+            key,
+            ".chat.json",
+            "application/json",
+            chat,
+            primary,
+        );
 
-        // Year and media directories, month documents, attachment files.
+        // Direct month directories contain both bounded documents and every
+        // attachment in one chronological namespace.
         let months: BTreeSet<(u16, u8)> = chat
             .messages
             .iter()
             .map(|m| partition_of(m.sent_at_ms))
             .collect();
-        let years: BTreeSet<u16> = months.iter().map(|&(year, _)| year).collect();
-        for &year in &years {
-            let year_key = common::year_dir_key(chat.chat_id.0, year);
-            let year_dir = appearance_id(view, year_key);
+        for &(year, month) in &months {
+            let month_key = CanonicalKey::MonthDir(MonthDirKey {
+                chat: common::chat_key(chat.chat_id.0),
+                year,
+                month,
+            });
+            let month_dir = appearance_id(view, month_key);
             insert_dir_appearance(
                 tx,
-                &year_dir,
+                &month_dir,
                 &chat_dir,
                 view,
-                &gramdrive_state::model::identity::ItemKey::Canonical(year_key).id(),
-                "year_dir",
-                &year.to_string(),
+                &gramdrive_state::model::identity::ItemKey::Canonical(month_key).id(),
+                "month_dir",
+                &format!("{year:04}-{month:02}"),
             );
 
-            let media_key = common::media_dir_key(chat.chat_id.0, year);
-            let media_dir = appearance_id(view, media_key);
-            insert_dir_appearance(
-                tx,
-                &media_dir,
-                &year_dir,
-                view,
-                &gramdrive_state::model::identity::ItemKey::Canonical(media_key).id(),
-                "media_dir",
-                "media",
-            );
-
-            for &(doc_year, month) in months.iter().filter(|&&(y, _)| y == year) {
-                let key = common::doc_key(
-                    chat.chat_id.0,
-                    DocPartition::Month {
-                        year: doc_year,
-                        month,
-                    },
-                    DocFormat::Markdown,
-                );
+            for (format, name, mime) in [
+                (DocFormat::Markdown, "Messages.md", "text/markdown"),
+                (DocFormat::Ndjson, "Messages.ndjson", "application/x-ndjson"),
+            ] {
+                let key =
+                    common::doc_key(chat.chat_id.0, DocPartition::Month { year, month }, format);
                 let doc = appearance_id(view, key);
-                insert_doc_appearance(
-                    tx,
-                    &doc,
-                    &year_dir,
-                    view,
-                    key,
-                    &format!("{month:02}.md"),
-                    "text/markdown",
-                    chat,
-                    primary,
-                );
+                insert_doc_appearance(tx, &doc, &month_dir, view, key, name, mime, chat, primary);
             }
         }
 
         for message in &chat.messages {
-            let (year, _) = partition_of(message.sent_at_ms);
-            let media_dir = appearance_id(view, common::media_dir_key(chat.chat_id.0, year));
+            let (year, month) = partition_of(message.sent_at_ms);
+            let month_dir = appearance_id(
+                view,
+                CanonicalKey::MonthDir(MonthDirKey {
+                    chat: common::chat_key(chat.chat_id.0),
+                    year,
+                    month,
+                }),
+            );
             for attachment in &message.attachments {
                 insert_attachment(
                     tx,
@@ -708,7 +786,7 @@ fn insert_chat_projection(
                     message.deleted,
                     attachment,
                     view,
-                    &media_dir,
+                    &month_dir,
                     primary,
                     attachment_counter,
                 );
@@ -745,6 +823,7 @@ fn view_columns(view: ChatListKind) -> (&'static str, Option<i32>) {
     match view {
         ChatListKind::Main => ("main", None),
         ChatListKind::Archive => ("archive", None),
+        ChatListKind::Stories => ("stories", None),
         ChatListKind::Folder(id) => ("folder", Some(id.0)),
     }
 }
@@ -786,7 +865,7 @@ fn insert_doc_appearance(
     item: &ItemId,
     parent: &ItemId,
     view: ChatListKind,
-    canonical: gramdrive_state::model::identity::CanonicalKey,
+    canonical: CanonicalKey,
     name: &str,
     mime: &str,
     chat: &SyntheticChat,
@@ -839,7 +918,7 @@ fn insert_attachment(
     message_deleted: bool,
     attachment: &synthetic::SyntheticAttachment,
     view: ChatListKind,
-    media_dir: &ItemId,
+    month_dir: &ItemId,
     primary: bool,
     counter: &mut u64,
 ) {
@@ -854,14 +933,14 @@ fn insert_attachment(
                             canonical_item_id, view_kind, view_folder_id, display_name,
                             safe_name, is_directory, mime_type, logical_size,
                             metadata_version, content_version, availability, created_at_ms,
-                            deleted_at_ms)
+                            deleted_at_ms, tombstone_provenance)
          VALUES (?1, ?2, ?3, 'attachment', ?4, ?5, ?6, ?7, ?8, ?8, 0, ?9, ?10, 'm1', ?11,
-                 ?12, ?13, ?14)",
+                 ?12, ?13, ?14, ?15)",
         params![
             item.as_bytes(),
             ACCOUNT_ID,
             NAMESPACE,
-            media_dir.as_bytes(),
+            month_dir.as_bytes(),
             canonical_id.as_bytes(),
             view_kind,
             folder_id,
@@ -876,6 +955,7 @@ fn insert_attachment(
             },
             sent_at_ms,
             message_deleted.then_some(sent_at_ms + 86_400_000),
+            message_deleted.then_some("reconcile"),
         ],
     )
     .expect("attachment item");

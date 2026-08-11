@@ -621,7 +621,8 @@ fn list_sort_key(list: ChatListKind) -> (u8, i32) {
     match list {
         ChatListKind::Main => (0, 0),
         ChatListKind::Archive => (1, 0),
-        ChatListKind::Folder(folder) => (2, folder.0),
+        ChatListKind::Stories => (2, 0),
+        ChatListKind::Folder(folder) => (3, folder.0),
     }
 }
 
@@ -673,6 +674,9 @@ mod tests {
         let list = match list {
             ChatListKind::Main => json!({"@type": "chatListMain"}),
             ChatListKind::Archive => json!({"@type": "chatListArchive"}),
+            ChatListKind::Stories => {
+                panic!("Stories is derived from storyListMain, not chatPosition")
+            }
             ChatListKind::Folder(folder) => {
                 json!({"@type": "chatListFolder", "chat_folder_id": folder.0})
             }

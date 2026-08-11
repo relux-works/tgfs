@@ -46,6 +46,7 @@ fn store_with_docs(years: &[u16]) -> StateStore {
     tx.upsert_chat(&chat_record(CHAT)).expect("chat");
     let root = common::account_root_id();
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: root.clone(),
         parent: None,
         display_name: "Root".to_owned(),
@@ -60,6 +61,7 @@ fn store_with_docs(years: &[u16]) -> StateStore {
     .expect("root");
     for year in years {
         tx.upsert_item(&ItemRecord {
+            aggregate_size: None,
             id: doc_id(*year),
             parent: Some(root.clone()),
             display_name: format!("{year}.ndjson"),
@@ -124,10 +126,12 @@ fn eviction_scans_and_removes_only_eligible_entries() {
     let unverified = doc_id(2027);
 
     let tx = store.write_txn().expect("write");
-    tx.upsert_cache_entry(&entry(&old, 100, 1_000))
-        .expect("entry");
-    tx.upsert_cache_entry(&entry(&newer, 200, 5_000))
-        .expect("entry");
+    let mut old_record = entry(&old, 100, 1_000);
+    old_record.kind = CacheKind::Thumbnail;
+    tx.upsert_cache_entry(&old_record).expect("entry");
+    let mut newer_record = entry(&newer, 200, 5_000);
+    newer_record.kind = CacheKind::Thumbnail;
+    tx.upsert_cache_entry(&newer_record).expect("entry");
     let mut record = entry(&pinned, 300, 500);
     record.pin = Some(PinOrigin::ArchiveMode);
     tx.upsert_cache_entry(&record).expect("entry");
@@ -242,9 +246,10 @@ fn device_wide_totals_split_pins_and_verification() {
         CacheTotals {
             total_bytes: 100 + 200 + 400 + 40,
             pinned_bytes: 200,
-            unpinned_bytes: 100 + 400 + 40,
-            // Evictable excludes the pinned entry and the unverified one.
-            evictable_bytes: 100 + 40,
+            // Generated documents are visible in total/by-kind accounting but
+            // exempt from the quota-governed unpinned and evictable totals.
+            unpinned_bytes: 40,
+            evictable_bytes: 40,
         }
     );
 
@@ -272,8 +277,9 @@ fn eviction_candidates_page_by_keyset_cursor() {
     let tx = store.write_txn().expect("write");
     for (offset, year) in years.iter().enumerate() {
         let access = 1_000 + offset as i64;
-        tx.upsert_cache_entry(&entry(&doc_id(*year), 10, access))
-            .expect("entry");
+        let mut record = entry(&doc_id(*year), 10, access);
+        record.kind = CacheKind::Thumbnail;
+        tx.upsert_cache_entry(&record).expect("entry");
     }
     tx.commit().expect("commit");
 
@@ -451,6 +457,87 @@ fn render_state_tracks_versions_watermarks_and_the_dirty_worklist() {
         state.content_version.as_ref().map(ContentVersion::as_str),
         Some("r1-w3")
     );
+    tx.tombstone_item(
+        &item,
+        6_000,
+        &MetadataVersion::new("m2").expect("tombstone version"),
+    )
+    .expect("tombstone");
+    assert!(
+        tx.read().dirty_render_items(10).expect("dirty").is_empty(),
+        "tombstoned documents must not consume the bounded live worklist"
+    );
+    tx.commit().expect("commit");
+}
+
+#[test]
+fn dirty_render_worklist_prefers_never_published_over_recently_redirtied() {
+    let mut store = store_with_docs(&[2024, 2025]);
+    let repeatedly_dirty = doc_id(2024);
+    let never_published = doc_id(2025);
+    let chat = common::chat_key(CHAT);
+    let tx = store.write_txn().expect("write");
+    tx.ensure_render_state(&repeatedly_dirty, 1, 1)
+        .expect("first render state");
+    tx.ensure_render_state(&never_published, 1, 1)
+        .expect("second render state");
+    tx.apply_message_changes(&chat, &[MessageChange::Observed(revision(1, 1_000))])
+        .expect("event");
+    let watermark = tx.read().latest_event_seq(&chat).expect("watermark");
+    tx.publish_render(
+        &repeatedly_dirty,
+        &chat,
+        watermark,
+        &RenderOutput {
+            content_version: content_version("published-v1"),
+            content_hash: Some(ContentHash::Sha256([4u8; 32])),
+            logical_size: 64,
+        },
+        2_000,
+    )
+    .expect("publish lower-sorting document");
+    tx.ensure_render_state(&repeatedly_dirty, 2, 1)
+        .expect("redirty after upgrade");
+
+    assert_eq!(
+        tx.read().dirty_render_items(1).expect("fair worklist"),
+        vec![never_published],
+        "a recently refreshed low-sorting chat must rotate behind untouched work"
+    );
+    tx.commit().expect("commit");
+}
+
+#[test]
+fn policy_skipped_render_state_is_durable_countable_and_requeueable() {
+    let mut store = store_with_docs(&[2026]);
+    let item = doc_id(2026);
+    let tx = store.write_txn().expect("write");
+    tx.ensure_render_state(&item, 1, 1).expect("ensure");
+
+    assert!(
+        tx.skip_render_due_to_policy(&item, 7_000)
+            .expect("record policy skip")
+    );
+    let state = tx.read().render_state(&item).expect("state").expect("row");
+    assert!(!state.dirty, "a policy skip cannot consume the worklist");
+    assert_eq!(
+        state.skip_reason,
+        Some(gramdrive_state::repo::RenderSkipReason::PolicyExcluded)
+    );
+    assert_eq!(state.skipped_at_ms, Some(7_000));
+    assert!(
+        tx.read()
+            .dirty_render_items(10)
+            .expect("worklist")
+            .is_empty(),
+        "the durable skip, not an in-memory cursor, removes the row"
+    );
+
+    tx.mark_render_dirty(&item).expect("explicit requeue");
+    let state = tx.read().render_state(&item).expect("state").expect("row");
+    assert!(state.dirty);
+    assert_eq!(state.skip_reason, None);
+    assert_eq!(state.skipped_at_ms, None);
     tx.commit().expect("commit");
 }
 

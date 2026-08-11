@@ -21,8 +21,9 @@ use gramdrive_state::model::identity::{
 };
 use gramdrive_state::model::version::{ContentVersion, MetadataVersion};
 use gramdrive_state::repo::{
-    AttachmentAvailability, AttachmentFacts, ChatListEntry, FileFacts, ItemAvailability,
-    ItemRecord, MessageChange,
+    AttachmentAvailability, AttachmentFacts, AttachmentFidelity, AttachmentLogicalKind,
+    ChatListEntry, FileFacts, ItemAvailability, ItemRecord, MessageChange,
+    ProviderFetchHealthObservation, TelegramRepresentation, TombstoneProvenance,
 };
 use gramdrive_state::{StateError, StateStore};
 
@@ -46,6 +47,7 @@ fn content_version(text: &str) -> ContentVersion {
 
 fn dir_item(id: &ItemId, parent: Option<&ItemId>, safe_name: &str) -> ItemRecord {
     ItemRecord {
+        aggregate_size: None,
         id: id.clone(),
         parent: parent.cloned(),
         display_name: safe_name.to_owned(),
@@ -61,6 +63,7 @@ fn dir_item(id: &ItemId, parent: Option<&ItemId>, safe_name: &str) -> ItemRecord
 
 fn doc_item(id: &ItemId, parent: &ItemId, safe_name: &str) -> ItemRecord {
     ItemRecord {
+        aggregate_size: None,
         id: id.clone(),
         parent: Some(parent.clone()),
         display_name: safe_name.to_owned(),
@@ -228,8 +231,14 @@ fn chat_lists_replace_atomically_and_read_in_presentation_order() {
     assert_eq!(read.chat_list(&folder).expect("list").len(), 1);
     drop(read);
 
-    // Replacement is total: a chat that left the list is gone (DEC-013).
+    // Whole-list removal requires Telegram's durable departure witness; a
+    // shorter snapshot alone is never permission to remove a chat tree.
     let tx = store.write_txn().expect("write");
+    for chat in [2, 3] {
+        let mut record = chat_record(chat);
+        record.left_at_ms = Some(2_000);
+        tx.upsert_chat(&record).expect("departure witness");
+    }
     tx.replace_chat_list(
         &main,
         &[ChatListEntry {
@@ -261,6 +270,197 @@ fn chat_lists_replace_atomically_and_read_in_presentation_order() {
         Err(StateError::InvalidArgument { .. }) => {}
         other => panic!("expected InvalidArgument, got {other:?}"),
     }
+}
+
+#[test]
+fn incomplete_or_uncorroborated_list_shrink_is_rejected_without_mutating_membership() {
+    let mut store = store();
+    let main = ChatListKey {
+        scope: scope(),
+        kind: ChatListKind::Main,
+    };
+    let tx = store.write_txn().expect("write");
+    for chat in [1, 2] {
+        tx.upsert_chat(&chat_record(chat)).expect("chat");
+    }
+    tx.replace_chat_list_with_audit(
+        &main,
+        &[
+            ChatListEntry {
+                chat_id: ChatId(1),
+                sort_order: 2,
+                pinned: false,
+            },
+            ChatListEntry {
+                chat_id: ChatId(2),
+                sort_order: 1,
+                pinned: false,
+            },
+        ],
+        true,
+        1_000,
+    )
+    .expect("initial audit");
+    tx.commit().expect("initial commit");
+
+    let tx = store.write_txn().expect("write");
+    let error = tx
+        .replace_chat_list_with_audit(
+            &main,
+            &[ChatListEntry {
+                chat_id: ChatId(2),
+                sort_order: 1,
+                pinned: false,
+            }],
+            false,
+            2_000,
+        )
+        .expect_err("incomplete list cannot remove its omitted member");
+    assert!(matches!(
+        error,
+        StateError::UnsafeChatListShrink {
+            before_count: 2,
+            after_count: 1,
+            uncorroborated_removals: 1,
+        }
+    ));
+    tx.commit()
+        .expect("read-only rejected attempt commits nothing");
+
+    let read = store.read_txn().expect("read");
+    assert_eq!(read.chat_list(&main).expect("list").len(), 2);
+    let audit = read
+        .latest_chat_list_commit_audit(&main)
+        .expect("audit")
+        .expect("initial audit remains latest");
+    assert_eq!(audit.before_count, 0);
+    assert_eq!(audit.after_count, 2);
+    assert!(audit.is_complete);
+    assert_eq!(audit.committed_at_ms, 1_000);
+}
+
+#[test]
+fn every_chat_list_namespace_rejects_an_unwitnessed_shrink() {
+    for kind in [
+        ChatListKind::Main,
+        ChatListKind::Archive,
+        ChatListKind::Folder(FolderId(7)),
+    ] {
+        let mut store = store();
+        let list = ChatListKey {
+            scope: scope(),
+            kind,
+        };
+        let tx = store.write_txn().expect("write");
+        for chat in [1, 2] {
+            tx.upsert_chat(&chat_record(chat)).expect("chat");
+        }
+        tx.replace_chat_list(
+            &list,
+            &[
+                ChatListEntry {
+                    chat_id: ChatId(1),
+                    sort_order: 2,
+                    pinned: false,
+                },
+                ChatListEntry {
+                    chat_id: ChatId(2),
+                    sort_order: 1,
+                    pinned: false,
+                },
+            ],
+        )
+        .expect("baseline membership");
+        tx.commit().expect("baseline commit");
+
+        let tx = store.write_txn().expect("short snapshot");
+        assert!(matches!(
+            tx.replace_chat_list_with_audit(
+                &list,
+                &[ChatListEntry {
+                    chat_id: ChatId(1),
+                    sort_order: 2,
+                    pinned: false,
+                }],
+                true,
+                2_000,
+            ),
+            Err(StateError::UnsafeChatListShrink {
+                before_count: 2,
+                after_count: 1,
+                uncorroborated_removals: 1,
+            })
+        ));
+        tx.commit().expect("rejected snapshot commits no mutation");
+
+        assert_eq!(
+            store
+                .read_txn()
+                .expect("read")
+                .chat_list(&list)
+                .expect("list")
+                .len(),
+            2,
+            "{kind:?} membership remains resumable after an anomalous shrink"
+        );
+    }
+}
+
+#[test]
+fn complete_list_shrink_with_a_departure_witness_removes_only_that_chat() {
+    let mut store = store();
+    let main = ChatListKey {
+        scope: scope(),
+        kind: ChatListKind::Main,
+    };
+    let tx = store.write_txn().expect("write");
+    for chat in [1, 2] {
+        tx.upsert_chat(&chat_record(chat)).expect("chat");
+    }
+    tx.replace_chat_list(
+        &main,
+        &[
+            ChatListEntry {
+                chat_id: ChatId(1),
+                sort_order: 2,
+                pinned: false,
+            },
+            ChatListEntry {
+                chat_id: ChatId(2),
+                sort_order: 1,
+                pinned: false,
+            },
+        ],
+    )
+    .expect("initial membership");
+    tx.commit().expect("initial commit");
+
+    let tx = store.write_txn().expect("witness departure");
+    let mut departed = chat_record(2);
+    departed.deleted_at_ms = Some(2_000);
+    tx.upsert_chat(&departed).expect("departure witness");
+    tx.replace_chat_list_with_audit(
+        &main,
+        &[ChatListEntry {
+            chat_id: ChatId(1),
+            sort_order: 2,
+            pinned: false,
+        }],
+        true,
+        2_000,
+    )
+    .expect("witnessed removal");
+    tx.commit().expect("commit witnessed removal");
+
+    let read = store.read_txn().expect("read");
+    assert_eq!(
+        read.chat_list(&main).expect("list"),
+        vec![ChatListEntry {
+            chat_id: ChatId(1),
+            sort_order: 2,
+            pinned: false,
+        }]
+    );
 }
 
 #[test]
@@ -678,6 +878,102 @@ fn tombstones_free_the_sibling_name_and_are_idempotent() {
 }
 
 #[test]
+fn tombstone_provenance_is_fixed_and_survives_idempotent_reobservation() {
+    let mut store = store();
+    let (_, _, _, doc_id) = build_tree(&mut store);
+    let tx = store.write_txn().expect("write");
+    tx.tombstone_item_with_provenance(&doc_id, 5_000, &version("m2"), TombstoneProvenance::Policy)
+        .expect("tombstone");
+    tx.tombstone_item_with_provenance(
+        &doc_id,
+        9_000,
+        &version("m3"),
+        TombstoneProvenance::Retention,
+    )
+    .expect("idempotent tombstone");
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    assert_eq!(
+        read.tombstone_provenance(&doc_id).expect("provenance"),
+        Some(TombstoneProvenance::Policy)
+    );
+}
+
+#[test]
+fn provider_fetch_health_is_durable_and_separates_engine_mapping_and_no_such_item() {
+    let mut store = store();
+    let tx = store.write_txn().expect("write");
+    tx.record_provider_fetch_health(ProviderFetchHealthObservation {
+        succeeded: false,
+        engine_failure: true,
+        provider_mapping: true,
+        no_such_item: true,
+        retryable: false,
+        observed_at_ms: 1_000,
+    })
+    .expect("not found report");
+    tx.record_provider_fetch_health(ProviderFetchHealthObservation {
+        succeeded: true,
+        engine_failure: false,
+        provider_mapping: false,
+        no_such_item: false,
+        retryable: false,
+        observed_at_ms: 2_000,
+    })
+    .expect("success report");
+    tx.commit().expect("commit");
+
+    let health = store
+        .read_txn()
+        .expect("read")
+        .provider_fetch_health()
+        .expect("health");
+    assert_eq!(health.callback_count, 2);
+    assert_eq!(health.success_count, 1);
+    assert_eq!(health.engine_failure_count, 1);
+    assert_eq!(health.provider_mapping_count, 1);
+    assert_eq!(health.no_such_item_count, 1);
+    assert_eq!(health.retryable_count, 0);
+}
+
+#[test]
+fn repository_preserves_legacy_tombstones_but_rejects_live_legacy_layout() {
+    let mut store = store();
+    let (root, _, chat, _) = build_tree(&mut store);
+    let legacy =
+        gramdrive_state::model::identity::ItemKey::Canonical(common::year_dir_key(CHAT, 1999)).id();
+    let mut record = dir_item(&legacy, Some(&chat), "1999");
+
+    let tx = store.write_txn().expect("write");
+    assert!(matches!(
+        tx.upsert_item(&record),
+        Err(StateError::InvalidArgument { .. })
+    ));
+    record.deleted_at_ms = Some(1_000);
+    tx.upsert_item(&record).expect("legacy tombstone");
+    tx.commit().expect("commit");
+
+    let stored = store
+        .read_txn()
+        .expect("read")
+        .item(&legacy)
+        .expect("item")
+        .expect("tombstone");
+    assert_eq!(stored.parent.as_ref(), Some(&chat));
+    assert_eq!(stored.deleted_at_ms, Some(1_000));
+    assert_eq!(
+        store
+            .read_txn()
+            .expect("read provenance")
+            .tombstone_provenance(&legacy)
+            .expect("provenance"),
+        Some(TombstoneProvenance::Reconcile)
+    );
+    assert_ne!(stored.parent.as_ref(), Some(&root));
+}
+
+#[test]
 fn attachment_refresh_never_detaches_verified_bytes() {
     let mut store = store();
     let chat = common::chat_key(CHAT);
@@ -690,11 +986,15 @@ fn attachment_refresh_never_detaches_verified_bytes() {
     };
     let facts = AttachmentFacts {
         key,
-        original_name: Some("photo.jpg".to_owned()),
+        logical_kind: AttachmentLogicalKind::Photo,
+        telegram_representation: TelegramRepresentation::OriginalDocument,
+        fidelity: AttachmentFidelity::Original,
+        source_name: Some("photo.jpg".to_owned()),
         mime_type: Some("image/jpeg".to_owned()),
-        logical_size: Some(2_048),
+        exact_size: Some(2_048),
         content_version: content_version("v1"),
         telegram_unique_id: Some("uniq".to_owned()),
+        telegram_local_file_id: Some(517),
         telegram_file_id: Some("file-1".to_owned()),
         file_reference: Some(b"ref-1".to_vec()),
         availability: AttachmentAvailability::Fetchable,
@@ -707,6 +1007,11 @@ fn attachment_refresh_never_detaches_verified_bytes() {
     tx.apply_message_changes(&chat, &[MessageChange::Observed(revision(1, 1_000))])
         .expect("message");
     tx.upsert_attachment(&facts).expect("attachment");
+    let mut metadata_only = facts.clone();
+    metadata_only.key.index = AttachmentIndex(1);
+    metadata_only.content_version = content_version("metadata-only");
+    tx.upsert_attachment(&metadata_only)
+        .expect("metadata-only attachment");
 
     // Linking requires the blob row first — no dangling references.
     match tx.link_attachment_blob(&key, &hash, 2_000) {
@@ -742,12 +1047,19 @@ fn attachment_refresh_never_detaches_verified_bytes() {
         read.attachments_of_message(&key.message)
             .expect("list")
             .len(),
-        1
+        2,
+        "the metadata-only sibling remains present"
     );
     assert_eq!(
         read.attachments_referencing_blob(scope().account, &hash)
             .expect("refs"),
         vec![key]
+    );
+    assert_eq!(
+        read.materialized_attachment_keys(scope().account)
+            .expect("materialized keys"),
+        vec![key],
+        "policy scans scale with materialized media, not metadata history"
     );
 }
 

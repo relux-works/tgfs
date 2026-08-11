@@ -16,6 +16,7 @@ private func account(
         displayName: name,
         authState: authState,
         namespaceVersion: 1,
+        displayTimezone: "UTC",
         rootItemId: "root-\(id)"
     )
 }

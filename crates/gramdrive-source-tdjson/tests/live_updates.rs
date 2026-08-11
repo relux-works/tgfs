@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use gramdrive_model::identity::{
-    AccountId, AccountKey, AccountScope, ChatId, ChatKey, MessageId, NamespaceVersion, SchemaFamily,
+    AccountId, AccountKey, AccountScope, ChatId, ChatKey, ChatListKey, ChatListKind, MessageId,
+    NamespaceVersion, SchemaFamily,
 };
 use gramdrive_model::version::MetadataVersion;
 use gramdrive_source_tdjson::TdError;
@@ -42,8 +43,8 @@ use gramdrive_source_tdjson::message::{MessageRecord, SenderRef};
 use gramdrive_source_tdjson::mock::SentRequest;
 use gramdrive_state::StateStore;
 use gramdrive_state::repo::{
-    AccountRecord, ChatRecord, ChatSyncRecord, ChatType, MessageChange, MessageEventKind,
-    MessageRevision, RetentionMode, SourceKind, SyncWindow,
+    AccountRecord, ChatListEntry, ChatRecord, ChatSyncRecord, ChatType, MessageChange,
+    MessageEventKind, MessageRevision, RetentionMode, SourceKind, SyncWindow,
 };
 
 use common::GUARD;
@@ -208,7 +209,7 @@ impl FixtureServer {
                 let page: Vec<Value> = chat
                     .iter()
                     .rev()
-                    .filter(|(id, _)| from == 0 || **id < from)
+                    .filter(|(id, _)| from == 0 || **id <= from)
                     .take(limit)
                     .map(|(_, message)| message.clone())
                     .collect();
@@ -254,6 +255,7 @@ fn store_with_chats(chat_ids: &[i64]) -> StateStore {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -530,7 +532,9 @@ fn drive(
                     return log;
                 }
             }
-            LiveStep::Unresolved { chat_id } => log.unresolved.push(chat_id),
+            LiveStep::Unresolved { chat_id, .. } => log.unresolved.push(chat_id),
+            LiveStep::ResyncRequired => {}
+            LiveStep::RecoveryRequired { .. } => {}
             LiveStep::Degraded(degraded) => log.degraded.push(degraded.chat_id),
             LiveStep::Idle => return log,
         }
@@ -975,11 +979,23 @@ fn an_unresolved_chat_tracks_and_replays_through_the_store() {
         "nothing commits before the chat exists"
     );
 
-    // The caller resolves the chat (canonical row first — the FK), then
-    // tracks it; the buffer replays.
+    // The caller resolves the chat (canonical row first — the FK), gives it a
+    // visible-list membership, then tracks it; the buffer replays.
     {
         let tx = store.write_txn().expect("write txn");
         upsert_chat_row(&tx, ghost);
+        tx.upsert_chat_list_entry(
+            &ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Main,
+            },
+            &ChatListEntry {
+                chat_id: ChatId(ghost),
+                sort_order: 1,
+                pinned: false,
+            },
+        )
+        .expect("list membership");
         tx.commit().expect("commit chat row");
     }
     assert!(machine.track_chat(ghost, None));
@@ -987,12 +1003,15 @@ fn an_unresolved_chat_tracks_and_replays_through_the_store() {
     assert_eq!(log.commits.len(), 1);
     assert_eq!(stored_message_ids(&mut store, ghost), vec![7]);
     let tx = store.read_txn().expect("read txn");
-    assert!(
-        tx.chat_sync_state(&chat_key(ghost))
-            .expect("sync state reads")
-            .is_none(),
-        "no cursor is ever established for an uncrawled chat"
+    let pending = tx
+        .chat_sync_state(&chat_key(ghost))
+        .expect("sync state reads")
+        .expect("schema seeds pending chat progress");
+    assert_eq!(
+        pending.window, None,
+        "live updates never establish a cursor"
     );
+    assert!(!pending.history_complete);
 }
 
 /// The same loop through the real runtime over the mock tdjson: updates

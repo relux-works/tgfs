@@ -157,6 +157,21 @@ private final class ProgressLog: @unchecked Sendable {
 // MARK: - The contract itself
 
 @Suite struct HydrationContractTests {
+    @Test func thumbnailRequestRoundTripsWithItsBoundedOperation() throws {
+        let request = HydrationRequest(
+            accountId: 7,
+            itemId: "photo",
+            contentVersion: "v1",
+            purpose: .thumbnail,
+            maxWidthPx: 256,
+            maxHeightPx: 128)
+        let line = try HydrationWire.encodeLine(request)
+        let decoded = try HydrationWire.decodeLine(
+            HydrationRequest.self, from: line.dropLast())
+        #expect(decoded == request)
+        #expect(decoded.protocolVersion == 2)
+    }
+
     @Test func socketPathRuleIsFixedUnderTheDataRoot() {
         let url = HydrationContract.socketURL(
             dataRoot: URL(fileURLWithPath: "/container/data"))
@@ -221,7 +236,7 @@ private final class ProgressLog: @unchecked Sendable {
     }
 
     @Test func theRequestLineArrivesVerbatimAndEventsStreamInOrder() async throws {
-        try await withServer([
+        _ = try await withServer([
             .send(.progress(HydrationProgress(bytesTransferred: 10, bytesTotal: 42))),
             .send(.progress(HydrationProgress(bytesTransferred: 42, bytesTotal: 42))),
             .send(.done(sampleContent)),
@@ -237,8 +252,94 @@ private final class ProgressLog: @unchecked Sendable {
         }
     }
 
-    @Test func aFailureEventThrowsItsFailure() async throws {
+    @Test func stagedBytesStayOwnedUntilMaterializationClonesThem() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-materialization-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staged = directory.appendingPathComponent("staged.generated.json")
+        let destination = directory.appendingPathComponent("cloned.generated.json")
+        let bytes = Data("{\"generation\":\"before-publication\"}\n".utf8)
+        try bytes.write(to: staged)
+
+        let cloneStarted = TestSignal()
+        let peerClosed = TestSignal()
+        let allowClone = DispatchSemaphore(value: 0)
+        let content = HydratedContent(
+            stagedPath: staged.path, contentVersion: "generated-v1", byteCount: UInt64(bytes.count))
         try await withServer([
+            .send(.done(content)),
+            .awaitPeerClose(onClosed: { peerClosed.signal() }),
+        ]) { _, client in
+            let task = Task { [client] in
+                try await client.hydrateAndMaterialize(sampleRequest, onProgress: { _ in }) {
+                    received in
+                    cloneStarted.signal()
+                    allowClone.wait()
+                    try FileManager.default.copyItem(
+                        at: URL(fileURLWithPath: received.stagedPath), to: destination)
+                    return destination
+                }
+            }
+            await cloneStarted.wait()
+            #expect(!peerClosed.isSignalled, "the client must not close before copyItem")
+            allowClone.signal()
+            let cloned = try await task.value
+            #expect(cloned == destination)
+            #expect(try Data(contentsOf: cloned) == bytes, "the clone preserves exact bytes")
+            await peerClosed.wait()
+        }
+    }
+
+    @Test func cancellationDuringMaterializationKeepsTheStagedBytesOwnedUntilTheCloneReturns()
+        async throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-cancel-materialization-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staged = directory.appendingPathComponent("staged.generated.json")
+        let destination = directory.appendingPathComponent("cloned.generated.json")
+        let bytes = Data("{\"generation\":\"cancelled-after-done\"}\n".utf8)
+        try bytes.write(to: staged)
+
+        let cloneStarted = TestSignal()
+        let peerClosed = TestSignal()
+        let allowClone = DispatchSemaphore(value: 0)
+        let content = HydratedContent(
+            stagedPath: staged.path, contentVersion: "generated-v1", byteCount: UInt64(bytes.count))
+        try await withServer([
+            .send(.done(content)),
+            .awaitPeerClose(onClosed: { peerClosed.signal() }),
+        ]) { _, client in
+            let task = Task { [client] in
+                try await client.hydrateAndMaterialize(sampleRequest, onProgress: { _ in }) {
+                    received in
+                    cloneStarted.signal()
+                    allowClone.wait()
+                    try FileManager.default.copyItem(
+                        at: URL(fileURLWithPath: received.stagedPath), to: destination)
+                    return destination
+                }
+            }
+            await cloneStarted.wait()
+            task.cancel()
+            // Cancellation after `done` is recorded, but it cannot expose EOF
+            // and let the server release its generated-file lease before this
+            // callback has copied the exact staged bytes.
+            #expect(!peerClosed.isSignalled)
+            allowClone.signal()
+            await #expect(throws: CancellationError.self) {
+                _ = try await task.value
+            }
+            let copied = try Data(contentsOf: destination)
+            #expect(copied == bytes)
+            await peerClosed.wait()
+        }
+    }
+
+    @Test func aFailureEventThrowsItsFailure() async throws {
+        _ = try await withServer([
             .send(
                 .failure(
                     HydrationFailure(
@@ -386,6 +487,30 @@ private final class ProgressLog: @unchecked Sendable {
         #expect(connection.isCancelled)
     }
 
+    @Test func cancellationDuringMaterializationDefersWireCloseUntilFinish() {
+        var pair = [Int32](repeating: -1, count: 2)
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0)
+        let local = pair[0]
+        let peer = pair[1]
+        defer { close(peer) }
+        _ = fcntl(peer, F_SETFL, O_NONBLOCK)
+
+        let connection = HydrationConnection()
+        #expect(connection.adopt(descriptor: local))
+        #expect(connection.beginMaterialization())
+        connection.cancel()
+        #expect(connection.isCancelled)
+
+        // Cancellation is remembered but must not publish EOF while a clone
+        // may still be reading the generated source.
+        var byte: UInt8 = 0
+        #expect(read(peer, &byte, 1) == -1)
+        #expect(errno == EAGAIN || errno == EWOULDBLOCK)
+
+        connection.finish()
+        #expect(read(peer, &byte, 1) == 0)
+    }
+
     @Test func finishRetiresTheDescriptorSoALaterCancelIsANoOp() {
         // A socketpair gives a peer to observe the close through, so "finish
         // closed the descriptor" is proven without reading the fd number back
@@ -446,5 +571,11 @@ private final class TestSignal: @unchecked Sendable {
             waiters.append(continuation)
             lock.unlock()
         }
+    }
+
+    var isSignalled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return signalled
     }
 }

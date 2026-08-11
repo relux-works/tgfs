@@ -19,7 +19,9 @@ import UniformTypeIdentifiers
 /// Telegram; SYNC-060 forbids surfacing those capabilities through native
 /// providers). Content Telegram protects or has dropped (POL-4) carries no
 /// read capability either — the byte fetch it would gate is one the engine
-/// never performs.
+/// never performs. A file with no exact projected extent is likewise kept
+/// non-readable until whole-content verification is possible; an estimate is
+/// never promoted into a logical-size claim.
 public final class GramDriveFileProviderItem: NSObject, NSFileProviderItem {
     /// The durable metadata this item projects (DOM-001).
     public let metadata: ItemMetadata
@@ -58,10 +60,22 @@ public final class GramDriveFileProviderItem: NSObject, NSFileProviderItem {
         Self.contentType(for: metadata)
     }
 
-    /// Logical size in bytes for files whose size is known; `nil` for
-    /// directories and for files before their size is known.
+    /// Logical size in bytes: a file's own content extent, or a directory's
+    /// exact indexed-descendant rollup (BUG-260728-2qfzbd). `nil` when no
+    /// size is claimed — a file before its extent is projected, a directory
+    /// before a reconciliation pass has summed it, and a directory that owns
+    /// no rollup at all (a chat list or the folder catalog, whose children
+    /// are chats rather than correspondence). That last case is why `nil`
+    /// and zero stay distinct here: zero is "this subtree is indexed and
+    /// holds no bytes", which is a claim, and `nil` is the absence of one.
+    ///
+    /// Publishing the rollup is what lets the system answer "how big is this
+    /// chat?" from durable metadata, before the folder is enumerated and
+    /// without fetching one content byte: the value is a sum of sizes the
+    /// index already holds, never a download and never an estimate.
     public var documentSize: NSNumber? {
-        guard !metadata.isDirectory, let size = metadata.logicalSize else { return nil }
+        guard let size = metadata.isDirectory ? metadata.aggregateSize : metadata.logicalSize
+        else { return nil }
         return NSNumber(value: size)
     }
 
@@ -101,6 +115,21 @@ public final class GramDriveFileProviderItem: NSObject, NSFileProviderItem {
     public var contentModificationDate: Date? {
         Self.date(fromEpochMs: metadata.modifiedAtMs)
     }
+
+    /// The item's initial "last used" date: the most recent correspondence
+    /// instant the index holds for it (BUG-260728-2qfzbd).
+    ///
+    /// A chat the user has never opened locally still has a truthful answer
+    /// to "when was this last used" — the last message in it — and that is
+    /// far better than the epoch the absent property renders as. This is a
+    /// *floor*, not an override: `lastUsedDate` is one of the three
+    /// locally-owned presentation properties (with `tagData` and
+    /// `favoriteRank`), so when the system records a genuine newer local
+    /// access it pushes it back through `modifyItem`, which accepts it
+    /// rather than refusing and reverting it.
+    public var lastUsedDate: Date? {
+        Self.date(fromEpochMs: metadata.modifiedAtMs)
+    }
 }
 
 extension GramDriveFileProviderItem {
@@ -131,19 +160,22 @@ extension GramDriveFileProviderItem {
     }
 
     /// The read-only capability surface (DEC-007 / SYNC-060). Directories may
-    /// be enumerated; fetchable files may be read; content Telegram protects
-    /// or has dropped (POL-4) advertises nothing at all. No mutating
+    /// be enumerated; fetchable files with an exact extent may be read;
+    /// content Telegram protects or has dropped (POL-4) advertises nothing at
+    /// all. No mutating
     /// capability — write, rename, reparent, trash, delete, add-subitem —
     /// appears for any kind, which is the invariant SYNC-061 depends on to
     /// return a stable read-only error to clients that ignore capabilities.
+    /// TDLib's `expected_size` remains nil in the projection and cannot
+    /// justify a whole-content read capability.
     static func capabilities(for metadata: ItemMetadata) -> NSFileProviderItemCapabilities {
         if metadata.isDirectory {
             return .allowsContentEnumerating
         }
         switch metadata.availability {
-        case .fetchable:
+        case .fetchable where metadata.logicalSize != nil:
             return .allowsReading
-        case .restricted, .unavailable:
+        case .fetchable, .restricted, .unavailable:
             return []
         }
     }
@@ -156,9 +188,9 @@ extension GramDriveFileProviderItem {
             return [.userReadable, .userExecutable]
         }
         switch metadata.availability {
-        case .fetchable:
+        case .fetchable where metadata.logicalSize != nil:
             return .userReadable
-        case .restricted, .unavailable:
+        case .fetchable, .restricted, .unavailable:
             return []
         }
     }

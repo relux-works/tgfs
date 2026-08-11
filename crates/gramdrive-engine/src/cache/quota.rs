@@ -36,9 +36,12 @@ const EVICTION_BATCH: usize = 64;
 /// changed) into a concrete plan/status without touching a byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotaPolicy {
-    /// The ceiling unpinned cache bytes are kept under. Pinned and
-    /// Archive-Mode bytes are quota-exempt (POL-2): counted and surfaced,
-    /// but never measured against this limit and never evicted.
+    /// The ceiling quota-managed cache bytes are kept under. Pinned,
+    /// Archive-Mode, and generated-document bytes are quota-exempt (POL-2):
+    /// counted and surfaced, but never measured against this limit and never
+    /// evicted. Generated documents are exempt because their deterministic
+    /// renderer can reuse an immutable materialization reference; excluding
+    /// them removes the eviction/publication filesystem race structurally.
     pub limit_bytes: u64,
 }
 
@@ -50,32 +53,43 @@ impl Default for QuotaPolicy {
     }
 }
 
-/// The SYNC-050 accounting breakdown of device cache use: each category
-/// counted separately, plus the pin/verification splits a quota decision
-/// reads. Byte figures are `cache_entries` row sizes summed device-wide (the
-/// on-disk cache is one budget), except `partial_transfer_bytes`, which is
-/// staged transfer bytes not yet promoted to cache.
+/// The SYNC-050 accounting breakdown of device cache use: each materialization
+/// category is counted separately, plus the overlapping policy slices a quota
+/// decision reads. `blob_bytes + generated_doc_bytes + thumbnail_bytes` equals
+/// `total_cache_bytes`; `pinned_bytes`, `unpinned_bytes`,
+/// `generated_doc_exempt_bytes`, and `evictable_bytes` are policy dimensions
+/// and must not be summed. Byte figures are `cache_entries` row sizes summed
+/// device-wide (the on-disk cache is one budget), except
+/// `partial_transfer_bytes`, which is staged transfer bytes not yet promoted
+/// to cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheAccounting {
     /// Materialized attachment-blob bytes.
     pub blob_bytes: u64,
     /// Materialized generated-document bytes.
     pub generated_doc_bytes: u64,
+    /// Generated-document bytes exempt from quota reclamation. This includes
+    /// pinned generated documents, so it intentionally overlaps
+    /// [`Self::pinned_bytes`]; keeping it separate from the category total
+    /// ensures the exemption is never hidden from storage reporting.
+    pub generated_doc_exempt_bytes: u64,
     /// Materialized thumbnail bytes (POL-2: thumbnails are always eager).
     pub thumbnail_bytes: u64,
     /// Bytes staged by live transfers — partial content that is not cache
     /// and is reclaimed by cancellation, never by eviction (SYNC-050).
     pub partial_transfer_bytes: u64,
-    /// Total materialized cache bytes: `blob + generated_doc + thumbnail`,
-    /// equivalently `pinned + unpinned`.
+    /// Total materialized cache bytes: `blob + generated_doc + thumbnail`.
+    /// Policy-slice fields intentionally overlap and are not an alternative
+    /// total.
     pub total_cache_bytes: u64,
     /// Bytes an explicit pin or Archive-Mode coverage holds — quota-exempt
-    /// but counted (POL-2).
+    /// but counted (POL-2), including any generated documents also reported
+    /// by [`Self::generated_doc_exempt_bytes`].
     pub pinned_bytes: u64,
-    /// Bytes no pin protects — the figure the quota is measured against.
+    /// Unpinned non-generated-document bytes — the figure the quota measures.
     pub unpinned_bytes: u64,
-    /// Bytes eviction can reclaim right now: unpinned *and* verified
-    /// (SYNC-052). A subset of `unpinned_bytes`.
+    /// Bytes eviction can reclaim right now: quota-managed, unpinned, and
+    /// verified (SYNC-052). A subset of `unpinned_bytes`.
     pub evictable_bytes: u64,
 }
 
@@ -87,7 +101,7 @@ pub struct CacheAccounting {
 pub struct QuotaAssessment {
     /// The limit this status was computed against.
     pub limit_bytes: u64,
-    /// Unpinned bytes — what the limit governs.
+    /// Quota-managed unpinned bytes — what the limit governs.
     pub unpinned_bytes: u64,
     /// Pinned/Archive-Mode bytes — exempt, reported for the app's usage view.
     pub pinned_bytes: u64,
@@ -232,6 +246,7 @@ impl Evictor {
         Ok(CacheAccounting {
             blob_bytes: blob,
             generated_doc_bytes: generated_doc,
+            generated_doc_exempt_bytes: generated_doc,
             thumbnail_bytes: thumbnail,
             partial_transfer_bytes: partial,
             total_cache_bytes: totals.total_bytes,
@@ -312,9 +327,11 @@ impl Evictor {
     /// Ordering is row-before-file: the `cache_entries` row is dropped and
     /// committed before its object is deleted, so a crash in the window
     /// leaves an object no row claims — reconciliation's `OrphanCacheObject`
-    /// reclaims it (SYNC-053). Every victim is re-validated at execution: a
-    /// candidate newly pinned, read, or hydrating is skipped, and the delete
-    /// itself refuses ineligible rows (SYNC-051).
+    /// reclaims it (SYNC-053). Generated-document row removal atomically
+    /// dirties its render state, so the still-published item facts always have
+    /// a deterministic path to new bytes. Every victim is re-validated at
+    /// execution: a candidate newly pinned, read, or hydrating is skipped,
+    /// and the delete itself refuses ineligible rows (SYNC-051).
     fn execute(
         &self,
         store: &mut StateStore,

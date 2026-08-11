@@ -3,8 +3,162 @@ import GramDriveAgentCore
 import GramDriveCompanion
 import GramDriveFileProvider
 import GramDriveSupport
+import Sparkle
 import SwiftUI
 import os
+
+@MainActor
+private final class GramDriveApplicationDelegate: NSObject, NSApplicationDelegate {
+  static let lifecycle = CompanionApplicationLifecycle()
+  private var terminationProgressAlert: NSAlert?
+  private var pendingUpdateBuild: String?
+  let updateAvailability = UpdateAvailability()
+  private var updaterAvailabilityObservation: NSKeyValueObservation?
+
+  lazy var updaterController = SPUStandardUpdaterController(
+    startingUpdater: true,
+    updaterDelegate: self,
+    userDriverDelegate: nil)
+
+  private lazy var terminationCoordinator = CompanionTerminationCoordinator.live(
+    layout: GramDriveCompanionApp.layout())
+
+  private lazy var terminationDriver = ApplicationTerminationRequestDriver(
+    requestTermination: { [weak self] intent in
+      await self?.terminationCoordinator.requestTermination(intent) ?? false
+    },
+    cancelTermination: { [weak self] in
+      await self?.terminationCoordinator.cancelTermination() ?? false
+    })
+
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    Self.lifecycle.applicationDidFinishLaunching()
+    updaterAvailabilityObservation = updaterController.updater.observe(
+      \.canCheckForUpdates,
+      options: [.initial, .new]
+    ) { [weak self] updater, _ in
+      Task { @MainActor [weak self] in
+        self?.updateAvailability.setCanCheckForUpdates(updater.canCheckForUpdates)
+      }
+    }
+  }
+
+  func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+    Self.lifecycle.applicationShouldHandleReopen()
+  }
+
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    let intent: CompanionTerminationCoordinator.Intent
+    if let pendingUpdateBuild {
+      intent = .update(targetBuild: pendingUpdateBuild)
+    } else {
+      intent = .userQuit
+    }
+    guard terminationDriver.applicationShouldTerminate(intent: intent, reply: { [weak self] allowed in
+      self?.replyToTerminationOnce(allowed)
+    }) else { return .terminateLater }
+    presentTerminationProgress()
+    return .terminateLater
+  }
+
+  func checkForUpdates() {
+    updaterController.checkForUpdates(nil)
+  }
+
+  /// An in-flight AppKit termination has an explicit recovery route for a
+  /// user who chooses to keep GramDrive open. The shared reply helper keeps
+  /// the original request's reply exactly-once even if the normal drain task
+  /// reaches a terminal result concurrently.
+  func cancelPendingTermination() {
+    terminationDriver.cancelPendingTermination { [weak self] allowed in
+      self?.replyToTerminationOnce(allowed)
+    }
+  }
+
+  private func replyToTerminationOnce(_ allowed: Bool) {
+    dismissTerminationProgress()
+    NSApplication.shared.reply(toApplicationShouldTerminate: allowed)
+    if !allowed { presentTerminationCancelledExplanation() }
+  }
+
+  private func presentTerminationProgress() {
+    guard let window = NSApplication.shared.keyWindow else { return }
+    let alert = NSAlert()
+    alert.messageText = "Preparing GramDrive to quit"
+    alert.informativeText = "Waiting for File Provider transfers to reach a safe boundary."
+    alert.addButton(withTitle: "Keep GramDrive Open")
+    alert.addButton(withTitle: "Continue Quitting")
+    terminationProgressAlert = alert
+    alert.beginSheetModal(for: window) { [weak self] response in
+      guard response == .alertFirstButtonReturn else { return }
+      self?.cancelPendingTermination()
+    }
+  }
+
+  private func dismissTerminationProgress() {
+    guard let alert = terminationProgressAlert else { return }
+    terminationProgressAlert = nil
+    if let parent = alert.window.sheetParent {
+      parent.endSheet(alert.window, returnCode: .abort)
+    }
+  }
+
+  private func presentTerminationCancelledExplanation() {
+    let alert = NSAlert()
+    alert.messageText = "GramDrive is still running"
+    alert.informativeText = terminationCoordinator.lastFailureMessage
+      ?? "The agent could not safely stop. Try again, or use Force Quit if you need to stop immediately."
+    alert.addButton(withTitle: "Try Again")
+    alert.addButton(withTitle: "Keep GramDrive Open")
+    if alert.runModal() == .alertFirstButtonReturn {
+      NSApplication.shared.terminate(nil)
+    }
+  }
+}
+
+extension GramDriveApplicationDelegate: SPUUpdaterDelegate {
+  func updater(_ updater: SPUUpdater, didDownloadUpdate item: SUAppcastItem) {
+    pendingUpdateBuild = item.versionString
+  }
+
+  func updater(
+    _ updater: SPUUpdater,
+    willInstallUpdateOnQuit item: SUAppcastItem,
+    immediateInstallationBlock: @escaping () -> Void
+  ) -> Bool {
+    // AppKit's termination gate owns the drain and its one reply. Returning
+    // false keeps Sparkle from taking the immediate-install shortcut before
+    // the agent has stopped admitting File Provider work.
+    pendingUpdateBuild = item.versionString
+    return false
+  }
+}
+
+/// Retains one state-to-File-Provider change relay per registered domain for
+/// the companion process lifetime. The lock permits replacement from the
+/// detached setup operation without making the SwiftUI app global actor-bound.
+private final class LiveChangeRelayRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var relays: [ChangeSignalRelay] = []
+
+    func replace(with relays: [ChangeSignalRelay]) {
+        lock.lock()
+        let previous = self.relays
+        self.relays = relays
+        lock.unlock()
+        for relay in previous { relay.stop() }
+    }
+
+    func signalAll() {
+        lock.lock()
+        let current = relays
+        lock.unlock()
+        for relay in current { relay.signalEnumeratorsAfterAgentReplacement() }
+    }
+}
 
 /// The GramDrive companion shell (PLAT-MAC-005): a menu-bar app over the
 /// engine-hosting agent. It hosts no engine and performs no Telegram
@@ -17,8 +171,59 @@ import os
 /// process has none.
 @main
 struct GramDriveCompanionApp: App {
+    @NSApplicationDelegateAdaptor(GramDriveApplicationDelegate.self)
+    private var applicationDelegate
+    nonisolated private static let changeRelays = LiveChangeRelayRegistry()
+
+    private static let domainSetup = CoalescingFileProviderDomainSetup {
+        let registrar = SystemDomainRegistrar()
+        switch await DomainStartupReconcile.run(registrar: registrar) {
+        case .skipped:
+            throw LiveDomainSetupError.sharedStorageUnavailable
+        case .failed:
+            throw LiveDomainSetupError.registrationFailed
+        case .reconciled(let outcome):
+            guard let domain = outcome.desired.first else {
+                throw LiveDomainSetupError.authorizedAccountUnavailable
+            }
+            let platformURL = try await registrar.userVisibleRootURL(for: domain)
+            try GramDriveCompanionApp.installChangeRelays(
+                desired: outcome.desired, registrar: registrar)
+            let rootURL = try await GramDriveCompanionApp.resolveDriveRoot(
+                platformURL: platformURL)
+            return FileProviderDomainSetupResult(rootURL: rootURL)
+        }
+    }
+
+    nonisolated private static func installChangeRelays(
+        desired: [DesiredDomain],
+        registrar: SystemDomainRegistrar
+    ) throws {
+        let container = try AppGroup.containerURL()
+        let dataRoot = AppGroup.dataRootURL(containerURL: container)
+        var relays: [ChangeSignalRelay] = []
+        for domain in desired {
+            guard let signaling = registrar.changeSignaler(for: domain) else { continue }
+            let store = try SharedState.open(dataRoot: dataRoot, role: .provider)
+            guard let account = try store.account(accountId: domain.accountId) else {
+                continue
+            }
+            let relay = ChangeSignalRelay(
+                probe: { try store.dataVersion() },
+                containerProbe: {
+                    try ProviderContainerChangeResolver.changes(
+                        store: store, account: account, after: $0)
+                },
+                signaling: signaling)
+            try relay.start()
+            relays.append(relay)
+        }
+        changeRelays.replace(with: relays)
+    }
+
     @State private var model = CompanionViewModel.live(
         layout: GramDriveCompanionApp.layout(),
+        domainSetup: GramDriveCompanionApp.domainSetup,
         // The app half of the SEC-004 removal: after the agent's engine
         // half completes, deregister the account's File Provider domain —
         // domain management can only run in the app embedding the
@@ -30,51 +235,34 @@ struct GramDriveCompanionApp: App {
                 disposition: .deleteLocalData,
                 registrar: SystemDomainRegistrar(),
                 remover: SystemDomainRemover())
+        },
+        matchingAgentReady: {
+            GramDriveCompanionApp.changeRelays.signalAll()
         })
-
-    init() {
-        // Launch-time File Provider domain reconcile (TASK-260715-3s44pc
-        // registration): the shell is the app that embeds the extension, so
-        // domain management runs here — off the main thread, never blocking or
-        // failing startup.
-        //
-        // This is the SYNC-070 startup recovery, and it is deliberately the
-        // *add-only* reconcile, not the full repair: it re-registers every
-        // account's domain (recovering Finder state under the stable
-        // identifier) but never removes anything. Automatically tearing down
-        // Finder state on every launch is exactly the failure mode the
-        // reconcile/repair split exists to prevent — an empty or partial
-        // canonical read at startup would otherwise make every domain look
-        // like a stray and wipe it. Stray cleanup is the user-triggered repair
-        // (SYNC-071), wired behind the explicit "Repair File Provider Domains"
-        // command below. Idempotent: a healthy install logs a settled pass.
-        Task.detached(priority: .utility) {
-            let logger = Logger(
-                subsystem: "com.reluxworks.gramdrive",
-                category: "file-provider-domains"
-            )
-            switch await DomainStartupReconcile.run() {
-            case .skipped(let reason):
-                logger.info("domain reconcile skipped: \(reason, privacy: .public)")
-            case .failed(let reason):
-                logger.error("domain reconcile failed: \(reason, privacy: .public)")
-            case .reconciled(let outcome):
-                let plan = outcome.plan
-                logger.info(
-                    """
-                    domain reconcile: adds=\(plan.adds.count) \
-                    renames=\(plan.renames.count) keeps=\(plan.keeps.count) \
-                    strays=\(plan.strays.count)
-                    """
-                )
-            }
-        }
-    }
 
     /// The full-shell window id.
     static let mainWindowID = "gramdrive-main"
     /// The first-launch Welcome window id.
     static let onboardingWindowID = "gramdrive-onboarding"
+
+    /// `getUserVisibleURL(for: .rootContainer)` may transiently resolve to the
+    /// CloudStorage container while Finder is publishing the registered
+    /// domain child. Accept an exact GramDrive URL immediately; otherwise
+    /// wait a bounded interval for the child and fail into onboarding Retry.
+    private static func resolveDriveRoot(platformURL: URL) async throws -> URL {
+        if platformURL.lastPathComponent.hasPrefix(DomainIdentity.displayNameBase) {
+            return platformURL
+        }
+
+        let location = CloudStorageDriveLocation()
+        for _ in 0..<20 {
+            if let rootURL = location.resolveDriveURL() {
+                return rootURL
+            }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        throw LiveDomainSetupError.rootURLUnavailable
+    }
 
     var body: some Scene {
         // The menu-bar item, present from first launch. Its click surface is
@@ -84,12 +272,17 @@ struct GramDriveCompanionApp: App {
             MenuBarStatusView(
                 model: model,
                 mainWindowID: GramDriveCompanionApp.mainWindowID,
-                onboardingWindowID: GramDriveCompanionApp.onboardingWindowID)
+                onboardingWindowID: GramDriveCompanionApp.onboardingWindowID,
+                checkForUpdates: { applicationDelegate.checkForUpdates() },
+                updateAvailability: applicationDelegate.updateAvailability)
         } label: {
             MenuBarLaunchLabel(
                 systemImage: "externaldrive.badge.person.crop",
+                startAgentSession: { await model.startAgentSession() },
                 shouldPresentOnboarding: { model.onboarding.isPresented },
-                onboardingWindowID: GramDriveCompanionApp.onboardingWindowID)
+                mainWindowID: GramDriveCompanionApp.mainWindowID,
+                onboardingWindowID: GramDriveCompanionApp.onboardingWindowID,
+                lifecycle: GramDriveApplicationDelegate.lifecycle)
         }
         .menuBarExtraStyle(.window)
 
@@ -102,12 +295,19 @@ struct GramDriveCompanionApp: App {
 
         // The same surface in a resizable window, for the full settings view.
         Window("GramDrive", id: GramDriveCompanionApp.mainWindowID) {
-            CompanionRootView(model: model)
+            CompanionRootView(
+                model: model,
+                checkForUpdates: { applicationDelegate.checkForUpdates() },
+                updateAvailability: applicationDelegate.updateAvailability)
         }
         .commands {
             // SYNC-071: domain repair can *remove* domains, so it never runs
             // automatically — only from this explicit user action.
             CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    applicationDelegate.checkForUpdates()
+                }
+                .disabled(!applicationDelegate.updateAvailability.canCheckForUpdates)
                 Button("Repair File Provider Domains…") {
                     GramDriveCompanionApp.repairFileProviderDomains()
                 }
@@ -163,7 +363,7 @@ struct GramDriveCompanionApp: App {
     /// Resolves the agent runtime layout. Prefers the signed App Group
     /// container; falls back to a local Application Support root for an
     /// unsigned dev run, so the shell is runnable without the entitlement.
-    static func layout() -> AgentRuntimeLayout {
+    nonisolated static func layout() -> AgentRuntimeLayout {
         if let container = try? AppGroup.containerURL() {
             return AgentRuntimeLayout(dataRoot: AppGroup.dataRootURL(containerURL: container))
         }
@@ -177,29 +377,55 @@ struct GramDriveCompanionApp: App {
     }
 }
 
+/// Stable, non-sensitive failure categories for the live setup seam. Raw
+/// platform errors never reach onboarding, logs, or task evidence.
+private enum LiveDomainSetupError: Error {
+    case sharedStorageUnavailable
+    case registrationFailed
+    case authorizedAccountUnavailable
+    case rootURLUnavailable
+}
+
 /// The always-present menu-bar label. Beyond drawing the status glyph, it is
 /// the app's one reliably-instantiated view at launch in a menu-bar-only
-/// (`LSUIElement`) shell, so it hosts the first-launch onboarding trigger:
-/// once per process, if onboarding has not been completed, it opens the
-/// Welcome window and brings the app forward. Manual entry points (the
-/// compact panel's "Setup Guide…" and Help ▸ GramDrive Setup Guide) cover the
-/// re-run and any case where the launch trigger does not fire.
+/// (`LSUIElement`) shell, so it consumes durable cold-launch and reopen
+/// requests from the AppKit delegate and routes them through the same singleton
+/// window action used by the menu bar.
 private struct MenuBarLaunchLabel: View {
     let systemImage: String
+    let startAgentSession: () async -> Void
     let shouldPresentOnboarding: () -> Bool
+    let mainWindowID: String
     let onboardingWindowID: String
+    let lifecycle: CompanionApplicationLifecycle
     @Environment(\.openWindow) private var openWindow
-    @State private var didAttemptLaunchPresentation = false
+    @State private var presentationConsumer = CompanionWindowPresentationConsumer()
+    @State private var didStartAgentSession = false
 
     var body: some View {
         Image(systemName: systemImage)
             .task {
-                guard !didAttemptLaunchPresentation else { return }
-                didAttemptLaunchPresentation = true
-                guard shouldPresentOnboarding() else { return }
-                openWindow(id: onboardingWindowID)
-                NSApplication.shared.activate(ignoringOtherApps: true)
+                presentPendingApplicationRequest()
+                guard !didStartAgentSession else { return }
+                didStartAgentSession = true
+                await startAgentSession()
             }
+            .onChange(of: lifecycle.presentationGeneration) {
+                presentPendingApplicationRequest()
+            }
+    }
+
+    private var actionRouter: CompanionActionRouter {
+        CompanionActionRouter(
+            mainWindowID: mainWindowID,
+            onboardingWindowID: onboardingWindowID,
+            shouldPresentOnboarding: shouldPresentOnboarding,
+            openWindow: { openWindow(id: $0) },
+            activateApplication: { CompanionApplicationActivation.activate() })
+    }
+
+    private func presentPendingApplicationRequest() {
+        presentationConsumer.presentPendingRequest(from: lifecycle, using: actionRouter)
     }
 }
 
@@ -214,7 +440,7 @@ private struct SetupGuideCommand: View {
         Button("GramDrive Setup Guide…") {
             onSelect()
             openWindow(id: windowID)
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            CompanionApplicationActivation.activate()
         }
     }
 }

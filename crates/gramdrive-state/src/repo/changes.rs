@@ -121,7 +121,7 @@ pub enum MessageEventKind {
 }
 
 impl MessageEventKind {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Observed => "observed",
             Self::Edited => "edited",
@@ -129,7 +129,7 @@ impl MessageEventKind {
         }
     }
 
-    fn parse(text: &str) -> Result<Self, StateError> {
+    pub(super) fn parse(text: &str) -> Result<Self, StateError> {
         match text {
             "observed" => Ok(Self::Observed),
             "edited" => Ok(Self::Edited),
@@ -225,6 +225,40 @@ const MESSAGE_COLUMNS: &str =
     "message_id, sender_id, sent_at_ms, edited_at_ms, is_deleted, latest_event_seq";
 
 impl ReadTxn<'_> {
+    /// Current retained normalized payload of one live message.
+    ///
+    /// The join follows `messages.latest_event_seq`, so stale history pages
+    /// cannot overwrite a newer attachment projection after change
+    /// application has rejected them.
+    pub fn current_message_payload(
+        &self,
+        message: &MessageKey,
+    ) -> Result<Option<MessagePayload>, StateError> {
+        let (account_id, namespace) = scope_columns(&message.chat.scope);
+        let raw: Option<(Option<i64>, Option<Vec<u8>>)> = self
+            .conn()
+            .prepare_cached(
+                "SELECT e.payload_schema, e.payload
+                 FROM messages m
+                 JOIN message_events e ON e.event_seq = m.latest_event_seq
+                 WHERE m.account_id = ?1 AND m.namespace_version = ?2 AND m.chat_id = ?3
+                   AND m.message_id = ?4 AND m.is_deleted = 0",
+            )?
+            .query_row(
+                params![
+                    account_id,
+                    namespace,
+                    message.chat.chat_id.0,
+                    message.message_id.0
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        raw.map(|(schema, bytes)| payload_from_columns(schema, bytes))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     /// The current observed state of one message.
     pub fn message(&self, key: &MessageKey) -> Result<Option<MessageState>, StateError> {
         let (account_id, namespace) = scope_columns(&key.chat.scope);
@@ -404,23 +438,75 @@ impl ReadTxn<'_> {
         }))
     }
 
-    /// Chats of one scope that still need history, least-recently synced
-    /// first — the backfill backlog (SYNC-021).
+    /// Runnable listed chats of one scope that still need history, least
+    /// recently *given a turn* first — the bounded backfill backlog
+    /// (SYNC-021).
+    ///
+    /// Cursor rows may outlive list membership so a chat can resume if it
+    /// reappears. Current eligibility therefore comes from
+    /// `chat_list_entries`; canonical metadata outside every Telegram list is
+    /// never repeatedly scanned. Terminal retry-on-demand rows — a chat
+    /// Telegram refused or a request that failed — stay out of background
+    /// scheduling; an explicit eligible foreground request can still retry
+    /// them through a point read.
+    ///
+    /// A `degraded` chat is *not* one of those. Degradation is this engine's
+    /// own fence — a live gap, a buffer overflow, an edit whose individual
+    /// ids could not be retained — and it means "re-crawl me from the top",
+    /// not "the source said no". Excluding it starved every chat that ever
+    /// hit one: on a real preserved profile, 59 of 410 incomplete listed
+    /// chats sat fenced indefinitely, reachable only if the user happened to
+    /// open them in Finder (BUG-260728-2qfzbd). A degradation that names a
+    /// retry deadline waits for it; one that does not is runnable now.
+    ///
+    /// The order is keyed on `last_backfill_at_ms` — when this chat was last
+    /// handed a history turn — and deliberately *not* on `last_sync_at_ms`,
+    /// which the live-update path stamps too. Ordering by the latter let
+    /// ordinary incoming messages reset a chat's place in the queue, so the
+    /// busiest correspondences were the ones that never crawled backward: on
+    /// a preserved profile the reported chat held an unmoved backward
+    /// frontier for over an hour while the account indexed 123k messages from
+    /// quieter chats (BUG-260728-2qfzbd). A never-turned chat sorts first
+    /// (NULL leads in SQLite ASC), so every incomplete chat gets a turn
+    /// before any chat gets a second one.
     pub fn backfill_backlog(
         &self,
         scope: &AccountScope,
         limit: u32,
+        now_ms: i64,
     ) -> Result<Vec<ChatId>, StateError> {
         let (account_id, namespace) = scope_columns(scope);
         let mut statement = self.conn().prepare_cached(
-            "SELECT chat_id FROM chat_sync_state
-             WHERE account_id = ?1 AND namespace_version = ?2 AND history_complete = 0
-             ORDER BY last_sync_at_ms LIMIT ?3",
+            "SELECT s.chat_id
+             FROM chat_sync_state s
+             JOIN chats c
+               ON c.account_id = s.account_id
+              AND c.namespace_version = s.namespace_version
+              AND c.chat_id = s.chat_id
+             LEFT JOIN chat_content_progress p
+               ON p.account_id = s.account_id
+              AND p.namespace_version = s.namespace_version
+              AND p.chat_id = s.chat_id
+             WHERE s.account_id = ?1 AND s.namespace_version = ?2
+               AND s.history_complete = 0
+               AND c.deleted_at_ms IS NULL
+               AND c.is_protected = 0
+               AND EXISTS (
+                   SELECT 1 FROM chat_list_entries e
+                   WHERE e.account_id = s.account_id
+                     AND e.namespace_version = s.namespace_version
+                     AND e.chat_id = s.chat_id
+               )
+               AND (p.chat_id IS NULL
+                    OR p.phase IN ('pending', 'syncing', 'cancelled')
+                    OR (p.phase = 'degraded'
+                        AND (p.retry_at_ms IS NULL OR p.retry_at_ms <= ?4)))
+             ORDER BY s.last_backfill_at_ms, s.chat_id LIMIT ?3",
         )?;
-        let rows = statement
-            .query_map(params![account_id, namespace, i64::from(limit)], |row| {
-                Ok(ChatId(row.get(0)?))
-            })?;
+        let rows = statement.query_map(
+            params![account_id, namespace, i64::from(limit), now_ms],
+            |row| Ok(ChatId(row.get(0)?)),
+        )?;
         let mut chats = Vec::new();
         for row in rows {
             chats.push(row?);
@@ -676,14 +762,76 @@ impl WriteTxn<'_> {
                 // Mirror purges a deleted message's content entirely: the
                 // tombstone just appended carries none, and every revision it
                 // supersedes is purged to a marker (POL-3). Audit keeps those
-                // revisions as the content-preserving side of the tombstone.
+                // revisions and the attachment metadata/verified byte links
+                // observed with them. Mirror removes attachment ownership in
+                // this same transaction; it never leaves content rows behind
+                // for a deleted message.
                 if retention == RetentionMode::Mirror {
                     self.purge_message_content(chat, message_id, None)?;
+                    let message = MessageKey {
+                        chat: *chat,
+                        message_id,
+                    };
+                    for attachment in self.read().attachments_of_message(&message)? {
+                        self.purge_attachment_materialization(
+                            &attachment.facts.key,
+                            observed_at_ms,
+                        )?;
+                    }
+                    self.conn()
+                        .prepare_cached(
+                            "DELETE FROM attachments
+                             WHERE account_id = ?1 AND namespace_version = ?2
+                               AND chat_id = ?3 AND message_id = ?4",
+                        )?
+                        .execute(params![account_id, namespace, chat.chat_id.0, message_id.0,])?;
                 }
                 applied.deleted += 1;
             }
         }
         Ok(())
+    }
+
+    /// Purges every retained payload for a chat after an authoritative
+    /// chat-level content restriction becomes active.
+    ///
+    /// Message projection rows and event identity/timestamps remain as minimal
+    /// sync tombstones. The update is idempotent and intentionally ignores the
+    /// account retention mode: Telegram restrictions override Mirror and
+    /// Audit.
+    pub fn purge_restricted_chat_message_content(
+        &self,
+        chat: &ChatKey,
+    ) -> Result<usize, StateError> {
+        let (account_id, namespace) = scope_columns(&chat.scope);
+        Ok(self
+            .conn()
+            .prepare_cached(
+                "UPDATE message_events SET payload = NULL, payload_schema = NULL
+                 WHERE account_id = ?1 AND namespace_version = ?2 AND chat_id = ?3
+                   AND payload IS NOT NULL",
+            )?
+            .execute(params![account_id, namespace, chat.chat_id.0])?)
+    }
+
+    /// Applies a per-message authoritative restriction prospectively while
+    /// preserving only the latest body-free placeholder payload.
+    ///
+    /// In Audit this removes any earlier allowed revision immediately; a later
+    /// removal of the restriction cannot resurrect those payloads.
+    pub fn purge_restricted_message_history(
+        &self,
+        message: &MessageKey,
+    ) -> Result<usize, StateError> {
+        let state = self
+            .read()
+            .message(message)?
+            .ok_or(StateError::RowNotFound { entity: "message" })?;
+        self.purge_message_content(
+            &message.chat,
+            message.message_id,
+            Some(state.latest_event_seq),
+        )
     }
 
     /// Purges the payload of a message's event rows to a marker (the schema's
@@ -769,6 +917,33 @@ impl WriteTxn<'_> {
                 record.history_complete,
                 record.last_sync_at_ms,
             ])?;
+        Ok(())
+    }
+
+    /// Records that this chat was handed a backward-history turn (SYNC-021).
+    ///
+    /// The backlog's rotation key, and the only writer of it. Call it where
+    /// the scheduler *selects* a chat, not where a crawl succeeds: a turn
+    /// that ends in a spacing wait, a source error, or an empty page is
+    /// still a turn, and a key advanced only by success is a key a
+    /// repeatedly failing chat holds at the head of the queue forever.
+    ///
+    /// Deliberately separate from [`WriteTxn::record_chat_sync`], which
+    /// carries the cursor the crawl moved. Merging them would put the
+    /// rotation key back on the live-update path that stamps that record,
+    /// which is the starvation this exists to prevent (BUG-260728-2qfzbd).
+    ///
+    /// Silently does nothing when the chat has no cursor row yet: rows are
+    /// created by the chat trigger, and a chat with no row is not in the
+    /// backlog to be scheduled.
+    pub fn record_backfill_turn(&self, chat: &ChatKey, at_ms: i64) -> Result<(), StateError> {
+        let (account_id, namespace) = scope_columns(&chat.scope);
+        self.conn()
+            .prepare_cached(
+                "UPDATE chat_sync_state SET last_backfill_at_ms = ?4
+                 WHERE account_id = ?1 AND namespace_version = ?2 AND chat_id = ?3",
+            )?
+            .execute(params![account_id, namespace, chat.chat_id.0, at_ms])?;
         Ok(())
     }
 }

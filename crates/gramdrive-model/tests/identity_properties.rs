@@ -11,10 +11,11 @@
 //! rename could reach an encoding; see the identity module docs.
 
 use gramdrive_model::identity::{
-    AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
-    CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
-    FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MediaDirKey,
-    MessageId, MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
+    AccountId, AccountKey, AccountScope, ActiveStoriesKey, AppearanceKey, AttachmentIndex,
+    AttachmentKey, BlobKey, CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash,
+    DocFormat, DocPartition, FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId,
+    ItemKey, MediaDirKey, MessageId, MessageKey, MonthDirKey, NamespaceVersion, OrderDocKey,
+    SchemaFamily, StoryAppearanceKey, StoryAppearanceLocation, StoryId, StoryKey, YearDirKey,
 };
 use proptest::prelude::*;
 
@@ -35,6 +36,7 @@ fn arb_list_kind() -> impl Strategy<Value = ChatListKind> {
     prop_oneof![
         Just(ChatListKind::Main),
         Just(ChatListKind::Archive),
+        Just(ChatListKind::Stories),
         any::<i32>().prop_map(|id| ChatListKind::Folder(FolderId(id))),
     ]
 }
@@ -51,6 +53,21 @@ fn arb_message() -> impl Strategy<Value = MessageKey> {
         chat,
         message_id: MessageId(id),
     })
+}
+
+fn arb_story() -> impl Strategy<Value = StoryKey> {
+    (arb_chat(), any::<i64>()).prop_map(|(poster, id)| StoryKey {
+        poster,
+        story_id: StoryId(id),
+    })
+}
+
+fn arb_story_location() -> impl Strategy<Value = StoryAppearanceLocation> {
+    prop_oneof![
+        Just(StoryAppearanceLocation::Active),
+        (any::<u16>(), any::<u8>())
+            .prop_map(|(year, month)| StoryAppearanceLocation::Month { year, month }),
+    ]
 }
 
 fn arb_partition() -> impl Strategy<Value = DocPartition> {
@@ -72,6 +89,11 @@ fn arb_canonical() -> impl Strategy<Value = CanonicalKey> {
             .prop_map(|(chat, year)| CanonicalKey::YearDir(YearDirKey { chat, year })),
         (arb_chat(), any::<u16>())
             .prop_map(|(chat, year)| CanonicalKey::MediaDir(MediaDirKey { chat, year })),
+        (arb_chat(), any::<u16>(), any::<u8>()).prop_map(|(chat, year, month)| {
+            CanonicalKey::MonthDir(MonthDirKey { chat, year, month })
+        }),
+        arb_chat().prop_map(|chat| CanonicalKey::ActiveStories(ActiveStoriesKey { chat })),
+        arb_story().prop_map(CanonicalKey::Story),
         arb_message().prop_map(CanonicalKey::Message),
         (arb_message(), any::<u32>()).prop_map(|(message, index)| {
             CanonicalKey::Attachment(AttachmentKey {
@@ -117,6 +139,13 @@ fn arb_item_key() -> impl Strategy<Value = ItemKey> {
         arb_canonical().prop_map(ItemKey::Canonical),
         (arb_list_kind(), arb_canonical())
             .prop_map(|(view, item)| ItemKey::Appearance(AppearanceKey { view, item })),
+        (arb_story(), arb_list_kind(), arb_story_location()).prop_map(|(story, view, location)| {
+            ItemKey::StoryAppearance(StoryAppearanceKey {
+                story,
+                view,
+                location,
+            })
+        }),
     ]
 }
 
@@ -176,6 +205,18 @@ proptest! {
         prop_assert_ne!(canonical, appearance);
     }
 
+    /// Story placement is identity-only metadata and cannot alias the canonical bytes.
+    #[test]
+    fn canonical_story_and_appearance_namespaces_are_separate(
+        story in arb_story(),
+        view in arb_list_kind(),
+        location in arb_story_location(),
+    ) {
+        let canonical = ItemKey::Canonical(CanonicalKey::Story(story)).id();
+        let appearance = ItemKey::StoryAppearance(StoryAppearanceKey { story, view, location }).id();
+        prop_assert_ne!(canonical, appearance);
+    }
+
     /// PRD-013/DOM-022: one canonical chat seen through Main, Archive, and a
     /// folder yields three distinct appearance identities, while the wrapped
     /// canonical key stays identical.
@@ -200,6 +241,7 @@ proptest! {
             match id.key() {
                 ItemKey::Appearance(parsed) => prop_assert_eq!(parsed.item, item),
                 ItemKey::Canonical(_) => prop_assert!(false, "appearance decoded as canonical"),
+                ItemKey::StoryAppearance(_) => prop_assert!(false, "chat appearance decoded as story appearance"),
             }
         }
     }

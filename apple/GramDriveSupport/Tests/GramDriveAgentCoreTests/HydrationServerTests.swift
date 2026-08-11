@@ -37,16 +37,42 @@ private final class ScriptedHydrator: ContentHydrating, @unchecked Sendable {
 
     private let lock = NSLock()
     private let handler: Handler
+    private let releaseHandler: (@Sendable (HydratedContent) -> Void)?
     private(set) var recordedRequests: [HydrationRequest] = []
+    private var recordedPriorities: [TaskPriority] = []
+    private var releasedContents: [HydratedContent] = []
+    private var releaseQos: [qos_class_t] = []
 
-    init(_ handler: @escaping Handler) {
+    init(
+        _ handler: @escaping Handler,
+        release: (@Sendable (HydratedContent) -> Void)? = nil
+    ) {
         self.handler = handler
+        self.releaseHandler = release
     }
 
     var requests: [HydrationRequest] {
         lock.lock()
         defer { lock.unlock() }
         return recordedRequests
+    }
+
+    var released: [HydratedContent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return releasedContents
+    }
+
+    var priorities: [TaskPriority] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedPriorities
+    }
+
+    var releasedAtUserInitiatedQos: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !releaseQos.isEmpty && releaseQos.allSatisfy { $0 == QOS_CLASS_USER_INITIATED }
     }
 
     func hydrate(
@@ -58,10 +84,19 @@ private final class ScriptedHydrator: ContentHydrating, @unchecked Sendable {
         return try await handler(request, progress, token)
     }
 
+    func release(_ content: HydratedContent) {
+        lock.lock()
+        releasedContents.append(content)
+        releaseQos.append(qos_class_self())
+        lock.unlock()
+        releaseHandler?(content)
+    }
+
     // `NSLock` may not be taken from an async context.
     private func record(_ request: HydrationRequest) {
         lock.lock()
         recordedRequests.append(request)
+        recordedPriorities.append(Task.currentPriority)
         lock.unlock()
     }
 }
@@ -169,6 +204,258 @@ struct HydrationServerTests {
         }
     }
 
+    @Test("An admitted demand hydrator runs at user-initiated task priority")
+    func admittedDemandUsesForegroundPriority() async throws {
+        let hydrator = ScriptedHydrator { _, _, _ in sampleContent }
+        try await withHydrationServer(hydrator: hydrator) { harness in
+            _ = try await harness.client.hydrate(sampleRequest) { _ in }
+            #expect(hydrator.priorities == [.high])
+        }
+    }
+
+    @Test("Raw hydration never returns a scoped generated descriptor")
+    func rawHydrationRefusesScopedGeneratedDescriptor() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-server-success-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staged = directory.appendingPathComponent("generated.json")
+        try Data("success".utf8).write(to: staged)
+        let leased = HydratedContent(
+            stagedPath: staged.path,
+            contentVersion: "generated-v1",
+            byteCount: 7,
+            leaseID: "generated-lease")
+        let hydrator = ScriptedHydrator { _, _, _ in leased }
+        try await withHydrationServer(hydrator: hydrator) { harness in
+            await #expect(throws: HydrationTransportError.self) {
+                _ = try await harness.client.hydrate(sampleRequest) { _ in }
+            }
+            var waited = 0
+            while hydrator.released.isEmpty && waited < 100 {
+                try await Task.sleep(for: .milliseconds(5))
+                waited += 1
+            }
+            #expect(hydrator.released == [leased])
+            #expect(hydrator.releasedAtUserInitiatedQos)
+            #expect(harness.server.activeConnectionCount == 0)
+        }
+    }
+
+    @Test("Cancellation during materialization keeps its transferred descriptor alive")
+    func cancellationDuringMaterializationKeepsDescriptorAlive() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-server-cancel-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staged = directory.appendingPathComponent("generated.json")
+        let destination = directory.appendingPathComponent("cloned.json")
+        let bytes = Data("{\"generation\":\"leased-through-cancel\"}\n".utf8)
+        try bytes.write(to: staged)
+        let leased = HydratedContent(
+            stagedPath: staged.path,
+            contentVersion: "generated-v1",
+            byteCount: UInt64(bytes.count),
+            leaseID: "cancelled-materialization-lease")
+        let cloneStarted = TestSignal()
+        let allowClone = DispatchSemaphore(value: 0)
+        let hydrator = ScriptedHydrator { _, _, _ in leased }
+
+        try await withHydrationServer(hydrator: hydrator) { harness in
+            let task = Task { [client = harness.client] in
+                try await client.hydrateAndMaterialize(sampleRequest, onProgress: { _ in }) {
+                    content in
+                    cloneStarted.signal()
+                    allowClone.wait()
+                    try content.cloneMaterializationSource(to: destination)
+                    return destination
+                }
+            }
+            await cloneStarted.wait()
+            task.cancel()
+            // Post-done cancellation does not release the pathname lease
+            // before the synchronous clone returns.
+            #expect(hydrator.released.isEmpty)
+            allowClone.signal()
+            await #expect(throws: CancellationError.self) {
+                _ = try await task.value
+            }
+            let copied = try Data(contentsOf: destination)
+            #expect(copied == bytes)
+
+            var waited = 0
+            while (hydrator.released != [leased] || harness.server.activeConnectionCount != 0)
+                && waited < 100
+            {
+                try await Task.sleep(for: .milliseconds(5))
+                waited += 1
+            }
+            #expect(hydrator.released == [leased])
+            #expect(harness.server.activeConnectionCount == 0)
+        }
+    }
+
+    @Test("Generated pathname survives until File Provider materializes it")
+    func generatedPathnameSurvivesUntilMaterialization() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-descriptor-handoff-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staged = directory.appendingPathComponent("obsolete-generated.json")
+        let destination = directory.appendingPathComponent("cloned.json")
+        let bytes = Data("{\"generation\":\"survives-reclaim\"}\n".utf8)
+        try bytes.write(to: staged)
+        let leased = HydratedContent(
+            stagedPath: staged.path,
+            contentVersion: "generated-v1",
+            byteCount: UInt64(bytes.count),
+            leaseID: "descriptor-handoff-lease")
+        let descriptorReceived = TestSignal()
+        let hydrator = ScriptedHydrator(
+            { _, _, _ in leased },
+            release: { _ in
+                try? FileManager.default.removeItem(at: staged)
+            })
+
+        try await withHydrationServer(hydrator: hydrator) { harness in
+            let materialization = Task { [client = harness.client] in
+                try await client.hydrateAndMaterialize(sampleRequest, onProgress: { _ in }) {
+                    content in
+                    #expect(content.transferredFileDescriptor != nil)
+                    descriptorReceived.signal()
+                    #expect(FileManager.default.fileExists(atPath: staged.path))
+                    try content.cloneMaterializationSource(to: destination)
+                    return destination
+                }
+            }
+            await descriptorReceived.wait()
+            let copied = try await materialization.value
+            #expect(try Data(contentsOf: copied) == bytes)
+
+            var waited = 0
+            while harness.server.activeConnectionCount != 0 && waited < 100 {
+                try await Task.sleep(for: .milliseconds(5))
+                waited += 1
+            }
+            #expect(hydrator.released == [leased])
+            #expect(harness.server.activeConnectionCount == 0)
+            #expect(!FileManager.default.fileExists(atPath: staged.path))
+        }
+    }
+
+    @Test("A disconnected post-done client releases its generation lease")
+    func disconnectedMaterializationReleasesLease() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-server-disconnect-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staged = directory.appendingPathComponent("generated.json")
+        try Data("disconnect".utf8).write(to: staged)
+        let leased = HydratedContent(
+            stagedPath: staged.path,
+            contentVersion: "generated-v1",
+            byteCount: 10,
+            leaseID: "abandoned-generated-lease")
+        let hydrator = ScriptedHydrator { _, _, _ in leased }
+        try await withHydrationServer(hydrator: hydrator) { harness in
+            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            #expect(fd >= 0)
+            try UnixSocketAddress.connect(descriptor: fd, path: harness.socketURL.path)
+            let request = try HydrationWire.encodeLine(sampleRequest)
+            let written = request.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+            #expect(written == request.count)
+            var buffer = Data()
+            var chunk = [UInt8](repeating: 0, count: 1024)
+            while !buffer.contains(0x0A) {
+                let received = try UnixFileDescriptorTransfer.receive(into: &chunk, on: fd)
+                let count = received.count
+                if let descriptor = received.fileDescriptor { close(descriptor) }
+                #expect(count > 0)
+                guard count > 0 else { return }
+                buffer.append(contentsOf: chunk[0..<count])
+            }
+            let event = try HydrationWire.decodeLine(
+                HydrationEvent.self, from: Data(buffer.prefix(while: { $0 != 0x0A })))
+            guard case .done(let returned) = event else {
+                Issue.record("expected done before the client disconnect")
+                return
+            }
+            #expect(returned.leaseID == leased.leaseID)
+            // Disconnect abandons the materialization boundary and releases
+            // the server-side pathname lease without a timer.
+            close(fd)
+            var waited = 0
+            while (harness.server.activeConnectionCount != 0 || hydrator.released.isEmpty)
+                && waited < 100
+            {
+                try await Task.sleep(for: .milliseconds(5))
+                waited += 1
+            }
+            #expect(harness.server.activeConnectionCount == 0)
+            #expect(hydrator.released == [leased])
+        }
+    }
+
+    @Test("Graceful shutdown is bounded while descriptor materialization is paused")
+    func shutdownDrainsBeforePausedDescriptorMaterializationReturns() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-server-shutdown-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staged = directory.appendingPathComponent("generated.json")
+        let destination = directory.appendingPathComponent("cloned.json")
+        let bytes = Data("{\"generation\":\"leased-through-shutdown\"}\n".utf8)
+        try bytes.write(to: staged)
+        let leased = HydratedContent(
+            stagedPath: staged.path,
+            contentVersion: "generated-v1",
+            byteCount: UInt64(bytes.count),
+            leaseID: "shutdown-materialization-lease")
+        let cloneStarted = TestSignal()
+        let allowClone = DispatchSemaphore(value: 0)
+        let stopped = TestSignal()
+        let hydrator = ScriptedHydrator(
+            { _, _, _ in leased },
+            release: { _ in
+                // Models successor reconciliation after the bounded lifecycle
+                // close releases the server's generated-path lease.
+                try? FileManager.default.removeItem(at: staged)
+            })
+
+        try await withHydrationServer(hydrator: hydrator) { harness in
+            let materialization = Task { [client = harness.client] in
+                try await client.hydrateAndMaterialize(sampleRequest, onProgress: { _ in }) {
+                    content in
+                    cloneStarted.signal()
+                    allowClone.wait()
+                    try content.cloneMaterializationSource(to: destination)
+                    return destination
+                }
+            }
+            await cloneStarted.wait()
+            let shutdown = Task {
+                await harness.server.stopAndDrain(timeout: .milliseconds(20))
+                stopped.signal()
+            }
+
+            // Shutdown reaches its terminal state without waiting for a
+            // wedged callback: the File Provider owns the descriptor now.
+            await stopped.wait()
+            #expect(hydrator.released == [leased])
+            #expect(harness.server.activeConnectionCount == 0)
+            #expect(!FileManager.default.fileExists(atPath: staged.path))
+
+            allowClone.signal()
+            let copied = try await materialization.value
+            #expect(copied == destination)
+            #expect(try Data(contentsOf: copied) == bytes)
+            await stopped.wait()
+            _ = await shutdown.value
+            #expect(hydrator.released == [leased])
+            #expect(harness.server.activeConnectionCount == 0)
+        }
+    }
+
     @Test("An admission refusal is terminal and never reaches the hydrator")
     func admissionRefusalIsTerminal() async throws {
         let hydrator = ScriptedHydrator { _, _, _ in
@@ -264,6 +551,12 @@ struct HydrationServerTests {
             }
             // The EOF monitor fired the FFI token — the engine-side cancel.
             await observedCancel.wait()
+            var waited = 0
+            while harness.server.activeConnectionCount != 0 && waited < 100 {
+                try await Task.sleep(for: .milliseconds(5))
+                waited += 1
+            }
+            #expect(harness.server.activeConnectionCount == 0)
         }
     }
 
@@ -400,6 +693,17 @@ struct HydrationServerTests {
 @Suite struct AgentLifecycleHydrationTests {
     init() { _ = ignoreSIGPIPEInTestProcess }
 
+    @Test("Agent admission preserves unavailable versus restricted")
+    func admissionAvailabilityCategories() throws {
+        #expect(AgentLifecycle.hydrationAdmissionFailure(for: .fetchable) == nil)
+        #expect(
+            AgentLifecycle.hydrationAdmissionFailure(for: .restricted)?.category
+                == .restricted)
+        #expect(
+            AgentLifecycle.hydrationAdmissionFailure(for: .unavailable)?.category
+                == .notFound)
+    }
+
     @Test("A wired hydrator brings the endpoint up; admission runs over real state")
     func lifecycleServesHydration() async throws {
         try await withTemporaryDirectoryAsync { root in
@@ -430,20 +734,18 @@ struct HydrationServerTests {
         }
     }
 
-    @Test("Without a hydrator the endpoint is not offered at all")
-    func noHydratorNoEndpoint() async throws {
+    @Test("The production core hydrator endpoint is offered without injection")
+    func productionHydratorEndpointStarts() async throws {
         try await withTemporaryDirectoryAsync { root in
             let lifecycle = AgentLifecycle(configuration: AgentConfiguration(dataRoot: root))
             try lifecycle.start()
-            let client = AgentHydrationClient(
-                socketURL: { lifecycle.runtimeLayout.hydrationSocket })
-            await #expect(
-                throws: HydrationTransportError.agentUnavailable(
-                    path: lifecycle.runtimeLayout.hydrationSocket.path)
-            ) {
-                _ = try await client.hydrate(sampleRequest) { _ in }
-            }
+            #expect(
+                FileManager.default.fileExists(
+                    atPath: lifecycle.runtimeLayout.hydrationSocket.path))
             _ = await lifecycle.shutdown(reason: .terminate)
+            #expect(
+                !FileManager.default.fileExists(
+                    atPath: lifecycle.runtimeLayout.hydrationSocket.path))
         }
     }
 }

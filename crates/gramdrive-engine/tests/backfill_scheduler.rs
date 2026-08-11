@@ -22,12 +22,15 @@ use gramdrive_engine::backfill::{
     WaitReason,
 };
 use gramdrive_engine::model::identity::{
-    AccountId, AccountKey, AccountScope, ChatId, ChatKey, MessageId, NamespaceVersion,
+    AccountId, AccountKey, AccountScope, AttachmentIndex, AttachmentKey, CanonicalKey, ChatId,
+    ChatKey, ChatListKey, ChatListKind, ItemKey, MessageId, MessageKey, NamespaceVersion,
 };
-use gramdrive_engine::model::version::MetadataVersion;
+use gramdrive_engine::model::version::{ContentVersion, MetadataVersion};
 use gramdrive_engine::state::StateStore;
 use gramdrive_engine::state::repo::{
-    AccountRecord, ChatRecord, ChatSyncRecord, ChatType, RetentionMode, SourceKind, SyncWindow,
+    AccountRecord, ChatContentPhase, ChatContentProgressRecord, ChatListEntry, ChatRecord,
+    ChatSyncRecord, ChatType, FileFacts, ItemAvailability, ItemRecord, RetentionMode, SourceKind,
+    SyncWindow,
 };
 
 const ACCOUNT_ID: i64 = 7;
@@ -65,6 +68,7 @@ fn seed_account(store: &mut StateStore, archive_mode: bool) {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode,
         secret_ref: None,
@@ -75,7 +79,7 @@ fn seed_account(store: &mut StateStore, archive_mode: bool) {
     tx.commit().expect("commit");
 }
 
-fn add_chat(store: &mut StateStore, chat: i64) {
+fn add_canonical_chat(store: &mut StateStore, chat: i64) {
     let tx = store.write_txn().expect("write");
     tx.upsert_chat(&ChatRecord {
         key: chat_key(chat),
@@ -93,10 +97,56 @@ fn add_chat(store: &mut StateStore, chat: i64) {
     tx.commit().expect("commit");
 }
 
+fn add_chat(store: &mut StateStore, chat: i64) {
+    add_canonical_chat(store, chat);
+    let tx = store.write_txn().expect("write membership");
+    tx.upsert_chat_list_entry(
+        &ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Main,
+        },
+        &ChatListEntry {
+            chat_id: ChatId(chat),
+            sort_order: chat,
+            pinned: false,
+        },
+    )
+    .expect("membership");
+    tx.commit().expect("commit membership");
+}
+fn set_progress(store: &mut StateStore, chat: i64, phase: ChatContentPhase) {
+    let exceptional = matches!(
+        phase,
+        ChatContentPhase::Unavailable
+            | ChatContentPhase::Protected
+            | ChatContentPhase::Failed
+            | ChatContentPhase::Degraded
+    );
+    let retryable = matches!(
+        phase,
+        ChatContentPhase::Unavailable | ChatContentPhase::Failed | ChatContentPhase::Degraded
+    );
+    let tx = store.write_txn().expect("write");
+    tx.put_chat_content_progress(
+        &chat_key(chat),
+        &ChatContentProgressRecord {
+            phase,
+            failure_category: exceptional.then(|| "content-state".to_owned()),
+            retryable,
+            retry_at_ms: None,
+            attempt_count: 1,
+            updated_at_ms: 500,
+        },
+    )
+    .expect("progress");
+    tx.commit().expect("commit");
+}
+
 /// Records a chat's history-traversal state. `history_complete` decides
-/// whether the chat still needs history; `last_sync_at_ms` orders the
-/// background backlog (older first).
-fn set_sync(store: &mut StateStore, chat: i64, history_complete: bool, last_sync_at_ms: i64) {
+/// whether the chat still needs history; `at_ms` is stamped as both the last
+/// observation and the last backward-history *turn*, and it is the turn that
+/// orders the background backlog (older first).
+fn set_sync(store: &mut StateStore, chat: i64, history_complete: bool, at_ms: i64) {
     let tx = store.write_txn().expect("write");
     tx.record_chat_sync(
         &chat_key(chat),
@@ -106,10 +156,12 @@ fn set_sync(store: &mut StateStore, chat: i64, history_complete: bool, last_sync
                 newest: MessageId(20),
             }),
             history_complete,
-            last_sync_at_ms: Some(last_sync_at_ms),
+            last_sync_at_ms: Some(at_ms),
         },
     )
     .expect("sync");
+    tx.record_backfill_turn(&chat_key(chat), at_ms)
+        .expect("turn");
     tx.commit().expect("commit");
 }
 
@@ -127,6 +179,56 @@ fn demand<'a>(visible: &'a [ChatId], requested: &'a [ChatId]) -> BackfillDemand<
 
 fn scheduler() -> BackfillScheduler {
     BackfillScheduler::with_defaults()
+}
+
+fn add_archive_candidate(
+    store: &mut StateStore,
+    message: i64,
+) -> gramdrive_engine::model::identity::ItemId {
+    let root = ItemKey::Canonical(CanonicalKey::Account(scope().account)).id();
+    let item = ItemKey::Canonical(CanonicalKey::Attachment(AttachmentKey {
+        message: MessageKey {
+            chat: chat_key(1),
+            message_id: MessageId(message),
+        },
+        index: AttachmentIndex(0),
+    }))
+    .id();
+    let tx = store.write_txn().expect("write candidate");
+    tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
+        id: root.clone(),
+        parent: None,
+        display_name: "Account".to_owned(),
+        safe_name: "Account".to_owned(),
+        metadata_version: metadata("root-v1"),
+        content: None,
+        availability: ItemAvailability::Fetchable,
+        created_at_ms: None,
+        modified_at_ms: None,
+        deleted_at_ms: None,
+    })
+    .expect("root");
+    tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
+        id: item.clone(),
+        parent: Some(root),
+        display_name: "allowed.bin".to_owned(),
+        safe_name: "allowed.bin".to_owned(),
+        metadata_version: metadata("attachment-meta-v1"),
+        content: Some(FileFacts {
+            mime_type: Some("application/octet-stream".to_owned()),
+            logical_size: Some(64),
+            content_version: Some(ContentVersion::new("attachment-v1").expect("version")),
+        }),
+        availability: ItemAvailability::Fetchable,
+        created_at_ms: None,
+        modified_at_ms: None,
+        deleted_at_ms: None,
+    })
+    .expect("candidate");
+    tx.commit().expect("commit candidate");
+    item
 }
 
 // ---------------------------------------------------------------------------
@@ -225,12 +327,79 @@ fn schedules_visible_then_requested_then_background_then_drains() {
 }
 
 #[test]
+fn background_round_robin_ignores_older_ineligible_cursors() {
+    let mut store = StateStore::open_in_memory().expect("open");
+    seed_account(&mut store, false);
+
+    // Canonical TDLib metadata can be much broader than the provider
+    // namespace. Give these hidden chats the oldest possible cursors: the
+    // pre-fix backlog would spend every bounded scan on them.
+    for chat in 100..164 {
+        add_canonical_chat(&mut store, chat);
+        set_sync(&mut store, chat, false, 0);
+    }
+    for (chat, last_sync) in [(1, 10), (2, 20), (3, 30)] {
+        add_chat(&mut store, chat);
+        set_sync(&mut store, chat, false, last_sync);
+    }
+
+    let sched = scheduler();
+    let mut selected = Vec::new();
+    for now in [1_000, 1_100, 1_200] {
+        let BackfillStep::AdvanceHistory { chat_id, priority } = sched
+            .plan_next(
+                &mut store,
+                scope(),
+                BackfillDemand::NONE,
+                HostConditions::UNCONSTRAINED,
+                now,
+            )
+            .expect("plan listed chat")
+        else {
+            panic!("listed backlog must remain runnable");
+        };
+        assert_eq!(priority, BackfillPriority::Background);
+        selected.push(chat_id);
+        set_sync(&mut store, chat_id.0, false, now);
+    }
+
+    assert_eq!(
+        selected,
+        vec![ChatId(1), ChatId(2), ChatId(3)],
+        "each independent visible chat gets a background quantum before any repeats"
+    );
+}
+
+#[test]
+fn stale_foreground_hint_cannot_make_an_unlisted_chat_eligible() {
+    let mut store = StateStore::open_in_memory().expect("open");
+    seed_account(&mut store, false);
+    add_canonical_chat(&mut store, 9);
+    set_sync(&mut store, 9, false, 0);
+
+    assert_eq!(
+        scheduler()
+            .plan_next(
+                &mut store,
+                scope(),
+                demand(&[ChatId(9)], &[]),
+                HostConditions::UNCONSTRAINED,
+                1_000,
+            )
+            .expect("plan"),
+        BackfillStep::Idle {
+            reason: IdleReason::BacklogDrained,
+        }
+    );
+}
+
+#[test]
 fn a_visible_chat_never_synced_still_schedules() {
     let mut store = StateStore::open_in_memory().expect("open");
     seed_account(&mut store, false);
     add_chat(&mut store, 42);
-    // No chat_sync_state row at all — a chat the user opened before any
-    // crawl anchored it. It still needs history.
+    // Schema v13 seeds a windowless pending row when the first list
+    // membership makes the chat eligible. It still needs history.
     let sched = scheduler();
     let visible = [ChatId(42)];
     assert_eq!(
@@ -247,6 +416,70 @@ fn a_visible_chat_never_synced_still_schedules() {
             chat_id: ChatId(42),
             priority: BackfillPriority::Visible,
         },
+    );
+}
+
+#[test]
+fn a_never_synced_chat_is_in_the_bounded_background_backlog() {
+    let mut store = StateStore::open_in_memory().expect("open");
+    seed_account(&mut store, false);
+    add_chat(&mut store, 42);
+
+    assert_eq!(
+        scheduler()
+            .plan_next(
+                &mut store,
+                scope(),
+                BackfillDemand::NONE,
+                HostConditions::UNCONSTRAINED,
+                1_000,
+            )
+            .expect("plan"),
+        BackfillStep::AdvanceHistory {
+            chat_id: ChatId(42),
+            priority: BackfillPriority::Background,
+        }
+    );
+}
+
+#[test]
+fn failed_background_work_waits_for_an_explicit_retry() {
+    let mut store = StateStore::open_in_memory().expect("open");
+    seed_account(&mut store, false);
+    add_chat(&mut store, 42);
+    set_progress(&mut store, 42, ChatContentPhase::Failed);
+    let sched = scheduler();
+
+    assert_eq!(
+        sched
+            .plan_next(
+                &mut store,
+                scope(),
+                BackfillDemand::NONE,
+                HostConditions::UNCONSTRAINED,
+                1_000,
+            )
+            .expect("background plan"),
+        BackfillStep::Idle {
+            reason: IdleReason::BacklogDrained,
+        }
+    );
+
+    let requested = [ChatId(42)];
+    assert_eq!(
+        sched
+            .plan_next(
+                &mut store,
+                scope(),
+                demand(&[], &requested),
+                HostConditions::UNCONSTRAINED,
+                1_000,
+            )
+            .expect("explicit retry"),
+        BackfillStep::AdvanceHistory {
+            chat_id: ChatId(42),
+            priority: BackfillPriority::Requested,
+        }
     );
 }
 
@@ -676,6 +909,66 @@ fn archive_media_honors_disk_warnings_and_device_conditions() {
         MediaPolicy::Suspended {
             reason: MediaSuspend::PowerSaving,
         },
+    );
+}
+
+#[test]
+fn archive_worklist_is_retention_independent_and_low_disk_safe() {
+    let mut store = StateStore::open_in_memory().expect("open");
+    seed_account(&mut store, false);
+    let item = add_archive_candidate(&mut store, 50);
+    let tx = store.write_txn().expect("enable Archive Mode");
+    tx.set_archive_mode(scope().account, true, 1_000)
+        .expect("enable");
+    tx.commit().expect("commit Archive Mode");
+    let sched = scheduler();
+
+    assert_eq!(
+        sched
+            .archive_media_worklist(
+                &mut store,
+                scope(),
+                conditions(
+                    NetworkState::Online,
+                    PowerState::Unconstrained,
+                    DiskState::Low,
+                ),
+                2_000,
+                10,
+            )
+            .expect("low-disk worklist"),
+        Vec::new(),
+        "low disk must suppress eager hydration"
+    );
+    assert_eq!(
+        sched
+            .archive_media_worklist(
+                &mut store,
+                scope(),
+                HostConditions::UNCONSTRAINED,
+                2_000,
+                10,
+            )
+            .expect("Mirror worklist"),
+        vec![item.clone()]
+    );
+
+    let tx = store.write_txn().expect("switch Audit");
+    tx.set_retention_mode(scope().account, RetentionMode::Audit, None, 3_000)
+        .expect("Audit");
+    tx.commit().expect("commit Audit");
+    assert_eq!(
+        sched
+            .archive_media_worklist(
+                &mut store,
+                scope(),
+                HostConditions::UNCONSTRAINED,
+                3_000,
+                10,
+            )
+            .expect("Audit worklist"),
+        vec![item],
+        "Audit must neither create nor suppress Archive byte demand"
     );
 }
 

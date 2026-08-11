@@ -122,12 +122,15 @@ pub enum ChatListKind {
     Main,
     /// The archive.
     Archive,
+    /// The account-wide active/profile Stories view. This is driven by
+    /// `storyListMain`, not by Telegram's Main chat-list membership.
+    Stories,
     /// A custom Telegram folder.
     Folder(FolderId),
 }
 
-/// Canonical identity of one chat-list view root (Main, Archive, or a
-/// custom folder) within an account.
+/// Canonical identity of one chat-list view root (Main, Archive, Stories, or
+/// a custom folder) within an account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChatListKey {
     /// Owning account and namespace epoch.
@@ -137,7 +140,7 @@ pub struct ChatListKey {
 }
 
 /// Canonical identity of the fixed directory that groups every custom
-/// Telegram-folder view of an account — "Telegram Folders" in the default
+/// Telegram-folder view of an account — "Folders" in the default
 /// layout (`.spec/sync-and-filesystem-semantics.md`, tree layout).
 ///
 /// Scoped like [`ChatListKey`]: the catalog is chat-list-level structure, so
@@ -162,6 +165,24 @@ pub struct ChatKey {
     pub scope: AccountScope,
     /// Telegram chat ID within that scope.
     pub chat_id: ChatId,
+}
+
+/// Canonical identity of the fixed `Active Stories` directory of a chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActiveStoriesKey {
+    /// The chat whose currently active, saveable stories are projected.
+    pub chat: ChatKey,
+}
+
+/// Canonical identity of one direct `YYYY-MM` directory in a chat timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MonthDirKey {
+    /// The chat the month belongs to.
+    pub chat: ChatKey,
+    /// Calendar year formatted in the account display timezone.
+    pub year: u16,
+    /// Calendar month, 1-12.
+    pub month: u8,
 }
 
 /// Canonical identity of one calendar-year directory of a chat's export
@@ -223,6 +244,48 @@ pub struct AttachmentKey {
     pub index: AttachmentIndex,
 }
 
+/// Telegram story identifier within the posting chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoryId(pub i64);
+
+/// Canonical identity of one story: exactly `(poster_chat_id, story_id)`
+/// inside an account namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoryKey {
+    /// Chat that posted the story; carries account and namespace scope.
+    pub poster: ChatKey,
+    /// Telegram story id within `poster`.
+    pub story_id: StoryId,
+}
+
+/// Where one canonical story is presented in the date-first tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StoryAppearanceLocation {
+    /// Ephemeral appearance under `Active Stories`.
+    Active,
+    /// Persistent profile-page appearance in a direct monthly timeline.
+    Month {
+        /// Calendar year formatted in the account display timezone.
+        year: u16,
+        /// Calendar month, 1-12.
+        month: u8,
+    },
+}
+
+/// Stable identity of one presentation of canonical story bytes.
+///
+/// This key always wraps a [`StoryKey`]; the bytes remain owned by the
+/// canonical story and are never copied into the appearance identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoryAppearanceKey {
+    /// Canonical story being presented.
+    pub story: StoryKey,
+    /// Chat-list view containing the chat timeline.
+    pub view: ChatListKind,
+    /// Tree location of this appearance.
+    pub location: StoryAppearanceLocation,
+}
+
 /// Output format of a generated document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocFormat {
@@ -230,7 +293,7 @@ pub enum DocFormat {
     Ndjson,
     /// Rendered Markdown transcript.
     Markdown,
-    /// JSON chat metadata document (`chat.json`).
+    /// Hidden JSON chat metadata document (`.chat.json`).
     Json,
 }
 
@@ -340,6 +403,10 @@ pub enum CanonicalKey {
     FolderCatalog(FolderCatalogKey),
     /// A chat.
     Chat(ChatKey),
+    /// The fixed `Active Stories` directory of a chat.
+    ActiveStories(ActiveStoriesKey),
+    /// A direct `YYYY-MM` directory of a chat timeline.
+    MonthDir(MonthDirKey),
     /// A calendar-year directory of a chat's export.
     YearDir(YearDirKey),
     /// The media directory of one chat-export year.
@@ -348,6 +415,8 @@ pub enum CanonicalKey {
     Message(MessageKey),
     /// A downloadable attachment.
     Attachment(AttachmentKey),
+    /// One canonical Telegram story.
+    Story(StoryKey),
     /// A generated NDJSON/Markdown document.
     GeneratedDoc(GeneratedDocKey),
     /// The ordering-metadata document of a chat-list root.
@@ -376,6 +445,8 @@ pub enum ItemKey {
     Canonical(CanonicalKey),
     /// One virtual appearance of a canonical item.
     Appearance(AppearanceKey),
+    /// One active or persistent appearance of canonical story bytes.
+    StoryAppearance(StoryAppearanceKey),
 }
 
 impl From<CanonicalKey> for ItemKey {
@@ -387,6 +458,12 @@ impl From<CanonicalKey> for ItemKey {
 impl From<AppearanceKey> for ItemKey {
     fn from(key: AppearanceKey) -> Self {
         Self::Appearance(key)
+    }
+}
+
+impl From<StoryAppearanceKey> for ItemKey {
+    fn from(key: StoryAppearanceKey) -> Self {
+        Self::StoryAppearance(key)
     }
 }
 

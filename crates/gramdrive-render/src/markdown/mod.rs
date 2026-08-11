@@ -5,7 +5,7 @@
 //! a self-describing front-matter header, then the messages grouped by day,
 //! with senders, wall-clock times in an explicit timezone, replies, edits,
 //! reactions, service events, and links from attachments to their files under
-//! `media/`. Where NDJSON ([`crate::ndjson`]) is the lossless record view, this
+//! the same direct `YYYY-MM/` namespace. Where NDJSON ([`crate::ndjson`]) is the lossless record view, this
 //! is the readable one — a *view*, never a source of truth (DOM-006), so a
 //! rerun over unchanged records rewrites nothing.
 //!
@@ -21,14 +21,13 @@
 //!
 //! # Timezone (SYNC-031)
 //!
-//! All civil dates and times are computed in one caller-supplied [`UtcOffset`],
-//! declared once in the header. The offset is a fixed number of seconds east of
-//! UTC — a display setting the engine holds for the account, not a per-document
-//! degree of freedom — so the renderer needs no timezone database and stays
-//! dependency-free (POL-6). Like the retention mode, the offset is a rendering
-//! configuration held constant per account and is not folded into
-//! [`content_version_token`]; a configuration change is re-rendered by the
-//! engine, exactly as a renderer-version bump is.
+//! All civil dates and times are computed in one caller-supplied
+//! [`DisplayTimeZone`], declared once in the header. Production callers resolve
+//! the account's persisted IANA zone, including historical offset transitions;
+//! [`UtcOffset`] remains available for fixed-zone fixtures. Like the retention
+//! mode, the timezone and the account's monotonic render-policy generation are
+//! folded into [`content_version_token`]. A policy-only transition therefore
+//! cannot reuse a message-watermark version for different bytes.
 //!
 //! # Injection safety (SYNC-031)
 //!
@@ -48,17 +47,18 @@
 //!
 //! # Schema versioning
 //!
-//! [`SCHEMA_VERSION`] and [`RENDERER_VERSION`] are frozen for format v1; the
+//! [`SCHEMA_VERSION`] and [`RENDERER_VERSION`] are frozen per format; the
 //! header declares both. A format change is a version bump plus a new golden
-//! fixture, never a silent mutation of v1 — the same discipline the NDJSON
+//! fixture, never a silent mutation of a published version — the same discipline the NDJSON
 //! renderer, identity codec, and cursor formats follow.
 
 mod render;
 mod text;
 
 pub use crate::record::{
-    Attachment, Availability, Deletion, Entity, EntityKind, MediaKind, MessageBody, MessageHistory,
-    Reaction, ReactionKey, RetentionMode, Revision, Sender, ServiceAction,
+    Attachment, AttachmentFidelity, Availability, Deletion, Entity, EntityKind, MediaKind,
+    MessageBody, MessageHistory, Reaction, ReactionKey, RetentionMode, Revision, Sender,
+    ServiceAction, TelegramRepresentation,
 };
 
 use std::fmt;
@@ -66,16 +66,20 @@ use std::fmt;
 use gramdrive_model::identity::{
     CanonicalKey, ChatKey, DocFormat, DocPartition, GeneratedDocKey, ItemId, ItemKey, SchemaFamily,
 };
+use jiff::{
+    civil::Date,
+    tz::{Offset, TimeZone},
+};
 
 /// Stable schema identifier written into every document header.
 pub const SCHEMA_ID: &str = "gramdrive.transcript";
 
-/// Format-schema version of the Markdown output, frozen for format v1
+/// Format-schema version of the Markdown output; v2 uses direct month links
 /// (SYNC-031).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
-/// Version of this renderer implementation, frozen for v1 (DOM-006).
-pub const RENDERER_VERSION: u32 = 1;
+/// Version of this renderer implementation (DOM-006).
+pub const RENDERER_VERSION: u32 = 4;
 
 /// Schema family of the monthly Markdown document (DOM-023). Part of its stable
 /// identity; the family lineage is per-format, so it is independent of the
@@ -87,14 +91,11 @@ pub const MONTH_MARKDOWN_SCHEMA_FAMILY: SchemaFamily = SchemaFamily(1);
 /// nonsensical multi-day offset is rejected.
 const MAX_OFFSET_SECONDS: i32 = 24 * 60 * 60;
 
-/// A fixed display timezone: a whole number of seconds east of UTC.
+/// A fixed timezone helper: a whole number of seconds east of UTC.
 ///
-/// Deliberately not a named IANA zone. A fixed offset is all a deterministic,
-/// dependency-free renderer can honor without shipping a time-zone database
-/// (POL-6), and it is exactly "timezone-explicit" in the SYNC-031 sense: the
-/// header states the offset, and every timestamp in the document is computed in
-/// it. Daylight-saving transitions within a rendered month are out of scope for
-/// v1; the engine picks the offset in effect for the partition.
+/// Production rendering uses [`DisplayTimeZone::named`]. This type is retained
+/// for explicit UTC/fixed-offset fixtures and callers whose persisted setting
+/// is itself a fixed offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UtcOffset {
     /// Seconds east of UTC. Invariant: `|seconds| <= MAX_OFFSET_SECONDS`.
@@ -170,6 +171,113 @@ impl fmt::Display for InvalidUtcOffset {
 
 impl std::error::Error for InvalidUtcOffset {}
 
+/// Persisted account display timezone used for civil partitions and text.
+#[derive(Debug, Clone)]
+pub struct DisplayTimeZone {
+    label: String,
+    timezone: TimeZone,
+}
+
+impl DisplayTimeZone {
+    /// Resolves a persisted IANA zone name such as `Asia/Tbilisi`.
+    pub fn named(name: &str) -> Result<Self, InvalidDisplayTimeZone> {
+        let timezone = TimeZone::get(name).map_err(|error| InvalidDisplayTimeZone {
+            name: name.to_owned(),
+            detail: error.to_string(),
+        })?;
+        Ok(Self {
+            label: name.to_owned(),
+            timezone,
+        })
+    }
+
+    /// Builds a fixed-offset timezone for deterministic fixtures.
+    pub fn fixed(offset: UtcOffset) -> Self {
+        Self {
+            label: offset.label(),
+            timezone: TimeZone::fixed(
+                Offset::from_seconds(offset.seconds()).unwrap_or(Offset::UTC),
+            ),
+        }
+    }
+
+    /// Stable zone name written into generated-document headers.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// IANA/fixed transition rules shared with the planner.
+    pub fn timezone(&self) -> &TimeZone {
+        &self.timezone
+    }
+
+    /// UTC millisecond bounds of one local civil month.
+    pub fn month_bounds_ms(
+        &self,
+        year: u16,
+        month: u8,
+    ) -> Result<(i64, i64), InvalidDisplayTimeZone> {
+        let year = i16::try_from(year).map_err(|_| InvalidDisplayTimeZone {
+            name: self.label.clone(),
+            detail: format!("year {year} is outside the supported civil range"),
+        })?;
+        let month = i8::try_from(month).map_err(|_| InvalidDisplayTimeZone {
+            name: self.label.clone(),
+            detail: format!("month {month} is outside the supported civil range"),
+        })?;
+        let (next_year, next_month) = if month == 12 {
+            (year.saturating_add(1), 1)
+        } else {
+            (year, month.saturating_add(1))
+        };
+        let start = Date::new(year, month, 1)
+            .and_then(|date| date.to_zoned(self.timezone.clone()))
+            .map_err(|error| InvalidDisplayTimeZone {
+                name: self.label.clone(),
+                detail: error.to_string(),
+            })?;
+        let end = Date::new(next_year, next_month, 1)
+            .and_then(|date| date.to_zoned(self.timezone.clone()))
+            .map_err(|error| InvalidDisplayTimeZone {
+                name: self.label.clone(),
+                detail: error.to_string(),
+            })?;
+        Ok((
+            start.timestamp().as_millisecond(),
+            end.timestamp().as_millisecond(),
+        ))
+    }
+}
+
+impl PartialEq for DisplayTimeZone {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label
+    }
+}
+
+impl Eq for DisplayTimeZone {}
+
+/// A persisted display timezone could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidDisplayTimeZone {
+    /// Rejected persisted name.
+    pub name: String,
+    /// Resolver detail suitable for diagnostics.
+    pub detail: String,
+}
+
+impl fmt::Display for InvalidDisplayTimeZone {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "display timezone '{}' could not be resolved: {}",
+            self.name, self.detail
+        )
+    }
+}
+
+impl std::error::Error for InvalidDisplayTimeZone {}
+
 /// Everything the renderer needs to produce one monthly Markdown document.
 ///
 /// Borrows its message slice so the engine can render a partition it already
@@ -185,10 +293,12 @@ pub struct MarkdownInput<'a> {
     /// The account's retention mode, which selects the POL-3 projection.
     pub retention_mode: RetentionMode,
     /// The fixed display timezone for every date and time in the document.
-    pub timezone: UtcOffset,
+    pub timezone: &'a DisplayTimeZone,
     /// The event-log watermark these records reflect: the document is current
     /// as of every event at or below this sequence (SYNC-024).
     pub input_watermark_seq: i64,
+    /// Monotonic account policy generation pinned with the input snapshot.
+    pub render_generation: i64,
     /// The message histories to render, in canonical order.
     pub messages: &'a [MessageHistory],
 }
@@ -196,9 +306,9 @@ pub struct MarkdownInput<'a> {
 /// The stable identity of the monthly Markdown document for a chat partition
 /// (DOM-023). Independent of the chat title, renderer version, and watermark.
 ///
-/// The engine uses this to key the document's `render_state` and item rows; the
-/// header embeds its text form so a reader can join a rendered file back to the
-/// item it projects.
+/// Provider-visible `render_state` and item rows use appearance ids. This
+/// canonical id is embedded in the header as the stable logical document key
+/// shared by those appearances.
 pub fn document_id(chat: ChatKey, partition: DocPartition) -> ItemId {
     ItemKey::Canonical(CanonicalKey::GeneratedDoc(GeneratedDocKey {
         chat,
@@ -210,15 +320,23 @@ pub fn document_id(chat: ChatKey, partition: DocPartition) -> ItemId {
 }
 
 /// The composite content-version token for a document rendered at
-/// `input_watermark_seq` (DOM-006): the renderer and schema versions plus the
-/// watermark. Two renders that agree on all three — at a fixed retention mode
-/// and timezone (see the module docs) — produce byte-identical bytes, so equal
-/// tokens mean equal content.
+/// `input_watermark_seq` (DOM-006): renderer/schema versions, watermark, and
+/// every byte-shaping account policy input. Equal tokens therefore witness the
+/// same retention projection, timezone, and monotonic policy generation.
 ///
 /// Returned as text; the engine wraps it in
 /// `gramdrive_model::version::ContentVersion` when it publishes.
-pub fn content_version_token(input_watermark_seq: i64) -> String {
-    format!("{SCHEMA_ID}/s{SCHEMA_VERSION}/r{RENDERER_VERSION}/w{input_watermark_seq}")
+pub fn content_version_token(
+    input_watermark_seq: i64,
+    render_generation: i64,
+    retention_mode: RetentionMode,
+    display_timezone: &str,
+) -> String {
+    format!(
+        "{SCHEMA_ID}/s{SCHEMA_VERSION}/r{RENDERER_VERSION}/w{input_watermark_seq}/g{render_generation}/retention-{}/tz-{}",
+        retention_mode.tag(),
+        display_timezone
+    )
 }
 
 /// Renders a complete monthly Markdown document to a string.
@@ -241,5 +359,8 @@ pub fn render_transcript(input: &MarkdownInput<'_>) -> String {
 /// bounded by the largest single block rather than the document size (the
 /// story's bounded-output criterion). Propagates any error the sink returns.
 pub fn write_transcript<W: fmt::Write>(out: &mut W, input: &MarkdownInput<'_>) -> fmt::Result {
+    if !crate::record::attachment_contract_is_valid(input.messages) {
+        return Err(fmt::Error);
+    }
     render::write_document(out, input)
 }

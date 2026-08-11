@@ -1,5 +1,6 @@
 import FileProvider
 import Foundation
+import GramDriveCore
 
 /// Why a page handed back by the system cannot continue this listing: it
 /// was not minted by this codec for this container. Typed so the enumerator
@@ -27,19 +28,34 @@ enum EnumerationPageCursor {
     /// build's page is foreign, never half-understood.
     private struct Payload: Codable {
         let version: Int
+        let accountId: Int64
+        let namespaceVersion: UInt32
+        let journalInstance: String
         let parent: String
         let after: String
     }
 
     /// The one version this build mints and accepts.
-    static let version = 1
+    static let version = 2
 
     /// The continuation page after `after` within `parent`.
-    static func page(parent: String, after: String) -> NSFileProviderPage {
+    static func page(
+        parent: String,
+        after: String,
+        account: AccountInfo,
+        journal: ChangeJournalState
+    ) -> NSFileProviderPage {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         guard
-            let data = try? encoder.encode(Payload(version: version, parent: parent, after: after))
+            let data = try? encoder.encode(
+                Payload(
+                    version: version,
+                    accountId: account.accountId,
+                    namespaceVersion: account.namespaceVersion,
+                    journalInstance: journal.instanceId,
+                    parent: parent,
+                    after: after))
         else {
             // Encoding three concrete strings cannot fail; the guard exists
             // because `JSONEncoder.encode` is typed as throwing.
@@ -56,7 +72,9 @@ enum EnumerationPageCursor {
     /// else is [`EnumerationPageCursorError.foreignPage`].
     static func startAnchor(
         of page: NSFileProviderPage,
-        parent: String
+        parent: String,
+        account: AccountInfo,
+        journal: ChangeJournalState
     ) throws -> String? {
         let raw = page.rawValue
         if raw == NSFileProviderPage.initialPageSortedByName as Data
@@ -67,6 +85,9 @@ enum EnumerationPageCursor {
         guard
             let payload = try? JSONDecoder().decode(Payload.self, from: raw),
             payload.version == version,
+            payload.accountId == account.accountId,
+            payload.namespaceVersion == account.namespaceVersion,
+            payload.journalInstance == journal.instanceId,
             payload.parent == parent
         else {
             throw EnumerationPageCursorError.foreignPage

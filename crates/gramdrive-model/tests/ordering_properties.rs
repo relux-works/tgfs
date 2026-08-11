@@ -19,6 +19,7 @@ fn arb_list() -> impl Strategy<Value = ChatListKey> {
         prop_oneof![
             Just(ChatListKind::Main),
             Just(ChatListKind::Archive),
+            Just(ChatListKind::Stories),
             any::<i32>().prop_map(|id| ChatListKind::Folder(FolderId(id))),
         ],
     )

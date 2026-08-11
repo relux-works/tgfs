@@ -16,8 +16,8 @@ use gramdrive_model::identity::{
     NamespaceVersion,
 };
 use gramdrive_model::naming::{
-    FALLBACK_NAME, NameKind, Platform, SafeName, SiblingName, chat_folder_name, resolve_siblings,
-    sanitize,
+    DisplayTimestamp, FALLBACK_NAME, NameKind, Platform, SafeName, SiblingName,
+    attachment_display_name, chat_folder_name, resolve_siblings, sanitize,
 };
 
 struct Case {
@@ -581,5 +581,29 @@ fn policy_rejects_what_no_single_platform_rejects() {
     assert_eq!(
         SafeName::parse(decomposed),
         Err(NameViolation::NotNormalized)
+    );
+}
+
+#[test]
+fn attachment_names_are_date_first_and_truthful_about_the_source_name() {
+    let timestamp = DisplayTimestamp {
+        year: 2026,
+        month: 7,
+        day: 21,
+        hour: 9,
+        minute: 8,
+        second: 7,
+    };
+    assert_eq!(
+        attachment_display_name(timestamp, Some("sender original.mov"), "Video.mp4"),
+        "2026-07-21 09-08-07 sender original.mov"
+    );
+    assert_eq!(
+        attachment_display_name(timestamp, None, "Telegram Photo.jpg"),
+        "2026-07-21 09-08-07 Telegram Photo.jpg"
+    );
+    assert_eq!(
+        attachment_display_name(timestamp, Some(""), ""),
+        "2026-07-21 09-08-07 Attachment"
     );
 }

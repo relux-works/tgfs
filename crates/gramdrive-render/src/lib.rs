@@ -1,5 +1,5 @@
-//! GramDrive renderers — deterministic NDJSON and Markdown projections of
-//! chat history.
+//! GramDrive renderers — deterministic JSON, NDJSON, and Markdown projections
+//! of chat state and history.
 //!
 //! This crate owns the lossless `messages.ndjson` renderer ([`ndjson`]) and the
 //! human-readable monthly Markdown renderer ([`markdown`]). Both renderers are
@@ -25,6 +25,7 @@ pub use gramdrive_model as model;
 mod json;
 mod record;
 
+pub mod chat_json;
 pub mod civil;
 pub mod markdown;
 pub mod ndjson;

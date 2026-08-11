@@ -26,7 +26,7 @@ public final class AuthorizationViewModel {
     /// Set when no control channel can drive authorization — an honest
     /// terminal for the screen, distinct from any auth state.
     public private(set) var unavailable: ControlChannelUnavailable?
-    /// True while a `start`/`submit` round-trip is in flight.
+    /// True while a session transition or control-channel round-trip is in flight.
     public private(set) var isSubmitting: Bool = false
 
     private let backend: any CompanionBackend
@@ -45,13 +45,15 @@ public final class AuthorizationViewModel {
 
     /// Starts a fresh authorization session and begins rendering its states.
     public func begin() async {
-        cancelConsumption()
+        guard !isSubmitting else { return }
+        isSubmitting = true
+        defer { isSubmitting = false }
+
+        await endExistingSession()
         reset()
         let session = backend.makeAuthorizationSession()
         self.session = session
-        isSubmitting = true
         let result = await session.start()
-        isSubmitting = false
         switch result {
         case .unavailable(let reason):
             unavailable = reason
@@ -69,6 +71,7 @@ public final class AuthorizationViewModel {
     /// current state (which is recorded, not sent). The resulting state, when
     /// the agent accepts the action, arrives on the state stream.
     public func submit(_ input: CompanionAuthInput) async {
+        guard !isSubmitting else { return }
         guard input.isValid(in: state) else {
             lastInvalidInput = input
             return
@@ -79,8 +82,8 @@ public final class AuthorizationViewModel {
         }
         lastInvalidInput = nil
         isSubmitting = true
+        defer { isSubmitting = false }
         let result = await session.submit(input)
-        isSubmitting = false
         switch result {
         case .accepted:
             lastRejection = nil
@@ -95,8 +98,11 @@ public final class AuthorizationViewModel {
 
     /// Abandons the flow locally (`cancel`) and stops rendering.
     public func cancel() async {
-        await session?.cancel()
-        cancelConsumption()
+        guard !isSubmitting else { return }
+        isSubmitting = true
+        defer { isSubmitting = false }
+
+        await endExistingSession()
     }
 
     /// Awaits the state stream ending (it ends on `closed`, `cancel`, or a
@@ -121,8 +127,17 @@ public final class AuthorizationViewModel {
         }
     }
 
-    private func cancelConsumption() {
-        consumeTask?.cancel()
+    /// Ends an existing control-channel session before opening another one.
+    /// This is also the QR-to-phone fallback: TDLib rotates QR links itself,
+    /// but changing auth methods requires a fresh phone-capable session.
+    private func endExistingSession() async {
+        let existingSession = session
+        let existingConsumption = consumeTask
+        await existingSession?.cancel()
+        // Keep the sole state consumer alive through the terminal event and
+        // stream completion. In production that completion is delayed until
+        // the FFI auth pump has released its single-sign-in ScopeGuard.
+        await existingConsumption?.value
         consumeTask = nil
         session = nil
     }

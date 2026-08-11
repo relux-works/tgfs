@@ -75,9 +75,10 @@
 //!
 //! A `downloadFile` rejected with Telegram's `FILE_REFERENCE_*` class means
 //! the remote locator went stale — refreshable metadata, never identity.
-//! The machine then asks for the containing message (`getMessage`), which
+//! The machine then asks for the containing message (`getMessage`) or story
+//! (`getStory`), which
 //! makes TDLib re-learn the reference for the same `file_id`, verifies the
-//! refreshed attachment still names the pinned content (a changed
+//! refreshed object still names the pinned content (a changed
 //! `remote_unique_id` is a version conflict, not a refresh), and resolves
 //! the call with [`SourceError::StaleReference`] — the category whose
 //! contract is "the adapter refreshes and the caller retries". The retry
@@ -117,11 +118,14 @@ use serde_json::{Value, json};
 use gramdrive_model::ByteRange;
 use gramdrive_model::identity::ItemId;
 use gramdrive_model::version::ContentVersion;
-use gramdrive_source::{ContentChunk, ContentSink, FetchRequest, SinkControl, SourceError};
+use gramdrive_source::{
+    ContentChunk, ContentSink, ContentSource, FetchRequest, SinkControl, SourceError, SourceFuture,
+};
 
 use crate::error::{TdError, retryable_after};
 use crate::message::{AttachmentAvailability, normalize_message};
 use crate::runtime::TdClient;
+use crate::story::normalize_story;
 
 /// Default local read slice: 256 KiB. Bounds per-fetch memory to one slice
 /// and sits below the engine's default chunk grid, so even a whole-chunk
@@ -196,13 +200,18 @@ impl std::error::Error for InvalidPriority {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTarget {
     /// TDLib's file id — the locator `downloadFile` takes, stable within
-    /// one TDLib database and naming immutable remote content.
+    /// one running TDLib client and naming immutable remote content.
     pub file_id: i32,
-    /// The chat holding the attachment's message, for the reference
-    /// refresh (`getMessage`).
-    pub chat_id: i64,
-    /// The attachment's message, for the reference refresh.
-    pub message_id: i64,
+    /// Telegram's durable remote file locator. Unlike `file_id`, this
+    /// survives client/database restarts and can be rebound to the current
+    /// process-local id with `getRemoteFile`.
+    pub remote_id: Option<String>,
+    /// Exact TDLib file constructor paired with `getRemoteFile`. Resolving
+    /// media as an unknown file can produce a handle that `downloadFile`
+    /// cannot rematerialize.
+    pub remote_file_type: Option<RemoteFileType>,
+    /// Canonical owner used to refresh an expired Telegram file reference.
+    pub refresh: RefreshTarget,
     /// POL-4 availability. Anything but
     /// [`AttachmentAvailability::Fetchable`] is rejected before any
     /// network call.
@@ -218,6 +227,70 @@ pub struct FileTarget {
     /// The content version the source currently serves for this item —
     /// compared against the fetch's pin (DOM-003, SYNC-042).
     pub version: ContentVersion,
+}
+
+/// TDLib `FileType` constructors used by persisted downloadable content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteFileType {
+    /// `messageDocument.document`.
+    Document,
+    /// `messagePhoto.photo`.
+    Photo,
+    /// `messageVideo.video`.
+    Video,
+    /// `messageAnimation.animation`.
+    Animation,
+    /// `messageAudio.audio`.
+    Audio,
+    /// `messageVoiceNote.voice`.
+    VoiceNote,
+    /// `messageVideoNote.video_note`.
+    VideoNote,
+    /// `messageSticker.sticker`.
+    Sticker,
+    /// A story photo primary locator.
+    PhotoStory,
+    /// A story video primary locator.
+    VideoStory,
+    /// A file-backed thumbnail locator.
+    Thumbnail,
+}
+
+impl RemoteFileType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Document => "fileTypeDocument",
+            Self::Photo => "fileTypePhoto",
+            Self::Video => "fileTypeVideo",
+            Self::Animation => "fileTypeAnimation",
+            Self::Audio => "fileTypeAudio",
+            Self::VoiceNote => "fileTypeVoiceNote",
+            Self::VideoNote => "fileTypeVideoNote",
+            Self::Sticker => "fileTypeSticker",
+            Self::PhotoStory => "fileTypePhotoStory",
+            Self::VideoStory => "fileTypeVideoStory",
+            Self::Thumbnail => "fileTypeThumbnail",
+        }
+    }
+}
+
+/// Canonical source object that can refresh one TDLib file reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshTarget {
+    /// A normal message attachment refreshed through `getMessage`.
+    Message {
+        /// Chat containing the message.
+        chat_id: i64,
+        /// Telegram message identifier.
+        message_id: i64,
+    },
+    /// Save-permitted story content refreshed through non-viewing `getStory`.
+    Story {
+        /// Chat that posted the story.
+        poster_chat_id: i64,
+        /// Telegram story identifier.
+        story_id: i64,
+    },
 }
 
 /// What an [`ItemId`] resolves to, for fetch purposes.
@@ -239,6 +312,36 @@ pub enum CatalogEntry {
 pub trait FetchCatalog: Send + Sync {
     /// The entry for `item`, or `None` when no such item exists.
     fn resolve(&self, item: &ItemId) -> Option<CatalogEntry>;
+
+    /// Persists locator facts learned by a successful source-object refresh.
+    ///
+    /// The default keeps in-memory/test catalogs source-compatible. Durable
+    /// state catalogs override it so a relaunch does not forget the refreshed
+    /// locator. Implementations must preserve item and content identity.
+    fn persist_refresh(
+        &self,
+        _item: &ItemId,
+        _refresh: &RefreshedFileTarget,
+    ) -> Result<(), SourceError> {
+        Ok(())
+    }
+}
+
+/// Locator facts verified from the source object returned by a refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshedFileTarget {
+    /// TDLib's process-local numeric file locator.
+    pub file_id: i32,
+    /// Telegram's current remote file locator.
+    pub remote_id: Option<String>,
+    /// Telegram's stable content identity.
+    pub remote_unique_id: Option<String>,
+    /// Current exact extent, when TDLib reports one.
+    pub size: Option<u64>,
+    /// Current saveability gate.
+    pub availability: AttachmentAvailability,
+    /// Telegram's raw per-message save permission.
+    pub can_be_saved: bool,
 }
 
 /// Download adapter tuning. Policy, not durable state.
@@ -269,10 +372,12 @@ impl Default for DownloadConfig {
 /// payload it was handed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitKind {
+    /// Rebind a durable remote locator to this TDLib client's numeric id.
+    ResolveRemote,
     /// The ranged `downloadFile`; TDLib is doing network work until it
     /// answers, so an abandoning driver should fire the cancel request.
     Download,
-    /// The `getMessage` reference refresh; no download is running.
+    /// The source-object reference refresh; no download is running.
     Refresh,
 }
 
@@ -309,6 +414,8 @@ pub enum DownloadStep {
 /// [`DownloadMachine::progress`] reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadPhase {
+    /// Rebinding the durable remote locator to this TDLib client.
+    Resolving,
     /// Waiting for the ranged download to complete inside TDLib.
     Downloading,
     /// Refreshing an expired content reference.
@@ -336,10 +443,21 @@ pub struct DownloadProgress {
 
 #[derive(Debug)]
 enum Phase {
+    /// Resolve the durable remote id into this client's numeric file id.
+    ResolveRemote,
     /// Submit the ranged download; awaiting its response.
     Download,
-    /// Submit the `getMessage` refresh; awaiting its response.
-    Refresh,
+    /// Submit the source-object refresh; awaiting its response.
+    Refresh {
+        /// Continue the same fetch after an initial remote-id rebind.
+        ///
+        /// `getRemoteFile` restores the process-local id but not the owner
+        /// source TDLib needs to renew a Telegram file reference. Refreshing
+        /// the canonical message/story before the first download supplies
+        /// that source. A refresh reached after an already-started download
+        /// keeps the existing retry classification instead.
+        resume_download: bool,
+    },
     /// Reading local bytes at `cursor`.
     Read {
         path: String,
@@ -363,6 +481,7 @@ pub struct DownloadMachine {
     /// A `Submit` obligation is unanswered.
     outstanding: bool,
     failed: Option<SourceError>,
+    refreshed: Option<RefreshedFileTarget>,
 }
 
 impl DownloadMachine {
@@ -387,9 +506,17 @@ impl DownloadMachine {
             cursor: request.range.start(),
             outstanding: false,
             failed: None,
+            refreshed: None,
         };
         match gate(&request.range, &request.version, entry) {
-            Ok(target) => machine.target = Some(target),
+            Ok(target) => {
+                machine.phase = if target.remote_id.is_some() {
+                    Phase::ResolveRemote
+                } else {
+                    Phase::Download
+                };
+                machine.target = Some(target);
+            }
             Err(error) => machine.failed = Some(error),
         }
         machine
@@ -423,13 +550,19 @@ impl DownloadMachine {
                 DownloadPhase::Failed
             } else {
                 match self.phase {
+                    Phase::ResolveRemote => DownloadPhase::Resolving,
                     Phase::Download => DownloadPhase::Downloading,
-                    Phase::Refresh => DownloadPhase::Refreshing,
+                    Phase::Refresh { .. } => DownloadPhase::Refreshing,
                     Phase::Read { .. } => DownloadPhase::Delivering,
                     Phase::Done => DownloadPhase::Complete,
                 }
             },
         }
+    }
+
+    /// Takes locator facts verified during the last refresh response.
+    pub fn take_refreshed(&mut self) -> Option<RefreshedFileTarget> {
+        self.refreshed.take()
     }
 
     /// The caller's current obligation. A terminal failure repeats.
@@ -445,6 +578,24 @@ impl DownloadMachine {
             }));
         };
         match &self.phase {
+            Phase::ResolveRemote => {
+                self.outstanding = true;
+                let Some(remote_file_id) = target.remote_id.as_deref() else {
+                    return Err(self.fail(SourceError::Internal {
+                        detail: "remote resolution has no durable remote file id".to_owned(),
+                    }));
+                };
+                Ok(DownloadStep::Submit {
+                    payload: json!({
+                        "@type": "getRemoteFile",
+                        "remote_file_id": remote_file_id,
+                        "file_type": target.remote_file_type.map(|file_type| {
+                            json!({"@type": file_type.as_str()})
+                        }),
+                    }),
+                    kind: SubmitKind::ResolveRemote,
+                })
+            }
             Phase::Download => {
                 self.outstanding = true;
                 Ok(DownloadStep::Submit {
@@ -459,14 +610,29 @@ impl DownloadMachine {
                     kind: SubmitKind::Download,
                 })
             }
-            Phase::Refresh => {
+            Phase::Refresh { .. } => {
                 self.outstanding = true;
-                Ok(DownloadStep::Submit {
-                    payload: json!({
+                let payload = match target.refresh {
+                    RefreshTarget::Message {
+                        chat_id,
+                        message_id,
+                    } => json!({
                         "@type": "getMessage",
-                        "chat_id": target.chat_id,
-                        "message_id": target.message_id,
+                        "chat_id": chat_id,
+                        "message_id": message_id,
                     }),
+                    RefreshTarget::Story {
+                        poster_chat_id,
+                        story_id,
+                    } => json!({
+                        "@type": "getStory",
+                        "story_poster_chat_id": poster_chat_id,
+                        "story_id": story_id,
+                        "only_local": false,
+                    }),
+                };
+                Ok(DownloadStep::Submit {
+                    payload,
                     kind: SubmitKind::Refresh,
                 })
             }
@@ -502,8 +668,11 @@ impl DownloadMachine {
         }
         self.outstanding = false;
         match &self.phase {
+            Phase::ResolveRemote => self.on_remote_outcome(outcome),
             Phase::Download => self.on_download_outcome(outcome),
-            Phase::Refresh => self.on_refresh_outcome(outcome),
+            Phase::Refresh { resume_download } => {
+                self.on_refresh_outcome(outcome, *resume_download)
+            }
             Phase::Read { .. } | Phase::Done => Err(self.fail(SourceError::Internal {
                 detail: "a response was fed outside a request phase".to_owned(),
             })),
@@ -602,6 +771,101 @@ impl DownloadMachine {
         error
     }
 
+    fn on_remote_outcome(&mut self, outcome: Result<Value, TdError>) -> Result<(), SourceError> {
+        match outcome {
+            Ok(file) => match self.verify_remote_file(&file) {
+                Ok(refresh) => {
+                    if let Some(target) = &mut self.target {
+                        target.file_id = refresh.file_id;
+                        target.remote_id = refresh.remote_id.clone();
+                        target.remote_unique_id = refresh.remote_unique_id.clone();
+                        target.size = refresh.size;
+                    }
+                    // A durable remote id only restores a process-local id.
+                    // Re-open the canonical owner so TDLib can associate a
+                    // refreshable file source before persisting the rebound
+                    // locator or starting the ranged download.
+                    self.phase = Phase::Refresh {
+                        resume_download: true,
+                    };
+                    Ok(())
+                }
+                Err(error) => Err(self.fail(error)),
+            },
+            Err(error) => Err(self.fail(classify_runtime_error(error, "getRemoteFile"))),
+        }
+    }
+
+    fn verify_remote_file(&self, file: &Value) -> Result<RefreshedFileTarget, SourceError> {
+        let Some(target) = &self.target else {
+            return Err(SourceError::Internal {
+                detail: "remote-file response without a target".to_owned(),
+            });
+        };
+        if file.get("@type").and_then(Value::as_str) != Some("file") {
+            return Err(SourceError::Internal {
+                detail: "getRemoteFile answered something other than a file".to_owned(),
+            });
+        }
+        let file_id = file
+            .get("id")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| SourceError::Internal {
+                detail: "getRemoteFile returned no usable process-local file id".to_owned(),
+            })?;
+        let remote = file.get("remote").unwrap_or(&Value::Null);
+        let remote_id = remote
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if target.remote_id.is_some() && remote_id.is_none() {
+            return Err(SourceError::Unavailable {
+                detail: "getRemoteFile returned no current durable remote locator".to_owned(),
+            });
+        }
+        let remote_unique_id = remote
+            .get("unique_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(before) = target.remote_unique_id.as_deref()
+            && remote_unique_id.as_deref() != Some(before)
+        {
+            return Err(SourceError::VersionConflict {
+                current: Some(self.pinned.clone()),
+                detail: "getRemoteFile failed to preserve stable content identity".to_owned(),
+            });
+        }
+        let reported_size = file
+            .get("size")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .or_else(|| {
+                file.get("expected_size")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0)
+            });
+        if let (Some(before), Some(after)) = (target.size, reported_size)
+            && before != after
+        {
+            return Err(SourceError::VersionConflict {
+                current: Some(self.pinned.clone()),
+                detail: format!("getRemoteFile changed the pinned extent from {before} to {after}"),
+            });
+        }
+        Ok(RefreshedFileTarget {
+            file_id,
+            remote_id,
+            remote_unique_id,
+            size: reported_size.or(target.size),
+            availability: target.availability,
+            can_be_saved: true,
+        })
+    }
+
     fn on_download_outcome(&mut self, outcome: Result<Value, TdError>) -> Result<(), SourceError> {
         match outcome {
             Ok(file) => match self.validate_download(&file) {
@@ -616,7 +880,9 @@ impl DownloadMachine {
                     // DOM-007: the locator went stale; the refresh
                     // protocol runs before the failure surfaces, so the
                     // caller's retry finds a live reference.
-                    self.phase = Phase::Refresh;
+                    self.phase = Phase::Refresh {
+                        resume_download: false,
+                    };
                     return Ok(());
                 }
                 Err(self.fail(classify_runtime_error(error, "downloadFile")))
@@ -689,66 +955,239 @@ impl DownloadMachine {
         }
     }
 
-    /// Fold the `getMessage` refresh answer: verify the refreshed
-    /// attachment still names the pinned content, then surface
+    /// Fold the source-object refresh answer: verify the refreshed content
+    /// still names the pin, then surface
     /// [`SourceError::StaleReference`] — the caller retries against the
     /// now-live reference, and identity never moved (SYNC-045).
-    fn on_refresh_outcome(&mut self, outcome: Result<Value, TdError>) -> Result<(), SourceError> {
+    fn on_refresh_outcome(
+        &mut self,
+        outcome: Result<Value, TdError>,
+        resume_download: bool,
+    ) -> Result<(), SourceError> {
+        let (source_name, refresh_name) = match self.target.as_ref().map(|target| target.refresh) {
+            Some(RefreshTarget::Story { .. }) => ("story", "getStory refresh"),
+            _ => ("attachment's message", "getMessage refresh"),
+        };
         let error = match outcome {
-            Ok(message) => self.verify_refresh(&message),
+            Ok(message) => match self.verify_refresh(&message) {
+                Ok(refresh) => {
+                    if let Some(target) = &mut self.target {
+                        target.file_id = refresh.file_id;
+                        target.remote_id = refresh.remote_id.clone();
+                        target.remote_unique_id = refresh.remote_unique_id.clone();
+                        target.size = refresh.size;
+                    }
+                    self.refreshed = Some(refresh);
+                    if resume_download {
+                        self.phase = Phase::Download;
+                        return Ok(());
+                    }
+                    SourceError::StaleReference {
+                        detail: "the content reference expired and was refreshed; retry the fetch"
+                            .to_owned(),
+                    }
+                }
+                Err(error) => error,
+            },
             Err(error) => {
-                if is_message_gone(&error) {
-                    SourceError::NotFound {
-                        detail: format!("the attachment's message is gone at the source: {error}"),
+                if is_source_object_gone(&error) {
+                    // TDLib only reports source state here. The provider's
+                    // durable item can still be live, so this must not be
+                    // promoted to an item-deletion claim.
+                    SourceError::Unavailable {
+                        detail: format!("the {source_name} is unavailable at the source: {error}"),
                     }
                 } else {
-                    classify_runtime_error(error, "getMessage refresh")
+                    classify_runtime_error(error, refresh_name)
                 }
             }
         };
         Err(self.fail(error))
     }
 
-    fn verify_refresh(&self, message: &Value) -> SourceError {
+    fn verify_refresh(&self, value: &Value) -> Result<RefreshedFileTarget, SourceError> {
         let Some(target) = &self.target else {
-            return SourceError::Internal {
+            return Err(SourceError::Internal {
                 detail: "refresh response without a target".to_owned(),
-            };
+            });
         };
+        match target.refresh {
+            RefreshTarget::Message {
+                chat_id,
+                message_id,
+            } => self.verify_message_refresh(value, target, chat_id, message_id),
+            RefreshTarget::Story {
+                poster_chat_id,
+                story_id,
+            } => self.verify_story_refresh(value, target, poster_chat_id, story_id),
+        }
+    }
+
+    fn verify_message_refresh(
+        &self,
+        message: &Value,
+        target: &FileTarget,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<RefreshedFileTarget, SourceError> {
         let record = match normalize_message(message) {
             Ok(record) => record,
             Err(error) => {
-                return SourceError::Internal {
+                return Err(SourceError::Internal {
                     detail: format!("the refreshed message did not normalize: {error}"),
-                };
+                });
             }
         };
+        if record.chat_id != chat_id || record.message_id != message_id {
+            return Err(SourceError::VersionConflict {
+                current: None,
+                detail: "getMessage returned a different message identity".to_owned(),
+            });
+        }
         let Some(descriptor) = record.content.attachment() else {
-            return SourceError::VersionConflict {
+            return Err(SourceError::VersionConflict {
                 current: None,
                 detail: "the refreshed message no longer carries the attachment".to_owned(),
-            };
+            });
         };
         if descriptor.availability != AttachmentAvailability::Fetchable {
-            return SourceError::Restricted {
+            return Err(SourceError::Restricted {
                 detail: "the attachment is restricted as of the refresh (POL-4)".to_owned(),
-            };
+            });
         }
-        if let (Some(before), Some(after)) =
-            (&target.remote_unique_id, &descriptor.remote_unique_id)
-            && before != after
-        {
-            return SourceError::VersionConflict {
+        if !record.can_be_saved {
+            return Err(SourceError::Restricted {
+                detail: "the refreshed message can no longer be saved (POL-4)".to_owned(),
+            });
+        }
+        let file_id = descriptor.file_id.ok_or_else(|| SourceError::Unavailable {
+            detail: "the refreshed message has no process-local TDLib file id".to_owned(),
+        })?;
+        if let Some(before) = target.remote_unique_id.as_deref() {
+            match descriptor.remote_unique_id.as_deref() {
+                Some(after) if before == after => {}
+                Some(after) => {
+                    return Err(SourceError::VersionConflict {
+                        current: None,
+                        detail: format!(
+                            "the refreshed message carries different content \
+                             (remote unique id {before} became {after})"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(SourceError::VersionConflict {
+                        current: None,
+                        detail: "the refreshed message lost the pinned stable content identity"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        if let Some(before) = target.size {
+            match descriptor.size {
+                Some(after) if before == after => {}
+                Some(after) => {
+                    return Err(SourceError::VersionConflict {
+                        current: None,
+                        detail: format!(
+                            "the refreshed message changed the pinned extent from {before} to {after}"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(SourceError::VersionConflict {
+                        current: None,
+                        detail: "the refreshed message lost the pinned content extent".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(RefreshedFileTarget {
+            file_id,
+            remote_id: descriptor.remote_id.clone(),
+            remote_unique_id: descriptor.remote_unique_id.clone(),
+            size: descriptor.size,
+            availability: descriptor.availability,
+            can_be_saved: record.can_be_saved,
+        })
+    }
+
+    fn verify_story_refresh(
+        &self,
+        value: &Value,
+        target: &FileTarget,
+        poster_chat_id: i64,
+        story_id: i64,
+    ) -> Result<RefreshedFileTarget, SourceError> {
+        let story = normalize_story(value).map_err(|_| SourceError::Internal {
+            detail: "the refreshed story did not normalize".to_owned(),
+        })?;
+        if story.poster_chat_id != poster_chat_id || story.story_id != story_id {
+            return Err(SourceError::VersionConflict {
                 current: None,
-                detail: format!(
-                    "the refreshed message carries different content \
-                     (remote unique id {before} became {after})"
-                ),
-            };
+                detail: "getStory returned a different canonical story identity".to_owned(),
+            });
         }
-        SourceError::StaleReference {
-            detail: "the content reference expired and was refreshed; retry the fetch".to_owned(),
+        if !story.can_be_forwarded {
+            return Err(SourceError::Restricted {
+                detail: "the refreshed story can no longer be saved (POL-4)".to_owned(),
+            });
         }
+        let locator = story
+            .locators
+            .iter()
+            .find(|locator| locator.is_primary)
+            .ok_or_else(|| SourceError::VersionConflict {
+                current: None,
+                detail: "the refreshed story no longer carries supported primary content"
+                    .to_owned(),
+            })?;
+        let file_id = locator
+            .local_file_id
+            .ok_or_else(|| SourceError::Unavailable {
+                detail: "the refreshed story has no process-local TDLib file id".to_owned(),
+            })?;
+        if let Some(before) = target.remote_unique_id.as_deref() {
+            match locator.remote_unique_id.as_deref() {
+                Some(after) if before == after => {}
+                Some(after) => {
+                    return Err(SourceError::VersionConflict {
+                        current: None,
+                        detail: format!(
+                            "the refreshed story carries different content \
+                             (remote unique id {before} became {after})"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(SourceError::VersionConflict {
+                        current: None,
+                        detail: "the refreshed story lost the pinned stable content identity"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        if let Some(before) = target.size {
+            let after = locator.size.or(locator.expected_size);
+            if after != Some(before) {
+                return Err(SourceError::VersionConflict {
+                    current: None,
+                    detail: format!(
+                        "the refreshed story changed or lost the pinned extent {before}"
+                    ),
+                });
+            }
+        }
+        Ok(RefreshedFileTarget {
+            file_id,
+            remote_id: locator.remote_file_id.clone(),
+            remote_unique_id: locator.remote_unique_id.clone(),
+            size: locator.size.or(locator.expected_size),
+            availability: AttachmentAvailability::Fetchable,
+            can_be_saved: true,
+        })
     }
 }
 
@@ -773,6 +1212,11 @@ fn gate(
         Some(CatalogEntry::File(target)) => target,
     };
     if target.availability != AttachmentAvailability::Fetchable {
+        if target.availability == AttachmentAvailability::Unavailable {
+            return Err(SourceError::Unavailable {
+                detail: "the attachment has no usable Telegram file locator".to_owned(),
+            });
+        }
         return Err(SourceError::Restricted {
             detail: match target.availability {
                 AttachmentAvailability::Restricted => {
@@ -781,6 +1225,7 @@ fn gate(
                 AttachmentAvailability::ViewOnce => {
                     "the attachment is view-once (POL-4); its bytes are never persisted"
                 }
+                AttachmentAvailability::Unavailable => "unreachable",
                 AttachmentAvailability::Fetchable => "unreachable",
             }
             .to_owned(),
@@ -815,8 +1260,9 @@ pub(crate) fn is_stale_reference(error: &TdError) -> bool {
     matches!(error, TdError::Td { message, .. } if message.contains("FILE_REFERENCE"))
 }
 
-/// Whether a `getMessage` rejection means the message no longer exists.
-fn is_message_gone(error: &TdError) -> bool {
+/// Whether a source-object refresh says the message or story is unavailable.
+/// This is source evidence only: deletion remains a durable-state decision.
+fn is_source_object_gone(error: &TdError) -> bool {
     matches!(
         error,
         TdError::Td { code, message }
@@ -1050,17 +1496,21 @@ impl TdDownloader {
     ) -> Result<(), SourceError> {
         let entry = self.catalog.resolve(&request.item);
         let mut machine = DownloadMachine::new(&request, entry, &self.config);
-        // Gate failures cost no lock and no network; only a live target
-        // serializes on its file (module docs: one conversation per file).
-        let _serialized = match machine.file_id() {
-            Some(file_id) => Some(self.locks.acquire(file_id).await),
-            None => None,
-        };
+        // A durable remote id is resolved before serialization because the
+        // catalog's numeric id may belong to an earlier TDLib client.
+        let mut serialized: Option<LockGuard> = None;
         let mut cancel = CancelGuard::disarmed(self.client.clone());
         loop {
             match machine.next_step()? {
                 DownloadStep::Submit { payload, kind } => {
                     if kind == SubmitKind::Download {
+                        if serialized.is_none() {
+                            let file_id =
+                                machine.file_id().ok_or_else(|| SourceError::Internal {
+                                    detail: "download has no process-local file id".to_owned(),
+                                })?;
+                            serialized = Some(self.locks.acquire(file_id).await);
+                        }
                         cancel.arm(machine.cancel_request());
                     }
                     let outcome = match self.client.request(payload) {
@@ -1068,7 +1518,13 @@ impl TdDownloader {
                         Err(error) => Err(error),
                     };
                     cancel.disarm();
-                    machine.on_response(outcome)?;
+                    let response = machine.on_response(outcome);
+                    if matches!(kind, SubmitKind::ResolveRemote | SubmitKind::Refresh)
+                        && let Some(refresh) = machine.take_refreshed()
+                    {
+                        self.catalog.persist_refresh(&request.item, &refresh)?;
+                    }
+                    response?;
                 }
                 DownloadStep::ReadLocal { path, offset, len } => {
                     // The mid-fetch half of version verification: the pin
@@ -1102,6 +1558,16 @@ impl TdDownloader {
                 DownloadStep::Done => return Ok(()),
             }
         }
+    }
+}
+
+impl ContentSource for TdDownloader {
+    fn fetch<'a>(
+        &'a self,
+        request: FetchRequest,
+        sink: &'a mut dyn ContentSink,
+    ) -> SourceFuture<'a, ()> {
+        TdDownloader::fetch(self, request, sink)
     }
 }
 
@@ -1157,8 +1623,12 @@ mod tests {
     fn target() -> FileTarget {
         FileTarget {
             file_id: FILE_ID,
-            chat_id: CHAT_ID,
-            message_id: MESSAGE_ID,
+            remote_id: None,
+            remote_file_type: None,
+            refresh: RefreshTarget::Message {
+                chat_id: CHAT_ID,
+                message_id: MESSAGE_ID,
+            },
             availability: AttachmentAvailability::Fetchable,
             remote_unique_id: Some("unique-1".to_owned()),
             size: Some(100),
@@ -1225,6 +1695,14 @@ mod tests {
     }
 
     fn refreshed_message(unique_id: &str, can_be_saved: bool) -> Value {
+        refreshed_message_facts(Some(unique_id), Some(100), can_be_saved)
+    }
+
+    fn refreshed_message_facts(
+        unique_id: Option<&str>,
+        size: Option<u64>,
+        can_be_saved: bool,
+    ) -> Value {
         json!({
             "@type": "message",
             "id": MESSAGE_ID,
@@ -1240,7 +1718,7 @@ mod tests {
                     "mime_type": "application/octet-stream",
                     "document": {
                         "id": FILE_ID,
-                        "size": 100,
+                        "size": size,
                         "remote": {"id": "r-1", "unique_id": unique_id},
                     },
                 },
@@ -1603,6 +2081,71 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_story_reference_refreshes_without_opening_or_viewing_the_story() {
+        let mut story_target = target();
+        story_target.refresh = RefreshTarget::Story {
+            poster_chat_id: CHAT_ID,
+            story_id: 91,
+        };
+        let mut machine = machine(Some(CatalogEntry::File(story_target)));
+        into_refresh(&mut machine);
+
+        let Ok(DownloadStep::Submit { payload, kind }) = machine.next_step() else {
+            panic!("the story refresh is a request obligation");
+        };
+        assert_eq!(kind, SubmitKind::Refresh);
+        assert_eq!(
+            payload,
+            json!({
+                "@type": "getStory",
+                "story_poster_chat_id": CHAT_ID,
+                "story_id": 91,
+                "only_local": false,
+            })
+        );
+        assert_ne!(payload["@type"], "openStory");
+
+        let error = machine
+            .on_response(Ok(json!({
+                "@type": "story",
+                "id": 91,
+                "poster_chat_id": CHAT_ID,
+                "date": 1_784_692_800,
+                "is_posted_to_chat_page": true,
+                "can_be_forwarded": true,
+                "content": {
+                    "@type": "storyContentVideo",
+                    "video": {
+                        "@type": "storyVideo",
+                        "video": {
+                            "@type": "file",
+                            "id": FILE_ID,
+                            "size": 100,
+                            "remote": {
+                                "@type": "remoteFile",
+                                "id": "remote-refreshed",
+                                "unique_id": "unique-1"
+                            }
+                        }
+                    }
+                }
+            })))
+            .expect_err("a verified story refresh asks the caller to retry");
+        assert!(matches!(error, SourceError::StaleReference { .. }));
+        assert_eq!(
+            machine.take_refreshed(),
+            Some(RefreshedFileTarget {
+                file_id: FILE_ID,
+                remote_id: Some("remote-refreshed".to_owned()),
+                remote_unique_id: Some("unique-1".to_owned()),
+                size: Some(100),
+                availability: AttachmentAvailability::Fetchable,
+                can_be_saved: true,
+            })
+        );
+    }
+
+    #[test]
     fn a_refresh_that_finds_different_content_is_a_version_conflict() {
         let mut machine = machine(Some(CatalogEntry::File(target())));
         into_refresh(&mut machine);
@@ -1617,6 +2160,28 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_that_loses_known_stable_identity_is_a_version_conflict() {
+        let mut machine = machine(Some(CatalogEntry::File(target())));
+        into_refresh(&mut machine);
+        let _ = machine.next_step().expect("submit refresh");
+        let error = machine
+            .on_response(Ok(refreshed_message_facts(None, Some(100), true)))
+            .expect_err("missing stable identity cannot prove the pin");
+        assert!(matches!(error, SourceError::VersionConflict { .. }));
+    }
+
+    #[test]
+    fn a_refresh_that_loses_known_extent_is_a_version_conflict() {
+        let mut machine = machine(Some(CatalogEntry::File(target())));
+        into_refresh(&mut machine);
+        let _ = machine.next_step().expect("submit refresh");
+        let error = machine
+            .on_response(Ok(refreshed_message_facts(Some("unique-1"), None, true)))
+            .expect_err("missing extent cannot prove the pin");
+        assert!(matches!(error, SourceError::VersionConflict { .. }));
+    }
+
+    #[test]
     fn a_refresh_that_finds_restricted_content_fails_closed() {
         let mut machine = machine(Some(CatalogEntry::File(target())));
         into_refresh(&mut machine);
@@ -1628,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_whose_message_is_gone_is_not_found() {
+    fn a_refresh_whose_message_is_gone_is_retryable_source_unavailable() {
         let mut machine = machine(Some(CatalogEntry::File(target())));
         into_refresh(&mut machine);
         let _ = machine.next_step().expect("submit refresh");
@@ -1638,7 +2203,7 @@ mod tests {
                 message: "MESSAGE_ID_INVALID".to_owned(),
             }))
             .expect_err("the message is gone");
-        assert!(matches!(error, SourceError::NotFound { .. }));
+        assert!(matches!(error, SourceError::Unavailable { .. }));
     }
 
     #[test]

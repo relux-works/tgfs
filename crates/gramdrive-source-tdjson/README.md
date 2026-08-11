@@ -27,8 +27,9 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `config` | `TdlibConfig` and the storage/memory policy: per-account `setTdlibParameters`/`setOption`/`addProxy` request builders, on-disk isolation with a clean logout wipe (`StorageLayout`), and the `SecretSource` keychain seam |
 | `removal` | `AccountRemoval`: the crash-resumable account-removal workflow (SEC-004) — the SEC-004 cleanup sequenced behind a durable journal, distinguishing Telegram logout (`RevokeSession` → `logOut`) from local-only removal (`LocalOnly` → `close`), idempotent per stage and fail-safe under concurrent access |
 | `snapshot` | `SnapshotMachine`: the deterministic sans-IO initial chat-list snapshot (TASK-260715-30amrq) — `loadChats` pagination per list, the `getChats` order witness, lazy `getChat` detail resolution, flood-wait backoff advice, resumable per-list commits carrying Telegram's exact ordering metadata |
-| `history` | `CrawlMachine`: the deterministic sans-IO resumable per-chat history crawl (TASK-260715-26dnp6) — `getChatHistory` paging into normalized `MessageRecord`s, one commit per page carrying the durable `[oldest, newest]` window facts (`chat_sync_state`, SYNC-021/022), priority scheduling favoring visible/requested chats with page-by-page round-robin among equals, flood-wait backoff advice, and explicit per-chat unavailability for left/inaccessible chats |
-| `live` | `LiveMachine`: the deterministic sans-IO ordered live message update loop (TASK-260715-10p5zp) — `updateNewMessage`/`updateMessageSendSucceeded`, edit signals resolved through a `getMessage` refresh, and permanent `updateDeleteMessages` folded into ordered per-chat commits over `normalize_message`, each carrying the cursor advance it justifies (`chat_sync_state` newest, merged by the caller, SYNC-022); a live message above an unverified committed window opens a targeted `getChatHistory` gap bridge, recovered before the cursor moves (SYNC-023), and a failed bridge freezes the cursor explicitly |
+| `history` | `CrawlMachine`: the deterministic sans-IO resumable per-chat history crawl (TASK-260715-26dnp6) — TDLib's inclusive `getChatHistory(offset=0)` boundary is replayed idempotently while strictly older ids advance the cursor; one normalized `MessageRecord` commit per page carries the durable `[oldest, newest]` window facts (`chat_sync_state`, SYNC-021/022), priority scheduling favors visible/requested chats with page-by-page round-robin among equals, flood-wait backoff advice, and left/inaccessible chats become explicit per-chat unavailability |
+| `live` | `LiveMachine`: the deterministic sans-IO ordered live message update loop (TASK-260715-10p5zp) — `updateNewMessage`/`updateMessageSendSucceeded`, edit signals resolved through a `getMessage` refresh, and permanent `updateDeleteMessages` folded into ordered per-chat commits over `normalize_message`, each carrying the cursor advance it justifies (`chat_sync_state` newest, merged by the caller, SYNC-022); a live message above an unverified committed window opens a targeted `getChatHistory` gap bridge, recovered before the cursor moves (SYNC-023), and a failed bridge freezes the cursor explicitly. Pre-readiness unknown-chat buffering is capped per chat and account; overflow is reported and forces cursor/snapshot recovery rather than growing memory or silently advancing coverage. |
+| `story` | `StoryMachine`: bounded sans-I/O account-wide active/profile discovery and live story updates (TASK-260721-3e9bi8). Its hard request allow-list contains metadata reads only—including resumable `loadActiveStories(storyListMain)`—never `openStory`, live-view lifecycle methods, `downloadFile`, or mutations. Inclusive profile/archive cursors deduplicate their boundary; archived backfill is emitted only for the regular owner or exact creator/admin `can_edit_stories` evidence. Save-permitted photo/video observations retain typed, byte-free TDLib locator facts and exactly one canonical primary role; first-page profile pin order is emitted as appearance metadata. The normalized type has no caption, content JSON, local path, or bytes, and protected stories lose every locator before they cross this crate. |
 | `updates` | `UpdateMachine`: the deterministic sans-IO live chat-metadata/list update mapper (TASK-260715-1c8fea) — TDLib's push updates (title/photo/position/removed-from-list/protected-content, plus the user/supergroup username feed) folded into the same normalized change stream, with POL-1 invalidation classification (reorder → `order.json`, rename → folder rename), idempotent under duplicate and out-of-order delivery, and gap reporting for unknown chats |
 | `folders` | `FolderCatalogMachine`: the deterministic sans-IO folder (chat filter) catalog reducer (TASK-260715-54nopz) — `updateChatFolders` folded into a normalized folder create/rename/delete/reorder change stream with POL-1 invalidation classification, yielding the ordered folder set the snapshot enumerates; folder membership stays the chat machines' appearances, so a folder deletion removes only appearances |
 | `download` | `DownloadMachine` + `TdDownloader`: the ranged download adapter (TASK-260715-1onbmf) — the `DriveSource::fetch` side of this source. POL-4/version-pin/extent gates before any network call, synchronous ranged `downloadFile` with priority passthrough (1..=32), bounded local reads streamed into the caller's sink (never a whole file in memory, and TDLib's local file is read in place — never moved or deleted), per-file serialization (TDLib keeps one download conversation per file), `cancelDownloadFile` on abandon, and the `FILE_REFERENCE_*` → `getMessage` refresh surfacing as `StaleReference` with identity unmoved (SYNC-040..046, DOM-007). The `FetchCatalog` seam supplies per-item facts from the metadata store; conformance for ranged reads runs in `tests/fetch_conformance.rs` |
@@ -37,6 +38,16 @@ STORY-260715-3elo6l (tdlib-runtime-integration), EPIC-260715-2ptb18
 | `error` | `TdError`: typed conversion of `{"@type":"error"}` objects plus runtime lifecycle failures |
 | `mock` | `MockTdJson`: the deterministic in-process tdjson double the tests run against |
 | `real` | The FFI implementation over `libtdjson.dylib` — compiled only under `cfg(real_tdjson)` (below) |
+
+`MessageRecord` and its nested normalized vocabulary serialize as versioned
+JSON (`NORMALIZED_MESSAGE_SCHEMA_FAMILY`). The lifecycle-owned coordinator
+(TASK-260721-yrcjlo) writes that structured payload together with each page or
+live cursor/window advance in one state transaction; this crate still owns no
+I/O, database, scheduler, or File Provider callback.
+`can_be_saved=false` and every self-destruct flavor are normalized before that
+boundary: text/captions/entities, reply/topic/album references, reactions,
+service/unsupported payloads, and media locators/previews are removed.
+Restricted media keeps only truthful non-downloadable placeholder facts.
 
 ## Semantics
 
@@ -280,7 +291,7 @@ Guarantees the suites pin (`tests/chat_updates.rs`, unit tests in
 ## The folder (chat filter) catalog (`folders`)
 
 `FolderCatalogMachine` (TASK-260715-54nopz) discovers the custom Telegram
-folders that populate the "Telegram Folders/" catalog. It is a pure sans-IO
+folders that populate the "Folders/" catalog. It is a pure sans-IO
 full-state reducer over one update — `updateChatFolders`, pushed on connect and
 on every catalog change, always carrying the complete ordered folder list. Feed
 each to `on_update`, drain the net change with `take_batch`, and apply the
@@ -353,6 +364,7 @@ Platform-specific code: forbidden — the keychain lives behind the
 
 ```sh
 cargo test -p gramdrive-source-tdjson
+cargo test -p gramdrive-source-tdjson --test story_discovery
 ```
 
 Real-linkage smoke against the staged artifact (builds it first if needed

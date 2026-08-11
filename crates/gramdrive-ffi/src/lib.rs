@@ -27,6 +27,9 @@ uniffi::setup_scaffolding!("gramdrive");
 
 pub mod api;
 pub mod auth;
+pub mod hydration;
+pub mod namespace;
+pub mod policy;
 pub mod removal;
 pub mod shared_state;
 

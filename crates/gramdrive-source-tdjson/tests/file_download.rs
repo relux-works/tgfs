@@ -36,7 +36,8 @@ use gramdrive_source::{FetchRequest, SourceError};
 use gramdrive_source_tdjson::message::AttachmentAvailability;
 use gramdrive_source_tdjson::mock::SentRequest;
 use gramdrive_source_tdjson::{
-    CatalogEntry, DownloadConfig, DownloadPriority, FetchCatalog, FileTarget, TdDownloader,
+    CatalogEntry, DownloadConfig, DownloadPriority, FetchCatalog, FileTarget, RefreshTarget,
+    RefreshedFileTarget, RemoteFileType, TdDownloader,
 };
 use gramdrive_testkit::RecordingSink;
 use gramdrive_testkit::exec;
@@ -45,6 +46,9 @@ use gramdrive_testkit::fixture;
 use common::block_on;
 
 const FILE_ID: i32 = 700;
+const CURRENT_FILE_ID: i32 = 701;
+const REMOTE_ID: &str = "remote-payload";
+const CURRENT_REMOTE_ID: &str = "remote-payload-refreshed";
 const CHAT_ID: i64 = 100;
 const MESSAGE_ID: i64 = 5;
 const PAYLOAD: &[u8] = b"the exact bytes a tdlib download owes the caller, byte for byte";
@@ -60,8 +64,12 @@ fn item() -> ItemId {
 fn target() -> FileTarget {
     FileTarget {
         file_id: FILE_ID,
-        chat_id: CHAT_ID,
-        message_id: MESSAGE_ID,
+        remote_id: None,
+        remote_file_type: None,
+        refresh: RefreshTarget::Message {
+            chat_id: CHAT_ID,
+            message_id: MESSAGE_ID,
+        },
         availability: AttachmentAvailability::Fetchable,
         remote_unique_id: Some("unique-payload".to_owned()),
         size: Some(PAYLOAD.len() as u64),
@@ -82,6 +90,7 @@ fn request(start: u64, end: u64) -> FetchRequest {
 #[derive(Debug, Default)]
 struct TestCatalog {
     entries: Mutex<HashMap<ItemId, CatalogEntry>>,
+    refreshes: Mutex<Vec<(ItemId, RefreshedFileTarget)>>,
 }
 
 impl TestCatalog {
@@ -98,11 +107,27 @@ impl TestCatalog {
     fn set(&self, id: ItemId, entry: CatalogEntry) {
         self.entries.lock().expect("test mutex").insert(id, entry);
     }
+
+    fn refreshes(&self) -> Vec<(ItemId, RefreshedFileTarget)> {
+        self.refreshes.lock().expect("test mutex").clone()
+    }
 }
 
 impl FetchCatalog for TestCatalog {
     fn resolve(&self, item: &ItemId) -> Option<CatalogEntry> {
         self.entries.lock().expect("test mutex").get(item).cloned()
+    }
+
+    fn persist_refresh(
+        &self,
+        item: &ItemId,
+        refresh: &RefreshedFileTarget,
+    ) -> Result<(), SourceError> {
+        self.refreshes
+            .lock()
+            .expect("test mutex")
+            .push((item.clone(), refresh.clone()));
+        Ok(())
     }
 }
 
@@ -123,9 +148,20 @@ fn tdlib_file(name: &str, bytes: &[u8]) -> PathBuf {
 
 /// The `file` object a covering synchronous download answers with.
 fn file_response(extra: u64, client_id: i32, path: &str, offset: u64, prefix: u64) -> String {
+    file_response_for(FILE_ID, extra, client_id, path, offset, prefix)
+}
+
+fn file_response_for(
+    file_id: i32,
+    extra: u64,
+    client_id: i32,
+    path: &str,
+    offset: u64,
+    prefix: u64,
+) -> String {
     json!({
         "@type": "file",
-        "id": FILE_ID,
+        "id": file_id,
         "size": PAYLOAD.len(),
         "local": {
             "@type": "localFile",
@@ -134,6 +170,62 @@ fn file_response(extra: u64, client_id: i32, path: &str, offset: u64, prefix: u6
             "downloaded_prefix_size": prefix,
             "is_downloading_active": false,
             "is_downloading_completed": offset == 0 && prefix >= PAYLOAD.len() as u64,
+        },
+        "@extra": extra,
+        "@client_id": client_id,
+    })
+    .to_string()
+}
+
+fn remote_file_response(extra: u64, client_id: i32) -> String {
+    json!({
+        "@type": "file",
+        "id": CURRENT_FILE_ID,
+        "size": PAYLOAD.len(),
+        "expected_size": PAYLOAD.len(),
+        "local": {
+            "@type": "localFile",
+            "path": "",
+            "is_downloading_active": false,
+            "is_downloading_completed": false,
+        },
+        "remote": {
+            "@type": "remoteFile",
+            "id": CURRENT_REMOTE_ID,
+            "unique_id": "unique-payload",
+            "is_uploading_active": false,
+            "is_uploading_completed": true,
+            "uploaded_size": PAYLOAD.len(),
+        },
+        "@extra": extra,
+        "@client_id": client_id,
+    })
+    .to_string()
+}
+
+fn rebound_owner_message_response(extra: u64, client_id: i32) -> String {
+    json!({
+        "@type": "message",
+        "id": MESSAGE_ID,
+        "chat_id": CHAT_ID,
+        "date": 1_752_800_000,
+        "sender_id": {"@type": "messageSenderUser", "user_id": 42},
+        "can_be_saved": true,
+        "content": {
+            "@type": "messageDocument",
+            "caption": {"text": ""},
+            "document": {
+                "file_name": "payload.bin",
+                "mime_type": "application/octet-stream",
+                "document": {
+                    "id": CURRENT_FILE_ID,
+                    "size": PAYLOAD.len(),
+                    "remote": {
+                        "id": CURRENT_REMOTE_ID,
+                        "unique_id": "unique-payload"
+                    },
+                },
+            },
         },
         "@extra": extra,
         "@client_id": client_id,
@@ -152,9 +244,12 @@ fn error_response(extra: u64, client_id: i32, code: i64, message: &str) -> Strin
     .to_string()
 }
 
-/// The message the `getMessage` refresh answers with: the same attachment,
-/// the same locators — a pure reference refresh.
-fn refreshed_message(extra: u64, client_id: i32, unique_id: &str) -> String {
+fn refreshed_message_facts(
+    extra: u64,
+    client_id: i32,
+    unique_id: Option<&str>,
+    size: Option<u64>,
+) -> String {
     json!({
         "@type": "message",
         "id": MESSAGE_ID,
@@ -170,7 +265,7 @@ fn refreshed_message(extra: u64, client_id: i32, unique_id: &str) -> String {
                 "mime_type": "application/octet-stream",
                 "document": {
                     "id": FILE_ID,
-                    "size": PAYLOAD.len(),
+                    "size": size,
                     "remote": {"id": "r-1", "unique_id": unique_id},
                 },
             },
@@ -298,6 +393,123 @@ fn a_whole_file_fetch_streams_in_bounded_slices() {
         sink.chunks().len(),
         PAYLOAD.len()
     );
+}
+
+fn remote_rebinding_responder(
+    path: PathBuf,
+) -> impl FnMut(&SentRequest) -> Vec<String> + Send + 'static {
+    move |sent: &SentRequest| {
+        let value: Value = serde_json::from_str(&sent.json).expect("requests are JSON");
+        let extra = sent.extra().expect("the runtime injects @extra");
+        match value.get("@type").and_then(Value::as_str) {
+            Some("getRemoteFile") => {
+                assert_eq!(value["remote_file_id"], json!(REMOTE_ID));
+                assert_eq!(value["file_type"], json!({"@type": "fileTypeDocument"}));
+                vec![remote_file_response(extra, sent.client_id)]
+            }
+            Some("getMessage") => {
+                assert_eq!(value["chat_id"], json!(CHAT_ID));
+                assert_eq!(value["message_id"], json!(MESSAGE_ID));
+                vec![rebound_owner_message_response(extra, sent.client_id)]
+            }
+            Some("downloadFile") => {
+                assert_eq!(
+                    value.get("file_id").and_then(Value::as_i64),
+                    Some(i64::from(CURRENT_FILE_ID)),
+                    "download uses the id rebound into this TDLib client"
+                );
+                let offset = value.get("offset").and_then(Value::as_u64).expect("offset");
+                let limit = value.get("limit").and_then(Value::as_u64).expect("limit");
+                vec![file_response_for(
+                    CURRENT_FILE_ID,
+                    extra,
+                    sent.client_id,
+                    path.to_str().expect("utf-8 temp path"),
+                    offset,
+                    limit,
+                )]
+            }
+            Some("cancelDownloadFile") => vec![format!(
+                r#"{{"@type":"ok","@extra":{extra},"@client_id":{}}}"#,
+                sent.client_id
+            )],
+            other => panic!("unexpected request {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_small_exact_fetch_rebinds_a_durable_remote_id_before_download() {
+    let path = tdlib_file("small.bin", PAYLOAD);
+    let catalog = TestCatalog::with_file(CatalogEntry::File(FileTarget {
+        remote_id: Some(REMOTE_ID.to_owned()),
+        remote_file_type: Some(RemoteFileType::Document),
+        ..target()
+    }));
+    let (_runtime, handle, adapter) = downloader(Arc::clone(&catalog) as Arc<dyn FetchCatalog>, 8);
+    handle.set_responder(remote_rebinding_responder(path));
+
+    let (result, sink) = fetch_bytes(&adapter, request(0, PAYLOAD.len() as u64));
+    result.expect("small exact hydration succeeds after current-session rebind");
+    assert_eq!(sink.bytes(), PAYLOAD);
+    assert!(sink.is_complete());
+    assert_eq!(
+        catalog.refreshes(),
+        vec![(
+            item(),
+            RefreshedFileTarget {
+                file_id: CURRENT_FILE_ID,
+                remote_id: Some(CURRENT_REMOTE_ID.to_owned()),
+                remote_unique_id: Some("unique-payload".to_owned()),
+                size: Some(PAYLOAD.len() as u64),
+                availability: AttachmentAvailability::Fetchable,
+                can_be_saved: true,
+            },
+        )],
+        "the current process-local id is durable before bytes are read"
+    );
+    let types: Vec<Option<String>> = handle
+        .take_sent()
+        .iter()
+        .map(SentRequest::request_type)
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            Some("getRemoteFile".to_owned()),
+            Some("getMessage".to_owned()),
+            Some("downloadFile".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn a_ranged_fetch_uses_the_rebound_current_session_file_id() {
+    let path = tdlib_file("ranged.bin", PAYLOAD);
+    let catalog = TestCatalog::with_file(CatalogEntry::File(FileTarget {
+        remote_id: Some(REMOTE_ID.to_owned()),
+        remote_file_type: Some(RemoteFileType::Document),
+        ..target()
+    }));
+    let (_runtime, handle, adapter) = downloader(catalog, 8);
+    handle.set_responder(remote_rebinding_responder(path));
+
+    let (result, sink) = fetch_bytes(&adapter, request(7, 39));
+    result.expect("ranged hydration succeeds after current-session rebind");
+    assert_eq!(sink.bytes(), &PAYLOAD[7..39]);
+
+    let sent = handle.take_sent();
+    let download: Value = serde_json::from_str(
+        &sent
+            .iter()
+            .find(|sent| sent.request_type().as_deref() == Some("downloadFile"))
+            .expect("download request")
+            .json,
+    )
+    .expect("download JSON");
+    assert_eq!(download["file_id"], json!(CURRENT_FILE_ID));
+    assert_eq!(download["offset"], json!(7));
+    assert_eq!(download["limit"], json!(32));
 }
 
 #[test]
@@ -488,6 +700,53 @@ fn a_transport_failure_is_unavailable_and_recovers() {
 }
 
 #[test]
+fn a_remote_rebind_failure_is_retryable_and_the_next_attempt_recovers() {
+    let path = tdlib_file("payload.bin", PAYLOAD);
+    let catalog = TestCatalog::with_file(CatalogEntry::File(FileTarget {
+        remote_id: Some(REMOTE_ID.to_owned()),
+        remote_file_type: Some(RemoteFileType::Document),
+        ..target()
+    }));
+    let (_runtime, handle, adapter) = downloader(catalog, 16);
+    let mut failed = false;
+    let mut serve = remote_rebinding_responder(path);
+    handle.set_responder(move |sent: &SentRequest| {
+        if sent.request_type().as_deref() == Some("getRemoteFile") && !failed {
+            failed = true;
+            return vec![error_response(
+                sent.extra().expect("@extra"),
+                sent.client_id,
+                500,
+                "Failed to connect",
+            )];
+        }
+        serve(sent)
+    });
+
+    let (failed, sink) = fetch_bytes(&adapter, request(0, 16));
+    assert!(matches!(failed, Err(SourceError::Unavailable { .. })));
+    assert!(sink.bytes().is_empty());
+
+    let (retried, sink) = fetch_bytes(&adapter, request(0, 16));
+    retried.expect("a bounded caller retry re-resolves and downloads");
+    assert_eq!(sink.bytes(), &PAYLOAD[..16]);
+    let types: Vec<Option<String>> = handle
+        .take_sent()
+        .iter()
+        .map(SentRequest::request_type)
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            Some("getRemoteFile".to_owned()),
+            Some("getRemoteFile".to_owned()),
+            Some("getMessage".to_owned()),
+            Some("downloadFile".to_owned())
+        ]
+    );
+}
+
+#[test]
 fn lost_authorization_is_reported_as_such() {
     let path = tdlib_file("payload.bin", PAYLOAD);
     let catalog = TestCatalog::with_file(CatalogEntry::File(target()));
@@ -508,6 +767,14 @@ fn stale_reference_responder(
     path: PathBuf,
     unique_id: &'static str,
 ) -> impl FnMut(&SentRequest) -> Vec<String> + Send + 'static {
+    stale_reference_responder_with_facts(path, Some(unique_id), Some(PAYLOAD.len() as u64))
+}
+
+fn stale_reference_responder_with_facts(
+    path: PathBuf,
+    unique_id: Option<&'static str>,
+    size: Option<u64>,
+) -> impl FnMut(&SentRequest) -> Vec<String> + Send + 'static {
     let mut expired = false;
     let mut serve = serving_responder(path);
     move |sent: &SentRequest| {
@@ -523,7 +790,12 @@ fn stale_reference_responder(
                 )]
             }
             Some("getMessage") => {
-                vec![refreshed_message(extra, sent.client_id, unique_id)]
+                vec![refreshed_message_facts(
+                    extra,
+                    sent.client_id,
+                    unique_id,
+                    size,
+                )]
             }
             _ => serve(sent),
         }
@@ -534,7 +806,7 @@ fn stale_reference_responder(
 fn an_expired_reference_refreshes_surfaces_stale_and_then_recovers() {
     let path = tdlib_file("payload.bin", PAYLOAD);
     let catalog = TestCatalog::with_file(CatalogEntry::File(target()));
-    let (_runtime, handle, adapter) = downloader(catalog, 16);
+    let (_runtime, handle, adapter) = downloader(Arc::clone(&catalog) as Arc<dyn FetchCatalog>, 16);
     handle.set_responder(stale_reference_responder(path, "unique-payload"));
 
     let (result, sink) = fetch_bytes(&adapter, request(0, 16));
@@ -556,6 +828,21 @@ fn an_expired_reference_refreshes_surfaces_stale_and_then_recovers() {
         "the refresh is invisible to the caller: one failed call, \
          locators re-learned, identity untouched"
     );
+    assert_eq!(
+        catalog.refreshes(),
+        vec![(
+            item(),
+            RefreshedFileTarget {
+                file_id: FILE_ID,
+                remote_id: Some("r-1".to_owned()),
+                remote_unique_id: Some("unique-payload".to_owned()),
+                size: Some(PAYLOAD.len() as u64),
+                availability: AttachmentAvailability::Fetchable,
+                can_be_saved: true,
+            },
+        )],
+        "the refreshed locator is persisted before StaleReference escapes"
+    );
 
     // The retry the StaleReference contract promises now succeeds.
     let (retried, sink) = fetch_bytes(&adapter, request(0, 16));
@@ -575,6 +862,38 @@ fn a_refresh_that_reveals_different_content_is_a_version_conflict() {
         matches!(result, Err(SourceError::VersionConflict { .. })),
         "content that moved under the reference is a conflict, not a refresh; got {result:?}"
     );
+    assert!(sink.bytes().is_empty());
+}
+
+#[test]
+fn a_refresh_that_loses_known_stable_identity_is_a_version_conflict() {
+    let path = tdlib_file("payload.bin", PAYLOAD);
+    let catalog = TestCatalog::with_file(CatalogEntry::File(target()));
+    let (_runtime, handle, adapter) = downloader(catalog, 16);
+    handle.set_responder(stale_reference_responder_with_facts(
+        path,
+        None,
+        Some(PAYLOAD.len() as u64),
+    ));
+
+    let (result, sink) = fetch_bytes(&adapter, request(0, 16));
+    assert!(matches!(result, Err(SourceError::VersionConflict { .. })));
+    assert!(sink.bytes().is_empty());
+}
+
+#[test]
+fn a_refresh_that_loses_known_extent_is_a_version_conflict() {
+    let path = tdlib_file("payload.bin", PAYLOAD);
+    let catalog = TestCatalog::with_file(CatalogEntry::File(target()));
+    let (_runtime, handle, adapter) = downloader(catalog, 16);
+    handle.set_responder(stale_reference_responder_with_facts(
+        path,
+        Some("unique-payload"),
+        None,
+    ));
+
+    let (result, sink) = fetch_bytes(&adapter, request(0, 16));
+    assert!(matches!(result, Err(SourceError::VersionConflict { .. })));
     assert!(sink.bytes().is_empty());
 }
 
@@ -721,6 +1040,62 @@ fn an_abandoned_download_fires_the_network_cancel() {
         ],
         "abandoning the fetch tells TDLib to stop the network work (SYNC-043)"
     );
+}
+
+#[test]
+fn cancellation_after_remote_rebind_targets_the_current_session_file_id() {
+    let catalog = TestCatalog::with_file(CatalogEntry::File(FileTarget {
+        remote_id: Some(REMOTE_ID.to_owned()),
+        remote_file_type: Some(RemoteFileType::Document),
+        ..target()
+    }));
+    let (_runtime, handle, adapter) = downloader(catalog, 16);
+    handle.set_responder(move |sent: &SentRequest| {
+        let extra = sent.extra().expect("@extra");
+        match sent.request_type().as_deref() {
+            Some("getRemoteFile") => vec![remote_file_response(extra, sent.client_id)],
+            Some("getMessage") => {
+                vec![rebound_owner_message_response(extra, sent.client_id)]
+            }
+            Some("downloadFile") => Vec::new(),
+            Some("cancelDownloadFile") => vec![format!(
+                r#"{{"@type":"ok","@extra":{extra},"@client_id":{}}}"#,
+                sent.client_id
+            )],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+
+    let fetch = request(0, 16);
+    let mut sink = RecordingSink::new(fetch.range);
+    {
+        let mut future = adapter.fetch(fetch, &mut sink);
+        assert!(
+            exec::poll_n(std::pin::Pin::new(&mut future), 4).is_pending(),
+            "the remote rebind is in flight"
+        );
+        for _ in 0..20 {
+            assert!(
+                exec::poll_n(std::pin::Pin::new(&mut future), 8).is_pending(),
+                "the unanswered owner-backed download remains in flight"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    let sent = handle.take_sent();
+    let types: Vec<Option<String>> = sent.iter().map(SentRequest::request_type).collect();
+    assert_eq!(
+        types,
+        vec![
+            Some("getRemoteFile".to_owned()),
+            Some("getMessage".to_owned()),
+            Some("downloadFile".to_owned()),
+            Some("cancelDownloadFile".to_owned())
+        ]
+    );
+    let cancel: Value = serde_json::from_str(&sent[3].json).expect("cancel JSON");
+    assert_eq!(cancel["file_id"], json!(CURRENT_FILE_ID));
 }
 
 // ---------------------------------------------------------------------------

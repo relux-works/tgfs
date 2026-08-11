@@ -7,7 +7,7 @@
 //! [`normalize_message`] and projected with
 //! [`ThumbnailTarget::from_descriptor`] — so the photo/video/document classes
 //! (POL-2, the story checklist) are exercised through the same extraction the
-//! product uses. The mock's responder plays TDLib's side of a whole-file
+//! product uses. The mock's responder plays TDLib's side of a byte-bounded
 //! preview download over a temporary file this suite wrote; the assertions on
 //! its untouched content confirm the read-only ownership rule, and the
 //! assertion that only the *preview* file id is ever downloaded confirms a
@@ -51,6 +51,7 @@ const CHAT_ID: i64 = 100;
 const MESSAGE_ID: i64 = 5;
 /// The bytes of the world's preview file — a stand-in for a real JPEG.
 const PREVIEW: &[u8] = b"\xff\xd8\xff\xe0 a small jpeg preview, byte for byte \xff\xd9";
+const PREVIEW_CAP: u64 = 1024 * 1024;
 
 fn item() -> ItemId {
     fixture::attachment_id(fixture::scope(), CHAT_ID, MESSAGE_ID, 0)
@@ -79,8 +80,8 @@ fn thumbnail_object() -> Value {
     json!({
         "@type": "thumbnail",
         "format": {"@type": "thumbnailFormatJpeg"},
-        "width": 320,
-        "height": 240,
+        "width": 160,
+        "height": 120,
         "file": {"id": THUMB_FILE_ID, "size": PREVIEW.len(), "remote": remote("thumb")},
     })
 }
@@ -110,7 +111,7 @@ fn photo_message() -> Value {
         "caption": {"text": ""},
         "photo": {
             "sizes": [
-                {"type": "m", "width": 320, "height": 240,
+                {"type": "m", "width": 160, "height": 120,
                  "photo": {"id": THUMB_FILE_ID, "size": PREVIEW.len(), "remote": remote("thumb")}},
                 {"type": "y", "width": 1280, "height": 960,
                  "photo": {"id": MEDIA_FILE_ID, "size": 200_000, "remote": remote("media")}},
@@ -201,8 +202,15 @@ fn tdlib_file(bytes: &[u8]) -> PathBuf {
     path
 }
 
-/// The `file` object a covering whole-file preview download answers with.
-fn preview_response(extra: u64, client_id: i32, path: &str, size: u64) -> String {
+/// The `file` object a preview download answers with.
+fn preview_response(
+    extra: u64,
+    client_id: i32,
+    path: &str,
+    size: u64,
+    prefix: u64,
+    completed: bool,
+) -> String {
     json!({
         "@type": "file",
         "id": THUMB_FILE_ID,
@@ -211,9 +219,9 @@ fn preview_response(extra: u64, client_id: i32, path: &str, size: u64) -> String
             "@type": "localFile",
             "path": path,
             "download_offset": 0,
-            "downloaded_prefix_size": size,
+            "downloaded_prefix_size": prefix,
             "is_downloading_active": false,
-            "is_downloading_completed": true,
+            "is_downloading_completed": completed,
         },
         "@extra": extra,
         "@client_id": client_id,
@@ -253,8 +261,8 @@ fn serving_responder(path: PathBuf) -> impl FnMut(&SentRequest) -> Vec<String> +
                 );
                 assert_eq!(
                     value.get("limit").and_then(Value::as_u64),
-                    Some(0),
-                    "a preview is a whole-file download"
+                    Some(PREVIEW_CAP + 1),
+                    "a preview request is capped with one overflow sentinel byte"
                 );
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 vec![preview_response(
@@ -262,6 +270,8 @@ fn serving_responder(path: PathBuf) -> impl FnMut(&SentRequest) -> Vec<String> +
                     sent.client_id,
                     path.to_str().expect("utf-8 temp path"),
                     size,
+                    size,
+                    true,
                 )]
             }
             Some("cancelDownloadFile") => {
@@ -287,7 +297,7 @@ fn thumbnailer(
     let (client, _updates) = runtime.create_client().expect("client registers");
     let config = ThumbnailConfig {
         priority: DownloadPriority::new(9).expect("9 is in range"),
-        max_preview_bytes: NonZeroU64::new(1024 * 1024).expect("non-zero"),
+        max_preview_bytes: NonZeroU64::new(PREVIEW_CAP).expect("non-zero"),
     };
     let adapter = TdThumbnailer::new(client, catalog, config);
     (runtime, handle, adapter)
@@ -335,6 +345,45 @@ fn a_video_serves_its_thumbnail_frame() {
 #[test]
 fn a_document_serves_its_thumbnail() {
     assert_serves_preview(document_message());
+}
+
+#[test]
+fn an_unknown_size_oversized_locator_is_network_bounded() {
+    let mut target = target_of(&document_message());
+    target
+        .downloadable
+        .as_mut()
+        .expect("document has a downloadable preview")
+        .size = None;
+    let catalog = TestCatalog::with(target);
+    let (_runtime, handle, adapter) = thumbnailer(catalog);
+    handle.set_responder(|sent: &SentRequest| {
+        let value: Value = serde_json::from_str(&sent.json).expect("requests are JSON");
+        let extra = sent.extra().expect("the runtime injects @extra");
+        assert_eq!(
+            value.get("limit").and_then(Value::as_u64),
+            Some(PREVIEW_CAP + 1),
+            "TDLib must auto-cancel at the cap plus the overflow sentinel"
+        );
+        vec![preview_response(
+            extra,
+            sent.client_id,
+            "/td/partial-full-media.bin",
+            0,
+            PREVIEW_CAP + 1,
+            false,
+        )]
+    });
+
+    let error = block_on(adapter.thumbnail(item(), spec(256)))
+        .expect_err("the overflow sentinel refuses the mis-projected locator");
+    assert!(matches!(error, SourceError::Internal { .. }));
+    let sent = handle.take_sent();
+    assert_eq!(
+        sent.len(),
+        1,
+        "overflow ends the request without a read or retry"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +460,35 @@ fn an_unknown_item_answers_none() {
     let answer = block_on(adapter.thumbnail(item(), spec(256))).expect("resolves");
     assert_eq!(answer, None);
     assert!(handle.take_sent().is_empty());
+}
+
+#[test]
+fn non_image_preview_format_answers_none_without_network() {
+    let target = ThumbnailTarget {
+        availability: gramdrive_source_tdjson::message::AttachmentAvailability::Fetchable,
+        downloadable: Some(gramdrive_source_tdjson::message::ThumbnailDescriptor {
+            format: gramdrive_source_tdjson::message::ThumbnailFormat::Mpeg4,
+            file_id: i32::try_from(THUMB_FILE_ID).expect("test file id fits i32"),
+            remote_id: Some("remote-video-preview".to_owned()),
+            remote_unique_id: Some("unique-video-preview".to_owned()),
+            size: Some(64),
+            width: Some(160),
+            height: Some(120),
+        }),
+        inline: None,
+    };
+    let catalog = TestCatalog::with(target);
+    let (_runtime, handle, adapter) = thumbnailer(catalog);
+
+    let answer = block_on(adapter.thumbnail(item(), spec(256))).expect("resolves");
+    assert_eq!(
+        answer, None,
+        "an encoded video is not an Image-I/O thumbnail"
+    );
+    assert!(
+        handle.take_sent().is_empty(),
+        "unsupported preview formats are filtered before download"
+    );
 }
 
 // ---------------------------------------------------------------------------

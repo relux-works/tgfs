@@ -88,13 +88,39 @@ class EntitlementsTest(unittest.TestCase):
 
 class InfoPlistTest(unittest.TestCase):
     def test_app_info_plist_identity_and_floor(self):
-        plist = app.app_info_plist("1.2.3", "42")
+        plist = app.app_info_plist("1.2.3", "42", app.update_configuration("test"))
         self.assertEqual(plist["CFBundleIdentifier"], "com.reluxworks.gramdrive")
         self.assertEqual(plist["CFBundleExecutable"], "GramDrive")
         self.assertEqual(plist["CFBundleShortVersionString"], "1.2.3")
         self.assertEqual(plist["CFBundleVersion"], "42")
         self.assertEqual(plist["LSMinimumSystemVersion"], "14.0")
         self.assertIs(plist["LSUIElement"], True)
+        self.assertEqual(
+            plist["SUFeedURL"],
+            "https://github.com/relux-works/tgfs/releases/download/updates-test-v1/test.xml",
+        )
+        self.assertEqual(plist["SUPublicEDKey"], "T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo=")
+        self.assertIs(plist["SUVerifyUpdateBeforeExtraction"], True)
+        self.assertIs(plist["SURequireSignedFeed"], True)
+        self.assertEqual(plist["SUSignedFeedFailureExpirationInterval"], 0)
+
+    def test_update_channels_have_different_immutable_trust_surfaces(self):
+        test = app.update_configuration("test")
+        stable = app.update_configuration("stable")
+        self.assertNotEqual(test["feed_url"], stable["feed_url"])
+        self.assertNotEqual(test["public_key"], stable["public_key"])
+        self.assertEqual(
+            stable["feed_url"], "https://relux-works.github.io/tgfs/updates/stable/v1/stable.xml")
+        self.assertEqual(stable["public_key"], "FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE=")
+
+    def test_missing_or_invalid_reviewed_public_key_refuses_packaging(self):
+        with self.assertRaises(app.StepFailed):
+            app.update_configuration("test", {"test": {"feed_url": "https://example.test/feed.xml"}})
+        with self.assertRaises(app.StepFailed):
+            app.update_configuration(
+                "test",
+                {"test": {"feed_url": "https://example.test/feed.xml", "public_key": "not-base64"}},
+            )
 
     def test_appex_declares_a_file_provider_extension(self):
         plist = app.appex_info_plist("1.2.3", "42")
@@ -116,8 +142,41 @@ class InfoPlistTest(unittest.TestCase):
         self.assertEqual(plist["Label"], "com.reluxworks.gramdrive.agent")
         self.assertEqual(plist["BundleProgram"], "Contents/MacOS/gramdrive-agent")
         self.assertEqual(plist["AssociatedBundleIdentifiers"], ["com.reluxworks.gramdrive"])
+        self.assertIs(plist["RunAtLoad"], True)
+        self.assertEqual(
+            plist["KeepAlive"],
+            {"SuccessfulExit": False},
+            "a planned updater _exit must not relaunch the old build",
+        )
         # The label must equal the plist basename SMAppService resolves.
         self.assertEqual(plist["Label"], app.AGENT_LAUNCHD_LABEL)
+        agent = next(binary for binary in app.BINARIES if binary.key == "agent")
+        self.assertEqual(
+            plist["BundleProgram"],
+            agent.install_path,
+            "SMAppService and direct-spawn discovery must resolve the same packaged binary",
+        )
+
+
+class FileProviderEntryPointTest(unittest.TestCase):
+    """Pin the boundary that previously recursed before any callback."""
+
+    def test_swiftpm_links_nsextensionmain_as_the_macho_entry(self):
+        manifest = (REPO_ROOT / "apple" / "GramDriveSupport" / "Package.swift").read_text()
+        self.assertIn('"-Xlinker", "-e", "-Xlinker", "_NSExtensionMain"', manifest)
+
+    def test_swift_main_never_calls_nsextensionmain(self):
+        source = (
+            REPO_ROOT
+            / "apple"
+            / "GramDriveSupport"
+            / "Sources"
+            / "GramDriveFileProviderExtensionApp"
+            / "main.swift"
+        ).read_text()
+        self.assertNotIn("gramDriveNSExtensionMain()", source)
+        self.assertNotIn("exit(", source)
+        self.assertIn("GramDriveFileProviderExtension.self", source)
 
 
 class SigningOrderTest(unittest.TestCase):
@@ -208,14 +267,22 @@ class ParseTest(unittest.TestCase):
 
 
 class MarketingVersionTest(unittest.TestCase):
-    def test_strips_the_v_and_the_git_suffix(self):
-        self.assertEqual(app.marketing_version("v0.1.0"), "0.1.0")
-        self.assertEqual(app.marketing_version("v0.1.0-3-gabc123"), "0.1.0")
-        self.assertEqual(app.marketing_version("0.2.5-dirty"), "0.2.5")
+    def test_reads_the_reviewed_three_component_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / app.SUPPORT_PACKAGE
+            source.mkdir(parents=True)
+            (source / "Version.json").write_text(json.dumps({"marketing_version": "1.2.3"}))
+            self.assertEqual(app.marketing_version(root), "1.2.3")
 
-    def test_unparseable_yields_zeros_not_a_fabricated_number(self):
-        self.assertEqual(app.marketing_version("gabc123"), "0.0.0")
-        self.assertEqual(app.marketing_version(""), "0.0.0")
+    def test_invalid_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / app.SUPPORT_PACKAGE
+            source.mkdir(parents=True)
+            (source / "Version.json").write_text(json.dumps({"marketing_version": "1.2"}))
+            with self.assertRaises(app.StepFailed):
+                app.marketing_version(root)
 
 
 class AssertEntitlementsTest(unittest.TestCase):
@@ -285,7 +352,15 @@ class PipelineTest(unittest.TestCase):
                 bin_dir = Path(cwd) / ".build" / "release"
                 bin_dir.mkdir(parents=True, exist_ok=True)
                 for product in ("gramdrive-companion", "gramdrive-agent", "gramdrive-fileprovider"):
-                    (bin_dir / product).write_bytes(b"\xcf\xfa\xed\xfe macho")
+                    binary = bin_dir / product
+                    binary.write_bytes(b"\xcf\xfa\xed\xfe macho")
+                    binary.chmod(0o755)
+                sparkle = bin_dir / "Sparkle.framework" / "Versions" / "A"
+                (sparkle / "XPCServices" / "Downloader.xpc").mkdir(parents=True)
+                (sparkle / "XPCServices" / "Installer.xpc").mkdir(parents=True)
+                (sparkle / "Autoupdate").write_bytes(b"helper")
+                (sparkle / "Updater.app").mkdir()
+                (sparkle.parent / "Current").symlink_to("A")
                 return 0, str(bin_dir) + "\n"
             if joined.startswith("swift build"):
                 return 0, ""
@@ -330,18 +405,33 @@ class PipelineTest(unittest.TestCase):
 
         return run, calls
 
-    def stage(self, tmp: Path) -> tuple[Path, Path]:
+    def stage(self, tmp: Path, *, linked: bool = True) -> tuple[Path, Path]:
         """A repo with the SwiftPM package and a staged core package present."""
         repo = tmp / "repo"
         (repo / app.SUPPORT_PACKAGE).mkdir(parents=True)
+        (repo / app.SUPPORT_PACKAGE / "Version.json").write_text(
+            json.dumps({"marketing_version": "0.5.0"}))
         core = repo / app.DEFAULT_CORE_PACKAGE
         core.mkdir(parents=True)
         (core / "Package.swift").write_text("// core")
-        (core / "gramdrive-core-manifest.json").write_text(json.dumps({"contract_version": "0.5.0"}))
+        manifest = {"contract_version": "0.5.0"}
+        if linked:
+            manifest["tdjson"] = {"linked": True}
+            (core / "lib").mkdir()
+            (core / "lib" / "libtdjson.dylib").write_bytes(b"\xcf\xfa\xed\xfe dylib")
+        (core / "gramdrive-core-manifest.json").write_text(json.dumps(manifest))
         return repo, core
 
-    def run_pipeline(self, tmp: Path, *, extra=None, leak_get_task_allow=False, **kwargs):
-        repo, core = self.stage(tmp)
+    def run_pipeline(
+        self,
+        tmp: Path,
+        *,
+        extra=None,
+        leak_get_task_allow=False,
+        linked=True,
+        **kwargs,
+    ):
+        repo, core = self.stage(tmp, linked=linked)
         out = tmp / "out"
         out.mkdir()
         run, calls = self.scripted(extra, leak_get_task_allow=leak_get_task_allow)
@@ -385,12 +475,38 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(manifest["binary_arch"]["required"], "arm64")
             self.assertIn("lipo -archs", manifest["binary_arch"]["verified_by"])
 
+    def test_signed_package_refuses_a_core_without_tdjson_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(app.StepFailed) as caught:
+                self.run_pipeline(Path(tmp), linked=False)
+            self.assertIn("signed app packaging requires a tdjson-linked", str(caught.exception))
+
+    def test_unsigned_diagnostic_assembly_allows_an_unlinked_core(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _, _ = self.run_pipeline(Path(tmp), linked=False, unsigned=True)
+            self.assertFalse(manifest["tdjson"]["linked"])
+
+    def test_make_signed_and_notarized_recipes_use_the_default_linkage_guard(self):
+        makefile = (REPO_ROOT / "Makefile").read_text()
+        self.assertIn(
+            "package-app:\n\tpython3 .scripts/apple-app/build_app_bundle.py\n",
+            makefile,
+        )
+        self.assertIn(
+            "package-app-notarize:\n"
+            "\tpython3 .scripts/apple-app/build_app_bundle.py --notarize\n",
+            makefile,
+        )
+        self.assertNotIn("--require-tdjson", makefile)
+
     def test_assembles_the_expected_bundle_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, out = self.run_pipeline(Path(tmp))
             appdir = out / "GramDrive.app"
             self.assertTrue((appdir / "Contents" / "MacOS" / "GramDrive").is_file())
-            self.assertTrue((appdir / "Contents" / "MacOS" / "gramdrive-agent").is_file())
+            agent = appdir / "Contents" / "MacOS" / "gramdrive-agent"
+            self.assertTrue(agent.is_file())
+            self.assertTrue(agent.stat().st_mode & 0o111, "the bundled agent must stay executable")
             self.assertTrue(
                 (
                     appdir
@@ -402,6 +518,41 @@ class PipelineTest(unittest.TestCase):
                     / "GramDriveFileProvider"
                 ).is_file()
             )
+
+    def test_embeds_sparkle_helpers_and_signs_them_before_the_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, calls, out = self.run_pipeline(Path(tmp))
+            appdir = out / "GramDrive.app"
+            framework = appdir / "Contents" / "Frameworks" / "Sparkle.framework"
+            self.assertTrue((framework / "Versions" / "Current").is_symlink())
+            self.assertTrue((framework / "Versions" / "Current" / "Autoupdate").is_file())
+            self.assertTrue((framework / "Versions" / "Current" / "Updater.app").is_dir())
+            self.assertTrue(
+                (framework / "Versions" / "Current" / "XPCServices" / "Downloader.xpc").is_dir())
+            self.assertTrue(
+                (framework / "Versions" / "Current" / "XPCServices" / "Installer.xpc").is_dir())
+            order = [" ".join(call) for call in calls]
+            sparkle_helpers = [
+                framework / "Versions" / "Current" / "XPCServices" / "Installer.xpc",
+                framework / "Versions" / "Current" / "XPCServices" / "Downloader.xpc",
+                framework / "Versions" / "Current" / "Autoupdate",
+                framework / "Versions" / "Current" / "Updater.app",
+            ]
+            helper_indices = [
+                next(i for i, call in enumerate(order) if call.endswith(str(helper)))
+                for helper in sparkle_helpers
+            ]
+            sparkle_index = next(
+                i for i, call in enumerate(order) if call.endswith("Sparkle.framework"))
+            app_index = next(
+                i for i, call in enumerate(order)
+                if call.endswith("GramDrive.app"))
+            self.assertEqual(helper_indices, sorted(helper_indices))
+            self.assertLess(helper_indices[-1], sparkle_index)
+            self.assertLess(sparkle_index, app_index)
+            for helper, helper_index in zip(sparkle_helpers, helper_indices):
+                self.assertIn("--preserve-metadata=entitlements,requirements,flags", order[helper_index])
+                self.assertTrue(order[helper_index].startswith("codesign --force "))
             self.assertTrue((appdir / "Contents" / "Info.plist").is_file())
             self.assertTrue((appdir / "Contents" / "PkgInfo").is_file())
             self.assertTrue(
@@ -414,6 +565,16 @@ class PipelineTest(unittest.TestCase):
                 ).is_file()
             )
 
+    def test_adds_the_shared_frameworks_rpath_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, calls, _ = self.run_pipeline(Path(tmp))
+            rpath_calls = [
+                call for call in calls
+                if call[:2] == ("install_name_tool", "-add_rpath")
+                and "@executable_path/../Frameworks" in call
+            ]
+            self.assertEqual(len(rpath_calls), 1)
+
     def test_the_bundle_plists_are_what_the_system_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, out = self.run_pipeline(Path(tmp))
@@ -425,6 +586,32 @@ class PipelineTest(unittest.TestCase):
             )
             self.assertEqual(
                 appex["NSExtension"]["NSExtensionPointIdentifier"], "com.apple.fileprovider-nonui"
+            )
+
+    def test_packaged_variants_embed_only_their_exact_reviewed_trust_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, test_out = self.run_pipeline(root / "test")
+            _, _, stable_out = self.run_pipeline(root / "stable", update_channel="stable")
+            test_info = read_plist(test_out / "GramDrive.app" / "Contents" / "Info.plist")
+            stable_info = read_plist(stable_out / "GramDrive.app" / "Contents" / "Info.plist")
+            self.assertEqual(
+                (test_info["SUFeedURL"], test_info["SUPublicEDKey"]),
+                (
+                    "https://github.com/relux-works/tgfs/releases/download/updates-test-v1/test.xml",
+                    "T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo=",
+                ),
+            )
+            self.assertEqual(
+                (stable_info["SUFeedURL"], stable_info["SUPublicEDKey"]),
+                (
+                    "https://relux-works.github.io/tgfs/updates/stable/v1/stable.xml",
+                    "FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE=",
+                ),
+            )
+            self.assertNotEqual(
+                (test_info["SUFeedURL"], test_info["SUPublicEDKey"]),
+                (stable_info["SUFeedURL"], stable_info["SUPublicEDKey"]),
             )
 
     def test_signs_inside_out(self):
@@ -613,7 +800,7 @@ class PipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             manifest, _, out = self.run_pipeline(Path(tmp))
             rendered = (out / "CHECKSUMS.sha256").read_text()
-            self.assertIn("GramDrive-0.1.0.dmg", rendered)
+            self.assertIn("GramDrive-0.5.0.dmg", rendered)
             self.assertTrue(any(name.startswith("GramDrive.app/") for name in manifest["checksums"]))
 
     def test_reproducibility_claim_is_honest(self):

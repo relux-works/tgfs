@@ -99,6 +99,17 @@ class SuiteResolutionTests(unittest.TestCase):
         names = [step.name for step in run_automated.resolve_suite("apple", self.catalog)]
         self.assertEqual(names, ["swift-build", "swift-test"])
 
+    def test_live_content_suite_runs_the_combined_privacy_safe_matrix(self):
+        names = [
+            step.name
+            for step in run_automated.resolve_suite("live-content", self.catalog)
+        ]
+        self.assertEqual(names, ["live-content-matrix"])
+        self.assertIn(
+            ".scripts/acceptance/run_live_content.py",
+            self.catalog["live-content-matrix"].argv,
+        )
+
     def test_all_suite_excludes_the_apple_steps(self):
         # The apple leg needs macOS + Xcode and the staged core (`make package`),
         # so it must stay out of the everyday `all` gate that runs on any host.
@@ -229,6 +240,16 @@ class RunSuiteTests(unittest.TestCase):
         summary, _ = self.run_steps(["format"], runner)
         self.assertEqual(summary["commit"], "abc123def")
         self.assertTrue(summary["worktree_clean"])
+
+    def test_run_id_token_is_expanded_inside_step_commands(self):
+        runner = FakeRunner()
+        summary, code = self.run_steps(
+            ["live-content-matrix"], runner, run_id="matrix-42"
+        )
+        self.assertEqual(code, run_automated.EXIT_OK)
+        command = summary["steps"][0]["command"]
+        self.assertIn(".temp/acceptance/matrix-42/live-content.json", command)
+        self.assertNotIn(run_automated.RUN_ID_TOKEN, command)
 
     def test_provenance_writes_summary_and_per_step_logs(self):
         runner = FakeRunner({"cargo fmt": (1, "Diff in lib.rs\n")})

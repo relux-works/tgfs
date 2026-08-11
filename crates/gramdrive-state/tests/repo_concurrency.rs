@@ -24,7 +24,7 @@ use std::sync::Barrier;
 use common::{TempDb, account_record, chat_record, revision, scope};
 use gramdrive_state::StateStore;
 use gramdrive_state::model::cursor::ChangeCursor;
-use gramdrive_state::model::identity::MessageId;
+use gramdrive_state::model::identity::{CanonicalKey, ItemKey, MessageId, MonthDirKey};
 use gramdrive_state::model::version::{ContentVersion, MetadataVersion};
 use gramdrive_state::repo::{ItemAvailability, ItemRecord, MessageChange, TransferId};
 
@@ -93,6 +93,7 @@ fn two_connections_never_claim_the_same_transfer() {
     let tx = store.write_txn().expect("write");
     let root = common::account_root_id();
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: root.clone(),
         parent: None,
         display_name: "Root".to_owned(),
@@ -105,14 +106,17 @@ fn two_connections_never_claim_the_same_transfer() {
         deleted_at_ms: None,
     })
     .expect("root");
-    for (name, key) in [
-        ("a.ndjson", common::year_dir_key(CHAT, 2025)),
-        ("b.ndjson", common::year_dir_key(CHAT, 2026)),
-    ] {
-        // Year dirs stand in for any two distinct items; files would need
-        // more scaffolding and prove nothing extra here.
-        let id = gramdrive_state::model::identity::ItemKey::Canonical(key).id();
+    for (name, year) in [("2025-01", 2025), ("2026-01", 2026)] {
+        // Direct month dirs stand in for any two distinct items; files would
+        // need more scaffolding and prove nothing extra here.
+        let id = ItemKey::Canonical(CanonicalKey::MonthDir(MonthDirKey {
+            chat: common::chat_key(CHAT),
+            year,
+            month: 1,
+        }))
+        .id();
         tx.upsert_item(&ItemRecord {
+            aggregate_size: None,
             id: id.clone(),
             parent: Some(root.clone()),
             display_name: name.to_owned(),

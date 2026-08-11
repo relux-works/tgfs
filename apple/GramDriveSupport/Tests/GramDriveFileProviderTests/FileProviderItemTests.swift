@@ -14,8 +14,9 @@ import Testing
 /// ``expectedIsDirectory(_:)``, whose exhaustive switch is the compile-time
 /// guard).
 private let allItemKinds: [ItemKind] = [
-    .account, .chatList, .folderCatalog, .chat, .yearDir, .mediaDir,
-    .attachment, .generatedDoc, .orderDoc,
+    .account, .chatList, .folderCatalog, .chat, .activeStories, .monthDir,
+    .canonicalStory, .storyAppearance, .yearDir, .mediaDir, .attachment,
+    .generatedDoc, .orderDoc,
 ]
 
 /// The directory/file split, restated from the core's `kind_is_directory`.
@@ -23,9 +24,10 @@ private let allItemKinds: [ItemKind] = [
 /// until its directory-ness is declared.
 private func expectedIsDirectory(_ kind: ItemKind) -> Bool {
     switch kind {
-    case .account, .chatList, .folderCatalog, .chat, .yearDir, .mediaDir:
+    case .account, .chatList, .folderCatalog, .chat, .activeStories, .monthDir,
+         .yearDir, .mediaDir:
         return true
-    case .attachment, .generatedDoc, .orderDoc:
+    case .canonicalStory, .storyAppearance, .attachment, .generatedDoc, .orderDoc:
         return false
     }
 }
@@ -54,6 +56,11 @@ private func makeMetadata(
     metadataVersion: String = "m1",
     mimeType: String? = nil,
     logicalSize: UInt64? = nil,
+    aggregateSize: UInt64? = nil,
+    attachmentLogicalKind: String? = nil,
+    attachmentRepresentation: String? = nil,
+    attachmentFidelity: String? = nil,
+    attachmentSourceName: String? = nil,
     contentVersion: String? = nil,
     availability: ItemAvailability = .fetchable,
     createdAtMs: Int64? = nil,
@@ -62,6 +69,7 @@ private func makeMetadata(
     pin: PinOrigin? = nil
 ) -> ItemMetadata {
     ItemMetadata(
+        contractVersion: 1,
         id: id,
         parent: parent,
         kind: kind,
@@ -71,6 +79,12 @@ private func makeMetadata(
         metadataVersion: metadataVersion,
         mimeType: mimeType,
         logicalSize: logicalSize,
+        aggregateSize: aggregateSize,
+        attachmentLogicalKind: attachmentLogicalKind,
+        attachmentRepresentation: attachmentRepresentation,
+        attachmentFidelity: attachmentFidelity,
+        attachmentSourceName: attachmentSourceName,
+        attachmentExactSize: logicalSize,
         contentVersion: contentVersion,
         availability: availability,
         createdAtMs: createdAtMs,
@@ -96,7 +110,9 @@ struct FileProviderItemKindTests {
             let item = makeItem(makeMetadata(kind: kind, safeName: "node"))
             if expectedIsDirectory(kind) {
                 #expect(item.contentType == .folder, "kind \(kind) should be a folder")
-                #expect(item.documentSize == nil, "directory \(kind) has no document size")
+                #expect(
+                    item.documentSize == nil,
+                    "directory \(kind) publishes no size until a pass has rolled it up")
             } else {
                 #expect(item.contentType != .folder, "file kind \(kind) is not a folder")
             }
@@ -133,9 +149,19 @@ struct FileProviderItemKindTests {
 struct FileProviderItemAvailabilityTests {
     @Test("A fetchable file is readable and nothing more")
     func fetchableFileIsReadable() {
-        let item = makeItem(makeMetadata(kind: .attachment, availability: .fetchable))
+        let item = makeItem(
+            makeMetadata(kind: .attachment, logicalSize: 1, availability: .fetchable))
         #expect(item.capabilities == .allowsReading)
         #expect(item.fileSystemFlags == .userReadable)
+    }
+
+    @Test("An expected-size-only file stays non-readable until its exact extent is known")
+    func unknownExactSizeWithholdsReadCapability() {
+        let item = makeItem(
+            makeMetadata(kind: .attachment, logicalSize: nil, availability: .fetchable))
+        #expect(item.documentSize == nil)
+        #expect(item.capabilities == [])
+        #expect(item.fileSystemFlags == [])
     }
 
     @Test("Restricted content advertises no capability and no readable flag")
@@ -150,6 +176,31 @@ struct FileProviderItemAvailabilityTests {
         let item = makeItem(makeMetadata(kind: .attachment, availability: .unavailable))
         #expect(item.capabilities == [])
         #expect(item.fileSystemFlags == [])
+    }
+
+    @Test("Availability updates preserve identity while refreshing Finder-visible capability metadata")
+    func availabilityTransitionsRefreshCapabilitiesInPlace() {
+        let transitions: [(ItemAvailability, String, NSFileProviderItemCapabilities,
+            NSFileProviderFileSystemFlags)] = [
+            (.fetchable, "availability-fetchable", .allowsReading, .userReadable),
+            (.restricted, "availability-restricted", [], []),
+            (.unavailable, "availability-unavailable", [], []),
+        ]
+        var priorVersion: Data?
+
+        for (availability, version, capabilities, flags) in transitions {
+            let item = makeItem(makeMetadata(
+                id: "stable-attachment",
+                kind: .attachment,
+                metadataVersion: version,
+                logicalSize: 1,
+                availability: availability))
+            #expect(item.itemIdentifier == NSFileProviderItemIdentifier(rawValue: "stable-attachment"))
+            #expect(item.capabilities == capabilities)
+            #expect(item.fileSystemFlags == flags)
+            #expect(item.itemVersion.metadataVersion != priorVersion)
+            priorVersion = item.itemVersion.metadataVersion
+        }
     }
 
     @Test("A restricted item still carries its size and type — only the bytes are withheld")
@@ -358,6 +409,48 @@ struct FileProviderItemContentTypeTests {
 
 @Suite("File Provider item mapping — size and timestamps")
 struct FileProviderItemSizeTimeTests {
+    @Test("Original image documents preserve sender name, MIME, size, and source date")
+    func originalDocumentFidelity() {
+        let metadata = makeMetadata(
+            safeName: "2026-07-21 12-34-56 Camera Original.JPG",
+            mimeType: "image/jpeg",
+            logicalSize: 4_096,
+            attachmentLogicalKind: "photo",
+            attachmentRepresentation: "original_document",
+            attachmentFidelity: "original",
+            attachmentSourceName: "Camera Original.JPG",
+            createdAtMs: 1_721_562_896_000)
+        let item = makeItem(metadata)
+
+        #expect(item.filename == "2026-07-21 12-34-56 Camera Original.JPG")
+        #expect(item.contentType == .jpeg)
+        #expect(item.documentSize == 4_096)
+        #expect(item.creationDate == Date(timeIntervalSince1970: 1_721_562_896))
+        #expect(item.metadata.attachmentRepresentation == "original_document")
+        #expect(item.metadata.attachmentFidelity == "original")
+        #expect(item.metadata.attachmentSourceName == "Camera Original.JPG")
+    }
+
+    @Test("Telegram media keeps a generated name and never invents a sender filename")
+    func telegramVariantFidelity() {
+        let metadata = makeMetadata(
+            safeName: "2026-07-21 12-34-56 photo.jpg",
+            mimeType: "image/jpeg",
+            logicalSize: 2_048,
+            attachmentLogicalKind: "photo",
+            attachmentRepresentation: "message_photo",
+            attachmentFidelity: "telegram_variant",
+            attachmentSourceName: nil,
+            createdAtMs: 1_721_562_896_000)
+        let item = makeItem(metadata)
+
+        #expect(item.filename == "2026-07-21 12-34-56 photo.jpg")
+        #expect(item.documentSize == 2_048)
+        #expect(item.metadata.attachmentRepresentation == "message_photo")
+        #expect(item.metadata.attachmentFidelity == "telegram_variant")
+        #expect(item.metadata.attachmentSourceName == nil)
+    }
+
     @Test("A file's known logical size surfaces as its document size")
     func fileSizeSurfaces() {
         let item = makeItem(makeMetadata(kind: .attachment, logicalSize: 2048))
@@ -370,10 +463,54 @@ struct FileProviderItemSizeTimeTests {
         #expect(item.documentSize == nil)
     }
 
-    @Test("A directory never reports a document size, even if one is present")
-    func directoryHasNoSize() {
-        let item = makeItem(makeMetadata(kind: .chat, logicalSize: 999))
-        #expect(item.documentSize == nil)
+    @Test("A directory reports its descendant rollup, never a file's own size")
+    func directoryReportsAggregateSize() {
+        // `logicalSize` is a file's own extent and means nothing on a
+        // directory; the rollup is the separate fact a folder publishes
+        // (BUG-260728-2qfzbd).
+        let unrolled = makeItem(makeMetadata(kind: .chat, logicalSize: 999))
+        #expect(unrolled.documentSize == nil)
+
+        let rolled = makeItem(
+            makeMetadata(kind: .chat, logicalSize: 999, aggregateSize: 8_192))
+        #expect(rolled.documentSize == NSNumber(value: 8192))
+    }
+
+    @Test("A chat folder answers its size before anything below it is enumerated")
+    func chatFolderSizeIsAnswerableFromMetadataAlone() {
+        // The whole point of the rollup: one item read, no children fetched,
+        // no content byte downloaded, and the answer is exact.
+        let chat = makeItem(
+            makeMetadata(
+                kind: .chat, isDirectory: true, safeName: "Chat", aggregateSize: 1_234_567))
+        #expect(chat.documentSize == NSNumber(value: 1_234_567))
+        #expect(chat.capabilities == .allowsContentEnumerating)
+        #expect(chat.contentType == .folder)
+    }
+
+    @Test("An empty folder publishes a zero size, which is not the same as unknown")
+    func emptyFolderPublishesZero() {
+        let empty = makeItem(makeMetadata(kind: .monthDir, aggregateSize: 0))
+        #expect(empty.documentSize == NSNumber(value: 0))
+        let unknown = makeItem(makeMetadata(kind: .monthDir, aggregateSize: nil))
+        #expect(unknown.documentSize == nil)
+    }
+
+    @Test("A folder's last-used date starts at its newest correspondence, not the epoch")
+    func lastUsedDateStartsAtNewestCorrespondence() {
+        // A chat nobody has opened locally still has a truthful answer to
+        // "when was this last used": its most recent message
+        // (BUG-260728-2qfzbd).
+        let dated = makeItem(
+            makeMetadata(
+                kind: .chat, createdAtMs: 1_600_000_000_000, modifiedAtMs: 1_600_000_500_000))
+        #expect(dated.lastUsedDate == Date(timeIntervalSince1970: 1_600_000_500))
+        #expect(dated.creationDate == Date(timeIntervalSince1970: 1_600_000_000))
+
+        let undated = makeItem(makeMetadata(kind: .chat))
+        #expect(
+            undated.lastUsedDate == nil,
+            "with no indexed correspondence the honest answer is absent, never 1970")
     }
 
     @Test("Millisecond timestamps map to dates; absent ones map to nil")

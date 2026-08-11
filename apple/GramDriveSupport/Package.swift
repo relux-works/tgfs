@@ -33,6 +33,16 @@ let coreLinkerSettings: [LinkerSetting] = [
     .unsafeFlags(["-L\(corePackagePath)/lib"])
 ]
 
+// App extensions are entered by the system at Foundation's NSExtensionMain,
+// exactly like Xcode's App Extension product type. Calling NSExtensionMain
+// from a normal Swift executable main recursively re-enters the extension
+// runtime on macOS and prevents the principal class from receiving callbacks.
+let fileProviderExtensionLinkerSettings: [LinkerSetting] = coreLinkerSettings + [
+    .unsafeFlags(
+        ["-Xlinker", "-e", "-Xlinker", "_NSExtensionMain"],
+        .when(platforms: [.macOS]))
+]
+
 let package = Package(
     name: "GramDriveSupport",
     // POL-5 / DEC-017: macOS 14+ arm64 is the v1 support matrix.
@@ -71,7 +81,8 @@ let package = Package(
         .executable(name: "gramdrive-shared-state-smoke", targets: ["SharedStateSmoke"]),
     ],
     dependencies: [
-        .package(name: "GramDriveCore", path: corePackagePath)
+        .package(name: "GramDriveCore", path: corePackagePath),
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", exact: "2.9.5"),
     ],
     targets: [
         .target(
@@ -115,6 +126,7 @@ let package = Package(
             name: "GramDriveCompanionMain",
             dependencies: [
                 "GramDriveCompanion",
+                .product(name: "Sparkle", package: "Sparkle"),
                 "GramDriveAgentCore",
                 "GramDriveFileProvider",
                 "GramDriveSupport",
@@ -129,7 +141,7 @@ let package = Package(
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
             ],
-            linkerSettings: coreLinkerSettings
+            linkerSettings: fileProviderExtensionLinkerSettings
         ),
         .executableTarget(
             name: "SharedStateSmoke",

@@ -16,24 +16,27 @@ public enum AgentPresence: Equatable, Sendable {
     }
 }
 
-/// The account's authorization standing, as far as the shell can honestly
-/// tell from the agent's health today.
-///
-/// The health payload does not carry an authorization field yet (the auth
-/// story owns wiring it), so a running agent reports ``unknown`` rather than a
-/// guessed "authorized" — the same honesty the snapshot's `nil` fields keep.
-/// When the payload gains an auth field, this mapping extends without the UI
-/// changing.
+/// The account's authorization standing from the durable account summaries
+/// carried by agent health.
 public enum AccountStatus: Equatable, Sendable {
     /// The agent is not running, so no account can be served.
     case agentUnavailable
     /// The agent is up, but its health does not (yet) report authorization.
     case unknown
+    /// At least one configured account is durably authorized.
+    case authorized
+    /// The agent reported no configured account.
+    case notConfigured
+    /// Accounts exist, but none is currently authorized.
+    case authorizationRequired
 
     public var label: String {
         switch self {
         case .agentUnavailable: return "Agent not running"
         case .unknown: return "Status not reported yet"
+        case .authorized: return "Authorized"
+        case .notConfigured: return "No account configured"
+        case .authorizationRequired: return "Authorization required"
         }
     }
 }
@@ -120,6 +123,7 @@ extension Date {
 @Observable
 public final class CompanionStatusViewModel {
     public private(set) var readout: HealthReadout = .notRunning
+    private var reportedProviderStatus: ProviderDomainStatus?
 
     private let backend: any CompanionBackend
 
@@ -134,8 +138,16 @@ public final class CompanionStatusViewModel {
 
     public var agentPresence: AgentPresence { Self.agentPresence(from: readout) }
     public var accountStatus: AccountStatus { Self.accountStatus(from: readout) }
-    public var providerStatus: ProviderDomainStatus { Self.providerStatus(from: readout) }
+    public var providerStatus: ProviderDomainStatus {
+        reportedProviderStatus ?? Self.providerStatus(from: readout)
+    }
     public var diagnostics: DiagnosticsReport? { Self.diagnostics(from: readout) }
+
+    /// Reports the app-owned result of domain reconciliation. Health remains
+    /// the cross-process fallback for future agent-owned registration state.
+    public func reportProviderStatus(_ status: ProviderDomainStatus) {
+        reportedProviderStatus = status
+    }
 
     // MARK: - Pure derivations
 
@@ -153,7 +165,12 @@ public final class CompanionStatusViewModel {
 
     public nonisolated static func accountStatus(from readout: HealthReadout) -> AccountStatus {
         switch readout {
-        case .running: return .unknown
+        case .running(let snapshot):
+            guard let accounts = snapshot.accounts else { return .unknown }
+            if accounts.contains(where: { $0.authState == "authorized" }) {
+                return .authorized
+            }
+            return accounts.isEmpty ? .notConfigured : .authorizationRequired
         case .notRunning, .timedOut, .error: return .agentUnavailable
         }
     }

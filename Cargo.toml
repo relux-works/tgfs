@@ -56,6 +56,13 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # and its build script (a limb-width probe) is already named in deny.toml
 # [bans.build].
 serde_json = { version = "1.0" }
+serde = { version = "1.0", features = ["derive"] }
+
+# IANA timezone rules for date-first monthly partitions. The persisted account
+# setting is a zone name (for example `Asia/Tbilisi`), not a fixed offset; Jiff
+# keeps DST and historical transitions out of hand-written calendar code. The
+# bundled database makes partition selection independent of host tzdb state.
+jiff = { version = "0.2.32", default-features = false, features = ["std", "tzdb-bundle-always"] }
 
 # Unicode tables for the naming policy (SYNC-013). All three carry licenses
 # inside the POL-6 allow list (MIT OR Apache-2.0, and MIT for caseless), so

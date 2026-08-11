@@ -15,8 +15,9 @@ use gramdrive_model::identity::{
     NamespaceVersion, SchemaFamily,
 };
 use gramdrive_render::ndjson::{
-    Attachment, Availability, Deletion, Entity, EntityKind, MediaKind, MessageBody, MessageHistory,
-    Reaction, ReactionKey, Revision, Sender, ServiceAction,
+    Attachment, AttachmentFidelity, Availability, Deletion, Entity, EntityKind, MediaKind,
+    MessageBody, MessageHistory, Reaction, ReactionKey, Revision, Sender, ServiceAction,
+    TelegramRepresentation,
 };
 
 // --- JSON parser -----------------------------------------------------------
@@ -502,9 +503,11 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                 body.attachments = vec![Attachment {
                     index: AttachmentIndex(0),
                     media_kind: MediaKind::Photo,
-                    name: Some("IMG_0001.jpg".to_owned()),
+                    telegram_representation: TelegramRepresentation::OriginalDocument,
+                    fidelity: AttachmentFidelity::Original,
+                    source_name: Some("IMG_0001.jpg".to_owned()),
                     mime_type: Some("image/jpeg".to_owned()),
-                    size: Some(204_800),
+                    exact_size: Some(204_800),
                     availability: Availability::Fetchable,
                     content_hash: Some(digest(0xab)),
                     media_name: Some("IMG_0001.jpg".to_owned()),
@@ -524,9 +527,11 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                 body.attachments = vec![Attachment {
                     index: AttachmentIndex(0),
                     media_kind: MediaKind::Video,
-                    name: None,
+                    telegram_representation: TelegramRepresentation::Video,
+                    fidelity: AttachmentFidelity::TelegramVariant,
+                    source_name: None,
                     mime_type: Some("video/mp4".to_owned()),
-                    size: Some(5_242_880),
+                    exact_size: Some(5_242_880),
                     availability: Availability::Fetchable,
                     content_hash: None,
                     media_name: Some("video_0105.mp4".to_owned()),
@@ -547,9 +552,11 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                 body.attachments = vec![Attachment {
                     index: AttachmentIndex(0),
                     media_kind: MediaKind::Document,
-                    name: Some("secret.pdf".to_owned()),
+                    telegram_representation: TelegramRepresentation::OriginalDocument,
+                    fidelity: AttachmentFidelity::Original,
+                    source_name: Some("secret.pdf".to_owned()),
                     mime_type: Some("application/pdf".to_owned()),
-                    size: Some(1_024),
+                    exact_size: Some(1_024),
                     availability: Availability::Restricted,
                     content_hash: None,
                     media_name: None,
@@ -569,9 +576,11 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                     Attachment {
                         index: AttachmentIndex(0),
                         media_kind: MediaKind::Photo,
-                        name: None,
+                        telegram_representation: TelegramRepresentation::Photo,
+                        fidelity: AttachmentFidelity::MetadataOnly,
+                        source_name: None,
                         mime_type: None,
-                        size: None,
+                        exact_size: None,
                         availability: Availability::ViewOnce,
                         content_hash: None,
                         media_name: None,
@@ -579,9 +588,11 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                     Attachment {
                         index: AttachmentIndex(1),
                         media_kind: MediaKind::Voice,
-                        name: None,
+                        telegram_representation: TelegramRepresentation::Voice,
+                        fidelity: AttachmentFidelity::MetadataOnly,
+                        source_name: None,
                         mime_type: Some("audio/ogg".to_owned()),
-                        size: None,
+                        exact_size: None,
                         availability: Availability::Unavailable,
                         content_hash: None,
                         media_name: None,
@@ -591,9 +602,13 @@ pub(crate) fn corpus() -> Vec<MessageHistory> {
                         media_kind: MediaKind::Other {
                             kind: "giveaway".to_owned(),
                         },
-                        name: None,
+                        telegram_representation: TelegramRepresentation::Other {
+                            representation: "giveaway".to_owned(),
+                        },
+                        fidelity: AttachmentFidelity::MetadataOnly,
+                        source_name: None,
                         mime_type: None,
-                        size: None,
+                        exact_size: None,
                         availability: Availability::Unavailable,
                         content_hash: None,
                         media_name: None,

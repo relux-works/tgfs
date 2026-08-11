@@ -14,9 +14,20 @@ public protocol DriveLocationProviding: Sendable {
     /// The user-visible Finder URL of the drive, when it can be resolved yet.
     /// `nil` before any provider folder exists (e.g. sign-in not finished).
     func resolveDriveURL() -> URL?
+    /// Reveals one already-resolved drive URL.
+    @discardableResult
+    func reveal(_ url: URL) -> Bool
     /// Reveals the drive in Finder. Returns whether a location could be shown.
     @discardableResult
     func reveal() -> Bool
+}
+
+extension DriveLocationProviding {
+    @discardableResult
+    public func reveal() -> Bool {
+        guard let url = resolveDriveURL() else { return false }
+        return reveal(url)
+    }
 }
 
 /// The product drive-location provider.
@@ -24,8 +35,9 @@ public protocol DriveLocationProviding: Sendable {
 /// macOS surfaces a File Provider replicated domain under
 /// `~/Library/CloudStorage`; GramDrive's domain presents as `GramDrive`
 /// (POL-7 / ``DomainIdentity``). This resolves the provider folder by that
-/// name prefix and, until it exists, falls back to the CloudStorage container
-/// itself so "Open in Finder" always lands somewhere sensible.
+/// name prefix. The CloudStorage container itself is deliberately not a
+/// success result: onboarding must not claim the drive is usable until the
+/// provider's actual child is present.
 public struct CloudStorageDriveLocation: DriveLocationProviding {
     private let baseDirectory: URL
     private let displayNamePrefix: String
@@ -53,18 +65,7 @@ public struct CloudStorageDriveLocation: DriveLocationProviding {
     }
 
     public func resolveDriveURL() -> URL? {
-        // Prefer a GramDrive-prefixed provider folder if one exists…
-        if let match = driveChild() {
-            return match
-        }
-        // …otherwise the CloudStorage container itself, when it is present.
-        var isDirectory: ObjCBool = false
-        if fileManager.fileExists(atPath: baseDirectory.path, isDirectory: &isDirectory),
-            isDirectory.boolValue
-        {
-            return baseDirectory
-        }
-        return nil
+        driveChild()
     }
 
     /// The first GramDrive-prefixed child of the CloudStorage directory, by
@@ -87,8 +88,7 @@ public struct CloudStorageDriveLocation: DriveLocationProviding {
     }
 
     @discardableResult
-    public func reveal() -> Bool {
-        guard let url = resolveDriveURL() else { return false }
+    public func reveal(_ url: URL) -> Bool {
         return revealer(url)
     }
 
@@ -123,10 +123,10 @@ public final class FixedDriveLocation: DriveLocationProviding, @unchecked Sendab
     public func resolveDriveURL() -> URL? { url }
 
     @discardableResult
-    public func reveal() -> Bool {
+    public func reveal(_ url: URL) -> Bool {
         lock.lock()
         _revealCount += 1
         lock.unlock()
-        return url != nil
+        return true
     }
 }

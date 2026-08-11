@@ -83,7 +83,7 @@ use gramdrive_model::ByteRange;
 use gramdrive_model::identity::ItemId;
 use gramdrive_model::version::ContentVersion;
 use gramdrive_source::SourceError;
-use gramdrive_source::{ContentChunk, ContentSink, DriveSource, FetchRequest, SinkControl};
+use gramdrive_source::{ContentChunk, ContentSink, ContentSource, FetchRequest, SinkControl};
 use gramdrive_state::StateStore;
 use gramdrive_state::repo::{FailureCategory, TransferId};
 
@@ -182,14 +182,29 @@ pub struct OpenOutcome {
     pub displaced: Option<StagingDisposal>,
 }
 
+/// What [`FetchCoordinator::subscribe`] did with sink-less demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "may carry a staging disposal the host must honor"]
+pub struct SubscribeOutcome {
+    /// The registered request handle. Close it when the caller detaches.
+    pub reader: ReaderId,
+    /// The live transfer the request is attached to.
+    pub transfer: TransferId,
+    /// Whether the demand coalesced onto an existing transfer.
+    pub coalesced: bool,
+    /// A staging area orphaned by acknowledging an abandoned cancel on the
+    /// same item and version; the host must delete it.
+    pub displaced: Option<StagingDisposal>,
+}
+
 /// What [`FetchCoordinator::close`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CloseOutcome {
-    /// The transfer the reader was attached to.
+    /// The transfer the live request was attached to.
     pub transfer: TransferId,
-    /// Readers still attached to that transfer. When this reaches zero the
-    /// host decides whether the transfer keeps running (a pin backfill
-    /// does) or is durably cancelled via
+    /// Ranged readers and sink-less subscribers still attached to that
+    /// transfer. When this reaches zero the host decides whether the
+    /// transfer keeps running (a pin backfill does) or is durably cancelled via
     /// [`FetchCoordinator::request_cancel`].
     pub remaining_readers: usize,
 }
@@ -314,14 +329,26 @@ pub enum RunOutcome {
     Ran(RunReport),
 }
 
+#[derive(Debug, Default)]
+struct ReaderRegistry {
+    by_transfer: HashMap<TransferId, Vec<Reader>>,
+    subscribers_by_transfer: HashMap<TransferId, Vec<ReaderId>>,
+    next_reader: u64,
+}
+
 /// The ranged fetch coordinator — see the module docs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FetchCoordinator {
     machine: TransferMachine,
     config: FetchConfig,
     /// Live reader subscriptions, keyed by the transfer serving them.
-    readers: HashMap<TransferId, Vec<Reader>>,
-    next_reader: u64,
+    ///
+    /// The registry is shared by cloned drivers so an async host may run a
+    /// claimed source attempt without preventing another request from
+    /// registering or closing a coalesced reader. The lock is held only for
+    /// synchronous reader bookkeeping and delivery, never across a source
+    /// await.
+    readers: Arc<Mutex<ReaderRegistry>>,
 }
 
 impl FetchCoordinator {
@@ -331,8 +358,7 @@ impl FetchCoordinator {
         Self {
             machine,
             config,
-            readers: HashMap::new(),
-            next_reader: 0,
+            readers: Arc::new(Mutex::new(ReaderRegistry::default())),
         }
     }
 
@@ -358,7 +384,7 @@ impl FetchCoordinator {
     /// ([`EngineError::NotHydratable`],
     /// [`EngineError::RangeBeyondExtent`]).
     pub fn open(
-        &mut self,
+        &self,
         store: &mut StateStore,
         item: &ItemId,
         wanted: ByteRange,
@@ -385,17 +411,22 @@ impl FetchCoordinator {
                 .ok_or(gramdrive_state::StateError::RowNotFound { entity: "transfer" })?
                 .content_version
         };
-        let reader = ReaderId(self.next_reader);
-        self.next_reader = self.next_reader.wrapping_add(1);
-        self.readers.entry(transfer).or_default().push(Reader {
-            id: reader,
-            item: item.clone(),
-            wanted,
-            pinned,
-            delivered: 0,
-            priority,
-            sink,
-        });
+        let mut registry = lock(&self.readers);
+        let reader = ReaderId(registry.next_reader);
+        registry.next_reader = registry.next_reader.wrapping_add(1);
+        registry
+            .by_transfer
+            .entry(transfer)
+            .or_default()
+            .push(Reader {
+                id: reader,
+                item: item.clone(),
+                wanted,
+                pinned,
+                delivered: 0,
+                priority,
+                sink,
+            });
         Ok(OpenOutcome {
             reader,
             transfer,
@@ -405,24 +436,100 @@ impl FetchCoordinator {
         })
     }
 
-    /// Unsubscribes a reader — the host closed its handle. The transfer
-    /// keeps running; see [`CloseOutcome::remaining_readers`] for the
-    /// cancel decision that is the host's to make.
-    pub fn close(&mut self, reader: ReaderId) -> Option<CloseOutcome> {
-        let transfer = *self
-            .readers
+    /// Unsubscribes a ranged reader or sink-less subscriber — the host closed
+    /// its handle. The transfer keeps running; see
+    /// [`CloseOutcome::remaining_readers`] for the cancel decision that is
+    /// the host's to make.
+    pub fn close(&self, reader: ReaderId) -> Option<CloseOutcome> {
+        let mut registry = lock(&self.readers);
+        let reader_transfer = registry
+            .by_transfer
             .iter()
-            .find(|(_, readers)| readers.iter().any(|r| r.id == reader))?
-            .0;
-        let readers = self.readers.get_mut(&transfer)?;
-        readers.retain(|r| r.id != reader);
-        let remaining_readers = readers.len();
-        if remaining_readers == 0 {
-            self.readers.remove(&transfer);
+            .find(|(_, readers)| readers.iter().any(|entry| entry.id == reader))
+            .map(|(transfer, _)| *transfer);
+        let subscriber_transfer = registry
+            .subscribers_by_transfer
+            .iter()
+            .find(|(_, subscribers)| subscribers.contains(&reader))
+            .map(|(transfer, _)| *transfer);
+        let transfer = reader_transfer.or(subscriber_transfer)?;
+
+        if let Some(readers) = registry.by_transfer.get_mut(&transfer) {
+            readers.retain(|entry| entry.id != reader);
+            if readers.is_empty() {
+                registry.by_transfer.remove(&transfer);
+            }
         }
+        if let Some(subscribers) = registry.subscribers_by_transfer.get_mut(&transfer) {
+            subscribers.retain(|entry| *entry != reader);
+            if subscribers.is_empty() {
+                registry.subscribers_by_transfer.remove(&transfer);
+            }
+        }
+        let remaining_readers = registry.by_transfer.get(&transfer).map_or(0, Vec::len)
+            + registry
+                .subscribers_by_transfer
+                .get(&transfer)
+                .map_or(0, Vec::len);
         Some(CloseOutcome {
             transfer,
             remaining_readers,
+        })
+    }
+
+    /// Number of live ranged readers and sink-less subscribers currently
+    /// attached to `transfer`.
+    ///
+    /// Hosts use this as an observation hook when coordinating independent
+    /// request lifetimes; cancellation authority still comes from the
+    /// atomic count returned by [`close`](Self::close).
+    pub fn reader_count(&self, transfer: TransferId) -> usize {
+        let registry = lock(&self.readers);
+        registry.by_transfer.get(&transfer).map_or(0, Vec::len)
+            + registry
+                .subscribers_by_transfer
+                .get(&transfer)
+                .map_or(0, Vec::len)
+    }
+
+    /// Registers a cancellable caller for sink-less demand.
+    ///
+    /// Unlike [`hydrate`](Self::hydrate), this gives an on-demand caller a
+    /// live handle that participates in coalesced cancellation ownership.
+    /// `requested` empty means the whole object, including a known exact
+    /// zero-byte object. No content sink is registered and no bytes are
+    /// delivered through this handle.
+    pub fn subscribe(
+        &self,
+        store: &mut StateStore,
+        item: &ItemId,
+        requested: &[ByteRange],
+        priority: Priority,
+        now_ms: i64,
+    ) -> Result<SubscribeOutcome, EngineError> {
+        let outcome = self
+            .machine
+            .request(store, item, requested, priority, now_ms)?;
+        let (transfer, coalesced, displaced) = match outcome {
+            RequestOutcome::Created {
+                transfer,
+                displaced,
+            } => (transfer, false, displaced),
+            RequestOutcome::Attached { transfer, .. } => (transfer, true, None),
+        };
+        let mut registry = lock(&self.readers);
+        let reader = ReaderId(registry.next_reader);
+        registry.next_reader = registry.next_reader.wrapping_add(1);
+        registry
+            .subscribers_by_transfer
+            .entry(transfer)
+            .or_default()
+            .push(reader);
+        Ok(SubscribeOutcome {
+            reader,
+            transfer,
+            coalesced,
+            displaced,
         })
     }
 
@@ -474,9 +581,9 @@ impl FetchCoordinator {
     /// with it, durable state stays resumable, and startup reconciliation
     /// returns the interrupted row to the queue.
     pub async fn run_next(
-        &mut self,
+        &self,
         store: &mut StateStore,
-        source: &dyn DriveSource,
+        source: &dyn ContentSource,
         staging_host: &mut dyn StagingHost,
         clock: &dyn Clock,
     ) -> Result<RunOutcome, EngineError> {
@@ -511,9 +618,9 @@ impl FetchCoordinator {
     /// One attempt of one claimed transfer, from resume plan to a durable
     /// resolution.
     async fn run_claim(
-        &mut self,
+        &self,
         store: &mut StateStore,
-        source: &dyn DriveSource,
+        source: &dyn ContentSource,
         staging_host: &mut dyn StagingHost,
         clock: &dyn Clock,
         mut claim: ClaimedTransfer,
@@ -586,8 +693,8 @@ impl FetchCoordinator {
         let mut staged = staged0;
         let shared = Arc::new(Mutex::new(SharedDelivery::default()));
         let mut handle = claim.staging().map(str::to_owned);
-        let has_readers = self
-            .readers
+        let has_readers = lock(&self.readers)
+            .by_transfer
             .get(&transfer)
             .is_some_and(|readers| !readers.is_empty());
         if !chunk_plan.is_empty() || (has_readers && !staged.is_empty()) {
@@ -736,6 +843,7 @@ impl FetchCoordinator {
         match self.machine.complete(store, &claim, clock.now_ms())? {
             CompleteOutcome::Promoted { staging } => {
                 let (reports, disposals) = self.reattach(store, transfer, clock.now_ms())?;
+                self.end_subscribers(transfer);
                 resolved.extend(reports);
                 Ok(RunOutcome::Ran(RunReport {
                     transfer,
@@ -815,14 +923,15 @@ impl FetchCoordinator {
     /// Streams newly covered bytes to every reader of `transfer`,
     /// resolving the ones that finish or stop.
     fn deliver(
-        &mut self,
+        &self,
         transfer: TransferId,
         staged: &[ByteRange],
         shared: &Arc<Mutex<SharedDelivery>>,
         resolved: &mut Vec<ReaderReport>,
     ) -> Result<(), TransferFault> {
         let read_cap = self.config.chunk_bytes.get();
-        let Some(readers) = self.readers.get_mut(&transfer) else {
+        let mut registry = lock(&self.readers);
+        let Some(readers) = registry.by_transfer.get_mut(&transfer) else {
             return Ok(());
         };
         let mut index = 0;
@@ -839,16 +948,19 @@ impl FetchCoordinator {
             }
         }
         if readers.is_empty() {
-            self.readers.remove(&transfer);
+            registry.by_transfer.remove(&transfer);
         }
         Ok(())
     }
 
     /// Fails every reader of `transfer` with `end`, in subscription order.
-    fn end_readers(&mut self, transfer: TransferId, end: &ReaderEnd) -> Vec<ReaderReport> {
-        self.readers
-            .remove(&transfer)
-            .unwrap_or_default()
+    fn end_readers(&self, transfer: TransferId, end: &ReaderEnd) -> Vec<ReaderReport> {
+        let readers = {
+            let mut registry = lock(&self.readers);
+            registry.subscribers_by_transfer.remove(&transfer);
+            registry.by_transfer.remove(&transfer).unwrap_or_default()
+        };
+        readers
             .into_iter()
             .map(|reader| ReaderReport {
                 reader: reader.id,
@@ -857,16 +969,27 @@ impl FetchCoordinator {
             .collect()
     }
 
+    /// Resolves sink-less request ownership for a terminal transfer.
+    fn end_subscribers(&self, transfer: TransferId) {
+        lock(&self.readers)
+            .subscribers_by_transfer
+            .remove(&transfer)
+            .unwrap_or_default();
+    }
+
     /// Moves the finished transfer's unsatisfied readers onto fresh demand
     /// — the machine's contract: "the fetch coordinator re-requests the
     /// remainder once the live transfer finishes" (SYNC-046).
     fn reattach(
-        &mut self,
+        &self,
         store: &mut StateStore,
         transfer: TransferId,
         now_ms: i64,
     ) -> Result<(Vec<ReaderReport>, Vec<StagingDisposal>), EngineError> {
-        let leftovers = self.readers.remove(&transfer).unwrap_or_default();
+        let leftovers = lock(&self.readers)
+            .by_transfer
+            .remove(&transfer)
+            .unwrap_or_default();
         let mut reports = Vec::new();
         let mut disposals = Vec::new();
         for reader in leftovers {
@@ -912,7 +1035,11 @@ impl FetchCoordinator {
                 reader: reader.id,
                 end: ReaderEnd::Reattached { transfer: next },
             });
-            self.readers.entry(next).or_default().push(reader);
+            lock(&self.readers)
+                .by_transfer
+                .entry(next)
+                .or_default()
+                .push(reader);
         }
         Ok((reports, disposals))
     }
@@ -920,7 +1047,7 @@ impl FetchCoordinator {
     /// Folds a [`FailOutcome`] into the run report, resolving readers for
     /// terminal outcomes and keeping them subscribed for recoverable ones.
     fn fail_report(
-        &mut self,
+        &self,
         transfer: TransferId,
         outcome: FailOutcome,
         mut resolved: Vec<ReaderReport>,
@@ -1004,7 +1131,7 @@ type SubFetchFuture<'a> =
 /// self-contained and droppable — dropping it is the prompt per-chunk
 /// cancel (SYNC-005).
 fn spawn_sub_fetch<'a>(
-    source: &'a dyn DriveSource,
+    source: &'a dyn ContentSource,
     item: ItemId,
     version: ContentVersion,
     chunk: ByteRange,

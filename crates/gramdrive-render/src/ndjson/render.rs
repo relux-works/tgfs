@@ -21,7 +21,7 @@ use crate::ndjson::{
 };
 use crate::record::{
     Attachment, Entity, EntityKind, MediaKind, MessageHistory, Reaction, ReactionKey,
-    RetentionMode, Sender, ServiceAction,
+    RetentionMode, Sender, ServiceAction, TelegramRepresentation,
 };
 
 /// The disposition of a rendered message record.
@@ -85,10 +85,17 @@ pub(super) fn header_line(buf: &mut String, input: &MessagesInput<'_>) {
         ("chat_id", Json::I64(input.chat.chat_id.0)),
         ("partition", partition_json(input.partition)),
         ("retention_mode", Json::str(input.retention_mode.tag())),
+        ("display_timezone", Json::str(input.display_timezone)),
         ("input_watermark_seq", Json::I64(input.input_watermark_seq)),
+        ("render_generation", Json::I64(input.render_generation)),
         (
             "content_version",
-            Json::owned(content_version_token(input.input_watermark_seq)),
+            Json::owned(content_version_token(
+                input.input_watermark_seq,
+                input.render_generation,
+                input.retention_mode,
+                input.display_timezone,
+            )),
         ),
     ]);
     header.write(buf);
@@ -139,6 +146,24 @@ where
     if count == 0 {
         return Ok(());
     }
+    let Some(&last) = order.last() else {
+        return Ok(());
+    };
+    if message.revisions[last].body.protected {
+        if matches!(mode, RetentionMode::Mirror) && message.deletion.is_some() {
+            return Ok(());
+        }
+        let disposition = message
+            .deletion
+            .map_or(RecordDisposition::Present, |deletion| {
+                RecordDisposition::Deleted {
+                    observed_at_ms: deletion.observed_at_ms,
+                }
+            });
+        build_message(buf, chat, message, 0, last, disposition);
+        emit(buf.as_str())?;
+        return Ok(());
+    }
 
     match mode {
         RetentionMode::Mirror => {
@@ -146,9 +171,6 @@ where
                 // Deleted: content and rendered view purged (POL-3).
                 return Ok(());
             }
-            let Some(&last) = order.last() else {
-                return Ok(());
-            };
             build_message(
                 buf,
                 chat,
@@ -188,6 +210,32 @@ fn build_message(
     buf.clear();
     let revision = &message.revisions[revision_index];
     let body = &revision.body;
+    let (text, entities, reply_to, thread_top, topic_id, album_id, reactions, attachments, service) =
+        if body.protected {
+            (
+                Json::Null,
+                Json::Array(Vec::new()),
+                Json::Null,
+                Json::Null,
+                Json::Null,
+                Json::Null,
+                Json::Array(Vec::new()),
+                Json::Array(Vec::new()),
+                Json::Null,
+            )
+        } else {
+            (
+                opt_str(body.text.as_deref()),
+                entities_json(&body.entities),
+                opt_message_id(body.reply_to),
+                opt_message_id(body.thread_top),
+                opt_i64(body.topic_id),
+                opt_i64(body.album_id),
+                reactions_json(&body.reactions),
+                attachments_json(chat, message.message_id, &body.attachments),
+                service_json(body.service.as_ref()),
+            )
+        };
     let record = Json::Object(vec![
         ("type", Json::str("message")),
         ("message_id", Json::I64(message.message_id.0)),
@@ -197,18 +245,15 @@ fn build_message(
         ("date_ms", Json::I64(message.sent_at_ms)),
         ("edited_ms", opt_i64(revision.edited_at_ms)),
         ("observed_ms", Json::I64(revision.observed_at_ms)),
-        ("text", opt_str(body.text.as_deref())),
-        ("entities", entities_json(&body.entities)),
-        ("reply_to_message_id", opt_message_id(body.reply_to)),
-        ("thread_top_message_id", opt_message_id(body.thread_top)),
-        ("topic_id", opt_i64(body.topic_id)),
-        ("album_id", opt_i64(body.album_id)),
-        ("reactions", reactions_json(&body.reactions)),
-        (
-            "attachments",
-            attachments_json(chat, message.message_id, &body.attachments),
-        ),
-        ("service", service_json(body.service.as_ref())),
+        ("text", text),
+        ("entities", entities),
+        ("reply_to_message_id", reply_to),
+        ("thread_top_message_id", thread_top),
+        ("topic_id", topic_id),
+        ("album_id", album_id),
+        ("reactions", reactions),
+        ("attachments", attachments),
+        ("service", service),
         ("protected", Json::Bool(body.protected)),
         ("deleted_ms", opt_i64(disposition.deleted_ms())),
         (
@@ -326,13 +371,21 @@ fn attachment_json<'a>(
         ("index", Json::U64(u64::from(attachment.index.0))),
         ("item_id", Json::owned(item_id)),
         ("media_kind", Json::str(attachment.media_kind.tag())),
+        (
+            "telegram_representation",
+            Json::str(attachment.telegram_representation.tag()),
+        ),
+        ("fidelity", Json::str(attachment.fidelity.tag())),
     ];
     if let MediaKind::Other { kind } = &attachment.media_kind {
         fields.push(("media_kind_raw", Json::str(kind)));
     }
-    fields.push(("name", opt_str(attachment.name.as_deref())));
+    if let TelegramRepresentation::Other { representation } = &attachment.telegram_representation {
+        fields.push(("telegram_representation_raw", Json::str(representation)));
+    }
+    fields.push(("source_name", opt_str(attachment.source_name.as_deref())));
     fields.push(("mime_type", opt_str(attachment.mime_type.as_deref())));
-    fields.push(("size", opt_u64(attachment.size)));
+    fields.push(("exact_size", opt_u64(attachment.exact_size)));
     fields.push(("availability", Json::str(attachment.availability.tag())));
     fields.push(("content", content_json(attachment.content_hash.as_ref())));
     Json::Object(fields)

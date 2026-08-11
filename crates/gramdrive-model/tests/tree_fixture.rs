@@ -12,11 +12,11 @@ use std::num::NonZeroUsize;
 use gramdrive_model::identity::{
     AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, CanonicalKey, ChatId,
     ChatKey, ChatListKind, ContentHash, FolderId, ItemId, ItemKey, MessageId, NamespaceVersion,
-    SchemaFamily,
+    SchemaFamily, StoryAppearanceLocation, StoryId,
 };
 use gramdrive_model::tree::{
     AccountRecord, AttachmentRecord, ChatRecord, ChildrenError, DocSchemas, FolderRecord,
-    MonthStamp, NodeKind, TreeInputError, TreeProjection,
+    MonthStamp, NodeKind, StoryRecord, TreeInputError, TreeProjection,
 };
 
 const JULY: MonthStamp = MonthStamp {
@@ -70,6 +70,7 @@ fn spec_chat() -> ChatRecord {
         memberships: vec![ChatListKind::Main],
         message_months: vec![JULY],
         attachments: vec![photo(500)],
+        stories: Vec::new(),
     }
 }
 
@@ -128,18 +129,19 @@ fn fixture_tree_matches_spec_layout() {
     let tree = build(Vec::new(), vec![spec_chat()]).unwrap();
     let expected = [
         "Account/",
-        "  Main/",
+        "  Chats/",
         "    order.json",
         "    Chat/",
-        "      chat.json",
-        "      messages.ndjson",
-        "      2026/",
-        "        07.md",
-        "        media/",
-        "          photo.jpg",
+        "      .chat.json",
+        "      2026-07/",
+        "        Messages.md",
+        "        Messages.ndjson",
+        "        photo.jpg",
         "  Archive/",
         "    order.json",
-        "  Telegram Folders/",
+        "  Stories/",
+        "    order.json",
+        "  Folders/",
     ];
     assert_eq!(walk_lines(&tree, page(64)).unwrap(), expected);
 }
@@ -154,17 +156,19 @@ fn page_size_one_yields_the_same_tree() {
     );
 }
 
-/// An account with no chats still exposes the three fixed roots.
+/// An account with no chats still exposes the four fixed roots.
 #[test]
 fn empty_account_has_fixed_roots() {
     let tree = build(Vec::new(), Vec::new()).unwrap();
     let expected = [
         "Account/",
-        "  Main/",
+        "  Chats/",
         "    order.json",
         "  Archive/",
         "    order.json",
-        "  Telegram Folders/",
+        "  Stories/",
+        "    order.json",
+        "  Folders/",
     ];
     assert_eq!(walk_lines(&tree, page(64)).unwrap(), expected);
 }
@@ -191,10 +195,9 @@ fn chat_with_username_uses_pol1_name() {
     );
 }
 
-/// A year that only has media (no message months) still gets its directory,
-/// and a month without attachments gets no media directory.
+/// Message and attachment months are merged into direct date-first folders.
 #[test]
-fn media_and_month_partitions_are_independent() {
+fn message_and_attachment_months_form_direct_partitions() {
     let mut chat = spec_chat();
     chat.message_months = vec![MonthStamp {
         year: 2025,
@@ -203,21 +206,108 @@ fn media_and_month_partitions_are_independent() {
     let tree = build(Vec::new(), vec![chat]).unwrap();
     let expected = [
         "Account/",
-        "  Main/",
+        "  Chats/",
         "    order.json",
         "    Chat/",
-        "      chat.json",
-        "      messages.ndjson",
-        "      2025/",
-        "        03.md",
-        "      2026/",
-        "        media/",
-        "          photo.jpg",
+        "      .chat.json",
+        "      2025-03/",
+        "        Messages.md",
+        "        Messages.ndjson",
+        "      2026-07/",
+        "        Messages.md",
+        "        Messages.ndjson",
+        "        photo.jpg",
         "  Archive/",
         "    order.json",
-        "  Telegram Folders/",
+        "  Stories/",
+        "    order.json",
+        "  Folders/",
     ];
     assert_eq!(walk_lines(&tree, page(64)).unwrap(), expected);
+}
+
+/// Active and persistent appearances share one canonical story and bytes.
+#[test]
+fn story_appearances_use_active_or_month_locations_without_copying_bytes() {
+    let mut chat = spec_chat();
+    chat.stories = vec![
+        StoryRecord {
+            story_id: StoryId(71),
+            location: StoryAppearanceLocation::Active,
+            display_name: "Story 71.mp4".to_string(),
+            size: Some(99),
+            content: Some(ContentHash::Sha256([0xbb; 32])),
+        },
+        StoryRecord {
+            story_id: StoryId(72),
+            location: StoryAppearanceLocation::Month {
+                year: 2026,
+                month: 7,
+            },
+            display_name: "2026-07-02 11-30-00 Story 72.mp4".to_string(),
+            size: Some(101),
+            content: Some(ContentHash::Sha256([0xcc; 32])),
+        },
+    ];
+    let tree = build(Vec::new(), vec![chat]).unwrap();
+    let lines = walk_lines(&tree, page(64)).unwrap();
+    assert!(lines.contains(&"      Active Stories/".to_string()));
+    assert!(lines.contains(&"        Story 71.mp4".to_string()));
+    assert!(lines.contains(&"        2026-07-02 11-30-00 Story 72.mp4".to_string()));
+
+    let story_nodes: Vec<_> = all_nodes(&tree)
+        .into_iter()
+        .filter(|node| node.kind == NodeKind::StoryAppearance)
+        .collect();
+    assert_eq!(story_nodes.len(), 2);
+    for node in story_nodes {
+        assert!(matches!(node.canonical, CanonicalKey::Story(_)));
+        assert_ne!(node.id, ItemKey::Canonical(node.canonical).id());
+        assert!(node.content.is_some());
+    }
+}
+
+/// The ephemeral container is truthful: it exists exactly when it has an
+/// active child. Persistent profile stories remain visible in their month
+/// without leaving an empty `Active Stories` sibling at chat root.
+#[test]
+fn active_stories_container_is_omitted_for_zero_or_persistent_only_stories() {
+    let mut persistent = spec_chat();
+    persistent.stories = vec![StoryRecord {
+        story_id: StoryId(72),
+        location: StoryAppearanceLocation::Month {
+            year: 2026,
+            month: 7,
+        },
+        display_name: "2026-07-02 11-30-00 Story 72.mp4".to_string(),
+        size: Some(101),
+        content: Some(ContentHash::Sha256([0xcc; 32])),
+    }];
+
+    for chat in [spec_chat(), persistent] {
+        let tree = build(Vec::new(), vec![chat]).unwrap();
+        let lines = walk_lines(&tree, page(64)).unwrap();
+        assert!(
+            !lines.contains(&"      Active Stories/".to_string()),
+            "{lines:?}"
+        );
+    }
+}
+
+fn all_nodes(tree: &TreeProjection) -> Vec<gramdrive_model::tree::TreeNode> {
+    let mut nodes = Vec::new();
+    let mut queue = vec![tree.root_id()];
+    while let Some(id) = queue.pop() {
+        if let Ok(page) = tree.children(&id, None, page(64)) {
+            for node in page.nodes {
+                if node.kind.is_directory() {
+                    queue.push(node.id.clone());
+                }
+                nodes.push(node);
+            }
+        }
+    }
+    nodes
 }
 
 /// PRD-013/SYNC-010: one canonical chat in two views is two appearance
@@ -276,6 +366,59 @@ fn multiple_appearances_share_canonical_records_and_blobs() {
     let blob_folder = subtree_blobs(&tree, &in_folder.id);
     assert_eq!(blob_main.len(), 1);
     assert_eq!(blob_main, blob_folder);
+}
+
+#[test]
+fn stories_is_a_distinct_top_level_view_without_main_membership() {
+    let mut chat = spec_chat();
+    chat.memberships = vec![ChatListKind::Stories];
+    chat.stories = vec![StoryRecord {
+        story_id: StoryId(42),
+        location: StoryAppearanceLocation::Active,
+        display_name: "Story 42.jpg".to_owned(),
+        size: Some(12),
+        content: Some(ContentHash::Sha256([42; 32])),
+    }];
+    let tree = build(Vec::new(), vec![chat]).expect("stories tree");
+    let stories = ItemKey::Canonical(CanonicalKey::ChatList(
+        gramdrive_model::identity::ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Stories,
+        },
+    ))
+    .id();
+    let story_chat = ItemKey::Appearance(AppearanceKey {
+        view: ChatListKind::Stories,
+        item: CanonicalKey::Chat(ChatKey {
+            scope: scope(),
+            chat_id: ChatId(100),
+        }),
+    })
+    .id();
+    let main_chat = ItemKey::Appearance(AppearanceKey {
+        view: ChatListKind::Main,
+        item: CanonicalKey::Chat(ChatKey {
+            scope: scope(),
+            chat_id: ChatId(100),
+        }),
+    })
+    .id();
+
+    assert_eq!(
+        tree.node(&stories).expect("Stories root").display_name,
+        "Stories"
+    );
+    assert!(
+        tree.children(&stories, None, page(8))
+            .expect("Stories children")
+            .nodes
+            .iter()
+            .any(|node| node.id == story_chat)
+    );
+    assert!(
+        tree.node(&main_chat).is_none(),
+        "Stories must not fabricate Main membership"
+    );
 }
 
 fn subtree_canonicals(tree: &TreeProjection, parent: &ItemId) -> Vec<CanonicalKey> {
@@ -454,6 +597,7 @@ fn page_boundaries_chain_without_gaps_or_repeats() {
             memberships: vec![ChatListKind::Main],
             message_months: Vec::new(),
             attachments: Vec::new(),
+            stories: Vec::new(),
         })
         .collect();
     let tree = build(Vec::new(), chats).unwrap();
@@ -518,7 +662,7 @@ fn children_errors_are_typed() {
         .unwrap()
         .nodes
         .remove(0);
-    assert_eq!(chat_json.display_name, "chat.json");
+    assert_eq!(chat_json.display_name, ".chat.json");
     assert_eq!(
         tree.children(&chat_json.id, None, page(1)),
         Err(ChildrenError::NotADirectory)
@@ -636,6 +780,7 @@ fn every_list_root_publishes_an_order_document() {
     for kind in [
         ChatListKind::Main,
         ChatListKind::Archive,
+        ChatListKind::Stories,
         ChatListKind::Folder(FolderId(7)),
     ] {
         let list = ItemKey::Canonical(CanonicalKey::ChatList(

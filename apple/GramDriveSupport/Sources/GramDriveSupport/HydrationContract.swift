@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// The wire contract of the agent's hydration endpoint — the second, and
@@ -28,7 +29,7 @@ public enum HydrationContract {
     /// Version of this wire contract. The request carries it; a server
     /// refuses a request from a different major (`internal` failure), which
     /// can only happen across a mismatched install.
-    public static let protocolVersion = 1
+    public static let protocolVersion = 2
 
     /// Size cap on the single request line. A request is an identifier and
     /// a version token; kilobytes mean a bug.
@@ -48,6 +49,14 @@ public enum HydrationContract {
     }
 }
 
+/// Which bounded operation the agent performs on the named item.
+public enum HydrationPurpose: String, Codable, Equatable, Sendable {
+    /// Materialize the complete provider-visible representation.
+    case content
+    /// Fetch only a dedicated source thumbnail; never the full media file.
+    case thumbnail
+}
+
 /// One hydration request: make this item's bytes materialized in the shared
 /// container, pinned to the content version the requester observed.
 public struct HydrationRequest: Codable, Equatable, Sendable {
@@ -61,17 +70,28 @@ public struct HydrationRequest: Codable, Equatable, Sendable {
     /// `nil` when the metadata carries no token yet; the engine then
     /// resolves the current version and reports it in `done`.
     public var contentVersion: String?
+    /// Full content or the separately bounded preview path.
+    public var purpose: HydrationPurpose
+    /// Thumbnail bounding box. Present only when ``purpose`` is `thumbnail`.
+    public var maxWidthPx: UInt32?
+    public var maxHeightPx: UInt32?
 
     public init(
         protocolVersion: Int = HydrationContract.protocolVersion,
         accountId: Int64,
         itemId: String,
-        contentVersion: String?
+        contentVersion: String?,
+        purpose: HydrationPurpose = .content,
+        maxWidthPx: UInt32? = nil,
+        maxHeightPx: UInt32? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.accountId = accountId
         self.itemId = itemId
         self.contentVersion = contentVersion
+        self.purpose = purpose
+        self.maxWidthPx = maxWidthPx
+        self.maxHeightPx = maxHeightPx
     }
 }
 
@@ -95,10 +115,14 @@ public struct HydrationProgress: Codable, Equatable, Sendable {
 /// shared container.
 ///
 /// The staged file is engine-owned cache content (SYNC-042: promoted
-/// atomically, only after version and integrity checks). The server keeps
-/// it valid at least until the connection closes; the client must copy or
-/// clone it out before disconnecting and must never move, modify, or delete
-/// it.
+/// atomically, only after version and integrity checks). For generated
+/// documents, the server retains the pathname lease until normal peer close
+/// and transfers an already-open descriptor to the File Provider process with
+/// the terminal event. That descriptor is not serialized on the wire: it is
+/// attached by the local transport after decode. It keeps the immutable inode
+/// alive if the agent crashes, restarts, or force-closes a wedged connection.
+/// Callers must materialize from ``materializationSourceURL`` and must never
+/// move, modify, or delete the source.
 public struct HydratedContent: Codable, Equatable, Sendable {
     /// Absolute path of the staged, fully verified file inside the shared
     /// container.
@@ -109,11 +133,78 @@ public struct HydratedContent: Codable, Equatable, Sendable {
     /// Exact byte count of the staged file; the client verifies its copy
     /// against it (never publish partial content — PRD-043).
     public var byteCount: UInt64
+    /// Encoded image type for thumbnail responses; absent for full content.
+    public var mimeType: String?
+    /// False only for a successful thumbnail request with no available preview.
+    public var isAvailable: Bool
+    /// Opaque marker for a generated-document descriptor hand-off. The File
+    /// Provider must not use this as an ownership token; it selects the
+    /// transferred descriptor materialization path instead.
+    public var leaseID: String?
+    /// An open descriptor received with the terminal event for a generated
+    /// document. It is transport-local, deliberately excluded from Codable,
+    /// and owned by the hydration client for the duration of its synchronous
+    /// materialization callback.
+    public var transferredFileDescriptor: Int32? = nil
 
-    public init(stagedPath: String, contentVersion: String?, byteCount: UInt64) {
+    public init(
+        stagedPath: String,
+        contentVersion: String?,
+        byteCount: UInt64,
+        mimeType: String? = nil,
+        isAvailable: Bool = true,
+        leaseID: String? = nil,
+        transferredFileDescriptor: Int32? = nil
+    ) {
         self.stagedPath = stagedPath
         self.contentVersion = contentVersion
         self.byteCount = byteCount
+        self.mimeType = mimeType
+        self.isAvailable = isAvailable
+        self.leaseID = leaseID
+        self.transferredFileDescriptor = transferredFileDescriptor
+    }
+
+    /// Source to clone during the synchronous materialization callback.
+    /// `/dev/fd` duplicates the receiver-owned descriptor, so it remains
+    /// usable after the agent releases its pathname lease or exits.
+    public var materializationSourceURL: URL {
+        if let transferredFileDescriptor {
+            return URL(fileURLWithPath: "/dev/fd/\(transferredFileDescriptor)", isDirectory: false)
+        }
+        return URL(fileURLWithPath: stagedPath, isDirectory: false)
+    }
+
+    /// Clones the transfer-owned source into `destination`. For a generated
+    /// document this uses the received descriptor directly, rather than
+    /// reopening its reclaimable pathname; `COPYFILE_CLONE` preserves the
+    /// normal APFS-clone materialization contract.
+    public func cloneMaterializationSource(to destination: URL) throws {
+        guard let transferredFileDescriptor else {
+            try FileManager.default.copyItem(at: materializationSourceURL, to: destination)
+            return
+        }
+        let destinationDescriptor = open(
+            destination.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+            S_IRUSR | S_IWUSR)
+        guard destinationDescriptor >= 0 else {
+            throw UnixSocketError.failed(operation: "open", code: errno)
+        }
+        defer { close(destinationDescriptor) }
+        let flags = copyfile_flags_t(COPYFILE_DATA | COPYFILE_CLONE)
+        guard fcopyfile(transferredFileDescriptor, destinationDescriptor, nil, flags) == 0 else {
+            throw UnixSocketError.failed(operation: "fcopyfile", code: errno)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stagedPath
+        case contentVersion
+        case byteCount
+        case mimeType
+        case isAvailable
+        case leaseID
     }
 }
 

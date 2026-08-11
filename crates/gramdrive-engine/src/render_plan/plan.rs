@@ -4,9 +4,9 @@
 //! Two halves of one protocol:
 //!
 //! - [`affected_documents`] / [`dirty_affected`] — the *marking* half. From the
-//!   send instants of the messages a change batch touched, the whole-chat
-//!   NDJSON plus the transcript of each touched calendar month are the affected
-//!   documents, and only those. [`dirty_affected`] records that on the durable
+//!   send instants of the messages a change batch touched, the Markdown/NDJSON
+//!   pair of each touched calendar month are the affected documents, and only
+//!   those. [`dirty_affected`] records that on the durable
 //!   dirty worklist in the caller's write transaction, so the worklist advances
 //!   atomically with the normalized state it reflects (SYNC-022).
 //! - [`plan_for_changes`] / [`plan_worklist`] — the *planning* half. Each
@@ -16,15 +16,12 @@
 //!   [`RenderJob`] carrying the watermark to render up to and the content
 //!   version the published bytes will bear.
 //!
-//! The planner never renders and never publishes. A job is executed by reading
-//! the partition's records up to `target_watermark_seq`, rendering, and calling
-//! `gramdrive_state`'s `publish_render`, which re-checks the watermark inside
-//! the publishing transaction: a render interrupted before it publishes leaves
-//! the previous version in place, and one that raced newer events publishes but
-//! stays dirty, so a partially regenerated document is never the visible file
-//! (SYNC-024, SYNC-033). The planner is what decides *which* documents that
-//! machinery runs for, and it converges — re-planning after a clean publish
-//! yields no job for that document.
+//! The planner never renders and never publishes. The monthly pipeline reads a
+//! pinned partition snapshot, composes both files, and calls the state layer's
+//! month-scoped publication check inside the transaction that advances both
+//! appearances. A render interrupted before publication leaves the previous
+//! pair visible, and a newer event in another month does not keep this
+//! partition dirty (SYNC-024, SYNC-033).
 
 use std::collections::BTreeSet;
 
@@ -32,9 +29,9 @@ use gramdrive_model::identity::{
     CanonicalKey, ChatKey, DocFormat, DocPartition, GeneratedDocKey, ItemId, ItemKey,
 };
 use gramdrive_model::version::ContentVersion;
-use gramdrive_render::markdown::UtcOffset;
+use gramdrive_render::markdown::DisplayTimeZone;
 use gramdrive_state::StateError;
-use gramdrive_state::repo::{ReadTxn, RenderStateRecord, WriteTxn};
+use gramdrive_state::repo::{ReadTxn, RenderCatalogEntry, RenderStateRecord, WriteTxn};
 
 use crate::render_plan::RenderPlanError;
 use crate::render_plan::catalog::DocClass;
@@ -69,7 +66,8 @@ pub enum RenderReason {
 /// (SYNC-024, SYNC-033).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderJob {
-    /// The generated-document item to regenerate.
+    /// Canonical logical document identity. Provider-visible render state is
+    /// stored only on the live appearance rows in the state catalog.
     pub document: ItemId,
     /// The chat whose event log the document is rendered from.
     pub chat: ChatKey,
@@ -92,9 +90,9 @@ pub struct RenderJob {
 
 /// An ordered, de-duplicated set of render jobs.
 ///
-/// Deterministic: for a change batch the whole-chat NDJSON comes first, then one
-/// job per affected month in ascending calendar order; for the worklist, jobs
-/// follow the worklist's own item order. Equal inputs yield an equal plan.
+/// Deterministic: a change batch yields the Markdown/NDJSON pair for each month
+/// in ascending calendar order; for the worklist, jobs follow the worklist's
+/// own item order. Equal inputs yield an equal plan.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RenderPlan {
     /// The jobs to run, in execution order.
@@ -119,37 +117,36 @@ impl RenderPlan {
 ///
 /// `touched` is the send instant (ms since the Unix epoch) of every message the
 /// batch observed, edited, or deleted — the values the change applier already
-/// holds. The whole-chat NDJSON is affected by any change; a monthly transcript
-/// is affected only for the civil month of each touched message, computed with
-/// the renderer's own calendar (`gramdrive_render::civil`), so the planner never
-/// files a message in a month the renderer would not group it under (SYNC-024,
-/// SYNC-031).
+/// holds. Both bounded monthly files are affected only for the civil month of
+/// each touched message, computed with the renderer's own IANA timezone rules
+/// (`gramdrive_render::civil`), so the planner never files a message in a month
+/// the renderer would not group it under (SYNC-024, SYNC-031).
 ///
-/// The result is de-duplicated and deterministically ordered — NDJSON first,
-/// then months ascending — so equal inputs yield an equal worklist. An empty
-/// `touched` yields no documents: a batch that changed nothing regenerates
-/// nothing.
+/// The result is de-duplicated and deterministically ordered — month ascending,
+/// then Markdown before NDJSON — so equal inputs yield an equal worklist. An
+/// empty `touched` yields no documents: a batch that changed nothing
+/// regenerates nothing.
 pub fn affected_documents(
     chat: ChatKey,
     touched: &[i64],
-    timezone: UtcOffset,
+    timezone: &DisplayTimeZone,
 ) -> Vec<GeneratedDocKey> {
     if touched.is_empty() {
         return Vec::new();
     }
     let mut months: BTreeSet<(i64, u32)> = BTreeSet::new();
     for &instant in touched {
-        months.insert(gramdrive_render::civil::year_month(
+        months.insert(gramdrive_render::civil::year_month_in_timezone(
             instant,
-            timezone.seconds(),
+            timezone.timezone(),
         ));
     }
-    let mut docs = Vec::with_capacity(months.len() + 1);
-    // Whole-chat NDJSON: any change regenerates the single lossless file.
-    docs.push(DocClass::Ndjson.document_key(chat, DocPartition::Chat));
-    // Only the transcript of each touched month, in ascending order.
+    let mut docs = Vec::with_capacity(months.len() * 2);
+    // Both files of each touched month, in stable Markdown/NDJSON order.
     for (year, month) in months {
-        docs.push(DocClass::MarkdownMonth.document_key(chat, month_partition(year, month)));
+        let partition = month_partition(year, month);
+        docs.push(DocClass::MarkdownMonth.document_key(chat, partition));
+        docs.push(DocClass::NdjsonMonth.document_key(chat, partition));
     }
     docs
 }
@@ -161,28 +158,33 @@ pub fn affected_documents(
 /// Call it in the same [`WriteTxn`] as the `apply_message_changes` and
 /// `put_cursor` that produced the batch: the worklist then advances atomically
 /// with the normalized state and cursor it reflects (SYNC-022, SYNC-024). The
-/// affected documents' item rows must already be projected into the tree; a
-/// document with no item row fails loudly on its foreign key rather than
-/// marking phantom work. Returns the marked document ids, in the deterministic
-/// order of [`affected_documents`].
+/// affected documents' appearance rows must already be projected into every
+/// live chat-list view. Returns every marked appearance id, grouped in the
+/// deterministic logical order of [`affected_documents`].
 pub fn dirty_affected(
     write: &WriteTxn<'_>,
     chat: ChatKey,
     touched: &[i64],
-    timezone: UtcOffset,
+    timezone: &DisplayTimeZone,
 ) -> Result<Vec<ItemId>, StateError> {
     let mut marked = Vec::new();
     for key in affected_documents(chat, touched, timezone) {
         let Some(class) = DocClass::for_key(&key) else {
             continue;
         };
-        let document = document_id(key);
-        // ensure_render_state creates the row (dirty by default) or bumps it on
-        // a version change; mark_render_dirty then forces the dirty bit for the
-        // common same-version case where only the content moved.
-        write.ensure_render_state(&document, class.renderer_version(), class.schema_version())?;
-        write.mark_render_dirty(&document)?;
-        marked.push(document);
+        let catalog = catalog_for_key(write.read(), key)?;
+        for entry in catalog {
+            // ensure_render_state creates the row (dirty by default) or bumps
+            // it on a version change; mark_render_dirty then forces the dirty
+            // bit for the common same-version case where only content moved.
+            write.ensure_render_state(
+                &entry.item,
+                class.renderer_version(),
+                class.schema_version(),
+            )?;
+            write.mark_render_dirty(&entry.item)?;
+            marked.push(entry.item);
+        }
     }
     Ok(marked)
 }
@@ -199,7 +201,7 @@ pub fn plan_for_changes(
     read: &ReadTxn<'_>,
     chat: ChatKey,
     touched: &[i64],
-    timezone: UtcOffset,
+    timezone: &DisplayTimeZone,
 ) -> Result<RenderPlan, RenderPlanError> {
     let mut jobs = Vec::new();
     for key in affected_documents(chat, touched, timezone) {
@@ -216,16 +218,24 @@ pub fn plan_for_changes(
 /// The dirty bit is the crash-durable record of outstanding render work: at
 /// startup or on a periodic sweep, this turns each dirty generated document into
 /// a job against its chat's current watermark. Documents whose format this
-/// planner does not render (a future `chat.json`) are left for their own
+/// planner does not render (`.chat.json`) are left for their own
 /// planner. Reads only.
 pub fn plan_worklist(read: &ReadTxn<'_>, limit: u32) -> Result<RenderPlan, RenderPlanError> {
     let mut jobs = Vec::new();
+    let mut seen = BTreeSet::new();
     for item in read.dirty_render_items(limit)? {
-        let ItemKey::Canonical(CanonicalKey::GeneratedDoc(key)) = item.key() else {
+        let ItemKey::Appearance(appearance) = item.key() else {
             // render_state should only key generated docs; anything else is not
             // this planner's to render.
             continue;
         };
+        let CanonicalKey::GeneratedDoc(key) = appearance.item else {
+            continue;
+        };
+        let logical_id = document_id(key);
+        if !seen.insert(logical_id.as_bytes().to_vec()) {
+            continue;
+        }
         if let Some(job) = evaluate(read, key)? {
             jobs.push(job);
         }
@@ -246,13 +256,45 @@ fn evaluate(
     let chat = key.chat;
     let partition = key.partition;
     let document = document_id(key);
-    let target = read.latest_event_seq(&chat)?;
-    let state = read.render_state(&document)?;
-    let Some(reason) = staleness(class, target, state.as_ref()) else {
+    let target = if class == DocClass::ChatJson {
+        0
+    } else {
+        read.latest_event_seq(&chat)?
+    };
+    let catalog = catalog_for_key(read, key)?;
+    let mut reason = None;
+    for entry in &catalog {
+        let state = read.render_state(&entry.item)?;
+        if let Some(candidate) = staleness(class, target, state.as_ref()) {
+            reason = strongest_reason(reason, candidate);
+        }
+    }
+    let Some(reason) = reason else {
         return Ok(None);
     };
-    let content_version = ContentVersion::new(class.content_version_token(target))
-        .map_err(RenderPlanError::Version)?;
+    let account = read
+        .account(chat.scope.account)?
+        .ok_or(StateError::RowNotFound { entity: "account" })?;
+    let chat_record = read
+        .chat(&chat)?
+        .ok_or(StateError::RowNotFound { entity: "chat" })?;
+    let render_generation = read
+        .render_generation(chat.scope.account)?
+        .ok_or(StateError::RowNotFound { entity: "account" })?;
+    let content_version = ContentVersion::new(
+        class
+            .content_version_token(
+                target,
+                render_generation,
+                account.retention_mode,
+                &account.display_timezone,
+                Some(&chat_record),
+            )
+            .ok_or(StateError::InvalidArgument {
+                what: "render class has no content-version scheme",
+            })?,
+    )
+    .map_err(RenderPlanError::Version)?;
     Ok(Some(RenderJob {
         document,
         chat,
@@ -263,6 +305,40 @@ fn evaluate(
         content_version,
         reason,
     }))
+}
+
+fn catalog_for_key(
+    read: &ReadTxn<'_>,
+    key: GeneratedDocKey,
+) -> Result<Vec<RenderCatalogEntry>, StateError> {
+    let catalog = match key.partition {
+        DocPartition::Chat => read.chat_render_catalog(key.chat)?,
+        DocPartition::Month { year, month } => read.month_render_catalog(key.chat, year, month)?,
+        DocPartition::Year { .. } => Vec::new(),
+    };
+    Ok(catalog
+        .into_iter()
+        .filter(|entry| entry.format == key.format && entry.schema_family == key.schema_family)
+        .collect())
+}
+
+fn strongest_reason(
+    current: Option<RenderReason>,
+    candidate: RenderReason,
+) -> Option<RenderReason> {
+    fn rank(reason: RenderReason) -> u8 {
+        match reason {
+            RenderReason::New => 0,
+            RenderReason::RendererUpgrade => 1,
+            RenderReason::SchemaUpgrade => 2,
+            RenderReason::Dirty => 3,
+            RenderReason::WatermarkBehind => 4,
+        }
+    }
+    Some(match current {
+        Some(current) if rank(current) <= rank(candidate) => current,
+        _ => candidate,
+    })
 }
 
 /// The staleness verdict for a document at `target` watermark, given its current
@@ -283,7 +359,7 @@ fn staleness(
         Some(RenderReason::SchemaUpgrade)
     } else if state.dirty {
         Some(RenderReason::Dirty)
-    } else if state.input_watermark_seq < target {
+    } else if class != DocClass::ChatJson && state.input_watermark_seq < target {
         Some(RenderReason::WatermarkBehind)
     } else {
         None

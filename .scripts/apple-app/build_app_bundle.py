@@ -55,6 +55,7 @@ Exit codes: 0 packaged, 1 a step failed, 2 the run could not start.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -126,6 +127,48 @@ DEFAULT_NOTARY_PROFILE = "gramdrive-notary"
 # from a keychain that already holds it; overridable for a different signer.
 DEFAULT_IDENTITY = f"Developer ID Application: Relux Works, LLC ({TEAM_ID})"
 IDENTITY_ENV = "GRAMDRIVE_SIGN_IDENTITY"
+
+# The Sparkle private seeds never enter this repository, build command, or
+# manifest. These independently reviewed public anchors are the complete
+# runtime trust surface for the immutable v1 feeds.
+UPDATE_CHANNELS = {
+    "test": {
+        "feed_url": "https://github.com/relux-works/tgfs/releases/download/updates-test-v1/test.xml",
+        "public_key": "T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo=",
+    },
+    "stable": {
+        "feed_url": "https://relux-works.github.io/tgfs/updates/stable/v1/stable.xml",
+        "public_key": "FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE=",
+    },
+}
+
+
+def update_configuration(channel: str, channels: dict | None = None) -> dict:
+    """Return one validated, checked-in Sparkle trust configuration.
+
+    A candidate can contain exactly one feed/key pair. Validation is retained
+    deliberately: an accidental deleted or malformed reviewed anchor must
+    refuse assembly instead of producing a client with weakened update trust.
+    ``channels`` exists only as a focused validation seam for packaging tests.
+    """
+    channels = UPDATE_CHANNELS if channels is None else channels
+    try:
+        configuration = channels[channel]
+        feed_url = configuration["feed_url"]
+        public_key = configuration["public_key"]
+    except (KeyError, TypeError) as error:
+        raise StepFailed(f"missing reviewed Sparkle configuration for channel {channel!r}") from error
+    if not isinstance(feed_url, str) or not feed_url.startswith("https://"):
+        raise StepFailed(f"invalid Sparkle feed URL for channel {channel!r}")
+    if not isinstance(public_key, str):
+        raise StepFailed(f"missing Sparkle public key for channel {channel!r}")
+    try:
+        decoded = base64.b64decode(public_key, validate=True)
+    except (ValueError, TypeError) as error:
+        raise StepFailed(f"invalid Sparkle public key for channel {channel!r}") from error
+    if len(decoded) != 32:
+        raise StepFailed(f"invalid Sparkle public key for channel {channel!r}")
+    return {"channel": channel, "feed_url": feed_url, "public_key": public_key}
 
 
 @dataclass(frozen=True)
@@ -259,7 +302,7 @@ ENTITLEMENTS: dict[str, Callable[[], dict]] = {
 }
 
 
-def app_info_plist(short_version: str, build_version: str) -> dict:
+def app_info_plist(short_version: str, build_version: str, update: dict) -> dict:
     """The containing app's Info.plist.
 
     LSUIElement: the shell's primary surface is a menu-bar extra, so it runs
@@ -278,6 +321,11 @@ def app_info_plist(short_version: str, build_version: str) -> dict:
         "LSUIElement": True,
         "NSHighResolutionCapable": True,
         "NSHumanReadableCopyright": "Relux Works, LLC",
+        "SUFeedURL": update["feed_url"],
+        "SUPublicEDKey": update["public_key"],
+        "SUVerifyUpdateBeforeExtraction": True,
+        "SURequireSignedFeed": True,
+        "SUSignedFeedFailureExpirationInterval": 0,
     }
 
 
@@ -322,7 +370,10 @@ def agent_launchd_plist() -> dict:
         "Label": AGENT_LAUNCHD_LABEL,
         "BundleProgram": "Contents/MacOS/gramdrive-agent",
         "RunAtLoad": True,
-        "KeepAlive": True,
+        # A deliberate `_exit(0)` after an accepted Sparkle replacement must
+        # leave this old helper down long enough for the new app bundle to
+        # start its matching agent. Crashes and signal deaths still restart.
+        "KeepAlive": {"SuccessfulExit": False},
         "ProcessType": "Adaptive",
         "AssociatedBundleIdentifiers": [APP_BUNDLE_ID],
     }
@@ -331,22 +382,18 @@ def agent_launchd_plist() -> dict:
 # -- versions ----------------------------------------------------------------
 
 
-def marketing_version(describe: str) -> str:
-    """The CFBundleShortVersionString derived from `git describe`.
-
-    A tag like `v0.1.0` or `v0.1.0-3-gabc` yields `0.1.0`; anything unparseable
-    (no tags yet) yields `0.0.0` rather than a fabricated number. This is the
-    human-facing version, distinct from the build number below.
-    """
-    text = describe.strip()
-    if text.startswith("v"):
-        text = text[1:]
-    # Drop the `-<commits>-g<sha>` and `-dirty` suffixes git appends.
-    head = text.split("-", 1)[0]
-    parts = head.split(".")
-    if head and all(part.isdigit() for part in parts) and parts:
-        return head
-    return "0.0.0"
+def marketing_version(repo_root: Path) -> str:
+    """Read the reviewed three-component product version from source."""
+    version_file = repo_root / SUPPORT_PACKAGE / "Version.json"
+    try:
+        value = json.loads(version_file.read_text(encoding="utf-8"))["marketing_version"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise StepFailed(f"cannot read marketing version from {version_file}: {error}") from error
+    if not isinstance(value, str) or value.count(".") != 2 or not all(
+        part.isdigit() for part in value.split(".")
+    ):
+        raise StepFailed("marketing_version must be a three-component numeric string")
+    return value
 
 
 # -- checksums (same shape as build_core_artifacts.py) -----------------------
@@ -391,13 +438,17 @@ def codesign_argv(
     entitlements: Path | None,
     timestamp: bool,
     identifier: str | None = None,
+    preserve_entitlements: bool = False,
 ) -> tuple[str, ...]:
     """The codesign command for one target.
 
     `--force` re-signs (SwiftPM leaves a debug ad-hoc signature); `--options
     runtime` is the hardened runtime notarization requires; `--timestamp` embeds
     a trusted timestamp (network to Apple's TSA). Entitlements are passed per
-    target so the app, agent, and extension each carry only their own.
+    target so the app, agent, and extension each carry only their own. Sparkle
+    ships helper-specific entitlements; its nested code is re-signed with
+    `--preserve-metadata=entitlements,requirements,flags` rather than silently
+    dropping those upstream requirements.
     `--generate-entitlement-der` keeps the modern DER entitlement form current
     codesign already emits, stated explicitly so a reader sees it is intended.
     `--identifier` pins the code-signing identifier: a bundle takes it from its
@@ -415,6 +466,8 @@ def codesign_argv(
         argv += ["--identifier", identifier]
     if entitlements is not None:
         argv += ["--entitlements", str(entitlements)]
+    elif preserve_entitlements:
+        argv.append("--preserve-metadata=entitlements,requirements,flags")
     argv.append(str(target))
     return tuple(argv)
 
@@ -725,7 +778,9 @@ class AppPackager:
                 )
         return bin_dir
 
-    def assemble_bundle(self, bin_dir: Path, versions: tuple[str, str]) -> Path:
+    def assemble_bundle(
+        self, bin_dir: Path, versions: tuple[str, str], update: dict
+    ) -> Path:
         """Lay out GramDrive.app around the three built executables."""
         short_version, build_version = versions
         app = self.out_dir / APP_BUNDLE_NAME
@@ -749,7 +804,8 @@ class AppPackager:
         )
 
         # Info.plists, PkgInfo, and the agent's launchd plist.
-        write_plist(contents / "Info.plist", app_info_plist(short_version, build_version))
+        write_plist(
+            contents / "Info.plist", app_info_plist(short_version, build_version, update))
         (contents / "PkgInfo").write_text("APPL????", encoding="ascii")
         write_plist(
             appex / "Contents" / "Info.plist",
@@ -760,6 +816,69 @@ class AppPackager:
             agent_launchd_plist(),
         )
         return app
+
+    # -- Sparkle ---------------------------------------------------------
+
+    def embed_sparkle_framework(self, app: Path, bin_dir: Path) -> None:
+        """Copy Sparkle as a real framework bundle, preserving symlinks and
+        helper/XPC modes, then give the companion its bundle-local rpath."""
+        source = bin_dir / "Sparkle.framework"
+        if not source.is_dir():
+            raise StepFailed(
+                f"Sparkle.framework is missing from {bin_dir}; SwiftPM did not build "
+                "the pinned updater product"
+            )
+        destination = app / "Contents" / "Frameworks" / "Sparkle.framework"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination, symlinks=True)
+        # Sparkle's framework version directory is currently B, not a stable
+        # public contract. Resolve through the framework's `Current` symlink.
+        required = (
+            "Autoupdate",
+            "Updater.app",
+            "XPCServices/Downloader.xpc",
+            "XPCServices/Installer.xpc",
+        )
+        active_version = destination / "Versions" / "Current"
+        missing = [relative for relative in required if not (active_version / relative).exists()]
+        if missing:
+            raise StepFailed("Sparkle framework is missing required helpers: " + ", ".join(missing))
+
+    def add_companion_frameworks_rpath(self, app: Path) -> None:
+        """Add the one runtime search path shared by Sparkle and tdjson.
+
+        This runs after optional tdjson fixups. Adding it while embedding
+        Sparkle and again while embedding tdjson makes `install_name_tool`
+        reject a valid bundle for a duplicate load command.
+        """
+        companion = app / "Contents" / "MacOS" / APP_EXECUTABLE_NAME
+        self.run(
+            "companion-frameworks-rpath",
+            (
+                "install_name_tool", "-add_rpath", "@executable_path/../Frameworks", str(companion),
+            ),
+        )
+
+    @staticmethod
+    def sparkle_nested_code(framework: Path) -> list[Path]:
+        """Return every required Sparkle helper in Apple's required order.
+
+        `Autoupdate` is a loose executable, not an `.app`/`.xpc` bundle, so a
+        generic bundle search misses it. Sign all helpers inside-out before
+        sealing Sparkle.framework: Installer.xpc, Downloader.xpc, Autoupdate,
+        then Updater.app.
+        """
+        active_version = framework / "Versions" / "Current"
+        helpers = [
+            active_version / "XPCServices" / "Installer.xpc",
+            active_version / "XPCServices" / "Downloader.xpc",
+            active_version / "Autoupdate",
+            active_version / "Updater.app",
+        ]
+        missing = [str(helper.relative_to(framework)) for helper in helpers if not helper.exists()]
+        if missing:
+            raise StepFailed("Sparkle framework is missing required helpers: " + ", ".join(missing))
+        return helpers
 
     # -- runtime libraries (tdjson) --------------------------------------
 
@@ -842,18 +961,16 @@ class AppPackager:
             ),
         )
         for executable, rpath in executables:
-            self.run(
-                f"fixup-{executable.name}",
-                (
-                    "install_name_tool",
-                    "-change",
-                    str(staged),
-                    "@rpath/libtdjson.dylib",
-                    "-add_rpath",
-                    rpath,
-                    str(executable),
-                ),
-            )
+            argv: list[str] = [
+                "install_name_tool", "-change", str(staged), "@rpath/libtdjson.dylib"
+            ]
+            # The companion's rpath is shared with Sparkle and is added once
+            # after this tdjson-specific fixup. The nested executables need
+            # their own relative rpaths here.
+            if executable.name != APP_EXECUTABLE_NAME:
+                argv += ["-add_rpath", rpath]
+            argv.append(str(executable))
+            self.run(f"fixup-{executable.name}", tuple(argv))
         self.assert_no_absolute_runtime_refs(app, sorted(bundled))
         return sorted(bundled)
 
@@ -922,6 +1039,23 @@ class AppPackager:
         # them because the team matches.
         frameworks = app / "Contents" / "Frameworks"
         if frameworks.is_dir():
+            sparkle = frameworks / "Sparkle.framework"
+            if sparkle.is_dir():
+                for nested in self.sparkle_nested_code(sparkle):
+                    self.run(
+                        f"codesign-sparkle-{nested.name}",
+                        codesign_argv(
+                            nested,
+                            identity=self.identity,
+                            entitlements=None,
+                            timestamp=timestamp,
+                            preserve_entitlements=True,
+                        ),
+                    )
+                self.run(
+                    "codesign-sparkle-framework",
+                    codesign_argv(sparkle, identity=self.identity, entitlements=None, timestamp=timestamp),
+                )
             for dylib in sorted(frameworks.glob("*.dylib")):
                 self.run(
                     f"codesign-frameworks-{dylib.name}",
@@ -1096,6 +1230,7 @@ def build_manifest(
     core_version: str,
     notarization: dict,
     source_date: str,
+    update: dict,
     is_signed: bool = True,
 ) -> dict:
     """The artifact's identity record.
@@ -1132,6 +1267,7 @@ def build_manifest(
             "verified_by": "lipo -archs on every built product (build_products)",
         },
         "minimum_system_version": MINIMUM_SYSTEM_VERSION,
+        "sparkle": {"channel": update["channel"], "feed_url": update["feed_url"]},
         "app_group": APP_GROUP,
         "signed": is_signed,
         "signing_identity": identity,
@@ -1181,6 +1317,7 @@ def package(
     runner: Runner = default_runner,
     echo: Callable[[str], None] = print,
     environ: dict[str, str] | None = None,
+    update_channel: str = "test",
 ) -> dict:
     """Run the whole pipeline and return the manifest.
 
@@ -1199,14 +1336,27 @@ def package(
         environ=environ,
     )
     environ = environ if environ is not None else os.environ
+    update = update_configuration(update_channel)
+    if not (core_package / "Package.swift").is_file():
+        raise StepFailed(
+            f"staged core package not found at {core_package}; run "
+            f"`make package` first or pass --core-package"
+        )
+    if not unsigned and not packager.core_tdjson_linked():
+        raise StepFailed(
+            "signed app packaging requires a tdjson-linked staged core; "
+            "re-run `GRAMDRIVE_TDLIB_ARTIFACT_DIR=.temp/tdlib/out make package`"
+        )
 
     git = packager.git_info()
-    short_version = marketing_version(git["describe"])
+    short_version = marketing_version(repo_root)
     build_version = packager.build_number()
 
     bin_dir = packager.build_products()
-    app = packager.assemble_bundle(bin_dir, (short_version, build_version))
+    app = packager.assemble_bundle(bin_dir, (short_version, build_version), update)
+    packager.embed_sparkle_framework(app, bin_dir)
     embedded_libraries = packager.embed_runtime_libraries(app)
+    packager.add_companion_frameworks_rpath(app)
     entitlement_files = packager.write_entitlement_files()
 
     notarization: dict = {"submitted": False}
@@ -1248,6 +1398,7 @@ def package(
         core_version=packager.core_version(),
         notarization=notarization,
         source_date=source_date(git, dict(environ)),
+        update=update,
         is_signed=not unsigned,
     )
     manifest["gatekeeper"] = {"spctl": spctl_verdict, "notarized": notarization.get("submitted", False)}
@@ -1304,6 +1455,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"Developer ID Application identity (default: {IDENTITY_ENV} or the Relux Works cert)",
     )
     parser.add_argument(
+        "--update-channel",
+        choices=tuple(UPDATE_CHANNELS),
+        default=os.environ.get("GRAMDRIVE_UPDATE_CHANNEL", "test"),
+        help="embedded Sparkle trust channel (default: test)",
+    )
+    parser.add_argument(
         "--notarize",
         action="store_true",
         help="submit the dmg for notarization and staple it (network; Apple)",
@@ -1347,7 +1504,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The assembly gate signs nothing, so it resolves no Developer ID identity —
     # the record simply says "unsigned".
     identity = "unsigned" if args.unsigned else resolve_identity(args.identity, dict(os.environ))
-
     try:
         package(
             repo_root,
@@ -1358,6 +1514,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             notary_profile=args.notary_profile,
             notary_keychain=args.notary_keychain.resolve() if args.notary_keychain else None,
             unsigned=args.unsigned,
+            update_channel=args.update_channel,
         )
     except StepFailed as failure:
         print(f"\nAPP PACKAGING FAILED\n{failure}", file=sys.stderr)

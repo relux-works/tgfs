@@ -66,6 +66,7 @@ fn file_id() -> ItemId {
 
 fn directory(id: ItemId, parent: Option<ItemId>, name: &str) -> ItemRecord {
     ItemRecord {
+        aggregate_size: None,
         id,
         parent,
         display_name: name.to_owned(),
@@ -87,6 +88,7 @@ fn seed(store: &mut StateStore) {
         display_name: "Smoke Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -99,6 +101,7 @@ fn seed(store: &mut StateStore) {
     txn.upsert_item(&directory(chat_dir_id(), Some(root_id()), "Chat 100"))
         .expect("chat dir");
     txn.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: file_id(),
         parent: Some(chat_dir_id()),
         display_name: "photo.jpg".to_owned(),

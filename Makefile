@@ -10,7 +10,7 @@
 
 GATE := python3 .scripts/acceptance/run_automated.py
 
-.PHONY: check check-core check-repo check-security check-apple gates fmt build test bindings \
+.PHONY: check check-core check-repo check-security check-apple check-live-content gates fmt build test bindings \
         smoke-bindings smoke-shared-state smoke-agent-lifecycle smoke-control-auth \
         package package-host-test \
         package-reproducible package-app package-app-unsigned package-app-notarize \
@@ -43,6 +43,13 @@ check-security:
 # staged core; native-ci runs it as its own job. Same entrypoint as CI.
 check-apple:
 	$(GATE) --suite apple --run-id local-apple
+
+# check-live-content — combined pre-install synthetic acceptance across the
+# focused Rust live-content suites and the full Swift package/provider
+# regressions. Evidence contains fixed labels, counts, booleans, timings and
+# tool versions only.
+check-live-content:
+	$(GATE) --suite live-content --run-id local-live-content
 
 # gates — list the suites and the exact command each step runs.
 gates:
@@ -183,7 +190,8 @@ package-reproducible:
 
 # package-app — build, assemble, and sign GramDrive.app + dmg, then verify
 # (codesign --deep --strict, entitlement dump, Gatekeeper). No notarization.
-# Output: .temp/app-packaging/.
+# The selected channel's reviewed public key is checked-in public
+# configuration, never a build environment input. Output: .temp/app-packaging/.
 package-app:
 	python3 .scripts/apple-app/build_app_bundle.py
 

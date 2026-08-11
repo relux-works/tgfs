@@ -1,6 +1,7 @@
 import FileProvider
 import Foundation
 import GramDriveCore
+import GramDriveSupport
 
 /// The one enumerator type of the provider (TASK-260715-rhcnhc;
 /// PLAT-MAC-004, SYNC-003, NFR-021): paged item listing for directory
@@ -41,20 +42,36 @@ import GramDriveCore
 ///
 /// # Deadlines and cancellation
 ///
-/// Every callback answers synchronously from short snapshot reads — no
-/// waiting on the network, the engine, or another process — so completion
-/// is prompt by construction and `invalidate` has nothing in flight to
-/// cancel.
-public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
+/// Every callback reads only one bounded local snapshot page. A watchdog
+/// still guards that read because a damaged or locked SQLite connection must
+/// not become Finder's indefinite spinner. Timeout and invalidation race
+/// through one completion gate, so the observer completes exactly once; a
+/// later request gets a fresh read and is the retry path.
+public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator, @unchecked Sendable {
     /// The default listing/change page size. Bounds callback memory
     /// (NFR-021); the system's `suggestedPageSize`/`suggestedBatchSize`
     /// caps it further when present.
     public static let defaultPageSize: UInt32 = 256
+    /// Maximum wall-clock time before an item-listing or change observer
+    /// receives a retryable error. The page read may unwind later, but cannot
+    /// complete the observer a second time.
+    public static let defaultEnumerationTimeout: TimeInterval = 8
+    private static let watchdogQueue = DispatchQueue(
+        label: "com.reluxworks.gramdrive.fileprovider.enumeration-watchdog",
+        qos: .userInitiated,
+        attributes: .concurrent)
 
     private let store: any SharedStateStoreProtocol
     private let accountId: Int64
     private let container: NSFileProviderItemIdentifier
     private let pageSize: UInt32
+    private let enumerationTimeout: TimeInterval
+    private let historyPriority: (any HistoryPrioritySignaling)?
+    private let chatPriorityRequest: HistoryPriorityRequest?
+    private let requestLock = NSLock()
+    private var listingRequests: [UUID: ListingRequest] = [:]
+    private var changeRequests: [UUID: ChangeRequest] = [:]
+    private var isInvalidated = false
 
     /// An enumerator over one container of one account's tree. `container`
     /// is either a directory's identifier (`.rootContainer` included) or
@@ -64,17 +81,42 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
         store: any SharedStateStoreProtocol,
         accountId: Int64,
         container: NSFileProviderItemIdentifier,
-        pageSize: UInt32 = GramDriveEnumerator.defaultPageSize
+        pageSize: UInt32 = GramDriveEnumerator.defaultPageSize,
+        enumerationTimeout: TimeInterval = GramDriveEnumerator.defaultEnumerationTimeout,
+        historyPriority: (any HistoryPrioritySignaling)? = nil,
+        chatPriorityRequest: HistoryPriorityRequest? = nil
     ) {
         self.store = store
         self.accountId = accountId
         self.container = container
-        self.pageSize = pageSize
+        self.pageSize = min(max(pageSize, 1), Self.defaultPageSize)
+        self.enumerationTimeout = max(0.001, enumerationTimeout)
+        self.historyPriority = historyPriority
+        self.chatPriorityRequest = chatPriorityRequest
     }
 
-    /// Nothing to cancel: every callback completed synchronously before
-    /// this can be called.
-    public func invalidate() {}
+    /// Cancels every observer that has not already completed. The underlying
+    /// local read is allowed to unwind, but its result is discarded.
+    public func invalidate() {
+        requestLock.lock()
+        let wasInvalidated = isInvalidated
+        isInvalidated = true
+        let listingRequests = Array(self.listingRequests.values)
+        let changeRequests = Array(self.changeRequests.values)
+        self.listingRequests.removeAll()
+        self.changeRequests.removeAll()
+        requestLock.unlock()
+        if !wasInvalidated, var request = chatPriorityRequest {
+            request.priority = .background
+            historyPriority?.signal(request)
+        }
+        for request in listingRequests {
+            request.resolve(.failure(CocoaError(.userCancelled)))
+        }
+        for request in changeRequests {
+            request.resolve(.failure(CocoaError(.userCancelled)))
+        }
+    }
 
     // MARK: - Item listing
 
@@ -82,12 +124,42 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderEnumerationObserver,
         startingAt page: NSFileProviderPage
     ) {
+        if var request = chatPriorityRequest {
+            request.priority = .visible
+            historyPriority?.signal(request)
+        }
+        let id = UUID()
+        let request = ListingRequest(observer: observer) { [weak self] in
+            self?.forgetListingRequest(id)
+        }
+        guard registerListingRequest(request, id: id) else {
+            request.resolve(.failure(CocoaError(.userCancelled)))
+            return
+        }
+
+        let watchdog = DispatchSource.makeTimerSource(queue: Self.watchdogQueue)
+        watchdog.schedule(deadline: .now() + enumerationTimeout)
+        watchdog.setEventHandler { [request] in
+            request.resolve(.failure(NSFileProviderError(.cannotSynchronize)))
+        }
+        watchdog.resume()
+        defer { watchdog.cancel() }
+
+        request.resolve(
+            listingOutcome(
+                startingAt: page,
+                suggestedPageSize: observer.suggestedPageSize))
+    }
+
+    private func listingOutcome(
+        startingAt page: NSFileProviderPage,
+        suggestedPageSize: Int?
+    ) -> ListingOutcome {
         if container == .workingSet {
             // macOS enumerates only changes on the working set (type docs);
             // an empty listing is the honest answer, not a claim that the
             // domain is empty — containers are where structure comes from.
-            observer.finishEnumerating(upTo: nil)
-            return
+            return .success(items: [], nextPage: nil)
         }
         do {
             let account = try resolveAccount()
@@ -102,32 +174,46 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
                     let metadata = try liveItem(id: parent),
                     metadata.deletedAtMs == nil
                 else {
-                    observer.finishEnumeratingWithError(NSFileProviderError(.noSuchItem))
-                    return
+                    return .failure(NSFileProviderError(.noSuchItem))
                 }
             }
-            let after = try EnumerationPageCursor.startAnchor(of: page, parent: parent)
-            let limit = effectiveLimit(suggested: observer.suggestedPageSize)
-            let children = try store.children(parent: parent, after: after, limit: limit)
-            if !children.isEmpty {
-                observer.didEnumerate(
-                    children.map {
-                        GramDriveFileProviderItem(metadata: $0, accountRootId: account.rootItemId)
-                    })
+            let journal = try store.changeJournalState()
+            let after = try EnumerationPageCursor.startAnchor(
+                of: page, parent: parent, account: account, journal: journal)
+            let limit = effectiveLimit(suggested: suggestedPageSize)
+            let result: ItemPage
+            do {
+                result = try store.childrenPage(parent: parent, after: after, limit: limit)
+            } catch let error as DriveError {
+                if case .NotFound = error {
+                    return .failure(NSFileProviderError(.pageExpired))
+                }
+                throw error
             }
-            if children.count == Int(limit), let last = children.last {
-                observer.finishEnumerating(
-                    upTo: EnumerationPageCursor.page(parent: parent, after: last.id))
+            let children = result.items
+            let items: [any NSFileProviderItem] = children.map {
+                GramDriveFileProviderItem(metadata: $0, accountRootId: account.rootItemId)
+            }
+            if let nextAfter = result.nextAfter {
+                return .success(
+                    items: items,
+                    nextPage: EnumerationPageCursor.page(
+                        parent: parent,
+                        after: nextAfter,
+                        account: account,
+                        journal: journal))
             } else {
-                observer.finishEnumerating(upTo: nil)
+                return .success(items: items, nextPage: nil)
             }
         } catch is EnumerationPageCursorError {
             // The platform's explicit recovery for an unusable page: the
             // system restarts from the initial page. Guessing a position
             // instead could duplicate or skip items (SYNC-003).
-            observer.finishEnumeratingWithError(NSFileProviderError(.pageExpired))
+            return .failure(NSFileProviderError(.pageExpired))
+        } catch let error as DriveError {
+            return .failure(Self.providerError(for: error))
         } catch {
-            observer.finishEnumeratingWithError(error)
+            return .failure(error)
         }
     }
 
@@ -137,6 +223,40 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderChangeObserver,
         from syncAnchor: NSFileProviderSyncAnchor
     ) {
+        // Reopening a folder the system has already listed answers from the
+        // change feed, not `enumerateItems`. It is the same user gesture and
+        // must raise the same hint — otherwise the second open of a chat only
+        // ever produced `invalidate()`'s release, actively *removing* demand
+        // for a chat the user just opened (BUG-260728-2qfzbd).
+        if var request = chatPriorityRequest {
+            request.priority = .visible
+            historyPriority?.signal(request)
+        }
+        let id = UUID()
+        let request = ChangeRequest(observer: observer) { [weak self] in
+            self?.forgetChangeRequest(id)
+        }
+        guard registerChangeRequest(request, id: id) else {
+            request.resolve(.failure(CocoaError(.userCancelled)))
+            return
+        }
+
+        let watchdog = DispatchSource.makeTimerSource(queue: Self.watchdogQueue)
+        watchdog.schedule(deadline: .now() + enumerationTimeout)
+        watchdog.setEventHandler { [request] in
+            request.resolve(.failure(NSFileProviderError(.cannotSynchronize)))
+        }
+        watchdog.resume()
+        defer { watchdog.cancel() }
+
+        request.resolve(
+            changeOutcome(from: syncAnchor, suggestedBatchSize: observer.suggestedBatchSize))
+    }
+
+    private func changeOutcome(
+        from syncAnchor: NSFileProviderSyncAnchor,
+        suggestedBatchSize: Int?
+    ) -> ChangeOutcome {
         do {
             let account = try resolveAccount()
             let journal = try store.changeJournalState()
@@ -144,10 +264,9 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
                 let anchor = EnumerationSyncAnchor.decode(syncAnchor),
                 anchor.isCurrent(account: account, journal: journal)
             else {
-                observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
-                return
+                return .failure(NSFileProviderError(.syncAnchorExpired))
             }
-            let limit = effectiveLimit(suggested: observer.suggestedBatchSize)
+            let limit = effectiveLimit(suggested: suggestedBatchSize)
             let changes = try store.itemChangesSince(
                 accountId: accountId, afterSequence: anchor.sequence, limit: limit)
 
@@ -165,21 +284,20 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
                             metadata: change.metadata, accountRootId: account.rootItemId))
                 }
             }
-            if !updated.isEmpty {
-                observer.didUpdate(updated)
-            }
-            if !deleted.isEmpty {
-                observer.didDeleteItems(withIdentifiers: deleted)
-            }
             let next = EnumerationSyncAnchor(
                 accountId: account.accountId,
                 namespaceVersion: account.namespaceVersion,
                 journalInstance: journal.instanceId,
                 sequence: changes.last?.sequence ?? anchor.sequence)
-            observer.finishEnumeratingChanges(
-                upTo: next.rawAnchor(), moreComing: changes.count == Int(limit))
+            return .success(
+                updated: updated,
+                deleted: deleted,
+                anchor: next.rawAnchor(),
+                moreComing: changes.count == Int(limit))
+        } catch let error as DriveError {
+            return .failure(Self.providerError(for: error))
         } catch {
-            observer.finishEnumeratingWithError(error)
+            return .failure(error)
         }
     }
 
@@ -215,6 +333,9 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
         guard let account = try store.account(accountId: accountId) else {
             throw NSFileProviderError(.noSuchItem)
         }
+        guard account.authState == "authorized" else {
+            throw DriveError.AuthRequired(detail: "account authorization is not usable")
+        }
         return account
     }
 
@@ -236,6 +357,142 @@ public final class GramDriveEnumerator: NSObject, NSFileProviderEnumerator {
     /// it offers a usable one.
     private func effectiveLimit(suggested: Int?) -> UInt32 {
         guard let suggested, suggested > 0 else { return pageSize }
-        return min(pageSize, UInt32(suggested))
+        return min(pageSize, UInt32(clamping: suggested))
+    }
+
+    private func registerListingRequest(_ request: ListingRequest, id: UUID) -> Bool {
+        requestLock.lock()
+        defer { requestLock.unlock() }
+        guard !isInvalidated else { return false }
+        listingRequests[id] = request
+        return true
+    }
+
+    private func forgetListingRequest(_ id: UUID) {
+        requestLock.lock()
+        listingRequests[id] = nil
+        requestLock.unlock()
+    }
+
+    private func registerChangeRequest(_ request: ChangeRequest, id: UUID) -> Bool {
+        requestLock.lock()
+        defer { requestLock.unlock() }
+        guard !isInvalidated else { return false }
+        changeRequests[id] = request
+        return true
+    }
+
+    private func forgetChangeRequest(_ id: UUID) {
+        requestLock.lock()
+        changeRequests[id] = nil
+        requestLock.unlock()
+    }
+
+    /// Maps durable/source failures to errors File Provider can recover from
+    /// without parsing diagnostic strings.
+    private static func providerError(for error: DriveError) -> any Error {
+        switch error {
+        case .NotFound:
+            return NSFileProviderError(.noSuchItem)
+        case .AuthRequired:
+            return NSFileProviderError(.notAuthenticated)
+        case .RateLimited, .SourceUnavailable:
+            return NSFileProviderError(.serverUnreachable)
+        case .Cancelled:
+            return CocoaError(.userCancelled)
+        case .InvalidArgument, .Storage, .Integrity, .Restricted, .VersionConflict, .Internal:
+            return NSFileProviderError(.cannotSynchronize)
+        }
+    }
+}
+
+private enum ListingOutcome {
+    case success(items: [any NSFileProviderItem], nextPage: NSFileProviderPage?)
+    case failure(any Error)
+}
+
+private enum ChangeOutcome {
+    case success(
+        updated: [any NSFileProviderItem],
+        deleted: [NSFileProviderItemIdentifier],
+        anchor: NSFileProviderSyncAnchor,
+        moreComing: Bool)
+    case failure(any Error)
+}
+
+/// One exactly-once gate around an NSFileProviderEnumerationObserver.
+private final class ListingRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private let observer: NSFileProviderEnumerationObserver
+    private let onFinish: @Sendable () -> Void
+    private var completed = false
+
+    init(
+        observer: NSFileProviderEnumerationObserver,
+        onFinish: @escaping @Sendable () -> Void
+    ) {
+        self.observer = observer
+        self.onFinish = onFinish
+    }
+
+    func resolve(_ outcome: ListingOutcome) {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        lock.unlock()
+
+        switch outcome {
+        case .success(let items, let nextPage):
+            if !items.isEmpty {
+                observer.didEnumerate(items)
+            }
+            observer.finishEnumerating(upTo: nextPage)
+        case .failure(let error):
+            observer.finishEnumeratingWithError(error)
+        }
+        onFinish()
+    }
+}
+
+/// One exactly-once gate around an NSFileProviderChangeObserver.
+private final class ChangeRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private let observer: NSFileProviderChangeObserver
+    private let onFinish: @Sendable () -> Void
+    private var completed = false
+
+    init(
+        observer: NSFileProviderChangeObserver,
+        onFinish: @escaping @Sendable () -> Void
+    ) {
+        self.observer = observer
+        self.onFinish = onFinish
+    }
+
+    func resolve(_ outcome: ChangeOutcome) {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        lock.unlock()
+
+        switch outcome {
+        case .success(let updated, let deleted, let anchor, let moreComing):
+            if !updated.isEmpty {
+                observer.didUpdate(updated)
+            }
+            if !deleted.isEmpty {
+                observer.didDeleteItems(withIdentifiers: deleted)
+            }
+            observer.finishEnumeratingChanges(upTo: anchor, moreComing: moreComing)
+        case .failure(let error):
+            observer.finishEnumeratingWithError(error)
+        }
+        onFinish()
     }
 }

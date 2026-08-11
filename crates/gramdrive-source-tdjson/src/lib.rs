@@ -88,6 +88,11 @@
 //!   the chat machines' `chat_list_entries` appearances, so a chat in several
 //!   folders is one canonical record with one appearance per folder and a
 //!   folder deletion removes only those appearances (SYNC-026, DOM-022).
+//! - [`story`] — [`StoryMachine`], the bounded non-viewing active/profile/
+//!   archive reducer (TASK-260721-3e9bi8): canonical byte-free metadata,
+//!   rights-gated resumable archive paging, destructive protected-content
+//!   redaction, and an explicit request allow-list that cannot encode view,
+//!   live-stream, mutation, or download calls.
 //! - [`download`] — [`DownloadMachine`] and [`TdDownloader`], the ranged
 //!   download adapter (TASK-260715-1onbmf): the `DriveSource::fetch` side of
 //!   this source. POL-4 and version-pin gates before any network call, a
@@ -151,6 +156,7 @@
 //! [`SnapshotMachine`]: snapshot::SnapshotMachine
 //! [`UpdateMachine`]: updates::UpdateMachine
 //! [`FolderCatalogMachine`]: folders::FolderCatalogMachine
+//! [`StoryMachine`]: story::StoryMachine
 //! [`AccountRemoval`]: removal::AccountRemoval
 //! [`RemovalMode::RevokeSession`]: removal::RemovalMode::RevokeSession
 //! [`RemovalMode::LocalOnly`]: removal::RemovalMode::LocalOnly
@@ -174,6 +180,7 @@ pub mod mock;
 pub mod removal;
 pub mod runtime;
 pub mod snapshot;
+pub mod story;
 pub mod thumbnail;
 pub mod updates;
 
@@ -186,7 +193,10 @@ mod wire;
 #[allow(unsafe_code)]
 pub mod real;
 
-pub use attachment::{MappedAttachment, map_attachment, map_message_attachments};
+pub use attachment::{
+    AttachmentFidelity, AttachmentLogicalKind, MappedAttachment, TelegramRepresentation,
+    map_attachment, map_message_attachments,
+};
 pub use auth::{
     AuthError, AuthInput, AuthMachine, AuthRejection, AuthState, AuthStep, CodeInfo, PasswordInfo,
     RetryAdvice,
@@ -198,8 +208,8 @@ pub use config::{
 };
 pub use download::{
     CatalogEntry, DownloadConfig, DownloadMachine, DownloadPhase, DownloadPriority,
-    DownloadProgress, DownloadStep, FetchCatalog, FileTarget, InvalidPriority, SubmitKind,
-    TdDownloader,
+    DownloadProgress, DownloadStep, FetchCatalog, FileTarget, InvalidPriority, RefreshTarget,
+    RefreshedFileTarget, RemoteFileType, SubmitKind, TdDownloader,
 };
 pub use error::TdError;
 pub use folders::{FolderCatalogBatch, FolderCatalogMachine, FolderDefinition, FolderInvalidation};
@@ -227,6 +237,12 @@ pub use runtime::{
 pub use snapshot::{
     ChatSnapshot, ListCommit, ListEntrySnapshot, SNAPSHOT_CURSOR_STREAM, SnapshotBackoff,
     SnapshotChatKind, SnapshotError, SnapshotMachine, SnapshotPlan, SnapshotRequest, SnapshotStep,
+};
+pub use story::{
+    BACKGROUND_STORY_REQUESTS, StoryAccountKind, StoryArchiveCapability, StoryBackoff,
+    StoryChatKind, StoryChatPlan, StoryCommit, StoryContentKind, StoryContentLocator, StoryError,
+    StoryFileType, StoryMachine, StoryObservation, StoryScanCursor, StoryStep,
+    background_story_request_allowed, normalize_story, normalize_story_account,
 };
 pub use thumbnail::{
     TdThumbnailer, ThumbnailCatalog, ThumbnailConfig, ThumbnailMachine, ThumbnailStep,

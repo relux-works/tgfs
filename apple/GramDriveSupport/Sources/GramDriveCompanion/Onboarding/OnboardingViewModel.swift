@@ -14,6 +14,8 @@ public enum InitialSyncStatus: Equatable, Sendable {
     case syncing(pending: Int)
     /// The agent is up, has synced, and nothing is pending.
     case upToDate
+    /// Local structure failed; the message contains the safe recovery action.
+    case failed(String)
 
     /// A short, user-facing line for the success step.
     public var label: String {
@@ -25,7 +27,9 @@ public enum InitialSyncStatus: Equatable, Sendable {
         case .syncing(let pending):
             return "Syncing your chats… (\(pending) \(pending == 1 ? "item" : "items") in progress)"
         case .upToDate:
-            return "Your chats are ready in Finder."
+            return "Your chat folders are ready in Finder."
+        case .failed(let message):
+            return message
         }
     }
 
@@ -33,9 +37,23 @@ public enum InitialSyncStatus: Equatable, Sendable {
     public var isActive: Bool {
         switch self {
         case .waitingForAgent, .preparing, .syncing: return true
-        case .upToDate: return false
+        case .upToDate, .failed: return false
         }
     }
+}
+
+/// The containing app's progress creating a usable Finder location.
+public enum FileProviderDomainSetupState: Equatable, Sendable {
+    /// No pass has run for the current onboarding attempt.
+    case idle
+    /// Domain reconciliation and root-URL resolution are in flight.
+    case settingUp
+    /// The stable domain exists and its Finder root is usable.
+    case ready
+    /// Registration or root resolution failed; the user can retry.
+    case failed
+
+    public var isReady: Bool { self == .ready }
 }
 
 /// The first-launch onboarding flow (TASK-260720-31nw0w): a guided
@@ -76,6 +94,8 @@ public final class OnboardingViewModel {
     /// persisted completion flag so a clean machine opens onboarding on first
     /// launch and a returning user does not.
     public var isPresented: Bool
+    /// The File Provider setup standing shown by the success step.
+    public private(set) var domainSetupState: FileProviderDomainSetupState = .idle
 
     /// The shared sign-in flow (embedded on the Sign In step).
     public let authorization: AuthorizationViewModel
@@ -85,19 +105,23 @@ public final class OnboardingViewModel {
     public let status: CompanionStatusViewModel
 
     private let driveLocation: any DriveLocationProviding
+    private let domainSetup: any FileProviderDomainSettingUp
     private let completionStore: any OnboardingCompletionStore
+    private var registeredDriveURL: URL?
 
     public init(
         authorization: AuthorizationViewModel,
         settings: CompanionSettingsViewModel,
         status: CompanionStatusViewModel,
         driveLocation: any DriveLocationProviding,
+        domainSetup: any FileProviderDomainSettingUp,
         completionStore: any OnboardingCompletionStore
     ) {
         self.authorization = authorization
         self.settings = settings
         self.status = status
         self.driveLocation = driveLocation
+        self.domainSetup = domainSetup
         self.completionStore = completionStore
         self.isPresented = !completionStore.hasCompletedOnboarding()
     }
@@ -108,10 +132,12 @@ public final class OnboardingViewModel {
     /// gates: the flow does not leave it until the account is authorized.
     public var canAdvance: Bool {
         switch step {
-        case .welcome, .defaults, .success:
+        case .welcome, .defaults:
             return true
         case .signIn:
             return authorization.isAuthorized
+        case .success:
+            return domainSetupState.isReady
         }
     }
 
@@ -156,6 +182,7 @@ public final class OnboardingViewModel {
     /// Finishes onboarding: persists whatever defaults are set, records
     /// completion so it never auto-shows again, and dismisses the window.
     public func finish() {
+        guard domainSetupState.isReady else { return }
         settings.save()
         completionStore.setCompletedOnboarding(true)
         isPresented = false
@@ -171,6 +198,8 @@ public final class OnboardingViewModel {
     /// Re-runs onboarding from the start — the Help ▸ Setup Guide entry.
     public func restart() {
         step = .welcome
+        domainSetupState = .idle
+        registeredDriveURL = nil
         isPresented = true
     }
 
@@ -186,13 +215,34 @@ public final class OnboardingViewModel {
 
     // MARK: - Success
 
-    /// The drive's user-visible Finder URL, when resolvable.
-    public var driveURL: URL? { driveLocation.resolveDriveURL() }
+    /// Reconciles the stable File Provider domain and resolves its actual
+    /// user-visible root. Safe to call from launch and from the success view:
+    /// overlapping calls coalesce at the injected setup seam, a ready model
+    /// is a no-op, and a failed model performs a fresh retry.
+    public func prepareFileProviderDomain() async {
+        guard domainSetupState != .settingUp, domainSetupState != .ready else { return }
+        domainSetupState = .settingUp
+        status.reportProviderStatus(.other("Registering…"))
+        do {
+            let result = try await domainSetup.reconcile()
+            registeredDriveURL = result.rootURL
+            domainSetupState = .ready
+            status.reportProviderStatus(.registered)
+        } catch {
+            registeredDriveURL = nil
+            domainSetupState = .failed
+            status.reportProviderStatus(.other("Registration failed — retry setup"))
+        }
+    }
+
+    /// The drive's user-visible Finder root after successful registration.
+    public var driveURL: URL? { registeredDriveURL }
 
     /// Reveals the drive in Finder. Returns whether a location could be shown.
     @discardableResult
     public func openDriveInFinder() -> Bool {
-        driveLocation.reveal()
+        guard let registeredDriveURL else { return false }
+        return driveLocation.reveal(registeredDriveURL)
     }
 
     /// Refreshes the agent health backing the sync indicator.
@@ -210,14 +260,29 @@ public final class OnboardingViewModel {
         case .notRunning, .timedOut, .error:
             return .waitingForAgent
         case .running(let snapshot):
+            if snapshot.finderContentState == .failed {
+                return .failed(
+                    snapshot.finderContentFailure?.message
+                        ?? "Finder structure is unavailable. Relaunch GramDrive to retry.")
+            }
             if snapshot.pendingTransferCount > 0 {
                 return .syncing(pending: snapshot.pendingTransferCount)
             }
-            // No source update reported yet → still preparing the chat list.
-            if snapshot.lastSourceUpdateMs == nil {
+            switch snapshot.finderContentState {
+            case .ready:
+                return .upToDate
+            case .waitingForAuthorization, .preparing:
                 return .preparing
+            case .failed:
+                // Handled above so the failure message can be projected.
+                return .failed("Finder structure is unavailable. Relaunch GramDrive to retry.")
+            case nil:
+                // Compatibility with a pre-v2 running agent.
+                if snapshot.lastSourceUpdateMs == nil {
+                    return .preparing
+                }
+                return .upToDate
             }
-            return .upToDate
         }
     }
 }

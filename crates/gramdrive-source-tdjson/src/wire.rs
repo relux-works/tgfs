@@ -17,6 +17,9 @@ pub(crate) fn list_json(list: ChatListKind) -> Value {
     match list {
         ChatListKind::Main => serde_json::json!({"@type": "chatListMain"}),
         ChatListKind::Archive => serde_json::json!({"@type": "chatListArchive"}),
+        // SnapshotPlan rejects this derived view before it can reach the
+        // wire. Reaching here would violate that source boundary.
+        ChatListKind::Stories => unreachable!("Stories is derived from storyListMain"),
         ChatListKind::Folder(folder) => {
             serde_json::json!({"@type": "chatListFolder", "chat_folder_id": folder.0})
         }

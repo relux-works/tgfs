@@ -18,7 +18,7 @@
 //! same archive is projected by the macOS File Provider, the Windows CfAPI
 //! host, the Android `DocumentsProvider`, and the Linux FUSE adapter; a name
 //! that differed per platform would make the same chat a different path
-//! depending on where it is read, and `chat.json` links (SYNC-032) would stop
+//! depending on where it is read, and `.chat.json` links (SYNC-032) would stop
 //! resolving across platforms.
 //!
 //! So the policy is the *union* of every platform's restrictions, and
@@ -111,6 +111,59 @@ use unicode_normalization::{UnicodeNormalization, is_nfc};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::identity::ItemId;
+
+/// Account-local civil timestamp used in attachment display names.
+///
+/// UTC conversion is deliberately outside naming: the state layer persists
+/// the account display timezone and the caller supplies the converted civil
+/// components. This keeps absolute source timestamps separate from display
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DisplayTimestamp {
+    /// Four-digit civil year.
+    pub year: u16,
+    /// Civil month, 1-12.
+    pub month: u8,
+    /// Civil day, 1-31.
+    pub day: u8,
+    /// Civil hour, 0-23.
+    pub hour: u8,
+    /// Civil minute, 0-59.
+    pub minute: u8,
+    /// Civil second, 0-59.
+    pub second: u8,
+}
+
+/// Builds the truthful raw attachment name used before sibling resolution.
+///
+/// `source_name` is present only when Telegram supplied an original document
+/// name. Telegram media representations pass `None` and use
+/// `generated_kind_name` (for example `photo.jpg`). The timestamp prefix is
+/// cross-platform safe and collision suffixes remain the responsibility of
+/// [`resolve_siblings`], where they derive from stable identity.
+pub fn attachment_display_name(
+    timestamp: DisplayTimestamp,
+    source_name: Option<&str>,
+    generated_kind_name: &str,
+) -> String {
+    let tail = source_name.filter(|name| !name.is_empty()).unwrap_or({
+        if generated_kind_name.is_empty() {
+            "Attachment"
+        } else {
+            generated_kind_name
+        }
+    });
+    format!(
+        "{:04}-{:02}-{:02} {:02}-{:02}-{:02} {}",
+        timestamp.year,
+        timestamp.month,
+        timestamp.day,
+        timestamp.hour,
+        timestamp.minute,
+        timestamp.second,
+        tail
+    )
+}
 
 /// Name given to an item whose title sanitizes to nothing.
 ///
@@ -551,6 +604,88 @@ pub fn chat_folder_name(title: &str, username: Option<&str>) -> String {
     }
 }
 
+/// Truthful leaf filename for one Telegram attachment, before the account-local
+/// timestamp prefix and sibling collision resolution are applied.
+///
+/// Only `original_document` may use a sender-provided source name. Telegram's
+/// processed media representations always use a generated representation name
+/// even when their wire object happens to carry a `file_name` member.
+pub fn attachment_leaf_name(
+    logical_kind: &str,
+    telegram_representation: &str,
+    source_name: Option<&str>,
+    mime_type: Option<&str>,
+) -> SafeName {
+    if telegram_representation == "original_document"
+        && let Some(source_name) = source_name.filter(|name| !name.is_empty())
+    {
+        return sanitize(source_name, NameKind::File);
+    }
+
+    let stem = match telegram_representation {
+        "message_photo" => "photo",
+        "message_video" => "video",
+        "message_animation" => "animation",
+        "message_audio" => "audio",
+        "message_voice" => "voice",
+        "message_video_note" => "video_note",
+        "message_sticker" => "sticker",
+        _ => match logical_kind {
+            "photo" => "photo",
+            "video" => "video",
+            "animation" => "animation",
+            "audio" => "audio",
+            "voice" => "voice",
+            "video_note" => "video_note",
+            "sticker" => "sticker",
+            "document" => "document",
+            _ => "attachment",
+        },
+    };
+    let extension =
+        mime_type
+            .and_then(attachment_mime_extension)
+            .or(match telegram_representation {
+                "message_photo" => Some("jpg"),
+                "message_video" | "message_animation" | "message_video_note" => Some("mp4"),
+                "message_voice" => Some("ogg"),
+                "message_sticker" => Some("webp"),
+                _ => None,
+            });
+    let raw = extension.map_or_else(
+        || stem.to_owned(),
+        |extension| format!("{stem}.{extension}"),
+    );
+    sanitize(&raw, NameKind::File)
+}
+
+fn attachment_mime_extension(mime_type: &str) -> Option<&'static str> {
+    let essence = mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    Some(match essence.as_str() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/flac" => "flac",
+        "audio/mp4" | "audio/x-m4a" | "audio/m4a" => "m4a",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        "application/x-tgsticker" => "tgs",
+        _ => return None,
+    })
+}
+
 /// Projects one untrusted title onto a single safe path component.
 ///
 /// Total: hostile input has no failure mode here, only a boring output. The
@@ -566,6 +701,15 @@ pub fn chat_folder_name(title: &str, username: Option<&str>) -> String {
 /// sanitize to one name. [`resolve_siblings`] is what makes a set of names
 /// projectable.
 pub fn sanitize(raw: &str, kind: NameKind) -> SafeName {
+    // A policy-valid component is already the canonical representation.
+    // Besides avoiding needless work, this makes the fixed-point guarantee
+    // independent of file-extension discovery: truncation can expose a
+    // short dot-tail that was not an extension in the original raw input.
+    if trim_edges(raw) == raw
+        && let Ok(safe) = SafeName::parse(raw)
+    {
+        return safe;
+    }
     let (stem, extension) = prepare(raw, kind);
     SafeName(compose(&stem, &extension, "", ComponentBudget::strictest()))
 }

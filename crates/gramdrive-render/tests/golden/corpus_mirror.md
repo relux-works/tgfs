@@ -1,7 +1,7 @@
 ---
 schema: gramdrive.transcript
-schema_version: 1
-renderer_version: 1
+schema_version: 2
+renderer_version: 4
 schema_family: 1
 document_id: gdaedaaaaaaaaaaaahaaaaaax7777rnyoe5uxagb7hbmbaaai
 account_id: 7
@@ -11,7 +11,8 @@ partition: 2023-11
 retention_mode: mirror
 timezone: UTC
 input_watermark_seq: 13
-content_version: gramdrive.transcript/s1/r1/w13
+render_generation: 0
+content_version: gramdrive.transcript/s2/r4/w13/g0/retention-mirror/tz-UTC
 ---
 
 # Chat -1001234567890
@@ -40,21 +41,17 @@ a reply
 
 _album 9000_
 
-- **photo** — [IMG\_0001\.jpg](media/IMG_0001.jpg) (204800 bytes)
+- **photo** — [IMG\_0001\.jpg](IMG_0001.jpg) (204800 bytes)
 
 **22:16:10 · user 555 · #105**
 
 _album 9000_
 
-- **video** — [(unnamed)](media/video_0105.mp4) (5242880 bytes) — _not downloaded yet_
+- **video** — [(unnamed)](video_0105.mp4) (5242880 bytes) — _not downloaded yet_
 
 **22:16:20 · user 999 · #106**
 
-no\-save channel
-
-_Protected content: Telegram forbids saving; media is not fetched (POL\-4)._
-
-- **document** — secret\.pdf (1024 bytes) — _restricted by Telegram; not fetched_
+_Protected content: Telegram forbids saving; content is not retained (POL\-4)._
 
 **22:16:30 · user 999 · #107**
 

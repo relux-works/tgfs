@@ -33,7 +33,7 @@ public enum FileProviderExtensionError: Error, Equatable {
 /// hydration endpoint through ``ContentFetcher`` — the extension asks the
 /// engine's host process for bytes, never a source directly.
 public final class GramDriveFileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
-    @unchecked Sendable
+    NSFileProviderThumbnailing, @unchecked Sendable
 {
     /// The account context every provider callback starts from: the
     /// configured account (including `rootItemId`, the durable identifier
@@ -50,6 +50,9 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
     private let lock = NSLock()
     private var cachedStore: SharedStateStore?
     let contentFetcher: ContentFetcher
+    let thumbnailFetcher: ThumbnailFetcher
+    private let historyPriority: any HistoryPrioritySignaling
+    private let providerFetchHealth: any ProviderFetchHealthSignaling
 
     /// The system's entry point: resolve shared state inside the App
     /// Group container the signed extension is entitled to.
@@ -71,17 +74,35 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
         domain: NSFileProviderDomain,
         dataRoot: @escaping @Sendable () throws -> URL,
         hydration: (any HydrationRequesting)? = nil,
-        fetchScratchDirectory: (@Sendable () throws -> URL)? = nil
+        fetchScratchDirectory: (@Sendable () throws -> URL)? = nil,
+        historyPriority: (any HistoryPrioritySignaling)? = nil,
+        providerFetchHealth: (any ProviderFetchHealthSignaling)? = nil
     ) {
         self.domain = domain
         self.resolveDataRoot = dataRoot
+        let prioritySignaler = historyPriority
+            ?? AgentHistoryPriorityClient(socketURL: {
+                AgentControlEndpoint.socketURL(dataRoot: try dataRoot())
+            })
+        self.historyPriority = prioritySignaler
+        let healthSignaler = providerFetchHealth
+            ?? AgentProviderFetchHealthClient(socketURL: {
+                AgentControlEndpoint.socketURL(dataRoot: try dataRoot())
+            })
+        self.providerFetchHealth = healthSignaler
+        let hydrationClient = hydration
+            ?? AgentHydrationClient(socketURL: {
+                HydrationContract.socketURL(dataRoot: try dataRoot())
+            })
         self.contentFetcher = ContentFetcher(
-            hydration: hydration
-                ?? AgentHydrationClient(socketURL: {
-                    HydrationContract.socketURL(dataRoot: try dataRoot())
-                }),
+            hydration: hydrationClient,
             scratchDirectory: fetchScratchDirectory
-                ?? Self.providerScratchDirectory(domain: domain))
+                ?? Self.providerScratchDirectory(domain: domain),
+            historyPriority: prioritySignaler,
+            telemetry: ProviderFetchTelemetry(health: healthSignaler))
+        self.thumbnailFetcher = ThumbnailFetcher(
+            hydration: hydrationClient,
+            telemetry: ProviderFetchTelemetry(health: healthSignaler))
         super.init()
     }
 
@@ -122,6 +143,7 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
 
     public func invalidate() {
         contentFetcher.cancelAll()
+        thumbnailFetcher.cancelAll()
         lock.lock()
         cachedStore = nil
         lock.unlock()
@@ -175,16 +197,25 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
         else {
             throw NSFileProviderError(.noSuchItem)
         }
+        signalHistoryPriority(for: metadata, accountId: context.account.accountId, .requested)
         return GramDriveFileProviderItem(
             metadata: metadata, accountRootId: context.account.rootItemId)
     }
 
-    /// Content fetch (TASK-260715-kkglhx): the whole behavior lives in
+    /// Content fetch (TASK-260715-kkglhx): Finder opens and Quick Look both
+    /// materialize through this same on-demand callback. The whole behavior lives in
     /// ``ContentFetcher`` — this callback only binds it to the domain's
     /// account context (minus the `NSFileProviderRequest` plumbing, which
     /// has no test-constructible form). A domain that does not resolve to
     /// a configured account answers `noSuchItem`, exactly like the item
     /// surface.
+    ///
+    /// It is also the drive's reliable "the user is in this chat" signal
+    /// (BUG-260728-2qfzbd): the fetcher raises `requested` history demand for
+    /// the enclosing chat while the read runs. Directory enumeration cannot
+    /// carry that signal on its own, because macOS answers a read of an
+    /// already-materialized folder from its own replica without ever calling
+    /// this extension.
     public func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
         version requestedVersion: NSFileProviderItemVersion?,
@@ -223,6 +254,51 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
             completionHandler: completionHandler)
     }
 
+    /// Finder thumbnailing is a separate bounded agent operation. It never
+    /// calls `fetchContents`, so asking for a preview cannot hydrate full media.
+    public func fetchThumbnails(
+        for itemIdentifiers: [NSFileProviderItemIdentifier],
+        requestedSize size: CGSize,
+        perThumbnailCompletionHandler: @escaping (
+            NSFileProviderItemIdentifier, Data?, (any Error)?
+        ) -> Void,
+        completionHandler: @escaping ((any Error)?) -> Void
+    ) -> Progress {
+        let perItem = UncheckedSendable(perThumbnailCompletionHandler)
+        let completion = UncheckedSendable(completionHandler)
+        return fetchThumbnailsCore(
+            itemIdentifiers: itemIdentifiers,
+            requestedSize: size,
+            perItemCompletion: { identifier, data, error in
+                perItem.value(identifier, data, error)
+            },
+            completion: { error in completion.value(error) })
+    }
+
+    func fetchThumbnailsCore(
+        itemIdentifiers: [NSFileProviderItemIdentifier],
+        requestedSize: CGSize,
+        perItemCompletion: @escaping ThumbnailFetcher.PerItemCompletion,
+        completion: @escaping ThumbnailFetcher.Completion
+    ) -> Progress {
+        thumbnailFetcher.fetchThumbnails(
+            itemIdentifiers: itemIdentifiers,
+            requestedSize: requestedSize,
+            context: { [self] in
+                do {
+                    let context = try accountContext()
+                    return (account: context.account, store: context.store)
+                } catch let error as FileProviderExtensionError {
+                    switch error {
+                    case .unrecognizedDomainIdentifier, .accountNotConfigured:
+                        throw NSFileProviderError(.noSuchItem)
+                    }
+                }
+            },
+            perItemCompletion: perItemCompletion,
+            completion: completion)
+    }
+
     public func createItem(
         basedOn itemTemplate: NSFileProviderItem,
         fields: NSFileProviderItemFields,
@@ -238,6 +314,19 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
         return completedProgress()
     }
 
+    /// V1 is read-only with respect to Telegram (DEC-007), so every change
+    /// that would have to travel *to* Telegram is refused.
+    ///
+    /// The three locally-owned presentation properties are the exception,
+    /// and refusing them would be wrong rather than strict: `lastUsedDate`,
+    /// `tagData` and `favoriteRank` never leave this Mac, and the system
+    /// pushes them here so a provider can keep them. Failing the
+    /// modification makes the system revert the user's own local state — a
+    /// chat they just opened would snap back to the date this extension
+    /// reports (BUG-260728-2qfzbd). Accepting them with no remaining pending
+    /// fields lets the genuine, newer local access date win over the
+    /// index-derived floor `GramDriveFileProviderItem.lastUsedDate`
+    /// publishes.
     public func modifyItem(
         _ item: NSFileProviderItem,
         baseVersion version: NSFileProviderItemVersion,
@@ -248,8 +337,20 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?)
             -> Void
     ) -> Progress {
+        if Self.isLocallyOwnedModification(changedFields) {
+            completionHandler(item, [], false, nil)
+            return completedProgress()
+        }
         completionHandler(nil, [], false, CocoaError(.featureUnsupported))
         return completedProgress()
+    }
+
+    /// Whether every changed field is a presentation property this Mac owns
+    /// on its own and that never maps to a Telegram write. An empty change
+    /// set is trivially local: there is nothing to send anywhere.
+    static func isLocallyOwnedModification(_ changedFields: NSFileProviderItemFields) -> Bool {
+        let locallyOwned: NSFileProviderItemFields = [.lastUsedDate, .tagData, .favoriteRank]
+        return changedFields.subtracting(locallyOwned).isEmpty
     }
 
     public func deleteItem(
@@ -295,6 +396,7 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
         if containerItemIdentifier == .trashContainer {
             throw CocoaError(.featureUnsupported)
         }
+        var chatPriorityRequest: HistoryPriorityRequest?
         if containerItemIdentifier != .workingSet, containerItemIdentifier != .rootContainer {
             let coreId = ItemIdentifierMapping.coreItemId(
                 for: containerItemIdentifier, accountRootId: context.account.rootItemId)
@@ -315,11 +417,29 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
             guard metadata.isDirectory else {
                 throw CocoaError(.featureUnsupported)
             }
+            if metadata.kind == .chat, let chatId = metadata.chatId {
+                chatPriorityRequest = HistoryPriorityRequest(
+                    accountId: context.account.accountId,
+                    chatId: chatId,
+                    priority: .visible)
+            }
         }
         return GramDriveEnumerator(
             store: context.store,
             accountId: context.account.accountId,
-            container: containerItemIdentifier)
+            container: containerItemIdentifier,
+            historyPriority: historyPriority,
+            chatPriorityRequest: chatPriorityRequest)
+    }
+
+    func signalHistoryPriority(
+        for metadata: ItemMetadata,
+        accountId: Int64,
+        _ priority: HistoryPriorityHint
+    ) {
+        guard metadata.kind == .chat, let chatId = metadata.chatId else { return }
+        historyPriority.signal(
+            HistoryPriorityRequest(accountId: accountId, chatId: chatId, priority: priority))
     }
 
     // MARK: - Internals
