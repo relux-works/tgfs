@@ -68,6 +68,7 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
         label: "com.reluxworks.gramdrive.hydration.client",
         qos: .userInitiated,
         attributes: .concurrent)
+    private let beforeResultDelivery: @Sendable () -> Void
 
     /// - Parameters:
     ///   - socketURL: resolves the endpoint per call (the data root may not
@@ -81,6 +82,19 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
     ) {
         self.resolveSocketURL = socketURL
         self.idleTimeout = idleTimeout
+        self.beforeResultDelivery = {}
+    }
+
+    /// Internal test seam that makes the result-delivery/cancellation boundary
+    /// deterministic. Production callers always use the public initializer.
+    init(
+        testingSocketURL socketURL: @escaping @Sendable () throws -> URL,
+        idleTimeout: Duration,
+        beforeResultDelivery: @escaping @Sendable () -> Void
+    ) {
+        self.resolveSocketURL = socketURL
+        self.idleTimeout = idleTimeout
+        self.beforeResultDelivery = beforeResultDelivery
     }
 
     public func hydrate(
@@ -116,18 +130,32 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
         onProgress: @escaping @Sendable (HydrationProgress) -> Void,
         terminal: @escaping @Sendable (HydratedContent) throws -> Output
     ) async throws -> Output {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                queue.async {
-                    continuation.resume(
-                        with: Result {
+        do {
+            let output = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    queue.async {
+                        let result = Result {
                             try self.exchangeBlocking(
                                 request, over: connection, onProgress: onProgress, terminal: terminal)
-                        })
+                        }
+                        self.beforeResultDelivery()
+                        continuation.resume(with: result)
+                    }
                 }
+            } onCancel: {
+                connection.cancel()
             }
-        } onCancel: {
-            connection.cancel()
+            // `exchangeBlocking` runs on a GCD thread, so it can select a
+            // timeout while cancellation is being delivered to the awaiting
+            // Swift task. Check that task's authoritative cancellation bit at
+            // the handoff, rather than relying solely on the I/O-side state.
+            try Task.checkCancellation()
+            return output
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            throw error
         }
     }
 
