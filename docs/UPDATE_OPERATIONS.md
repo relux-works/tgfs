@@ -14,14 +14,25 @@ This public runbook is the operator contract for Sparkle update delivery. Never 
    python3 .scripts/release/check_update_secret_inventory.py --set-notary-from "$SECURE_INPUT_DIR"
    ```
 
-5. Independently generate test and stable Sparkle keypairs offline. For each generation, run Sparkle's `generate_keys -x`, place its private export in encrypted offline escrow, review and commit only the public key/feed URL, then stream the base64 export directly into its designated environment secret. The pipelines must have no diagnostic consumer and must not be run with shell tracing:
+5. Independently generate test and stable Sparkle keypairs offline. Mount the encrypted offline escrow volume only for this procedure, make its directory owner-only (`0700`), and use a distinct, public, versioned Keychain account name for each channel/generation. `generate_keys` creates that account's keypair; `-x` only exports an existing account and therefore always requires an owner-only private-key-file operand. The following commands create V1, move its sole non-Keychain private export into encrypted escrow, then stream its base64 bytes directly from escrow to the designated environment secret. They have no diagnostic consumer and must not be run with shell tracing:
 
    ```sh
-   generate_keys -x | base64 | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64
-   generate_keys -x | base64 | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64
+   export SPARKLE_ESCROW_DIR=/Volumes/GramDriveUpdateEscrow
+   export SPARKLE_STAGE_DIR="$SECURE_INPUT_DIR/sparkle"
+   mkdir -m 700 "$SPARKLE_STAGE_DIR"
+   generate_keys --account GramDrive-Sparkle-Test-V1 >/dev/null
+   generate_keys --account GramDrive-Sparkle-Test-V1 -x "$SPARKLE_STAGE_DIR/test-v1.private"
+   mv "$SPARKLE_STAGE_DIR/test-v1.private" "$SPARKLE_ESCROW_DIR/test-v1.private"
+   base64 < "$SPARKLE_ESCROW_DIR/test-v1.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64
+
+   generate_keys --account GramDrive-Sparkle-Stable-V1 >/dev/null
+   generate_keys --account GramDrive-Sparkle-Stable-V1 -x "$SPARKLE_STAGE_DIR/stable-v1.private"
+   mv "$SPARKLE_STAGE_DIR/stable-v1.private" "$SPARKLE_ESCROW_DIR/stable-v1.private"
+   base64 < "$SPARKLE_ESCROW_DIR/stable-v1.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64
+   rmdir "$SPARKLE_STAGE_DIR"
    ```
 
-   Run the two commands in separate offline key-generation sessions; never reuse or copy an export between `updates-test` and `release`.
+   Record the public key from each creation command in the reviewed channel configuration and commit only that public key/feed URL. Unmount the escrow volume after storage. Run the test and stable sequences in separate offline key-generation sessions; never reuse or copy an export between `updates-test` and `release`. If a staging copy remains after a failed `mv`, destroy it with the organisation's approved local destruction procedure before continuing; do not create an unencrypted backup.
 
 6. Then run the value-free preflight:
 
@@ -67,20 +78,40 @@ Never rotate Developer ID and a Sparkle trust key in one bridge build.
 
 ### Stable Sparkle V1 to V2
 
-1. Generate and escrow V2 in a separate offline session, then set it only in `release` without an argv value:
+1. Generate and escrow V2 in a separate offline session, then set it only in `release` without an argv value. This sequence creates the distinct V2 Keychain identity before exporting it, and removes the staging export after it reaches encrypted escrow:
 
    ```sh
-   generate_keys -x | base64 | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64
+   export SPARKLE_ESCROW_DIR=/Volumes/GramDriveUpdateEscrow
+   export SPARKLE_STAGE_DIR="$SECURE_INPUT_DIR/sparkle"
+   mkdir -m 700 "$SPARKLE_STAGE_DIR"
+   generate_keys --account GramDrive-Sparkle-Stable-V2 >/dev/null
+   generate_keys --account GramDrive-Sparkle-Stable-V2 -x "$SPARKLE_STAGE_DIR/stable-v2.private"
+   mv "$SPARKLE_STAGE_DIR/stable-v2.private" "$SPARKLE_ESCROW_DIR/stable-v2.private"
+   base64 < "$SPARKLE_ESCROW_DIR/stable-v2.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64
+   rmdir "$SPARKLE_STAGE_DIR"
    ```
 
-   Review its public key and `https://relux-works.github.io/tgfs/updates/stable/v2/stable.xml`. Do not change Developer ID.
+   Review and commit its public key and `https://relux-works.github.io/tgfs/updates/stable/v2/stable.xml`, then unmount escrow. Do not change Developer ID.
 2. Build a higher-build stable bridge embedding the V2 key/URL. Publish exact bytes through test and validate appcast signature plus installed bundle configuration.
 3. With release approval, use V1 to publish the final `.../stable/v1/stable.xml` whose highest item is the bridge and whose enclosure is V1-signed. In the same complete Pages site publish V2 signed by V2. Never sign V1's URL with V2.
 4. Test a previously installed V1 stable client before publication, after it sees the bridge, after relaunch onto V2, and after a later V2-only update. Record only build and feed generation.
 5. Cut new downloads/releases to V2 only after that passes. Keep the V1 URL, old-key-signed bridge feed, bridge DMG, checksums, and release bytes live for supported clients. Freeze exact legacy bytes as checksummed immutable release assets.
 6. Remove V1 from CI only after freeze. Retain escrow through the support/recovery window; destroy it only with a two-person record of generation, custodians, time, and authorization—never the value.
 
-Test-key rotation follows the same pattern: create the independent V2 export and stream it only to `updates-test` with `--set SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64`; V1 `updates-test-v1/test.xml` signed by V1 offers a bridge embedding V2 and `updates-test-v2/test.xml`; keep V1 live for supported test clients. If every test client is disposable, revocation plus a manual reinstall is permitted only when that discontinuity is recorded.
+Test-key rotation uses this analogous independent V2 sequence; its account, export, secret, and feed URL must never be substituted with stable values:
+
+```sh
+export SPARKLE_ESCROW_DIR=/Volumes/GramDriveUpdateEscrow
+export SPARKLE_STAGE_DIR="$SECURE_INPUT_DIR/sparkle"
+mkdir -m 700 "$SPARKLE_STAGE_DIR"
+generate_keys --account GramDrive-Sparkle-Test-V2 >/dev/null
+generate_keys --account GramDrive-Sparkle-Test-V2 -x "$SPARKLE_STAGE_DIR/test-v2.private"
+mv "$SPARKLE_STAGE_DIR/test-v2.private" "$SPARKLE_ESCROW_DIR/test-v2.private"
+base64 < "$SPARKLE_ESCROW_DIR/test-v2.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64
+rmdir "$SPARKLE_STAGE_DIR"
+```
+
+Review and commit its public key and `https://github.com/relux-works/tgfs/releases/download/updates-test-v2/test.xml`, then unmount escrow. V1 `updates-test-v1/test.xml` signed by V1 offers a bridge embedding V2 and `updates-test-v2/test.xml`; keep V1 live for supported test clients. If every test client is disposable, revocation plus a manual reinstall is permitted only when that discontinuity is recorded.
 
 ### Developer ID certificate/export
 

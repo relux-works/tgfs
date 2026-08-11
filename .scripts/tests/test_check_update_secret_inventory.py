@@ -98,6 +98,26 @@ class InventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "empty"):
             inventory.set_secret("MACOS_CERT_P12", b"")
 
+    def test_runbook_requires_versioned_sparkle_creation_export_escrow_and_cleanup(self):
+        runbook = (SCRIPT.parents[2] / "docs/UPDATE_OPERATIONS.md").read_text()
+        expected_sequences = (
+            ("Test-V1", "test-v1.private", "SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64"),
+            ("Stable-V1", "stable-v1.private", "SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64"),
+            ("Test-V2", "test-v2.private", "SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64"),
+            ("Stable-V2", "stable-v2.private", "SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64"),
+        )
+        for generation, export_name, secret_name in expected_sequences:
+            account = f"GramDrive-Sparkle-{generation}"
+            self.assertIn(f"generate_keys --account {account} >/dev/null", runbook)
+            self.assertIn(f'generate_keys --account {account} -x "$SPARKLE_STAGE_DIR/{export_name}"', runbook)
+            self.assertIn(f'mv "$SPARKLE_STAGE_DIR/{export_name}" "$SPARKLE_ESCROW_DIR/{export_name}"', runbook)
+            self.assertIn(
+                f'base64 < "$SPARKLE_ESCROW_DIR/{export_name}" | python3 .scripts/release/check_update_secret_inventory.py --set {secret_name}',
+                runbook,
+            )
+        self.assertIn('rmdir "$SPARKLE_STAGE_DIR"', runbook)
+        self.assertNotRegex(runbook, r"generate_keys\s+-x(?:\s|$)")
+
 
 if __name__ == "__main__":
     unittest.main()
