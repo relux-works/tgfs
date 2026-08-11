@@ -57,7 +57,8 @@ private func settle(_ model: AuthorizationViewModel) async {
         #expect(model.isAuthorized)
         #expect(
             model.stateHistory.map(\.kind) == [
-                "configuring", "wait-phone-number", "wait-code", "wait-password", "ready",
+                "starting", "configuring", "wait-phone-number", "wait-code", "wait-password",
+                "ready",
             ])
     }
 
@@ -113,6 +114,53 @@ private func settle(_ model: AuthorizationViewModel) async {
         #expect(!model.isSubmitting)
         #expect(model.state == .waitPhoneNumber)
     }
+
+    @Test func restartAcknowledgesStartingBeforeStalledNamespaceTeardownTimesOut() async {
+        let first = DelayedClosingAuthorizationSession(
+            initialState: .waitQrConfirmation(link: "tg://login?token=stalled"))
+        let backend = InMemoryCompanionBackend(session: { first })
+        let model = AuthorizationViewModel(backend: backend, teardownTimeout: .milliseconds(20))
+
+        await model.begin()
+        for _ in 0..<100 where model.state.kind != "wait-qr-confirmation" {
+            await Task.yield()
+        }
+        #expect(model.state.kind == "wait-qr-confirmation")
+
+        var acknowledgements = first.cancelAcknowledgements.makeAsyncIterator()
+        let restart = Task { @MainActor in await model.begin() }
+        _ = await acknowledgements.next()
+        #expect(model.state == .starting, "the click must acknowledge before teardown completes")
+        #expect(model.isSubmitting)
+
+        await restart.value
+        #expect(model.unavailable == .timedOut)
+        #expect(model.state == .idle)
+        #expect(!model.isSubmitting)
+        first.releaseAfterClose()
+    }
+
+    @Test func repeatedCancellationKeepsSubmissionStateUntilStalledTeardownExpires() async {
+        let session = DelayedClosingAuthorizationSession(initialState: .waitPhoneNumber)
+        let backend = InMemoryCompanionBackend(session: { session })
+        // This only controls test scheduling: the assertion must run while the
+        // first cancellation is in flight, even when the full suite is busy.
+        let model = AuthorizationViewModel(backend: backend, teardownTimeout: .milliseconds(250))
+
+        await model.begin()
+        var acknowledgements = session.cancelAcknowledgements.makeAsyncIterator()
+        let firstCancellation = Task { @MainActor in await model.cancel() }
+        _ = await acknowledgements.next()
+        let repeatedCancellation = Task { @MainActor in await model.cancel() }
+        await repeatedCancellation.value
+
+        #expect(model.isSubmitting, "a coalesced cancel must not clear the first cancel's progress")
+        await firstCancellation.value
+        #expect(model.unavailable == .timedOut)
+        #expect(model.state == .idle)
+        #expect(!model.isSubmitting)
+        session.releaseAfterClose()
+    }
 }
 
 private final class SessionSequence: @unchecked Sendable {
@@ -160,7 +208,7 @@ private final class DelayedClosingAuthorizationSession: AuthorizationSession, @u
 
     func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult { .accepted }
 
-    func cancel() async {
+    func cancel() async -> ControlChannelUnavailable? {
         // Models the production ordering: TDLib accepts cancel first, then
         // reports terminal closure after the auth pump releases its slot.
         acknowledgementContinuation.yield(())
@@ -174,6 +222,7 @@ private final class DelayedClosingAuthorizationSession: AuthorizationSession, @u
                 lock.unlock()
             }
         }
+        return nil
     }
 
     func releaseAfterClose() {
@@ -212,7 +261,7 @@ private final class RecordingAuthorizationSession: AuthorizationSession, @unchec
         return .accepted
     }
 
-    func cancel() async {}
+    func cancel() async -> ControlChannelUnavailable? { nil }
 
     private func recordStart() {
         lock.lock()

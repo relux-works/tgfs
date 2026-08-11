@@ -203,9 +203,10 @@ public final class ScriptedAuthorizationSession: AuthorizationSession, @unchecke
     submitHandler(input)
   }
 
-  public func cancel() async {
+  public func cancel() async -> ControlChannelUnavailable? {
     _ = await submit(.cancel)
     continuation.finish()
+    return nil
   }
 
   /// Pushes one reported state onto the stream.

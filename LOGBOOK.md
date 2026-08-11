@@ -5,6 +5,12 @@
 
 ## 2026-08-11
 
+### 2158 — Sign-in control paths fail closed across startup, submit, and cancellation (BUG-260729-31bfuj)
+
+- FIX: `AuthorizationViewModel` renders `.starting` before any namespace teardown, coalesces repeated cancellation, maintains submission state across concurrent exits, and reports typed teardown failures. `LiveAuthorizationSession` now bounds channel open, first-event, submit, and the full cancellation path; a deadline closes the channel and returns `.timedOut`, while first-event EOF remains `.dropped`. Hosted auth submits receive the same bounded fail-closed behavior in `ControlServer`, retaining the current-main `Task.detached` Sendable boundary.
+- REGRESSION: deterministic Swift Testing coverage exercises a stalled model teardown, repeated cancellation, first-event timeout and EOF, stalled client submit, model-plus-live cancellation closure, and stalled hosted submit.
+- VALIDATION: focused authorization-view-model, live-control, and control-channel suites passed; `make check-apple` and `make check-security` passed. `swift format lint --strict` exited 1 because its default two-space rule flags pre-existing whole-file four-space indentation across repository sources/tests; no project formatter configuration or formatter gate exists, so this is retained as a non-green diagnostic rather than a formatting-wide rewrite.
+
 ### 0023 — Native x86_64 build requires an explicit detached auth submission boundary (BUG-260729-37ffmx)
 
 - FIRST-RED: exact-main native-ci run `31517011802` compiled the auth diagnostic patch on its x86_64 Swift host and rejected the reader-loop `Task` at `ControlServer.swift:813` as a non-Sendable closure transfer. The local arm64 Apple suite had passed, so the native result is preserved as architecture-specific compiler enforcement, not retried.

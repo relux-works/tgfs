@@ -146,13 +146,18 @@ public struct ControlServerConfiguration: Sendable {
   public var maxConcurrentConnections: Int
   /// Cap on waiting for the request line of an accepted connection.
   public var requestTimeout: Duration
+  /// Cap on a hosted agent answering one auth input. The client observes a
+  /// closed channel on expiry rather than leaving a sign-in control wedged.
+  public var authSubmissionTimeout: Duration
 
   public init(
     maxConcurrentConnections: Int = 8,
-    requestTimeout: Duration = .seconds(5)
+    requestTimeout: Duration = .seconds(5),
+    authSubmissionTimeout: Duration = .seconds(90)
   ) {
     self.maxConcurrentConnections = maxConcurrentConnections
     self.requestTimeout = requestTimeout
+    self.authSubmissionTimeout = authSubmissionTimeout
   }
 }
 
@@ -811,7 +816,15 @@ public final class ControlServer: @unchecked Sendable {
           return
         }
         Task.detached { [weak self, session, frame, connection] in
-          let answer = await session.submit(frame.input)
+          guard let answer = await Self.answerAuthInput(
+            session: session,
+            input: frame.input,
+            timeout: self?.configuration.authSubmissionTimeout ?? .seconds(90))
+          else {
+            connection.teardown()
+            self?.remove(connection)
+            return
+          }
           if let rejection = answer.rejection {
             self?.handlers.authDiagnostics?(AuthDiagnosticCode.refusal(for: rejection))
           }
@@ -822,6 +835,27 @@ public final class ControlServer: @unchecked Sendable {
                 outcome: answer.outcome,
                 rejection: answer.rejection)))
         }
+      }
+    }
+  }
+
+  /// A hosted engine call is allowed to outlive this task, but never the
+  /// control connection. This keeps a wedged namespace/auth pump from
+  /// pinning a submit control or the server's active-connection slot.
+  private static func answerAuthInput(
+    session: any AgentAuthSessionHosting,
+    input: ControlAuthInput,
+    timeout: Duration
+  ) async -> AgentAuthSubmitAnswer? {
+    let gate = AuthSubmissionDeadlineGate<AgentAuthSubmitAnswer?>(timedOut: { nil })
+    return await withCheckedContinuation { continuation in
+      gate.install(continuation)
+      Task.detached { [gate, session, input] in
+        gate.resolve(await session.submit(input))
+      }
+      Task.detached { [gate, timeout] in
+        try? await Task.sleep(for: timeout)
+        gate.timeout()
       }
     }
   }
@@ -874,6 +908,40 @@ public final class ControlServer: @unchecked Sendable {
     case .Internal:
       return ControlCommandFailure(category: .internalError, detail: "internal failure")
     }
+  }
+}
+
+private final class AuthSubmissionDeadlineGate<Value: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private let timedOut: @Sendable () -> Value
+  private var continuation: CheckedContinuation<Value, Never>?
+  private var resolved = false
+
+  init(timedOut: @escaping @Sendable () -> Value) {
+    self.timedOut = timedOut
+  }
+
+  func install(_ continuation: CheckedContinuation<Value, Never>) {
+    lock.lock()
+    self.continuation = continuation
+    lock.unlock()
+  }
+
+  func resolve(_ value: Value) {
+    lock.lock()
+    guard !resolved else {
+      lock.unlock()
+      return
+    }
+    resolved = true
+    let continuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+    continuation?.resume(returning: value)
+  }
+
+  func timeout() {
+    resolve(timedOut())
   }
 }
 
