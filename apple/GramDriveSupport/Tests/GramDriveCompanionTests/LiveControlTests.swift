@@ -137,7 +137,7 @@ struct LiveControlTests {
         #expect(!Self.processStillMatches(identity))
     }
 
-    @Test func realOlderAgentReplacementEscalatesAndStartsTheMatchingSameBinarySuccessor() async throws {
+    @Test func realOlderAgentReplacementWaitsForTheCommittedExitContractThenEscalates() async throws {
         let layout = try Self.tempLayout()
         let appBuild = "137"
         let preservedDomainInput = layout.dataRoot.appendingPathComponent("file-provider-domain-id")
@@ -179,6 +179,8 @@ struct LiveControlTests {
         )
 
         let replacementStarted = LockedBool()
+        let escalationUsed = LockedBool()
+        let observationClock = ManualObservationClock()
         let starter = ProcessStarter {
             replacementStarted.set(true)
             let process = try Self.startRealAgent(
@@ -193,13 +195,23 @@ struct LiveControlTests {
             layout: layout,
             healthTimeout: .milliseconds(50),
             starter: starter,
-            startupTimeout: .seconds(1),
+            // This is intentionally much longer than the committed-exit
+            // contract. A successor is allowed only after the terminator seam
+            // records exact-identity escalation, not after startup patience.
+            startupTimeout: .seconds(10),
             controlRetryInterval: .milliseconds(5),
             appBuild: appBuild,
-            matchingAgentReady: { hierarchyReady.set(true) }
+            accountDomainCleanup: nil,
+            matchingAgentReady: { hierarchyReady.set(true) },
+            committedExitObservationClock: observationClock.asCommittedExitClock(),
+            replacementProcessTerminator: { identity, pollInterval in
+                escalationUsed.set(true)
+                return await LiveCompanionBackend.terminateExactProcess(
+                    identity, pollInterval: pollInterval
+                )
+            }
         )
 
-        let replacementStart = ContinuousClock.now
         let result = await backend.fetchHealth()
 
         guard case let .running(snapshot) = result else {
@@ -217,10 +229,13 @@ struct LiveControlTests {
         #expect(replacementStarted.value)
         #expect(starter.startCount == 1)
         #expect(hierarchyReady.value)
-        #expect(
-            replacementStart.duration(to: ContinuousClock.now) < .seconds(5),
-            "the backend must use its exact-identity escalation before the test watchdog can exit the old process"
-        )
+        #expect(escalationUsed.value)
+        // The old agent delays both ordinary exit and its own watchdog for ten
+        // seconds. This fake observation clock advances only when the backend
+        // observes the still-matching old identity, so it deterministically
+        // proves that escalation consumed exactly the shared two-second
+        // committed-exit budget, not the ten-second new-agent startup budget.
+        #expect(observationClock.elapsed == CommitExitWatchdog.committedExitDeadline)
     }
 
     @Test func currentBuildRollbackRecoveryAcceptsAnAlreadyServingMatchingAgent() async throws {
@@ -1031,6 +1046,38 @@ private final class LockedBool: @unchecked Sendable {
 
     func set(_ value: Bool) {
         lock.withLock { stored = value }
+    }
+}
+
+private final class ManualObservationClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = ContinuousClock.now
+    private var totalElapsed: Duration = .zero
+
+    func asCommittedExitClock() -> LiveCompanionBackend.CommittedExitObservationClock {
+        LiveCompanionBackend.CommittedExitObservationClock(
+            now: { self.now },
+            sleep: { duration in self.advance(by: duration) }
+        )
+    }
+
+    var elapsed: Duration {
+        lock.lock()
+        defer { lock.unlock() }
+        return totalElapsed
+    }
+
+    private var now: ContinuousClock.Instant {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    private func advance(by duration: Duration) {
+        lock.lock()
+        current = current.advanced(by: duration)
+        totalElapsed += duration
+        lock.unlock()
     }
 }
 

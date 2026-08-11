@@ -15,11 +15,31 @@ import GramDriveSupport
 /// ``ControlChannelUnavailable/agentNotRunning`` — `notWired` is not a
 /// state this backend can produce.
 public struct LiveCompanionBackend: CompanionBackend {
+    /// The clock used only while observing an irrevocably committed older
+    /// process. Production uses the continuous clock; the internal seam lets
+    /// the real-process regression prove this lifecycle budget without
+    /// depending on host scheduler latency.
+    struct CommittedExitObservationClock: Sendable {
+        let now: @Sendable () -> ContinuousClock.Instant
+        let sleep: @Sendable (Duration) async -> Void
+
+        static let live = Self(
+            now: { ContinuousClock.now },
+            sleep: { duration in try? await Task.sleep(for: duration) }
+        )
+    }
+
     private let layout: AgentRuntimeLayout
     private let healthTimeout: Duration
     private let ensurer: AgentEnsurer
     private let controlConnectTimeout: Duration
     private let controlRetryInterval: Duration
+    /// `startupTimeout` bounds readiness of a new process. It must not also
+    /// delay recovery from an already-accepted commit: the old agent has
+    /// armed this shorter, shared hard-exit contract.
+    private let committedExitObservationTimeout: Duration
+    private let committedExitObservationClock: CommittedExitObservationClock
+    private let replacementProcessTerminator: @Sendable (AgentProcessIdentity, Duration) async -> Bool
     private let appBuild: String
     /// Fired only after a replacement reports the exact packaged build and a
     /// ready, enumerated hierarchy. The containing app uses it to wake existing
@@ -43,10 +63,41 @@ public struct LiveCompanionBackend: CompanionBackend {
         accountDomainCleanup: (@Sendable (Int64) async -> Void)? = nil,
         matchingAgentReady: (@Sendable () async -> Void)? = nil
     ) {
+        self.init(
+            layout: layout,
+            healthTimeout: healthTimeout,
+            starter: starter,
+            startupTimeout: startupTimeout,
+            controlRetryInterval: controlRetryInterval,
+            appBuild: appBuild,
+            accountDomainCleanup: accountDomainCleanup,
+            matchingAgentReady: matchingAgentReady,
+            committedExitObservationClock: .live,
+            replacementProcessTerminator: { identity, pollInterval in
+                await Self.terminateExactProcess(identity, pollInterval: pollInterval)
+            }
+        )
+    }
+
+    init(
+        layout: AgentRuntimeLayout,
+        healthTimeout: Duration,
+        starter: (any AgentStarting)?,
+        startupTimeout: Duration,
+        controlRetryInterval: Duration,
+        appBuild: String,
+        accountDomainCleanup: (@Sendable (Int64) async -> Void)?,
+        matchingAgentReady: (@Sendable () async -> Void)?,
+        committedExitObservationClock: CommittedExitObservationClock,
+        replacementProcessTerminator: @escaping @Sendable (AgentProcessIdentity, Duration) async -> Bool
+    ) {
         self.layout = layout
         self.healthTimeout = healthTimeout
         controlConnectTimeout = startupTimeout
         self.controlRetryInterval = controlRetryInterval
+        committedExitObservationTimeout = CommitExitWatchdog.committedExitDeadline
+        self.committedExitObservationClock = committedExitObservationClock
+        self.replacementProcessTerminator = replacementProcessTerminator
         self.appBuild = appBuild
         self.accountDomainCleanup = accountDomainCleanup
         self.matchingAgentReady = matchingAgentReady
@@ -185,16 +236,18 @@ public struct LiveCompanionBackend: CompanionBackend {
     }
 
     private func waitForAgentToDisappear(identity: AgentProcessIdentity) async -> Bool {
-        let deadline = ContinuousClock.now + controlConnectTimeout
-        while ContinuousClock.now < deadline {
+        // The accepted commit has armed `CommitExitWatchdog` for this exact
+        // bound. Do not consume the unrelated new-agent startup budget here:
+        // a wedged committed predecessor otherwise blocks replacement even
+        // though the lifecycle has become irreversible.
+        let deadline = committedExitObservationClock.now() + committedExitObservationTimeout
+        while committedExitObservationClock.now() < deadline {
             if identity.observe().provesCapturedProcessExited {
                 return true
             }
-            try? await Task.sleep(for: controlRetryInterval)
+            await committedExitObservationClock.sleep(controlRetryInterval)
         }
-        return await Self.terminateExactProcess(
-            identity, pollInterval: controlRetryInterval
-        )
+        return await replacementProcessTerminator(identity, controlRetryInterval)
     }
 
     /// A `commit` is irrevocable, so a wedged old helper is not a normal
