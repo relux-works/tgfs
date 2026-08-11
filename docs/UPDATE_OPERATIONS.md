@@ -154,7 +154,7 @@ rm "$SPARKLE_STAGE_DIR/test-v2.public"
 rmdir "$SPARKLE_STAGE_DIR"
 ```
 
-V1 `updates-test-v1/test.xml` signed by V1 offers a bridge embedding V2 and `updates-test-v2/test.xml`; keep V1 live for supported test clients. Once the bridge URL is frozen and verified, the equivalent test V1 retirement is:
+V1 `updates-test-v1/test.xml` signed by V1 offers a bridge embedding V2 and `updates-test-v2/test.xml`; keep V1 live for supported test clients. Retire test V1 only after its old-key bridge URL is frozen and verified, the V2 secret is stored and encrypted escrow is verified, and an old test V1 client has installed the bridge and passed a later V2-only update. The equivalent test V1 retirement is:
 
 ```sh
 set -e
@@ -175,7 +175,7 @@ rm "$SPARKLE_STAGE_DIR/test-v1-before-retirement.json" "$SPARKLE_STAGE_DIR/test-
 rmdir "$SPARKLE_STAGE_DIR"
 ```
 
-As with stable, do this only after V2 storage and escrow verification; retain the test V1 escrow export until its documented support/recovery decision authorizes destruction. If every test client is disposable, revocation plus a manual reinstall is permitted only when that discontinuity is recorded.
+Retain the test V1 escrow export through its documented support/recovery window; its destruction needs the same separate authorization as stable escrow. If every test client is disposable, revocation plus a manual reinstall is permitted only when that discontinuity is recorded.
 
 ### Developer ID certificate/export
 

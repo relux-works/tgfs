@@ -5,6 +5,12 @@
 
 ## 2026-08-11
 
+### 0013 — Sparkle key retirement ordering is now regression-protected (TASK-260810-3uh3mc)
+
+- FIX: The test-channel runbook now makes its retirement prerequisites explicit before any active-CI secret or local Keychain deletion: freeze and verify the V1 bridge, store V2, verify encrypted escrow, and prove an old V1 client can install the bridge and a later V2-only update. It retains escrow until the separately authorized support-window decision.
+- REGRESSION: the focused runbook policy test requires four distinct versioned accounts, public-key lookups and staging files, private export/escrow/setter mappings, public staging cleanup, and both environment-scoped V1-to-V2 retirement blocks. It verifies name-only inventory before/after, old-secret deletion, account-scoped Sparkle Keychain deletion, V2-present/V1-absent evidence, and the no-early-retirement ordering.
+- VALIDATION: focused inventory/runbook suite (11 tests), all 271 script tests, `make updates-secret-inventory`, and `make check-repo` (2/2) exited 0. Credential values were neither accessed nor emitted.
+
 ### 0012 — Update credential operations use a value-safe provisioning boundary (TASK-260810-3uh3mc)
 
 - DECISION: the update bootstrap tool receives credential bytes only on stdin or from validated owner-only files and invokes `gh secret set NAME --env ENV` without `--body`; it suppresses `gh` output. It maps exactly six `updates-test` names and one `release` name at bootstrap, with versioned Sparkle generations constrained to their own environment. Its name-only preflight invokes `gh secret list --env ... --json name`.

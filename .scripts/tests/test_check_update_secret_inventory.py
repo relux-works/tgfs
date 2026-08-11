@@ -101,22 +101,91 @@ class InventoryTests(unittest.TestCase):
     def test_runbook_requires_versioned_sparkle_creation_export_escrow_and_cleanup(self):
         runbook = (SCRIPT.parents[2] / "docs/UPDATE_OPERATIONS.md").read_text()
         expected_sequences = (
-            ("Test-V1", "test-v1.private", "SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64"),
-            ("Stable-V1", "stable-v1.private", "SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64"),
-            ("Test-V2", "test-v2.private", "SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64"),
-            ("Stable-V2", "stable-v2.private", "SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64"),
+            ("Test-V1", "test-v1", "SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64"),
+            ("Stable-V1", "stable-v1", "SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64"),
+            ("Test-V2", "test-v2", "SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64"),
+            ("Stable-V2", "stable-v2", "SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64"),
         )
-        for generation, export_name, secret_name in expected_sequences:
+        for generation, file_stem, secret_name in expected_sequences:
             account = f"GramDrive-Sparkle-{generation}"
-            self.assertIn(f"generate_keys --account {account} >/dev/null", runbook)
-            self.assertIn(f'generate_keys --account {account} -x "$SPARKLE_STAGE_DIR/{export_name}"', runbook)
-            self.assertIn(f'mv "$SPARKLE_STAGE_DIR/{export_name}" "$SPARKLE_ESCROW_DIR/{export_name}"', runbook)
-            self.assertIn(
-                f'base64 < "$SPARKLE_ESCROW_DIR/{export_name}" | python3 .scripts/release/check_update_secret_inventory.py --set {secret_name}',
-                runbook,
+            public_key = f'generate_keys --account {account} -p > "$SPARKLE_STAGE_DIR/{file_stem}.public"'
+            export = f'generate_keys --account {account} -x "$SPARKLE_STAGE_DIR/{file_stem}.private"'
+            escrow = f'mv "$SPARKLE_STAGE_DIR/{file_stem}.private" "$SPARKLE_ESCROW_DIR/{file_stem}.private"'
+            setter = (
+                f'base64 < "$SPARKLE_ESCROW_DIR/{file_stem}.private" '
+                f'| python3 .scripts/release/check_update_secret_inventory.py --set {secret_name}'
             )
+            self.assertIn(f"generate_keys --account {account} >/dev/null", runbook)
+            self.assertIn(public_key, runbook)
+            self.assertIn(export, runbook)
+            self.assertIn(escrow, runbook)
+            self.assertIn(setter, runbook)
+            self.assertLess(runbook.index(public_key), runbook.index(export))
+            self.assertLess(runbook.index(export), runbook.index(escrow))
+            self.assertLess(runbook.index(escrow), runbook.index(setter))
         self.assertIn('rmdir "$SPARKLE_STAGE_DIR"', runbook)
         self.assertNotRegex(runbook, r"generate_keys\s+-x(?:\s|$)")
+
+    def test_runbook_requires_public_key_cleanup_and_safe_retirement_ordering(self):
+        runbook = (SCRIPT.parents[2] / "docs/UPDATE_OPERATIONS.md").read_text()
+        public_cleanup_commands = (
+            'rm "$SPARKLE_STAGE_DIR/test-v1.public" "$SPARKLE_STAGE_DIR/stable-v1.public"',
+            'rm "$SPARKLE_STAGE_DIR/stable-v2.public"',
+            'rm "$SPARKLE_STAGE_DIR/test-v2.public"',
+        )
+        for cleanup in public_cleanup_commands:
+            self.assertIn(cleanup, runbook)
+
+        retirement_blocks = (
+            (
+                "release",
+                "SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64",
+                "SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64",
+                "GramDrive-Sparkle-Stable-V1",
+                "stable-v1",
+            ),
+            (
+                "updates-test",
+                "SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64",
+                "SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64",
+                "GramDrive-Sparkle-Test-V1",
+                "test-v1",
+            ),
+        )
+        for environment, old_secret, new_secret, account, file_stem in retirement_blocks:
+            start = runbook.index(f'export SPARKLE_RETIRE_ENV={environment}')
+            end = runbook.index("```", start)
+            block = runbook[start:end]
+            before = f'"$SPARKLE_STAGE_DIR/{file_stem}-before-retirement.json"'
+            after = f'"$SPARKLE_STAGE_DIR/{file_stem}-after-retirement.json"'
+            self.assertIn(f"export SPARKLE_OLD_SECRET={old_secret}", block)
+            self.assertIn(f"export SPARKLE_NEW_SECRET={new_secret}", block)
+            self.assertIn(f"export SPARKLE_OLD_ACCOUNT={account}", block)
+            self.assertIn(f'gh secret list --env "$SPARKLE_RETIRE_ENV" --json name > {before}', block)
+            self.assertIn(f'gh secret delete "$SPARKLE_OLD_SECRET" --env "$SPARKLE_RETIRE_ENV"', block)
+            self.assertIn(f'gh secret list --env "$SPARKLE_RETIRE_ENV" --json name > {after}', block)
+            self.assertIn('! grep -F "\\\"$SPARKLE_OLD_SECRET\\\""', block)
+            self.assertIn('grep -F "\\\"$SPARKLE_NEW_SECRET\\\""', block)
+            self.assertIn('security delete-generic-password -s https://sparkle-project.org -a "$SPARKLE_OLD_ACCOUNT"', block)
+            self.assertIn(f'rm {before} {after}', block)
+            self.assertIn('rmdir "$SPARKLE_STAGE_DIR"', block)
+
+        stable_retirement = runbook.index("export SPARKLE_RETIRE_ENV=release")
+        test_retirement = runbook.index("export SPARKLE_RETIRE_ENV=updates-test")
+        stable_prerequisites = (
+            "V2 secret was stored and encrypted escrow was verified",
+            "V2-only update has passed on the old client",
+            "old-key bridge URL is frozen",
+        )
+        for prerequisite in stable_prerequisites:
+            self.assertLess(runbook.index(prerequisite), stable_retirement)
+        test_prerequisites = (
+            "old-key bridge URL is frozen and verified",
+            "V2 secret is stored and encrypted escrow is verified",
+            "old test V1 client has installed the bridge and passed a later V2-only update",
+        )
+        for prerequisite in test_prerequisites:
+            self.assertLess(runbook.index(prerequisite), test_retirement)
 
 
 if __name__ == "__main__":
