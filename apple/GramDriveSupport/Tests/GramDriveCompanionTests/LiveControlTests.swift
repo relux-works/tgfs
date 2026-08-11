@@ -630,6 +630,102 @@ struct LiveControlTests {
         #expect(await session.submit(.cancel) == .unavailable(.dropped))
     }
 
+    @Test func liveSessionTimesOutWaitingForItsFirstAuthEventAndClosesTheChannel() async throws {
+        let layout = try Self.tempLayout()
+        let hosted = ScriptedCompanionHostedSession()
+        let agent = try FakeAgent(
+            layout: layout, authorizer: ScriptedCompanionAuthorizer(session: hosted)
+        )
+        defer { agent.stop() }
+
+        let session = LiveAuthorizationSession(
+            openChannel: { .opened(try! ControlAuthChannel.open(socketURL: layout.controlSocket)) },
+            firstEventTimeout: .milliseconds(20)
+        )
+        let states = StateCollector(session.states)
+
+        #expect(await session.start() == .unavailable(.timedOut))
+        #expect(await states.next(within: .seconds(1)) == nil)
+        #expect(hosted.isClosed)
+    }
+
+    @Test func liveSessionClassifiesFirstEventEOFAsDropped() async throws {
+        let layout = try Self.tempLayout()
+        let hosted = ScriptedCompanionHostedSession()
+        hosted.close()
+        let agent = try FakeAgent(
+            layout: layout, authorizer: ScriptedCompanionAuthorizer(session: hosted)
+        )
+        defer { agent.stop() }
+
+        let session = LiveAuthorizationSession(
+            openChannel: { .opened(try! ControlAuthChannel.open(socketURL: layout.controlSocket)) },
+            firstEventTimeout: .seconds(1)
+        )
+
+        #expect(await session.start() == .unavailable(.dropped))
+    }
+
+    @Test func liveSessionCancellationDeadlineClosesTheChannelAndClearsModelSubmission() async throws {
+        let layout = try Self.tempLayout()
+        let hosted = StalledCompanionHostedSession()
+        hosted.emit(ControlAuthState(kind: "wait-phone-number"))
+        let agent = try FakeAgent(
+            layout: layout, authorizer: ScriptedCompanionAuthorizer(session: hosted)
+        )
+        defer { agent.stop() }
+
+        let session = LiveAuthorizationSession(
+            openChannel: { .opened(try! ControlAuthChannel.open(socketURL: layout.controlSocket)) },
+            completionTimeout: .milliseconds(20)
+        )
+        let backend = InMemoryCompanionBackend(session: { session })
+        let model = await MainActor.run {
+            AuthorizationViewModel(backend: backend, teardownTimeout: .seconds(1))
+        }
+
+        await model.begin()
+        for _ in 0..<100 where await MainActor.run(body: { model.state != .waitPhoneNumber }) {
+            await Task.yield()
+        }
+        #expect(await MainActor.run { model.state == .waitPhoneNumber })
+
+        await model.cancel()
+        #expect(await MainActor.run { model.unavailable == .timedOut })
+        #expect(await MainActor.run { !model.isSubmitting })
+        let deadline = ContinuousClock.now + .seconds(1)
+        while !hosted.isClosed, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(hosted.isClosed)
+    }
+
+    @Test func liveSessionSubmissionTimeoutClosesAStalledAgentChannel() async throws {
+        let layout = try Self.tempLayout()
+        let hosted = StalledCompanionHostedSession()
+        hosted.emit(ControlAuthState(kind: "wait-phone-number"))
+        let agent = try FakeAgent(
+            layout: layout, authorizer: ScriptedCompanionAuthorizer(session: hosted)
+        )
+        defer { agent.stop() }
+
+        let session = LiveAuthorizationSession(
+            openChannel: { .opened(try! ControlAuthChannel.open(socketURL: layout.controlSocket)) },
+            submitTimeout: .milliseconds(20)
+        )
+        let states = StateCollector(session.states)
+        #expect(await session.start() == .started)
+        #expect(await states.next() == .waitPhoneNumber)
+
+        #expect(await session.submit(.requestQrCode) == .unavailable(.timedOut))
+        #expect(await states.next(within: .seconds(1)) == nil)
+        let deadline = ContinuousClock.now + .seconds(1)
+        while !hosted.isClosed, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(hosted.isClosed)
+    }
+
     // MARK: - The live backend
 
     @Test func backendStartsTheAgentThenRunsCommands() async throws {
@@ -923,7 +1019,7 @@ private final class RecordingRemover: AgentAccountRemoving, @unchecked Sendable 
 }
 
 private struct ScriptedCompanionAuthorizer: AgentAuthorizing {
-    let session: ScriptedCompanionHostedSession
+    let session: any AgentAuthSessionHosting
     func makeSession() throws -> any AgentAuthSessionHosting {
         session
     }
@@ -936,6 +1032,7 @@ private final class ScriptedCompanionHostedSession: AgentAuthSessionHosting, @un
     private let stream: AsyncStream<ControlAuthState>
     private let continuation: AsyncStream<ControlAuthState>.Continuation
     private var inputs: [ControlAuthInput] = []
+    private var closed = false
 
     var answer: AgentAuthSubmitAnswer = .accepted
 
@@ -953,6 +1050,10 @@ private final class ScriptedCompanionHostedSession: AgentAuthSessionHosting, @un
         return inputs
     }
 
+    var isClosed: Bool {
+        lock.withLock { closed }
+    }
+
     func emit(_ state: ControlAuthState) {
         continuation.yield(state)
     }
@@ -966,6 +1067,7 @@ private final class ScriptedCompanionHostedSession: AgentAuthSessionHosting, @un
     }
 
     func close() {
+        lock.withLock { closed = true }
         continuation.finish()
     }
 
@@ -974,6 +1076,50 @@ private final class ScriptedCompanionHostedSession: AgentAuthSessionHosting, @un
         defer { lock.unlock() }
         inputs.append(input)
         return answer
+    }
+}
+
+private final class StalledCompanionHostedSession: AgentAuthSessionHosting, @unchecked Sendable {
+    private let lock = NSLock()
+    private let stream: AsyncStream<ControlAuthState>
+    private let continuation: AsyncStream<ControlAuthState>.Continuation
+    private var closed = false
+    private var stalledSubmit: CheckedContinuation<AgentAuthSubmitAnswer, Never>?
+
+    init() {
+        (stream, continuation) = AsyncStream.makeStream(of: ControlAuthState.self)
+    }
+
+    var states: AsyncStream<ControlAuthState> { stream }
+
+    var isClosed: Bool {
+        lock.withLock { closed }
+    }
+
+    func emit(_ state: ControlAuthState) {
+        continuation.yield(state)
+    }
+
+    func submit(_: ControlAuthInput) async -> AgentAuthSubmitAnswer {
+        if lock.withLock({ closed }) { return .accepted }
+        return await withCheckedContinuation { continuation in
+            let wasClosed = lock.withLock { () -> Bool in
+                if closed { return true }
+                stalledSubmit = continuation
+                return false
+            }
+            if wasClosed { continuation.resume(returning: .accepted) }
+        }
+    }
+
+    func close() {
+        lock.lock()
+        closed = true
+        let submit = stalledSubmit
+        stalledSubmit = nil
+        lock.unlock()
+        continuation.finish()
+        submit?.resume(returning: .accepted)
     }
 }
 

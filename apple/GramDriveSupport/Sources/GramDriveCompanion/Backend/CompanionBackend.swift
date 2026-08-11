@@ -95,6 +95,8 @@ public enum ControlChannelUnavailable: Equatable, Sendable {
   case agentNotRunning
   /// The channel existed but dropped mid-operation.
   case dropped
+  /// The agent did not make progress before the operation's deadline.
+  case timedOut
 
   /// A short, user-facing explanation.
   public var message: String {
@@ -106,6 +108,8 @@ public enum ControlChannelUnavailable: Equatable, Sendable {
       return "The GramDrive agent is not running."
     case .dropped:
       return "Lost the connection to the GramDrive agent."
+    case .timedOut:
+      return "The GramDrive agent did not respond in time. Try signing in again."
     }
   }
 }

@@ -24,7 +24,9 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
   public typealias ChannelOpener = @Sendable () async -> ChannelOpen
 
   private let openChannel: ChannelOpener
+  private let firstEventTimeout: Duration
   private let submitTimeout: Duration
+  private let completionTimeout: Duration
 
   private let lock = NSLock()
   private var channel: ControlAuthChannel?
@@ -38,10 +40,14 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
 
   public init(
     openChannel: @escaping ChannelOpener,
-    submitTimeout: Duration = .seconds(90)
+    firstEventTimeout: Duration = .seconds(15),
+    submitTimeout: Duration = .seconds(90),
+    completionTimeout: Duration = .seconds(15)
   ) {
     self.openChannel = openChannel
+    self.firstEventTimeout = firstEventTimeout
     self.submitTimeout = submitTimeout
+    self.completionTimeout = completionTimeout
     (stateStream, stateContinuation) = AsyncStream.makeStream(of: CompanionAuthState.self)
   }
 
@@ -51,35 +57,63 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
 
   public func start() async -> AuthStartResult {
     let channel: ControlAuthChannel
-    switch await openChannel() {
-    case .unavailable(let reason):
+    switch await Self.race(
+      timeout: firstEventTimeout,
+      operation: openChannel,
+      onLateValue: { result in
+        if case let .opened(channel) = result { channel.close() }
+      }
+    ) {
+    case .timedOut:
+      finish()
+      return .unavailable(.timedOut)
+    case .value(.unavailable(let reason)):
       finish()
       return .unavailable(reason)
-    case .opened(let opened):
+    case .value(.opened(let opened)):
       channel = opened
     }
-    adopt(channel)
+    guard adopt(channel) else {
+      channel.close()
+      return .unavailable(.dropped)
+    }
 
     // The server's first line decides: a state (the session is live) or
-    // a refusal.
-    var iterator = channel.events.makeAsyncIterator()
-    switch await iterator.next() {
-    case .authState(let state):
+    // a refusal. Keep EOF separate from the deadline: an already-closed
+    // channel is actionable as a dropped connection, not a timeout.
+    let firstEvent = await Self.race(
+      timeout: firstEventTimeout,
+      operation: {
+        var iterator = channel.events.makeAsyncIterator()
+        return await iterator.next()
+      }
+    )
+    switch firstEvent {
+    case .timedOut:
+      channel.close()
+      finish()
+      return .unavailable(.timedOut)
+    case .value(nil):
+      channel.close()
+      finish()
+      return .unavailable(.dropped)
+    case .value(.some(.authState(let state))):
       stateContinuation.yield(Self.companionState(state))
-      // The iterator consumed the first event; the pump continues on
-      // the same iterator (AsyncStream is single-consumer).
+      // The first iterator is exhausted before this pump starts; the stream
+      // remains single-consumer for all subsequent events.
       Task { [weak self] in
+        var iterator = channel.events.makeAsyncIterator()
         while let event = await iterator.next() {
           self?.handle(event)
         }
         self?.finish()
       }
       return .started
-    case .commandFailed, .none:
+    case .value(.some(.commandFailed)):
       channel.close()
       finish()
       return .unavailable(.dropped)
-    case .some:
+    default:
       channel.close()
       finish()
       return .unavailable(.dropped)
@@ -96,20 +130,37 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
       do {
         try channel.send(frame)
       } catch {
-        resolve(seq: seq, with: .unavailable(.dropped))
+        failSubmission(seq: seq, reason: .dropped)
         return
       }
       let timeout = submitTimeout
       Task { [weak self] in
         try? await Task.sleep(for: timeout)
-        self?.resolve(seq: seq, with: .unavailable(.dropped))
+        self?.failSubmission(seq: seq, reason: .timedOut)
       }
     }
   }
 
-  public func cancel() async {
-    _ = await submit(.cancel)
-    await waitUntilFinished()
+  public func cancel() async -> ControlChannelUnavailable? {
+    let result = await Self.race(
+      timeout: completionTimeout,
+      operation: { [weak self] in
+        guard let self else { return AuthSubmitResult.unavailable(.dropped) }
+        let submission = await self.submit(.cancel)
+        await self.waitUntilFinished()
+        return submission
+      }
+    )
+    switch result {
+    case .timedOut:
+      finish()
+      return .timedOut
+    case .value(.unavailable(let reason)):
+      finish()
+      return reason
+    case .value:
+      return nil
+    }
   }
 
   // MARK: - Event routing
@@ -117,10 +168,15 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
   // NSLock is not async-safe to hold across suspension, so every locked
   // section lives in one of these synchronous helpers.
 
-  private func adopt(_ channel: ControlAuthChannel) {
+  private func adopt(_ channel: ControlAuthChannel) -> Bool {
     lock.lock()
+    guard !finished else {
+      lock.unlock()
+      return false
+    }
     self.channel = channel
     lock.unlock()
+    return true
   }
 
   private func reserveSubmission() -> (ControlAuthChannel, UInt64)? {
@@ -176,6 +232,11 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
     continuation?.resume(returning: result)
   }
 
+  private func failSubmission(seq: UInt64, reason: ControlChannelUnavailable) {
+    resolve(seq: seq, with: .unavailable(reason))
+    finish()
+  }
+
   /// Ends the session: the state stream finishes and every outstanding
   /// submit resolves as dropped. Idempotent.
   private func finish() {
@@ -202,6 +263,27 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
 
   deinit {
     finish()
+  }
+
+  /// Returns a value only if the operation wins its deadline. The operation
+  /// is deliberately detached: a non-cooperative agent must not keep the UI
+  /// task suspended after the control path has failed closed.
+  private static func race<Value: Sendable>(
+    timeout: Duration,
+    operation: @escaping @Sendable () async -> Value,
+    onLateValue: @escaping @Sendable (Value) -> Void = { _ in }
+  ) async -> DeadlineResult<Value> {
+    let gate = DeadlineGate<Value>(onLateValue: onLateValue)
+    return await withCheckedContinuation { continuation in
+      gate.install(continuation)
+      Task.detached { [gate] in
+        gate.resolve(await operation())
+      }
+      Task.detached { [gate, timeout] in
+        try? await Task.sleep(for: timeout)
+        gate.timeout()
+      }
+    }
   }
 
   // MARK: - Vocabulary mapping
@@ -298,5 +380,54 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
     default:
       return .other(code: rejection.code ?? 0, message: rejection.kind)
     }
+  }
+}
+
+private enum DeadlineResult<Value: Sendable>: Sendable {
+  case value(Value)
+  case timedOut
+}
+
+private final class DeadlineGate<Value: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private let onLateValue: @Sendable (Value) -> Void
+  private var continuation: CheckedContinuation<DeadlineResult<Value>, Never>?
+  private var resolved = false
+
+  init(onLateValue: @escaping @Sendable (Value) -> Void) {
+    self.onLateValue = onLateValue
+  }
+
+  func install(_ continuation: CheckedContinuation<DeadlineResult<Value>, Never>) {
+    lock.lock()
+    self.continuation = continuation
+    lock.unlock()
+  }
+
+  func resolve(_ value: Value) {
+    lock.lock()
+    guard !resolved else {
+      lock.unlock()
+      onLateValue(value)
+      return
+    }
+    resolved = true
+    let continuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+    continuation?.resume(returning: .value(value))
+  }
+
+  func timeout() {
+    lock.lock()
+    guard !resolved else {
+      lock.unlock()
+      return
+    }
+    resolved = true
+    let continuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+    continuation?.resume(returning: .timedOut)
   }
 }

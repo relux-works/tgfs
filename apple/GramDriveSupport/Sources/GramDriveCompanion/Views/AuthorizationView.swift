@@ -58,7 +58,10 @@ public struct AuthorizationView: View {
                 }
                 .disabled(model.isSubmitting)
                 if model.state.acceptsInput {
-                    Button("Cancel", role: .cancel) { Task { await model.cancel() } }
+                    Button(model.isCancelling ? "Cancelling…" : "Cancel", role: .cancel) {
+                        Task { await model.cancel() }
+                    }
+                    .disabled(model.isCancelling)
                 }
             }
         }
@@ -86,7 +89,7 @@ public struct AuthorizationView: View {
         case .idle:
             Section { Text("Not signed in. Start to authorize a Telegram account.") }
         case .starting, .configuring:
-            Section { ProgressView("Connecting…") }
+            Section { ProgressView(model.isCancelling ? "Cancelling…" : "Connecting…") }
         case .waitPhoneNumber:
             Section("Phone number") {
                 TextField("International format, e.g. +1 555 0100", text: $phoneNumber)
@@ -100,6 +103,7 @@ public struct AuthorizationView: View {
                 Button("Use QR code instead") {
                     Task { await model.submit(.requestQrCode) }
                 }
+                .disabled(model.isSubmitting)
             }
             .defaultFocus($focusedField, .phoneNumber)
         case .waitCode(let info):
@@ -113,6 +117,7 @@ public struct AuthorizationView: View {
                 Button("Submit Code") { submitCode() }
                     .disabled(code.isEmpty || model.isSubmitting)
                 Button("Resend code") { Task { await model.submit(.resendCode) } }
+                    .disabled(model.isSubmitting)
             }
             .defaultFocus($focusedField, .code)
         case .waitQrConfirmation(let link):

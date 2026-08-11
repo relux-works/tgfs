@@ -259,7 +259,8 @@ public protocol AuthorizationSession: Sendable {
     func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult
     /// Abandons the flow and returns only after ``states`` has finished and
     /// the session's resources are safe for a replacement session to acquire.
-    func cancel() async
+    /// A deadline or transport failure is reported as its typed reason.
+    func cancel() async -> ControlChannelUnavailable?
 }
 
 /// An authorization session that has no channel to drive: `start` reports
@@ -284,5 +285,5 @@ public struct UnavailableAuthorizationSession: AuthorizationSession {
         .unavailable(reason)
     }
 
-    public func cancel() async {}
+    public func cancel() async -> ControlChannelUnavailable? { reason }
 }

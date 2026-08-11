@@ -1088,6 +1088,27 @@ private final class LockedCount: @unchecked Sendable {
     #expect(session.isClosed, "EOF must close the hosted session")
   }
 
+  @Test func stalledHostedAuthSubmissionClosesTheChannelAtItsDeadline() async throws {
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let session = StalledHostedSession()
+    let server = try ControlServer.start(
+      socketURL: socket,
+      handlers: Self.handlers(authorizer: ScriptedAuthorizer(session: session)),
+      configuration: ControlServerConfiguration(authSubmissionTimeout: .milliseconds(20)))
+    defer { server.stop() }
+
+    let channel = try ControlAuthChannel.open(socketURL: socket)
+    defer { channel.close() }
+    let events = EventCollector(channel.events)
+    try channel.send(ControlAuthInputFrame(seq: 1, input: .requestQrCode))
+
+    #expect(await events.next(within: .seconds(1)) == nil)
+    #expect(session.isClosed, "the timed-out host must be closed with its connection")
+  }
+
   @Test func withoutAnAuthorizerTheUpgradeIsRefused() async throws {
     let root = try Self.tempRoot()
     let socket = ControlContract.socketURL(dataRoot: root)
@@ -1395,7 +1416,7 @@ private final class ScriptedContentPolicyController:
 }
 
 private struct ScriptedAuthorizer: AgentAuthorizing {
-  let session: ScriptedHostedSession
+  let session: any AgentAuthSessionHosting
 
   func makeSession() throws -> any AgentAuthSessionHosting {
     session
@@ -1485,5 +1506,45 @@ final class ScriptedHostedSession: AgentAuthSessionHosting, @unchecked Sendable 
     closed = true
     lock.unlock()
     continuation.finish()
+  }
+}
+
+private final class StalledHostedSession: AgentAuthSessionHosting, @unchecked Sendable {
+  private let lock = NSLock()
+  private let stream: AsyncStream<ControlAuthState>
+  private let continuation: AsyncStream<ControlAuthState>.Continuation
+  private var closed = false
+  private var stalledSubmit: CheckedContinuation<AgentAuthSubmitAnswer, Never>?
+
+  init() {
+    (stream, continuation) = AsyncStream.makeStream(of: ControlAuthState.self)
+  }
+
+  var states: AsyncStream<ControlAuthState> { stream }
+
+  var isClosed: Bool {
+    lock.withLock { closed }
+  }
+
+  func submit(_: ControlAuthInput) async -> AgentAuthSubmitAnswer {
+    if lock.withLock({ closed }) { return .accepted }
+    return await withCheckedContinuation { continuation in
+      let wasClosed = lock.withLock { () -> Bool in
+        if closed { return true }
+        stalledSubmit = continuation
+        return false
+      }
+      if wasClosed { continuation.resume(returning: .accepted) }
+    }
+  }
+
+  func close() {
+    lock.lock()
+    closed = true
+    let submit = stalledSubmit
+    stalledSubmit = nil
+    lock.unlock()
+    continuation.finish()
+    submit?.resume(returning: .accepted)
   }
 }
