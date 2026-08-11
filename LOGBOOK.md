@@ -5,6 +5,11 @@
 
 ## 2026-08-11
 
+### 0023 — Native x86_64 build requires an explicit detached auth submission boundary (BUG-260729-37ffmx)
+
+- FIRST-RED: exact-main native-ci run `31517011802` compiled the auth diagnostic patch on its x86_64 Swift host and rejected the reader-loop `Task` at `ControlServer.swift:813` as a non-Sendable closure transfer. The local arm64 Apple suite had passed, so the native result is preserved as architecture-specific compiler enforcement, not retried.
+- FIX: the reader queue now launches a `Task.detached` with explicit captures of the Sendable auth session/frame, the `@unchecked Sendable` server, and connection. It preserves asynchronous input processing and the fixed-code diagnostic emission while making the GCD-to-Swift-concurrency ownership boundary explicit.
+
 ### 0022 — Installed auth diagnostics retain only fixed lifecycle codes (BUG-260729-37ffmx)
 
 - ROOT CAUSE: the agent's health event ring lived only in process memory, while the control server had no redaction boundary between rich auth payloads and installed-build diagnostics. Relaunching therefore discarded the only useful auth trail, and logging an auth transition directly would risk serializing user-controlled data.
