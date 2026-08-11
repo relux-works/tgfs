@@ -8,7 +8,10 @@ import Testing
 /// The control channel end to end: the real server and the real client
 /// over a substitute socket, with scripted seams playing the engine
 /// (BUG-260720-3i74u1).
-@Suite struct ControlChannelTests {
+// These tests each run a blocking local IPC client and a server backed by
+// libdispatch. Serializing this suite avoids consuming the constrained test
+// executor with mutually waiting client/server pairs while other suites run.
+@Suite(.serialized) struct ControlChannelTests {
     // MARK: - Fixtures
 
     /// A per-test socket home under the system temp dir.
@@ -55,11 +58,38 @@ import Testing
             repairer: repairer)
     }
 
+    /// The real command client deliberately uses blocking socket I/O. Keep it
+    /// off Swift Testing's cooperative executor so a concurrently running
+    /// suite cannot starve the server queue it is waiting on.
+    private static func command(
+        _ request: ControlRequest,
+        socketURL: URL,
+        timeout: Duration = .seconds(5)
+    ) async throws -> ControlEvent {
+        try await Task.detached(priority: .utility) {
+            try ControlClient.command(request, socketURL: socketURL, timeout: timeout)
+        }.value
+    }
+
+    private static func waitUntil(
+        _ description: String,
+        within bound: Duration = .seconds(5),
+        condition: @escaping @Sendable () -> Bool,
+        sourceLocation: Testing.SourceLocation = #_sourceLocation
+    ) async {
+        let deadline = ContinuousClock.now + bound
+        while ContinuousClock.now < deadline {
+            if condition() { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        Issue.record("timed out waiting for \(description)", sourceLocation: sourceLocation)
+    }
+
     // (bounded event consumption lives in `EventCollector` below)
 
     // MARK: - Commands
 
-    @Test func statusAnswersTheLifecycleSnapshot() throws {
+    @Test func statusAnswersTheLifecycleSnapshot() async throws {
         let root = try Self.tempRoot()
         let socket = ControlContract.socketURL(dataRoot: root)
         try FileManager.default.createDirectory(
@@ -67,12 +97,11 @@ import Testing
         let server = try ControlServer.start(socketURL: socket, handlers: Self.handlers())
         defer { server.stop() }
 
-        let event = try ControlClient.command(
-            ControlRequest(operation: .status), socketURL: socket, timeout: .seconds(5))
+        let event = try await Self.command(ControlRequest(operation: .status), socketURL: socket)
         #expect(event == .status(Self.snapshot()))
     }
 
-    @Test func reloadSettingsAnswersTheAppliedDocument() throws {
+    @Test func reloadSettingsAnswersTheAppliedDocument() async throws {
         let root = try Self.tempRoot()
         let socket = ControlContract.socketURL(dataRoot: root)
         try FileManager.default.createDirectory(
@@ -80,8 +109,7 @@ import Testing
         let server = try ControlServer.start(socketURL: socket, handlers: Self.handlers())
         defer { server.stop() }
 
-        let event = try ControlClient.command(
-            ControlRequest(operation: .reloadSettings), socketURL: socket, timeout: .seconds(5))
+        let event = try await Self.command(ControlRequest(operation: .reloadSettings), socketURL: socket)
         #expect(event == .settings(AgentSettings(launchAtLogin: true, cacheQuotaBytes: 7)))
     }
 
@@ -97,8 +125,7 @@ import Testing
             socketURL: socket, handlers: Self.handlers(repairer: repairer))
         defer { server.stop() }
 
-        let event = try ControlClient.command(
-            ControlRequest(operation: .repair), socketURL: socket, timeout: .seconds(5))
+        let event = try await Self.command(ControlRequest(operation: .repair), socketURL: socket)
         #expect(
             event
                 == .commandFailed(
@@ -116,17 +143,16 @@ import Testing
             socketURL: socket, handlers: Self.handlers(remover: remover))
         defer { server.stop() }
 
-        let event = try ControlClient.command(
+        let event = try await Self.command(
             ControlRequest(
                 operation: .removeAccount,
                 removal: ControlRemovalRequest(accountId: 777, revokeSession: true)),
-            socketURL: socket,
-            timeout: .seconds(5))
+            socketURL: socket)
         #expect(event == .commandDone)
         #expect(remover.requests == [ControlRemovalRequest(accountId: 777, revokeSession: true)])
     }
 
-    @Test func removalWithoutParametersIsRefusedTyped() throws {
+    @Test func removalWithoutParametersIsRefusedTyped() async throws {
         let root = try Self.tempRoot()
         let socket = ControlContract.socketURL(dataRoot: root)
         try FileManager.default.createDirectory(
@@ -135,8 +161,7 @@ import Testing
             socketURL: socket, handlers: Self.handlers(remover: ScriptedRemover(outcome: .completed)))
         defer { server.stop() }
 
-        let event = try ControlClient.command(
-            ControlRequest(operation: .removeAccount), socketURL: socket, timeout: .seconds(5))
+        let event = try await Self.command(ControlRequest(operation: .removeAccount), socketURL: socket)
         guard case .commandFailed(let failure) = event else {
             Issue.record("expected a typed refusal, got \(event)")
             return
@@ -144,7 +169,7 @@ import Testing
         #expect(failure.category == .invalidArgument)
     }
 
-    @Test func aMissingSeamAnswersSourceUnavailable() throws {
+    @Test func aMissingSeamAnswersSourceUnavailable() async throws {
         let root = try Self.tempRoot()
         let socket = ControlContract.socketURL(dataRoot: root)
         try FileManager.default.createDirectory(
@@ -152,8 +177,7 @@ import Testing
         let server = try ControlServer.start(socketURL: socket, handlers: Self.handlers())
         defer { server.stop() }
 
-        let event = try ControlClient.command(
-            ControlRequest(operation: .repair), socketURL: socket, timeout: .seconds(5))
+        let event = try await Self.command(ControlRequest(operation: .repair), socketURL: socket)
         guard case .commandFailed(let failure) = event else {
             Issue.record("expected a typed refusal, got \(event)")
             return
@@ -161,7 +185,7 @@ import Testing
         #expect(failure.category == .sourceUnavailable)
     }
 
-    @Test func aVersionMismatchIsRefusedTyped() throws {
+    @Test func aVersionMismatchIsRefusedTyped() async throws {
         let root = try Self.tempRoot()
         let socket = ControlContract.socketURL(dataRoot: root)
         try FileManager.default.createDirectory(
@@ -169,10 +193,9 @@ import Testing
         let server = try ControlServer.start(socketURL: socket, handlers: Self.handlers())
         defer { server.stop() }
 
-        let event = try ControlClient.command(
+        let event = try await Self.command(
             ControlRequest(protocolVersion: 99, operation: .status),
-            socketURL: socket,
-            timeout: .seconds(5))
+            socketURL: socket)
         guard case .commandFailed(let failure) = event else {
             Issue.record("expected a typed refusal, got \(event)")
             return
@@ -203,11 +226,13 @@ import Testing
             handlers: Self.handlers(authorizer: ScriptedAuthorizer(session: session)))
         defer { server.stop() }
 
-        session.emit(ControlAuthState(kind: "starting"))
         let channel = try ControlAuthChannel.open(socketURL: socket)
         defer { channel.close() }
-
         let events = EventCollector(channel.events)
+        await Self.waitUntil("the server attaches to the auth-state stream") {
+            session.hasStateConsumer
+        }
+        session.emit(ControlAuthState(kind: "starting"))
         #expect(await events.next() == .authState(ControlAuthState(kind: "starting")))
 
         session.emit(ControlAuthState(kind: "wait-phone-number"))
@@ -246,10 +271,13 @@ import Testing
             handlers: Self.handlers(authorizer: ScriptedAuthorizer(session: session)))
         defer { server.stop() }
 
-        session.emit(ControlAuthState(kind: "starting"))
         let channel = try ControlAuthChannel.open(socketURL: socket)
         defer { channel.close() }
         let events = EventCollector(channel.events)
+        await Self.waitUntil("the server attaches to the auth-state stream") {
+            session.hasStateConsumer
+        }
+        session.emit(ControlAuthState(kind: "starting"))
         #expect(await events.next() == .authState(ControlAuthState(kind: "starting")))
 
         session.emit(ControlAuthState(kind: "closed"))
@@ -269,9 +297,12 @@ import Testing
             handlers: Self.handlers(authorizer: ScriptedAuthorizer(session: session)))
         defer { server.stop() }
 
-        session.emit(ControlAuthState(kind: "starting"))
         let channel = try ControlAuthChannel.open(socketURL: socket)
         let events = EventCollector(channel.events)
+        await Self.waitUntil("the server attaches to the auth-state stream") {
+            session.hasStateConsumer
+        }
+        session.emit(ControlAuthState(kind: "starting"))
         #expect(await events.next() == .authState(ControlAuthState(kind: "starting")))
 
         channel.close()
@@ -310,10 +341,13 @@ import Testing
             socketURL: socket,
             handlers: Self.handlers(authorizer: ScriptedAuthorizer(session: session)))
 
-        session.emit(ControlAuthState(kind: "starting"))
         let channel = try ControlAuthChannel.open(socketURL: socket)
         defer { channel.close() }
         let events = EventCollector(channel.events)
+        await Self.waitUntil("the server attaches to the auth-state stream") {
+            session.hasStateConsumer
+        }
+        session.emit(ControlAuthState(kind: "starting"))
         #expect(await events.next() == .authState(ControlAuthState(kind: "starting")))
 
         server.stop()
@@ -461,6 +495,7 @@ final class ScriptedHostedSession: AgentAuthSessionHosting, @unchecked Sendable 
     private let continuation: AsyncStream<ControlAuthState>.Continuation
     private var inputs: [ControlAuthInput] = []
     private var closed = false
+    private var stateConsumerReady = false
 
     /// The answer the next submit receives; tests mutate between inputs.
     var answer: AgentAuthSubmitAnswer = .accepted
@@ -470,7 +505,16 @@ final class ScriptedHostedSession: AgentAuthSessionHosting, @unchecked Sendable 
     }
 
     var states: AsyncStream<ControlAuthState> {
-        stream
+        lock.lock()
+        stateConsumerReady = true
+        lock.unlock()
+        return stream
+    }
+
+    var hasStateConsumer: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stateConsumerReady
     }
 
     var submitted: [ControlAuthInput] {
