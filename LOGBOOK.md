@@ -3,6 +3,15 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-08-11
+
+### 0001 — Self-hosted CI restores a missing Rust toolchain without shell-profile state (BUG-260720-27inl5)
+
+- ROOT CAUSE: public CI run `31443550054` (`rust-core`) and run `31443550101` (`tdlib` and `apple-build-test`) each invoked `rustup` before any bootstrap. Their clean macOS self-hosted runner had no command on `PATH`, so each job stopped with `rustup: command not found` and exit 127.
+- FIX: every Rust-consuming job in `ci.yml` and `native-ci.yml` now calls one shell bootstrap. It locates or non-interactively installs runner-owned rustup with `--no-modify-path`, reads the channel/profile/components exclusively from `rust-toolchain.toml`, reconciles them idempotently, and adds Cargo's bin directory through `GITHUB_PATH` for later steps.
+- INTEGRITY: a fresh install downloads the fixed rustup 1.29.0 archive for the runner architecture and checks its committed SHA-256 before it is marked executable. The bootstrap never executes a network binary on a checksum mismatch.
+- REGRESSION: a clean-runner mock runs the bootstrap twice with no rustup in the incoming path. It proves exactly one bootstrap download, one integrity verification, repeated reconciliation of Rust 1.91.0 with rustfmt/clippy, a single `GITHUB_PATH` entry, and no executable `source` command. A separate mock forces checksum failure and proves the downloaded installer never runs. A structural test pins all four workflow call sites to the shared bootstrap.
+
 ## 2026-08-10
 
 ### 1138 — Folder deletion requires a catalog witness, not a fabricated chat departure (BUG-260810-3nob99)

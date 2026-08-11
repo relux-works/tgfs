@@ -71,10 +71,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install the pinned Rust toolchain
-        run: |
-          rustup show
-          rustc --version
-          cargo --version
+        run: .github/scripts/bootstrap-rust-toolchain.sh
 
       - name: Restore the pinned TDLib artifact (runner-local cache)
         id: tdlib-cache
@@ -153,10 +150,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         # No hosted-cache step: see ci.yml rust-core (persistent runner,
         # machine-local CARGO_TARGET_DIR from the runner's .env).
-        run: |
-          rustup show
-          rustc --version
-          cargo --version
+        run: .github/scripts/bootstrap-rust-toolchain.sh
 
       - name: Stage the GramDriveCore artifact (host-test slice)
         # The Swift package resolves GramDriveCore by path; the staging builds
@@ -203,7 +197,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install the pinned Rust toolchain
-        run: rustup show
+        run: .github/scripts/bootstrap-rust-toolchain.sh
 
       - name: Stage the GramDriveCore artifact
         run: make package

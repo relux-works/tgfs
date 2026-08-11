@@ -55,11 +55,9 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install the pinned Rust toolchain
-        # rustup reads rust-toolchain.toml and installs 1.91.0 with rustfmt and
-        # clippy. The version lives in exactly that one file, so nothing here
-        # restates it and it cannot drift. The suite's `toolchain` step then
-        # re-verifies the active compiler actually matches before any gate
-        # trusts it.
+        # The bootstrap restores a missing runner-owned rustup installation
+        # without sourcing an interactive shell profile, then installs the
+        # exact channel/components declared in rust-toolchain.toml.
         #
         # No hosted-cache step (the Swatinem/rust-cache the hosted runner used):
         # the cache service sits behind the same blocked billing, and on a
@@ -67,10 +65,7 @@ jobs:
         # CARGO_TARGET_DIR the runner's .env sets — still speed only, never
         # correctness, for the same reason as before: toolchain and lockfile
         # are pinned, and cargo fingerprints rebuilds.
-        run: |
-          rustup show
-          rustc --version
-          cargo --version
+        run: .github/scripts/bootstrap-rust-toolchain.sh
 
       - name: Install cargo-deny (pinned)
         uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
