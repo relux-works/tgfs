@@ -810,7 +810,7 @@ public final class ControlServer: @unchecked Sendable {
           self?.remove(connection)
           return
         }
-        Task {
+        Task.detached { [weak self, session, frame, connection] in
           let answer = await session.submit(frame.input)
           if let rejection = answer.rejection {
             self?.handlers.authDiagnostics?(AuthDiagnosticCode.refusal(for: rejection))
