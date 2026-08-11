@@ -52,6 +52,13 @@ public struct AgentRuntimeLayout: Equatable, Sendable {
         agentDirectory.appendingPathComponent("settings.json", isDirectory: false)
     }
 
+    /// The bounded, privacy-safe installed-auth diagnostic trail:
+    /// `<root>/agent/auth-diagnostics.json`. It contains fixed event codes
+    /// only, never auth input, account, or path material.
+    public var authDiagnosticsFile: URL {
+        agentDirectory.appendingPathComponent("auth-diagnostics.json", isDirectory: false)
+    }
+
     public init(dataRoot: URL) {
         self.dataRoot = dataRoot
     }

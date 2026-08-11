@@ -141,7 +141,10 @@ enum AgentMain {
                     return accounts
                 },
                 beforeRepair: { lifecycleRef.lifecycle?.stopAllNamespaces() },
-                afterRepair: { lifecycleRef.lifecycle?.restartNamespaces() }
+                afterRepair: { lifecycleRef.lifecycle?.restartNamespaces() },
+                onSignedOutProbe: {
+                    lifecycleRef.lifecycle?.recordAuthDiagnostic(.probeSignedOut)
+                }
             ),
             contentPolicy: contentPolicy
         )
