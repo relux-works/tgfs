@@ -21,18 +21,26 @@ This public runbook is the operator contract for Sparkle update delivery. Never 
    export SPARKLE_STAGE_DIR="$SECURE_INPUT_DIR/sparkle"
    mkdir -m 700 "$SPARKLE_STAGE_DIR"
    generate_keys --account GramDrive-Sparkle-Test-V1 >/dev/null
+   generate_keys --account GramDrive-Sparkle-Test-V1 -p > "$SPARKLE_STAGE_DIR/test-v1.public"
    generate_keys --account GramDrive-Sparkle-Test-V1 -x "$SPARKLE_STAGE_DIR/test-v1.private"
    mv "$SPARKLE_STAGE_DIR/test-v1.private" "$SPARKLE_ESCROW_DIR/test-v1.private"
    base64 < "$SPARKLE_ESCROW_DIR/test-v1.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64
 
    generate_keys --account GramDrive-Sparkle-Stable-V1 >/dev/null
+   generate_keys --account GramDrive-Sparkle-Stable-V1 -p > "$SPARKLE_STAGE_DIR/stable-v1.public"
    generate_keys --account GramDrive-Sparkle-Stable-V1 -x "$SPARKLE_STAGE_DIR/stable-v1.private"
    mv "$SPARKLE_STAGE_DIR/stable-v1.private" "$SPARKLE_ESCROW_DIR/stable-v1.private"
    base64 < "$SPARKLE_ESCROW_DIR/stable-v1.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64
+   ```
+
+   Each `-p` command writes the one-line **public** `SUPublicEDKey` value to the named staging file. Copy that exact public line into the pending, reviewed test or stable channel configuration with its generation-specific feed URL; then remove the public staging records and directory before unmounting escrow:
+
+   ```sh
+   rm "$SPARKLE_STAGE_DIR/test-v1.public" "$SPARKLE_STAGE_DIR/stable-v1.public"
    rmdir "$SPARKLE_STAGE_DIR"
    ```
 
-   Record the public key from each creation command in the reviewed channel configuration and commit only that public key/feed URL. Unmount the escrow volume after storage. Run the test and stable sequences in separate offline key-generation sessions; never reuse or copy an export between `updates-test` and `release`. If a staging copy remains after a failed `mv`, destroy it with the organisation's approved local destruction procedure before continuing; do not create an unencrypted backup.
+   Commit only that public key/feed URL after review. Run the test and stable sequences in separate offline key-generation sessions; never reuse or copy an export between `updates-test` and `release`. If a staging copy remains after a failed `mv`, destroy it with the organisation's approved local destruction procedure before continuing; do not create an unencrypted backup.
 
 6. Then run the value-free preflight:
 
@@ -85,18 +93,46 @@ Never rotate Developer ID and a Sparkle trust key in one bridge build.
    export SPARKLE_STAGE_DIR="$SECURE_INPUT_DIR/sparkle"
    mkdir -m 700 "$SPARKLE_STAGE_DIR"
    generate_keys --account GramDrive-Sparkle-Stable-V2 >/dev/null
+   generate_keys --account GramDrive-Sparkle-Stable-V2 -p > "$SPARKLE_STAGE_DIR/stable-v2.public"
    generate_keys --account GramDrive-Sparkle-Stable-V2 -x "$SPARKLE_STAGE_DIR/stable-v2.private"
    mv "$SPARKLE_STAGE_DIR/stable-v2.private" "$SPARKLE_ESCROW_DIR/stable-v2.private"
    base64 < "$SPARKLE_ESCROW_DIR/stable-v2.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64
+   ```
+
+   The public file is the exact V2 `SUPublicEDKey` input for review. Review and commit it with `https://relux-works.github.io/tgfs/updates/stable/v2/stable.xml`, then remove that public staging file and directory before unmounting escrow:
+
+   ```sh
+   rm "$SPARKLE_STAGE_DIR/stable-v2.public"
    rmdir "$SPARKLE_STAGE_DIR"
    ```
 
-   Review and commit its public key and `https://relux-works.github.io/tgfs/updates/stable/v2/stable.xml`, then unmount escrow. Do not change Developer ID.
+   Do not change Developer ID.
 2. Build a higher-build stable bridge embedding the V2 key/URL. Publish exact bytes through test and validate appcast signature plus installed bundle configuration.
 3. With release approval, use V1 to publish the final `.../stable/v1/stable.xml` whose highest item is the bridge and whose enclosure is V1-signed. In the same complete Pages site publish V2 signed by V2. Never sign V1's URL with V2.
 4. Test a previously installed V1 stable client before publication, after it sees the bridge, after relaunch onto V2, and after a later V2-only update. Record only build and feed generation.
 5. Cut new downloads/releases to V2 only after that passes. Keep the V1 URL, old-key-signed bridge feed, bridge DMG, checksums, and release bytes live for supported clients. Freeze exact legacy bytes as checksummed immutable release assets.
-6. Remove V1 from CI only after freeze. Retain escrow through the support/recovery window; destroy it only with a two-person record of generation, custodians, time, and authorization—never the value.
+6. Retire V1 only after the old-key bridge URL is frozen, the immutable checksummed legacy-feed/release bytes are verified, and the V2-only update has passed on the old client. The following contains secret **names only**. It records the active release environment inventory before deletion, removes V1 from active CI, proves V1 absent and V2 present, then deletes the local account-scoped Keychain private-key item. Do not run the Keychain deletion until the V2 secret was stored and encrypted escrow was verified:
+
+   ```sh
+   set -e
+   export SPARKLE_RETIRE_ENV=release
+   export SPARKLE_OLD_SECRET=SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64
+   export SPARKLE_NEW_SECRET=SPARKLE_STABLE_V2_EDDSA_PRIVATE_KEY_B64
+   export SPARKLE_OLD_ACCOUNT=GramDrive-Sparkle-Stable-V1
+   mkdir -m 700 "$SPARKLE_STAGE_DIR"
+   gh secret list --env "$SPARKLE_RETIRE_ENV" --json name > "$SPARKLE_STAGE_DIR/stable-v1-before-retirement.json"
+   grep -F "\"$SPARKLE_OLD_SECRET\"" "$SPARKLE_STAGE_DIR/stable-v1-before-retirement.json"
+   grep -F "\"$SPARKLE_NEW_SECRET\"" "$SPARKLE_STAGE_DIR/stable-v1-before-retirement.json"
+   gh secret delete "$SPARKLE_OLD_SECRET" --env "$SPARKLE_RETIRE_ENV"
+   gh secret list --env "$SPARKLE_RETIRE_ENV" --json name > "$SPARKLE_STAGE_DIR/stable-v1-after-retirement.json"
+   ! grep -F "\"$SPARKLE_OLD_SECRET\"" "$SPARKLE_STAGE_DIR/stable-v1-after-retirement.json"
+   grep -F "\"$SPARKLE_NEW_SECRET\"" "$SPARKLE_STAGE_DIR/stable-v1-after-retirement.json"
+   security delete-generic-password -s https://sparkle-project.org -a "$SPARKLE_OLD_ACCOUNT"
+   rm "$SPARKLE_STAGE_DIR/stable-v1-before-retirement.json" "$SPARKLE_STAGE_DIR/stable-v1-after-retirement.json"
+   rmdir "$SPARKLE_STAGE_DIR"
+   ```
+
+   Retain the escrow export through the support/recovery window. Its later destruction is a separate authorization: two custodians record generation, escrow location, time, authorization, and the closed recovery window, then the authorized escrow custodian destroys the encrypted escrow copy under the organisation's approved escrow procedure. Never include the value in that record.
 
 Test-key rotation uses this analogous independent V2 sequence; its account, export, secret, and feed URL must never be substituted with stable values:
 
@@ -105,13 +141,41 @@ export SPARKLE_ESCROW_DIR=/Volumes/GramDriveUpdateEscrow
 export SPARKLE_STAGE_DIR="$SECURE_INPUT_DIR/sparkle"
 mkdir -m 700 "$SPARKLE_STAGE_DIR"
 generate_keys --account GramDrive-Sparkle-Test-V2 >/dev/null
+generate_keys --account GramDrive-Sparkle-Test-V2 -p > "$SPARKLE_STAGE_DIR/test-v2.public"
 generate_keys --account GramDrive-Sparkle-Test-V2 -x "$SPARKLE_STAGE_DIR/test-v2.private"
 mv "$SPARKLE_STAGE_DIR/test-v2.private" "$SPARKLE_ESCROW_DIR/test-v2.private"
 base64 < "$SPARKLE_ESCROW_DIR/test-v2.private" | python3 .scripts/release/check_update_secret_inventory.py --set SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64
+```
+
+The public file is the exact V2 `SUPublicEDKey` input for review. Review and commit it with `https://github.com/relux-works/tgfs/releases/download/updates-test-v2/test.xml`, then remove it and the staging directory:
+
+```sh
+rm "$SPARKLE_STAGE_DIR/test-v2.public"
 rmdir "$SPARKLE_STAGE_DIR"
 ```
 
-Review and commit its public key and `https://github.com/relux-works/tgfs/releases/download/updates-test-v2/test.xml`, then unmount escrow. V1 `updates-test-v1/test.xml` signed by V1 offers a bridge embedding V2 and `updates-test-v2/test.xml`; keep V1 live for supported test clients. If every test client is disposable, revocation plus a manual reinstall is permitted only when that discontinuity is recorded.
+V1 `updates-test-v1/test.xml` signed by V1 offers a bridge embedding V2 and `updates-test-v2/test.xml`; keep V1 live for supported test clients. Once the bridge URL is frozen and verified, the equivalent test V1 retirement is:
+
+```sh
+set -e
+export SPARKLE_RETIRE_ENV=updates-test
+export SPARKLE_OLD_SECRET=SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64
+export SPARKLE_NEW_SECRET=SPARKLE_TEST_V2_EDDSA_PRIVATE_KEY_B64
+export SPARKLE_OLD_ACCOUNT=GramDrive-Sparkle-Test-V1
+mkdir -m 700 "$SPARKLE_STAGE_DIR"
+gh secret list --env "$SPARKLE_RETIRE_ENV" --json name > "$SPARKLE_STAGE_DIR/test-v1-before-retirement.json"
+grep -F "\"$SPARKLE_OLD_SECRET\"" "$SPARKLE_STAGE_DIR/test-v1-before-retirement.json"
+grep -F "\"$SPARKLE_NEW_SECRET\"" "$SPARKLE_STAGE_DIR/test-v1-before-retirement.json"
+gh secret delete "$SPARKLE_OLD_SECRET" --env "$SPARKLE_RETIRE_ENV"
+gh secret list --env "$SPARKLE_RETIRE_ENV" --json name > "$SPARKLE_STAGE_DIR/test-v1-after-retirement.json"
+! grep -F "\"$SPARKLE_OLD_SECRET\"" "$SPARKLE_STAGE_DIR/test-v1-after-retirement.json"
+grep -F "\"$SPARKLE_NEW_SECRET\"" "$SPARKLE_STAGE_DIR/test-v1-after-retirement.json"
+security delete-generic-password -s https://sparkle-project.org -a "$SPARKLE_OLD_ACCOUNT"
+rm "$SPARKLE_STAGE_DIR/test-v1-before-retirement.json" "$SPARKLE_STAGE_DIR/test-v1-after-retirement.json"
+rmdir "$SPARKLE_STAGE_DIR"
+```
+
+As with stable, do this only after V2 storage and escrow verification; retain the test V1 escrow export until its documented support/recovery decision authorizes destruction. If every test client is disposable, revocation plus a manual reinstall is permitted only when that discontinuity is recorded.
 
 ### Developer ID certificate/export
 
