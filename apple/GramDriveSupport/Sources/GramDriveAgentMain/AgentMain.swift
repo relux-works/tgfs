@@ -108,7 +108,8 @@ enum AgentMain {
         let terminationExit = TerminationExitGate(
             watchdog: commitExitWatchdog,
             testCommittedExitDelay: testCommittedExitDelay,
-            hardExitWatchdogDelay: testTerminationHardExitWatchdog ?? .seconds(2)
+            hardExitWatchdogDelay: testTerminationHardExitWatchdog
+                ?? CommitExitWatchdog.committedExitDeadline
         )
         let contentPolicy: CoreContentPolicyController
         do {
@@ -267,7 +268,7 @@ enum AgentMain {
         init(
             watchdog: CommitExitWatchdog,
             testCommittedExitDelay: Duration? = nil,
-            hardExitWatchdogDelay: Duration = .seconds(2)
+            hardExitWatchdogDelay: Duration = CommitExitWatchdog.committedExitDeadline
         ) {
             self.watchdog = watchdog
             self.testCommittedExitDelay = testCommittedExitDelay

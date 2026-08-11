@@ -20,6 +20,10 @@ private final class ArmProbe: @unchecked Sendable {
 }
 
 struct CommitExitWatchdogTests {
+    @Test func productionCommittedExitDeadlineIsTwoSeconds() {
+        #expect(CommitExitWatchdog.committedExitDeadline == .seconds(2))
+    }
+
     @Test func installFailurePreventsEveryLaterArm() {
         let watchdog = CommitExitWatchdog(
             system: .init(

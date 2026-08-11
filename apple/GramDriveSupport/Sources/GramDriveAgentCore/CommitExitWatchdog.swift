@@ -7,6 +7,14 @@ import Foundation
 /// successful arm therefore means both that the process can receive
 /// `SIGALRM` and that the real-time timer was configured successfully.
 public final class CommitExitWatchdog: @unchecked Sendable {
+    /// The production interval armed after an accepted termination commit.
+    ///
+    /// The companion observes the captured process for exactly this interval
+    /// before it begins identity-checked escalation. Keeping the interval here
+    /// makes the agent's hard-exit guarantee and the replacement observer's
+    /// bounded wait one lifecycle contract rather than two unrelated timeouts.
+    public static let committedExitDeadline: Duration = .seconds(2)
+
     public struct SystemCalls: @unchecked Sendable {
         let installExitHandler: @Sendable () -> Bool
         let unblockAlarm: @Sendable () -> Bool
