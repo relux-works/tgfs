@@ -14,7 +14,7 @@ GATE := python3 .scripts/acceptance/run_automated.py
         smoke-bindings smoke-shared-state smoke-agent-lifecycle smoke-control-auth \
         package package-host-test \
         package-reproducible package-app package-app-unsigned package-app-notarize \
-        release-provenance tdlib tdlib-smoke tdlib-smoke-link tdjson-smoke tdlib-verify \
+        release-provenance updates-secret-inventory tdlib tdlib-smoke tdlib-smoke-link tdjson-smoke tdlib-verify \
         clean-gates accept-macos accept-macos-runsheet
 
 # check — the pre-push gate: the core and repo suites (what CI's rust-core job
@@ -209,6 +209,9 @@ package-app-notarize:
 # runs this same script. Output: .temp/release/.
 release-provenance:
 	python3 .scripts/release/build_release_provenance.py
+
+updates-secret-inventory:
+	python3 .scripts/release/check_update_secret_inventory.py $(if $(CHECK_GITHUB),--check-github)
 
 # --- TDLib artifact ----------------------------------------------------------
 # The pinned tdjson library GramDrive's local Telegram source links against.

@@ -5,6 +5,20 @@
 
 ## 2026-08-11
 
+### 0013 — Sparkle key retirement ordering is now regression-protected (TASK-260810-3uh3mc)
+
+- FIX: The test-channel runbook now makes its retirement prerequisites explicit before any active-CI secret or local Keychain deletion: freeze and verify the V1 bridge, store V2, verify encrypted escrow, and prove an old V1 client can install the bridge and a later V2-only update. It retains escrow until the separately authorized support-window decision.
+- REGRESSION: the focused runbook policy test requires four distinct versioned accounts, public-key lookups and staging files, private export/escrow/setter mappings, public staging cleanup, and both environment-scoped V1-to-V2 retirement blocks. It verifies name-only inventory before/after, old-secret deletion, account-scoped Sparkle Keychain deletion, V2-present/V1-absent evidence, and the no-early-retirement ordering.
+- VALIDATION: focused inventory/runbook suite (11 tests), all 271 script tests, `make updates-secret-inventory`, and `make check-repo` (2/2) exited 0. Credential values were neither accessed nor emitted.
+
+### 0012 — Update credential operations use a value-safe provisioning boundary (TASK-260810-3uh3mc)
+
+- DECISION: the update bootstrap tool receives credential bytes only on stdin or from validated owner-only files and invokes `gh secret set NAME --env ENV` without `--body`; it suppresses `gh` output. It maps exactly six `updates-test` names and one `release` name at bootstrap, with versioned Sparkle generations constrained to their own environment. Its name-only preflight invokes `gh secret list --env ... --json name`.
+- SECURITY: each Sparkle generation has a distinct versioned Keychain account. `generate_keys --account NAME` creates it, `generate_keys --account NAME -p` captures the reviewed public key, and `generate_keys --account NAME -x OWNER_ONLY_FILE` exports it; the export is moved into encrypted offline escrow before base64 is streamed to the setter. No private export is copied between test and stable channels or retained in staging. After the bridge URL is frozen and V2 is verified, documented value-free `gh secret delete` and `security delete-generic-password` commands remove the retired generation from active CI and the local Keychain; escrow retention/destruction remains separately authorized.
+- SECURITY: `security import -P` necessarily places the `.p12` password in process argv briefly. The runbook records its temporary dedicated-runner isolation and cleanup controls, followed by mandatory Developer ID reissue/revocation after the iteration.
+- RECOVERY: stable trust rotation is URL-generational: V1's old-key-signed bridge embeds V2's key/URL, V1 bytes remain live as immutable checksummed release assets, and old-client evidence is required before/after cutover. A recovery is forward-only, never an in-place DMG mutation or lower-build downgrade.
+- VALIDATION: the focused setter/inventory and Sparkle-command regression suite (10 tests), all 270 script tests, `make updates-secret-inventory`, the 2/2 `make check-repo` gate, and `git diff --check` exited 0 after the prior Sparkle-command correction. The subsequent documentation-only lifecycle correction requires the public-key capture and retirement sequence to be revalidated before review.
+
 ### 0001 — Self-hosted CI restores a missing Rust toolchain without shell-profile state (BUG-260720-27inl5)
 
 - ROOT CAUSE: public CI run `31443550054` (`rust-core`) and run `31443550101` (`tdlib` and `apple-build-test`) each invoked `rustup` before any bootstrap. Their clean macOS self-hosted runner had no command on `PATH`, so each job stopped with `rustup: command not found` and exit 127.
