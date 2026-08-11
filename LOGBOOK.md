@@ -5,6 +5,13 @@
 
 ## 2026-08-11
 
+### 0012 — Update credential operations use a name-only automation boundary (TASK-260810-3uh3mc)
+
+- DECISION: the update bootstrap tool accepts no credential values and invokes only `gh secret list --env ... --json name`; it verifies exactly six `updates-test` names and one `release` name. Values stay exclusively in GitHub's environment-secret UI or approved direct secret automation.
+- SECURITY: `security import -P` necessarily places the `.p12` password in process argv briefly. The runbook records its temporary dedicated-runner isolation and cleanup controls, followed by mandatory Developer ID reissue/revocation after the iteration.
+- RECOVERY: stable trust rotation is URL-generational: V1's old-key-signed bridge embeds V2's key/URL, V1 bytes remain live as immutable checksummed release assets, and old-client evidence is required before/after cutover. A recovery is forward-only, never an in-place DMG mutation or lower-build downgrade.
+- VALIDATION: value-free inventory preflight, all 264 script tests, repository gate, and `git diff --check` exited 0.
+
 ### 0001 — Self-hosted CI restores a missing Rust toolchain without shell-profile state (BUG-260720-27inl5)
 
 - ROOT CAUSE: public CI run `31443550054` (`rust-core`) and run `31443550101` (`tdlib` and `apple-build-test`) each invoked `rustup` before any bootstrap. Their clean macOS self-hosted runner had no command on `PATH`, so each job stopped with `rustup: command not found` and exit 127.
