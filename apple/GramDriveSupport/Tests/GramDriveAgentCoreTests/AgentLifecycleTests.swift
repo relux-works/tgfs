@@ -530,6 +530,51 @@ private func startedLifecycle(
         }
     }
 
+    @Test func authDiagnosticsPersistAcrossRelaunchAndRedactAuthPayloads() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let first = try startedLifecycle(dataRoot: root)
+            let sensitiveValues = [
+                "+15551234567", "843921", "correct-horse-battery-staple",
+                "tg://login?token=private", "987654321", "Ada Lovelace",
+            ]
+            let rejection = ControlAuthRejection(
+                kind: "other",
+                code: 987_654_321,
+                detail: sensitiveValues.joined(separator: " "))
+            let refusal = AuthDiagnosticCode.refusal(for: rejection)
+            let expected: [AuthDiagnosticCode] = [
+                .sessionStarted,
+                refusal,
+                .finalizeSucceeded,
+                .finalizeFailed,
+                .probeSignedOut,
+            ]
+            for code in expected {
+                first.recordAuthDiagnostic(code)
+            }
+
+            let firstPayload = try #require(
+                String(data: JSONEncoder().encode(first.healthSnapshot().recentEvents), encoding: .utf8))
+            let persistedPayload = try #require(
+                String(data: Data(contentsOf: first.runtimeLayout.authDiagnosticsFile), encoding: .utf8))
+            for value in sensitiveValues {
+                #expect(!firstPayload.localizedCaseInsensitiveContains(value))
+                #expect(!persistedPayload.localizedCaseInsensitiveContains(value))
+            }
+            #expect(
+                AuthDiagnosticTrail.logMessage(for: refusal)
+                    == "event=auth-refused-other")
+
+            await first.shutdown(reason: .terminate)
+            let second = try startedLifecycle(dataRoot: root)
+            let restored = second.healthSnapshot().recentEvents
+            for code in expected {
+                #expect(restored.contains(code.rawValue))
+            }
+            await second.shutdown(reason: .terminate)
+        }
+    }
+
     @Test func providerFetchHealthIsDurableAndExposesOnlyAggregateCounts() async throws {
         try await withTemporaryDirectoryAsync { root in
             let lifecycle = try startedLifecycle(dataRoot: root)

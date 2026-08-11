@@ -194,6 +194,7 @@ private final class LockedCount: @unchecked Sendable {
 
   private static func handlers(
     authorizer: (any AgentAuthorizing)? = nil,
+    authDiagnostics: (@Sendable (AuthDiagnosticCode) -> Void)? = nil,
     remover: (any AgentAccountRemoving)? = nil,
     repairer: (any AgentRepairing)? = nil,
     contentPolicy: (any AgentContentPolicyControlling)? = nil,
@@ -207,6 +208,7 @@ private final class LockedCount: @unchecked Sendable {
       status: { snapshot(accounts: accounts) },
       reloadSettings: { AgentSettings(launchAtLogin: true, cacheQuotaBytes: 7) },
       authorizer: authorizer,
+      authDiagnostics: authDiagnostics,
       remover: remover,
       repairer: repairer,
       contentPolicy: contentPolicy,
@@ -957,6 +959,47 @@ private final class LockedCount: @unchecked Sendable {
             rejection: ControlAuthRejection(kind: "invalid-code"))))
   }
 
+  @Test func authDiagnosticsUseFixedCodesForSessionRefusalAndFinalization() async throws {
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let session = ScriptedHostedSession()
+    let diagnostics = AuthDiagnosticCollector()
+    let server = try ControlServer.start(
+      socketURL: socket,
+      handlers: Self.handlers(
+        authorizer: ScriptedAuthorizer(session: session),
+        authDiagnostics: { diagnostics.record($0) }))
+    defer { server.stop() }
+
+    let channel = try ControlAuthChannel.open(socketURL: socket)
+    defer { channel.close() }
+    let events = EventCollector(channel.events)
+    await Self.waitUntil("the server attaches to the auth-state stream") {
+      session.hasStateConsumer
+    }
+    session.answer = .rejected(
+      ControlAuthRejection(kind: "other", code: 987_654_321, detail: "private-password"))
+    try channel.send(ControlAuthInputFrame(seq: 1, input: .submitCode("843921")))
+    _ = await events.next()
+    session.emit(
+      ControlAuthState(
+        kind: "ready",
+        account: ControlAccountIdentity(accountId: 987_654_321, displayName: "Ada Lovelace")))
+    _ = await events.next()
+    session.emit(ControlAuthState(kind: "failed", failureDetail: "tg://login?token=private"))
+    _ = await events.next()
+
+    await Self.waitUntil("auth diagnostic codes") {
+      let codes = diagnostics.codes
+      return codes.contains(.sessionStarted)
+        && codes.contains(.refusedOther)
+        && codes.contains(.finalizeSucceeded)
+        && codes.contains(.finalizeFailed)
+    }
+  }
+
   @Test func statusCompletesWhileAnAuthChannelRemainsOpen() async throws {
     let root = try Self.tempRoot()
     let socket = ControlContract.socketURL(dataRoot: root)
@@ -1356,6 +1399,23 @@ private struct ScriptedAuthorizer: AgentAuthorizing {
 
   func makeSession() throws -> any AgentAuthSessionHosting {
     session
+  }
+}
+
+private final class AuthDiagnosticCollector: @unchecked Sendable {
+  private let lock = NSLock()
+  private var recorded: [AuthDiagnosticCode] = []
+
+  func record(_ code: AuthDiagnosticCode) {
+    lock.lock()
+    recorded.append(code)
+    lock.unlock()
+  }
+
+  var codes: [AuthDiagnosticCode] {
+    lock.lock()
+    defer { lock.unlock() }
+    return recorded
   }
 }
 

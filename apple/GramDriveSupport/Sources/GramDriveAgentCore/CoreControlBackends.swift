@@ -505,19 +505,22 @@ public struct CoreRepairRunner: AgentRepairing {
   private let accounts: @Sendable () throws -> [AccountHealthSummary]
   private let beforeRepair: @Sendable () -> Void
   private let afterRepair: @Sendable () -> Void
+  private let onSignedOutProbe: @Sendable () -> Void
 
   public init(
     configuration: CoreAuthConfiguration,
     vault: any SecretVault,
     accounts: @escaping @Sendable () throws -> [AccountHealthSummary],
     beforeRepair: @escaping @Sendable () -> Void = {},
-    afterRepair: @escaping @Sendable () -> Void = {}
+    afterRepair: @escaping @Sendable () -> Void = {},
+    onSignedOutProbe: @escaping @Sendable () -> Void = {}
   ) {
     self.configuration = configuration
     self.vault = vault
     self.accounts = accounts
     self.beforeRepair = beforeRepair
     self.afterRepair = afterRepair
+    self.onSignedOutProbe = onSignedOutProbe
   }
 
   public func repair() async -> ControlCommandOutcome {
@@ -538,6 +541,7 @@ public struct CoreRepairRunner: AgentRepairing {
           accountId: account.accountId,
           vault: vault)
         if case .signedOut = outcome {
+          onSignedOutProbe()
           return .failed(
             ControlCommandFailure(
               category: .authRequired,

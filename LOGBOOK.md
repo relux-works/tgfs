@@ -5,6 +5,12 @@
 
 ## 2026-08-11
 
+### 0022 — Installed auth diagnostics retain only fixed lifecycle codes (BUG-260729-37ffmx)
+
+- ROOT CAUSE: the agent's health event ring lived only in process memory, while the control server had no redaction boundary between rich auth payloads and installed-build diagnostics. Relaunching therefore discarded the only useful auth trail, and logging an auth transition directly would risk serializing user-controlled data.
+- FIX: a bounded agent-runtime trail persists a closed vocabulary of auth lifecycle codes. The same code is sent to unified logging and the health ring; session start, classified refusal, successful/failed finalization, and signed-out repair probes are recorded without passing through auth inputs, state payloads, account identifiers, or display names.
+- REGRESSION: lifecycle tests prove the durable trail survives relaunch and that health, disk, and exact log rendering redact phone numbers, login codes, passwords, QR links, account ids, and display names. Control-channel coverage proves raw state/input payloads collapse to the expected fixed codes.
+
 ### 0021 — Hydration cancellation wins over an already-selected timeout (BUG-260811-1w36m6)
 
 - ROOT CAUSE: `AgentHydrationClient.exchangeBlocking` runs on a user-initiated GCD queue while the caller awaits its continuation in a Swift task. Under full-suite load, a blocking receive can select `.timedOut` and retire the descriptor just before cancellation is delivered to the awaiting task. The existing transport-side cancellation flag then remains false at the read boundary, so the preselected timeout is resumed even though `Task.isCancelled` is true.

@@ -171,6 +171,7 @@ public final class AgentLifecycle: @unchecked Sendable {
     private let layout: AgentRuntimeLayout
     private let startedAt: Date
     private let processIdentity: AgentProcessIdentity
+    private let authDiagnostics: AuthDiagnosticTrail
 
     private var state: AgentRunState = .launching
     private var instanceLock: SingleInstanceLock?
@@ -232,6 +233,7 @@ public final class AgentLifecycle: @unchecked Sendable {
         layout = AgentRuntimeLayout(dataRoot: configuration.dataRoot)
         startedAt = now
         processIdentity = AgentProcessIdentity.current()
+        authDiagnostics = AuthDiagnosticTrail(fileURL: layout.authDiagnosticsFile)
     }
 
     /// The lifecycle state, for hosts and tests.
@@ -257,6 +259,7 @@ public final class AgentLifecycle: @unchecked Sendable {
         } catch {
             throw AgentStartError.runtimeDirectory(underlying: error)
         }
+        setLocked { self.events = self.authDiagnostics.restore() }
 
         // Settings are advisory; unreadable settings must not keep the
         // engine host down. The failure is recorded, not swallowed.
@@ -344,6 +347,9 @@ public final class AgentLifecycle: @unchecked Sendable {
                         return try self.reloadSettings()
                     },
                     authorizer: seams.authorizer,
+                    authDiagnostics: { [weak self] code in
+                        self?.recordAuthDiagnostic(code)
+                    },
                     remover: seams.remover,
                     repairer: seams.repairer,
                     contentPolicy: seams.contentPolicy,
@@ -780,6 +786,14 @@ public final class AgentLifecycle: @unchecked Sendable {
             historyPriorityHints: historyPriorityHints,
             providerFetchHealth: providerFetchHealth
         )
+    }
+
+    /// Records a fixed installed-auth diagnostic code in the health ring,
+    /// durable trail, and unified log. This is the only auth diagnostics
+    /// ingress: callers cannot pass user-controlled strings.
+    public func recordAuthDiagnostic(_ code: AuthDiagnosticCode) {
+        authDiagnostics.record(code)
+        record(code.rawValue)
     }
 
     // MARK: - Internals

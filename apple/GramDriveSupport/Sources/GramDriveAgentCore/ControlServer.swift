@@ -85,6 +85,9 @@ public struct ControlServerHandlers: Sendable {
   public var status: @Sendable () -> AgentHealthSnapshot
   public var reloadSettings: @Sendable () throws -> AgentSettings
   public var authorizer: (any AgentAuthorizing)?
+  /// Fixed auth outcome codes only. The control server owns the redaction
+  /// boundary because it sees both raw user inputs and rich state payloads.
+  public var authDiagnostics: (@Sendable (AuthDiagnosticCode) -> Void)?
   public var remover: (any AgentAccountRemoving)?
   public var repairer: (any AgentRepairing)?
   public var contentPolicy: (any AgentContentPolicyControlling)?
@@ -109,6 +112,7 @@ public struct ControlServerHandlers: Sendable {
     status: @escaping @Sendable () -> AgentHealthSnapshot,
     reloadSettings: @escaping @Sendable () throws -> AgentSettings,
     authorizer: (any AgentAuthorizing)? = nil,
+    authDiagnostics: (@Sendable (AuthDiagnosticCode) -> Void)? = nil,
     remover: (any AgentAccountRemoving)? = nil,
     repairer: (any AgentRepairing)? = nil,
     contentPolicy: (any AgentContentPolicyControlling)? = nil,
@@ -122,6 +126,7 @@ public struct ControlServerHandlers: Sendable {
     self.status = status
     self.reloadSettings = reloadSettings
     self.authorizer = authorizer
+    self.authDiagnostics = authDiagnostics
     self.remover = remover
     self.repairer = repairer
     self.contentPolicy = contentPolicy
@@ -769,6 +774,7 @@ public final class ControlServer: @unchecked Sendable {
       remove(connection)
       return
     }
+    handlers.authDiagnostics?(.sessionStarted)
     connection.adopt(session: session)
 
     // A sign-in idles while the user reads and types; only the
@@ -782,6 +788,9 @@ public final class ControlServer: @unchecked Sendable {
     // the session being over, which ends the connection.
     Task { [weak self] in
       for await state in session.states {
+        if let code = AuthDiagnosticCode.finalization(for: state) {
+          self?.handlers.authDiagnostics?(code)
+        }
         connection.writeEvent(.authState(state))
       }
       connection.teardown()
@@ -803,6 +812,9 @@ public final class ControlServer: @unchecked Sendable {
         }
         Task {
           let answer = await session.submit(frame.input)
+          if let rejection = answer.rejection {
+            self?.handlers.authDiagnostics?(AuthDiagnosticCode.refusal(for: rejection))
+          }
           connection.writeEvent(
             .authSubmitResult(
               ControlAuthSubmitResult(
