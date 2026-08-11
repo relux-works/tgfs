@@ -5,6 +5,13 @@
 
 ## 2026-08-11
 
+### 0021 — Hydration cancellation wins over an already-selected timeout (BUG-260811-1w36m6)
+
+- ROOT CAUSE: `AgentHydrationClient.exchangeBlocking` runs on a user-initiated GCD queue while the caller awaits its continuation in a Swift task. Under full-suite load, a blocking receive can select `.timedOut` and retire the descriptor just before cancellation is delivered to the awaiting task. The existing transport-side cancellation flag then remains false at the read boundary, so the preselected timeout is resumed even though `Task.isCancelled` is true.
+- FIX: preserve the accepted live-socket `shutdown(2)` cancellation and the `HydrationConnection` descriptor/materialization ownership state machine. At the continuation handoff, normalize either a successful or failing worker result through the awaiting task's authoritative cancellation bit; a cancellation observed before delivery therefore throws `CancellationError`, while a cancellation after terminal `done` still waits for synchronous materialization before returning.
+- REGRESSION: an internal client-only delivery rendezvous holds the already-selected timeout result after the blocking exchange has retired its descriptor. The test cancels before allowing continuation delivery. It is a deterministic pre-fix red (exit 1: received `HydrationTransportError.timedOut`) and post-fix green (exit 0) without increasing the one-second idle timeout. Existing wire-close, fd-retirement, and cancelled-materialization regressions remain in the same hydration suite.
+- VALIDATION: three repeated `swift test --filter Hydration` runs exited 0. Sequential isolated staging logged `PACKAGING PASSED`; `make check-apple` exited 0 (2/2), `make check-core` logged 6/6 successful toolchain/format/lint/test/architecture/supply-chain steps, `make check-repo` exited 0 (2/2), `make check-security` exited 0 (1/1), and `git diff --check` exited 0. Source and evidence are ready for independent Sol/high review; no protected publication or exact-main CI claim is made here.
+
 ### 0020 — Replacement escalation follows the committed-exit contract (BUG-260811-3h5j1v)
 
 - INCIDENT: native-ci [run 31499429265](https://github.com/relux-works/tgfs/actions/runs/31499429265) failed only `LiveControlTests.realOlderAgentReplacementEscalatesAndStartsTheMatchingSameBinarySuccessor`: its end-to-end replacement completion interval (from before the initial health read through matching-successor hierarchy completion) was 5.040259506 seconds, just after its `< 5s` test watchdog. `ControlChannelTests` passed in 4.672 seconds; the full Swift run had one issue.

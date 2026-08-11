@@ -436,6 +436,41 @@ private final class ProgressLog: @unchecked Sendable {
             await closed.wait()
         }
     }
+
+    @Test func cancellationWinsWhenTheBlockingReadTimesOutBeforeItsResultIsDelivered() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-hydration-cancel-delivery-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let socketURL = directory.appendingPathComponent("hydration.sock")
+        let deliveryBlocked = TestSignal()
+        let allowDelivery = DispatchSemaphore(value: 0)
+        let server = try ScriptedSocketServer(
+            socketURL: socketURL,
+            script: [.awaitPeerClose(onClosed: {})])
+        defer { server.stop() }
+        let client = AgentHydrationClient(
+            testingSocketURL: { socketURL },
+            idleTimeout: .seconds(1),
+            beforeResultDelivery: {
+                deliveryBlocked.signal()
+                allowDelivery.wait()
+            })
+
+        let task = Task {
+            try await client.hydrate(sampleRequest) { _ in }
+        }
+        // The transport has already selected its timeout result and closed the
+        // descriptor. Cancellation now lands before that result is resumed
+        // into the awaiting Swift task, exactly the full-suite-load race.
+        await deliveryBlocked.wait()
+        task.cancel()
+        allowDelivery.signal()
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await task.value
+        }
+    }
 }
 
 // MARK: - The cancellation connection's fd guard
