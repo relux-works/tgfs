@@ -54,6 +54,95 @@ private final class LockedTerminationRequests: @unchecked Sendable {
     defer { lock.unlock() }
     return requests
   }
+
+}
+
+private final class LockedPreparedTermination: @unchecked Sendable {
+  private let lock = NSLock()
+  private var prepared = false
+  private var requests: [ControlTerminationRequest] = []
+
+  func recordPrepare(_ request: ControlTerminationRequest) {
+    lock.lock()
+    prepared = true
+    requests.append(request)
+    lock.unlock()
+  }
+
+  func acceptCommit(_ request: ControlTerminationRequest) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    guard prepared else { return false }
+    requests.append(request)
+    return true
+  }
+
+  var snapshot: [ControlTerminationRequest] {
+    lock.lock()
+    defer { lock.unlock() }
+    return requests
+  }
+
+  var recordedPrepareThenCommit: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return requests.map(\.action) == [.prepare, .commit]
+  }
+}
+
+private final class LockedControlServerEvents: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [ControlServerStartupEvent] = []
+
+  func append(_ event: ControlServerStartupEvent) {
+    lock.lock()
+    storage.append(event)
+    lock.unlock()
+  }
+
+  var snapshot: [ControlServerStartupEvent] {
+    lock.lock()
+    defer { lock.unlock() }
+    return storage
+  }
+
+  var diagnosticSummary: String {
+    snapshot.map(\.diagnosticName).joined(separator: " -> ")
+  }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage = false
+
+  func set() {
+    lock.lock()
+    storage = true
+    lock.unlock()
+  }
+
+  var value: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return storage
+  }
+}
+
+private final class LockedCount: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage = 0
+
+  func increment() {
+    lock.lock()
+    storage += 1
+    lock.unlock()
+  }
+
+  var value: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return storage
+  }
 }
 
 /// The control channel end to end: the real server and the real client
@@ -64,6 +153,14 @@ private final class LockedTerminationRequests: @unchecked Sendable {
 // mutually waiting client/server pairs from concurrently running suites.
 @Suite(.serialized) struct ControlChannelTests {
   // MARK: - Fixtures
+
+  /// Blocking UNIX-socket clients must not consume Swift Testing's cooperative
+  /// executor. This dedicated libdispatch queue remains available while test
+  /// tasks are suspended awaiting their responses.
+  private static let blockingClientQueue = DispatchQueue(
+    label: "com.reluxworks.gramdrive.tests.control-client",
+    qos: .userInitiated,
+    attributes: .concurrent)
 
   /// A per-test socket home under the system temp dir.
   private static func tempRoot() throws -> URL {
@@ -123,11 +220,65 @@ private final class LockedTerminationRequests: @unchecked Sendable {
   private static func command(
     _ request: ControlRequest,
     socketURL: URL,
+    didWriteRequest: @escaping @Sendable () -> Void = {},
     timeout: Duration = .seconds(5)
   ) async throws -> ControlEvent {
-    try await Task.detached(priority: .utility) {
-      try ControlClient.command(request, socketURL: socketURL, timeout: timeout)
-    }.value
+    try await withCheckedThrowingContinuation { continuation in
+      blockingClientQueue.async {
+        do {
+          let descriptor = try ControlClient.connect(socketURL: socketURL, receiveTimeout: timeout)
+          defer { close(descriptor) }
+          try ControlClient.writeLine(request, to: descriptor, path: socketURL.path)
+          didWriteRequest()
+          var buffer = Data()
+          continuation.resume(
+            returning: try ControlClient.readEvent(
+              from: descriptor, path: socketURL.path, buffer: &buffer))
+        } catch {
+          continuation.resume(throwing: error)
+        }
+      }
+    }
+  }
+
+  /// Sends prepare and commit in one dedicated blocking-client operation,
+  /// deliberately writing both before reading either response. Holding source
+  /// registration lets the test establish their real socket arrival order
+  /// without waiting on the prepare acknowledgement.
+  private static func pairedTerminationCommands(
+    prepare: ControlRequest,
+    commit: ControlRequest,
+    socketURL: URL,
+    didWritePrepare: @escaping @Sendable () -> Void = {},
+    didWriteCommit: @escaping @Sendable () -> Void = {}
+  ) async throws -> (ControlEvent, ControlEvent) {
+    try await withCheckedThrowingContinuation { continuation in
+      blockingClientQueue.async {
+        do {
+          let prepareDescriptor = try ControlClient.connect(
+            socketURL: socketURL, receiveTimeout: .seconds(5))
+          defer { close(prepareDescriptor) }
+          try ControlClient.writeLine(prepare, to: prepareDescriptor, path: socketURL.path)
+          didWritePrepare()
+
+          let commitDescriptor = try ControlClient.connect(
+            socketURL: socketURL, receiveTimeout: .seconds(5))
+          defer { close(commitDescriptor) }
+          try ControlClient.writeLine(commit, to: commitDescriptor, path: socketURL.path)
+          didWriteCommit()
+
+          var prepareBuffer = Data()
+          let prepareEvent = try ControlClient.readEvent(
+            from: prepareDescriptor, path: socketURL.path, buffer: &prepareBuffer)
+          var commitBuffer = Data()
+          let commitEvent = try ControlClient.readEvent(
+            from: commitDescriptor, path: socketURL.path, buffer: &commitBuffer)
+          continuation.resume(returning: (prepareEvent, commitEvent))
+        } catch {
+          continuation.resume(throwing: error)
+        }
+      }
+    }
   }
 
   private static func waitUntil(
@@ -160,6 +311,202 @@ private final class LockedTerminationRequests: @unchecked Sendable {
     #expect(event == .status(Self.snapshot()))
   }
 
+  @Test func statusIsAvailableImmediatelyAcrossLoadedServerStarts() async throws {
+    let endpointCount = 2
+    let requestsPerEndpoint = 2
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for _ in 0..<endpointCount {
+        group.addTask {
+          let root = try Self.tempRoot()
+          let socket = ControlContract.socketURL(dataRoot: root)
+          try FileManager.default.createDirectory(
+            at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+          let events = LockedControlServerEvents()
+          let server = try ControlServer.start(
+            socketURL: socket,
+            handlers: Self.handlers(),
+            startupObservation: ControlServerStartupObservation(record: events.append))
+          defer { server.stop() }
+
+          do {
+            try await withThrowingTaskGroup(of: ControlEvent.self) { requests in
+              for _ in 0..<requestsPerEndpoint {
+                requests.addTask {
+                  try await Self.command(
+                    ControlRequest(operation: .status), socketURL: socket)
+                }
+              }
+              for try await event in requests {
+                #expect(event == .status(Self.snapshot()))
+              }
+            }
+          } catch {
+            Issue.record(
+              "loaded status request failed after stages: \(events.diagnosticSummary)")
+            throw error
+          }
+          let stages = events.snapshot
+          #expect(stages.first == .listenerRegistered)
+          #expect(stages.filter { $0 == .connectionAccepted }.count == requestsPerEndpoint)
+          #expect(stages.filter { $0 == .workStarted }.count == requestsPerEndpoint)
+          #expect(stages.filter { $0 == .statusResponseCompleted }.count == requestsPerEndpoint)
+        }
+      }
+      try await group.waitForAll()
+    }
+  }
+
+  @Test func coalescedAcceptsDrainInOrderBeforeStatusWorkStarts() async throws {
+    let requestCount = 4
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let releaseRegistration = DispatchSemaphore(value: 0)
+    let registrationEntered = LockedFlag()
+    let writtenRequests = LockedCount()
+    let events = LockedControlServerEvents()
+
+    let startup = Task.detached {
+      try ControlServer.start(
+        socketURL: socket,
+        handlers: Self.handlers(),
+        startupObservation: ControlServerStartupObservation { event in
+          events.append(event)
+          guard event == .listenerRegistered else { return }
+          registrationEntered.set()
+          releaseRegistration.wait()
+        })
+    }
+    await Self.waitUntil("listener registration", condition: { registrationEntered.value })
+
+    let requests = Task {
+      try await withThrowingTaskGroup(of: ControlEvent.self) { group in
+        for _ in 0..<requestCount {
+          group.addTask {
+            try await Self.command(
+              ControlRequest(operation: .status),
+              socketURL: socket,
+              didWriteRequest: { writtenRequests.increment() })
+          }
+        }
+        var responses: [ControlEvent] = []
+        for try await response in group {
+          responses.append(response)
+        }
+        return responses
+      }
+    }
+    await Self.waitUntil(
+      "coalesced status writes",
+      condition: {
+        writtenRequests.value == requestCount
+      })
+    #expect(events.snapshot == [.listenerRegistered])
+
+    releaseRegistration.signal()
+    let server = try await startup.value
+    defer { server.stop() }
+    do {
+      for response in try await requests.value {
+        #expect(response == .status(Self.snapshot()))
+      }
+    } catch {
+      Issue.record(
+        "coalesced status request failed after stages: \(events.diagnosticSummary)")
+      throw error
+    }
+    await Self.waitUntil(
+      "coalesced status responses",
+      condition: {
+        events.snapshot.filter { $0 == .statusResponseCompleted }.count == requestCount
+      })
+
+    let stages = events.snapshot
+    let firstWork = try #require(stages.firstIndex(of: .workStarted))
+    #expect(stages.first == .listenerRegistered)
+    #expect(stages.filter { $0 == .connectionAccepted }.count == requestCount)
+    #expect(stages.filter { $0 == .workStarted }.count == requestCount)
+    #expect(stages.filter { $0 == .statusResponseCompleted }.count == requestCount)
+    #expect(stages[1..<firstWork].allSatisfy { $0 == .connectionAccepted })
+  }
+
+  @Test func startWaitsForRealListenerRegistrationBeforePublishingTheSocket() async throws {
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let releaseRegistration = DispatchSemaphore(value: 0)
+    let registrationEntered = LockedFlag()
+    let startupReturned = LockedFlag()
+    let requestWritten = LockedFlag()
+    let events = LockedControlServerEvents()
+
+    let startup = Task.detached {
+      defer { startupReturned.set() }
+      return try ControlServer.start(
+        socketURL: socket,
+        handlers: Self.handlers(),
+        startupObservation: ControlServerStartupObservation { event in
+          events.append(event)
+          guard event == .listenerRegistered else { return }
+          registrationEntered.set()
+          releaseRegistration.wait()
+        })
+    }
+    await Self.waitUntil("listener registration", condition: { registrationEntered.value })
+
+    // The socket was bound before the source registration callback. Connect
+    // and write while that callback is held, then prove `start` has not leaked
+    // a server reference during this socket-visible interval.
+    let request = Task.detached {
+      let descriptor = try ControlClient.connect(socketURL: socket, receiveTimeout: .seconds(2))
+      defer { close(descriptor) }
+      try ControlClient.writeLine(
+        ControlRequest(operation: .status), to: descriptor, path: socket.path)
+      requestWritten.set()
+      var buffer = Data()
+      return try ControlClient.readEvent(from: descriptor, path: socket.path, buffer: &buffer)
+    }
+    await Self.waitUntil("status request write", condition: { requestWritten.value })
+    #expect(startupReturned.value == false)
+    #expect(events.snapshot == [.listenerRegistered])
+
+    releaseRegistration.signal()
+    let server = try await startup.value
+    defer { server.stop() }
+    #expect(try await request.value == .status(Self.snapshot()))
+    await Self.waitUntil(
+      "status response dispatch",
+      condition: {
+        events.snapshot.contains(.statusResponseCompleted)
+      })
+    #expect(
+      events.snapshot == [
+        .listenerRegistered,
+        .connectionAccepted,
+        .workStarted,
+        .statusResponseCompleted,
+      ])
+  }
+
+  @Test func startRemovesTheSocketWhenListenerRegistrationIsCancelled() throws {
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+    #expect(throws: ControlServerStartupError.listenerSourceCancelledBeforeRegistration) {
+      try ControlServer.start(
+        socketURL: socket,
+        handlers: Self.handlers(),
+        startupObservation: ControlServerStartupObservation(
+          record: { _ in },
+          cancelBeforeResume: true))
+    }
+    #expect(FileManager.default.fileExists(atPath: socket.path) == false)
+  }
+
   @Test func reloadSettingsAnswersTheAppliedDocument() async throws {
     let root = try Self.tempRoot()
     let socket = ControlContract.socketURL(dataRoot: root)
@@ -168,7 +515,8 @@ private final class LockedTerminationRequests: @unchecked Sendable {
     let server = try ControlServer.start(socketURL: socket, handlers: Self.handlers())
     defer { server.stop() }
 
-    let event = try await Self.command(ControlRequest(operation: .reloadSettings), socketURL: socket)
+    let event = try await Self.command(
+      ControlRequest(operation: .reloadSettings), socketURL: socket)
     #expect(event == .settings(AgentSettings(launchAtLogin: true, cacheQuotaBytes: 7)))
   }
 
@@ -217,6 +565,57 @@ private final class LockedTerminationRequests: @unchecked Sendable {
     #expect(recorded.snapshot == [request, commit])
   }
 
+  @Test func coalescedPrepareExecutesBeforeCommitStateCheck() async throws {
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let releaseRegistration = DispatchSemaphore(value: 0)
+    let registrationEntered = LockedFlag()
+    let prepareWritten = LockedFlag()
+    let commitWritten = LockedFlag()
+    let prepared = LockedPreparedTermination()
+
+    let startup = Task.detached {
+      try ControlServer.start(
+        socketURL: socket,
+        handlers: ControlServerHandlers(
+          status: { Self.snapshot() },
+          reloadSettings: { AgentSettings() },
+          prepareForTermination: { prepared.recordPrepare($0) },
+          acceptTerminationCommit: { prepared.acceptCommit($0) }),
+        startupObservation: ControlServerStartupObservation { event in
+          guard event == .listenerRegistered else { return }
+          registrationEntered.set()
+          releaseRegistration.wait()
+        })
+    }
+    await Self.waitUntil("listener registration", condition: { registrationEntered.value })
+
+    let request = ControlTerminationRequest(
+      expectedAgentInstanceID: UUID(), reason: .update, targetBuild: "137")
+    var commit = request
+    commit.action = .commit
+    let responses = Task {
+      try await Self.pairedTerminationCommands(
+        prepare: ControlRequest(operation: .prepareForTermination, termination: request),
+        commit: ControlRequest(operation: .prepareForTermination, termination: commit),
+        socketURL: socket,
+        didWritePrepare: { prepareWritten.set() },
+        didWriteCommit: { commitWritten.set() })
+    }
+    await Self.waitUntil("coalesced prepare write", condition: { prepareWritten.value })
+    await Self.waitUntil("coalesced commit write", condition: { commitWritten.value })
+
+    releaseRegistration.signal()
+    let server = try await startup.value
+    defer { server.stop() }
+    let (prepareEvent, commitEvent) = try await responses.value
+    #expect(prepareEvent == .commandDone)
+    #expect(commitEvent == .terminationCommitAccepted)
+    #expect(prepared.recordedPrepareThenCommit)
+  }
+
   @Test func terminationPrepareRefusesBeforeAcknowledgingAnInvalidInstance() throws {
     let root = try Self.tempRoot()
     let socket = ControlContract.socketURL(dataRoot: root)
@@ -240,10 +639,11 @@ private final class LockedTerminationRequests: @unchecked Sendable {
       timeout: .seconds(5))
 
     #expect(
-      event == .commandFailed(
-        ControlCommandFailure(
-          category: .invalidArgument,
-          detail: "termination prepare was not accepted")))
+      event
+        == .commandFailed(
+          ControlCommandFailure(
+            category: .invalidArgument,
+            detail: "termination prepare was not accepted")))
     #expect(recorded.snapshot.isEmpty)
   }
 
@@ -555,6 +955,41 @@ private final class LockedTerminationRequests: @unchecked Sendable {
             seq: 9,
             outcome: "rejected",
             rejection: ControlAuthRejection(kind: "invalid-code"))))
+  }
+
+  @Test func statusCompletesWhileAnAuthChannelRemainsOpen() async throws {
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let session = ScriptedHostedSession()
+    let server = try ControlServer.start(
+      socketURL: socket,
+      handlers: Self.handlers(authorizer: ScriptedAuthorizer(session: session)))
+    defer { server.stop() }
+
+    let channel = try ControlAuthChannel.open(socketURL: socket)
+    defer { channel.close() }
+    let events = EventCollector(channel.events)
+    await Self.waitUntil("the server attaches to the auth-state stream") {
+      session.hasStateConsumer
+    }
+
+    let status = try await Self.command(
+      ControlRequest(operation: .status), socketURL: socket, timeout: .seconds(2))
+    #expect(status == .status(Self.snapshot()))
+    #expect(session.isClosed == false)
+
+    session.emit(ControlAuthState(kind: "wait-phone-number"))
+    #expect(
+      await events.next(within: .seconds(2))
+        == .authState(ControlAuthState(kind: "wait-phone-number")))
+    try channel.send(
+      ControlAuthInputFrame(seq: 17, input: .submitPhoneNumber("+9996612222")))
+    #expect(
+      await events.next(within: .seconds(2))
+        == .authSubmitResult(ControlAuthSubmitResult(seq: 17, outcome: "accepted")))
+    #expect(session.submitted == [.submitPhoneNumber("+9996612222")])
   }
 
   @Test func authSessionEndingFinishesTheChannel() async throws {

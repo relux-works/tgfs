@@ -151,6 +151,96 @@ public struct ControlServerConfiguration: Sendable {
   }
 }
 
+/// A startup failure that occurs after the listener has bound but before its
+/// dispatch source has become usable. `start` removes the listener on this
+/// path, so callers never receive a socket whose source was cancelled before
+/// registration.
+enum ControlServerStartupError: Error, Equatable, Sendable {
+  case listenerSourceCancelledBeforeRegistration
+}
+
+/// Test-only lifecycle markers. They deliberately live beside the real source
+/// lifecycle instead of simulating libdispatch, so tests can hold the actual
+/// registration callback while a real client is connected to the real socket.
+enum ControlServerStartupEvent: Equatable, Sendable {
+  case listenerRegistered
+  case connectionAccepted
+  case workStarted
+  case statusResponseCompleted
+
+  var diagnosticName: String {
+    switch self {
+    case .listenerRegistered:
+      "registered"
+    case .connectionAccepted:
+      "accepted"
+    case .workStarted:
+      "work-started"
+    case .statusResponseCompleted:
+      "response-completed"
+    }
+  }
+}
+
+/// An internal observation seam used only by the control-channel regression
+/// tests. Production callers use `ControlServer.start`, which installs no
+/// observer and has no test-specific scheduling behavior.
+struct ControlServerStartupObservation: Sendable {
+  let record: @Sendable (ControlServerStartupEvent) -> Void
+  let cancelBeforeResume: Bool
+
+  init(
+    record: @escaping @Sendable (ControlServerStartupEvent) -> Void,
+    cancelBeforeResume: Bool = false
+  ) {
+    self.record = record
+    self.cancelBeforeResume = cancelBeforeResume
+  }
+}
+
+/// Resolves exactly once, so source cancellation cannot strand the synchronous
+/// startup caller waiting for registration.
+private final class ControlServerReadiness: @unchecked Sendable {
+  private enum Result {
+    case pending
+    case registered
+    case cancelled
+  }
+
+  private let lock = NSLock()
+  private let signal = DispatchSemaphore(value: 0)
+  private var result: Result = .pending
+
+  func registered() {
+    resolve(.registered)
+  }
+
+  func cancelled() {
+    resolve(.cancelled)
+  }
+
+  func wait() throws {
+    signal.wait()
+    lock.lock()
+    let result = self.result
+    lock.unlock()
+    guard case .registered = result else {
+      throw ControlServerStartupError.listenerSourceCancelledBeforeRegistration
+    }
+  }
+
+  private func resolve(_ result: Result) {
+    lock.lock()
+    guard case .pending = self.result else {
+      lock.unlock()
+      return
+    }
+    self.result = result
+    lock.unlock()
+    signal.signal()
+  }
+}
+
 /// The agent's control endpoint: the serving side of ``ControlContract``
 /// (BUG-260720-3i74u1).
 ///
@@ -164,21 +254,52 @@ public final class ControlServer: @unchecked Sendable {
   private let lock = NSLock()
   private let acceptQueue: DispatchQueue
   private let workQueue: DispatchQueue
+  private let authInputQueue: DispatchQueue
   private let socketPath: String
   private let handlers: ControlServerHandlers
   private let configuration: ControlServerConfiguration
+  private let startupObservation: ControlServerStartupObservation?
 
   private var listener: Int32?
   private var acceptSource: (any DispatchSourceRead)?
   private var connections: [ObjectIdentifier: ControlConnection] = [:]
 
-  /// Binds, listens, and starts serving. A stale socket file (from a
-  /// killed predecessor) is removed first — safe under the agent's
+  /// Binds, listens, and starts serving before returning. A stale socket file
+  /// (from a killed predecessor) is removed first — safe under the agent's
   /// single-instance lock.
   public static func start(
     socketURL: URL,
     handlers: ControlServerHandlers,
     configuration: ControlServerConfiguration = ControlServerConfiguration()
+  ) throws -> ControlServer {
+    try startImpl(
+      socketURL: socketURL,
+      handlers: handlers,
+      configuration: configuration,
+      startupObservation: nil)
+  }
+
+  /// Starts a real control server with a test-only lifecycle observer. The
+  /// observer runs from the source registration callback, after kevent
+  /// registration and before `start` is allowed to return.
+  static func start(
+    socketURL: URL,
+    handlers: ControlServerHandlers,
+    configuration: ControlServerConfiguration = ControlServerConfiguration(),
+    startupObservation: ControlServerStartupObservation
+  ) throws -> ControlServer {
+    try startImpl(
+      socketURL: socketURL,
+      handlers: handlers,
+      configuration: configuration,
+      startupObservation: startupObservation)
+  }
+
+  private static func startImpl(
+    socketURL: URL,
+    handlers: ControlServerHandlers,
+    configuration: ControlServerConfiguration,
+    startupObservation: ControlServerStartupObservation?
   ) throws -> ControlServer {
     let path = socketURL.path
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -199,12 +320,25 @@ public final class ControlServer: @unchecked Sendable {
       unlink(path)
       throw UnixSocketError.failed(operation: "listen", code: code)
     }
+    let listenerFlags = fcntl(fd, F_GETFL)
+    guard listenerFlags >= 0, fcntl(fd, F_SETFL, listenerFlags | O_NONBLOCK) == 0 else {
+      let code = errno
+      close(fd)
+      unlink(path)
+      throw UnixSocketError.failed(operation: "fcntl", code: code)
+    }
     let server = ControlServer(
       listener: fd,
       socketPath: path,
       handlers: handlers,
-      configuration: configuration)
-    server.startAccepting()
+      configuration: configuration,
+      startupObservation: startupObservation)
+    do {
+      try server.startAccepting()
+    } catch {
+      server.stop()
+      throw error
+    }
     return server
   }
 
@@ -212,16 +346,24 @@ public final class ControlServer: @unchecked Sendable {
     listener: Int32,
     socketPath: String,
     handlers: ControlServerHandlers,
-    configuration: ControlServerConfiguration
+    configuration: ControlServerConfiguration,
+    startupObservation: ControlServerStartupObservation?
   ) {
     self.listener = listener
     self.socketPath = socketPath
     self.handlers = handlers
     self.configuration = configuration
+    self.startupObservation = startupObservation
     self.acceptQueue = DispatchQueue(label: "com.reluxworks.gramdrive.agent.control")
     self.workQueue = DispatchQueue(
       label: "com.reluxworks.gramdrive.agent.control.work",
-      qos: .utility,
+      // Requests accepted in one listener delivery execute in submission
+      // order. This is protocol-significant for prepare/commit termination:
+      // commit must observe the state recorded by the preceding prepare.
+      qos: .userInitiated)
+    self.authInputQueue = DispatchQueue(
+      label: "com.reluxworks.gramdrive.agent.control.auth-input",
+      qos: .userInitiated,
       attributes: .concurrent)
   }
 
@@ -258,51 +400,95 @@ public final class ControlServer: @unchecked Sendable {
 
   // MARK: - Accepting
 
-  private func startAccepting() {
+  private func startAccepting() throws {
     lock.lock()
-    defer { lock.unlock() }
-    guard let fd = listener else { return }
+    guard let fd = listener else {
+      lock.unlock()
+      throw ControlServerStartupError.listenerSourceCancelledBeforeRegistration
+    }
     let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: acceptQueue)
+    let readiness = ControlServerReadiness()
+    let observation = startupObservation
+    source.setRegistrationHandler {
+      // Dispatch guarantees this callback is submitted only after the read
+      // source's kevent has registered with the system. That makes it the
+      // lifecycle barrier; an empty queue hop cannot provide this guarantee.
+      observation?.record(.listenerRegistered)
+      readiness.registered()
+    }
     source.setEventHandler { [weak self] in
-      self?.acceptOne()
+      self?.acceptPendingConnections()
+    }
+    source.setCancelHandler {
+      readiness.cancelled()
+    }
+    acceptSource = source
+    lock.unlock()
+    if observation?.cancelBeforeResume == true {
+      source.cancel()
     }
     source.resume()
-    acceptSource = source
+    try readiness.wait()
   }
 
-  private func acceptOne() {
+  private func acceptPendingConnections() {
     lock.lock()
     let fd = listener
     lock.unlock()
     guard let fd else { return }
-    let conn = accept(fd, nil, nil)
-    guard conn >= 0 else { return }
-    _ = fcntl(conn, F_SETFD, FD_CLOEXEC)
-    var noSigpipe: Int32 = 1
-    _ = setsockopt(
-      conn, SOL_SOCKET, SO_NOSIGPIPE,
-      &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
-    var sendTimeout = timeval(tv_sec: 5, tv_usec: 0)
-    _ = setsockopt(
-      conn, SOL_SOCKET, SO_SNDTIMEO,
-      &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
-    let receiveSeconds = max(1, Int(configuration.requestTimeout.components.seconds))
-    var receiveTimeout = timeval(tv_sec: receiveSeconds, tv_usec: 0)
-    _ = setsockopt(
-      conn, SOL_SOCKET, SO_RCVTIMEO,
-      &receiveTimeout, socklen_t(MemoryLayout<timeval>.size))
+    var acceptedConnections: [ControlConnection] = []
+    while true {
+      let conn = accept(fd, nil, nil)
+      if conn < 0 {
+        if errno == EINTR { continue }
+        // The listener is non-blocking so this is the normal end of one
+        // read-source delivery. Draining it prevents queued clients from
+        // waiting for an unrelated future readability notification.
+        break
+      }
+      _ = fcntl(conn, F_SETFD, FD_CLOEXEC)
+      let connectionFlags = fcntl(conn, F_GETFL)
+      guard connectionFlags >= 0,
+        fcntl(conn, F_SETFL, connectionFlags & ~O_NONBLOCK) == 0
+      else {
+        close(conn)
+        continue
+      }
+      var noSigpipe: Int32 = 1
+      _ = setsockopt(
+        conn, SOL_SOCKET, SO_NOSIGPIPE,
+        &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+      var sendTimeout = timeval(tv_sec: 5, tv_usec: 0)
+      _ = setsockopt(
+        conn, SOL_SOCKET, SO_SNDTIMEO,
+        &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
+      let receiveSeconds = max(1, Int(configuration.requestTimeout.components.seconds))
+      var receiveTimeout = timeval(tv_sec: receiveSeconds, tv_usec: 0)
+      _ = setsockopt(
+        conn, SOL_SOCKET, SO_RCVTIMEO,
+        &receiveTimeout, socklen_t(MemoryLayout<timeval>.size))
 
-    let connection = ControlConnection(descriptor: conn)
-    // The accept queue must never block; everything past accept runs on
-    // the concurrent work queue.
-    workQueue.async { [weak self] in
-      self?.serve(connection)
+      let connection = ControlConnection(descriptor: conn)
+      startupObservation?.record(.connectionAccepted)
+      acceptedConnections.append(connection)
+    }
+
+    // Complete this accept batch before starting any request work. Besides
+    // keeping the source queue non-blocking, this preserves kernel accept
+    // order when several clients became readable in one coalesced delivery.
+    for connection in acceptedConnections {
+      // The accept queue must never block. The serial work queue preserves
+      // request execution order for this accepted batch.
+      workQueue.async { [weak self] in
+        self?.serve(connection)
+      }
     }
   }
 
   // MARK: - Per-connection lifecycle
 
   private func serve(_ connection: ControlConnection) {
+    startupObservation?.record(.workStarted)
     guard admit(connection) else {
       connection.refuse(
         ControlCommandFailure(
@@ -336,6 +522,7 @@ public final class ControlServer: @unchecked Sendable {
     case .status:
       connection.writeEvent(.status(handlers.status()))
       connection.finish()
+      startupObservation?.record(.statusResponseCompleted)
       remove(connection)
     case .reloadSettings:
       do {
@@ -602,7 +789,7 @@ public final class ControlServer: @unchecked Sendable {
     }
 
     // Reader: one input frame per line until EOF or protocol breach.
-    workQueue.async { [weak self] in
+    authInputQueue.async { [weak self] in
       while true {
         let frame: ControlAuthInputFrame
         do {
