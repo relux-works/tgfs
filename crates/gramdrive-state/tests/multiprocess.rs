@@ -104,6 +104,7 @@ fn seeded(path: &Path) -> StateStore {
     tx.upsert_account(&account_record()).expect("account");
     tx.upsert_chat(&chat_record(CHAT)).expect("chat");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: common::account_root_id(),
         parent: None,
         display_name: "Root".to_owned(),
@@ -117,6 +118,7 @@ fn seeded(path: &Path) -> StateStore {
     })
     .expect("root item");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: cas_item_id(),
         parent: Some(common::account_root_id()),
         display_name: "counter.bin".to_owned(),

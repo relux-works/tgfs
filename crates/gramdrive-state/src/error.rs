@@ -130,6 +130,18 @@ pub enum StateError {
         /// The lower watermark the publication carried.
         proposed: i64,
     },
+    /// A whole-list snapshot would remove members without both declaring
+    /// itself complete and carrying a durable chat-departure witness. The
+    /// transaction is unchanged so the caller can resume from its previous
+    /// checkpoint instead of publishing a false disappearance.
+    UnsafeChatListShrink {
+        /// Number of members before the proposed replacement.
+        before_count: u64,
+        /// Number of members in the proposed replacement.
+        after_count: u64,
+        /// Number of omitted members without `left_at_ms` or `deleted_at_ms`.
+        uncorroborated_removals: u64,
+    },
     /// A change cursor was presented against a scope it was not minted
     /// under — the wrong account, or a namespace epoch that has since been
     /// retired (SYNC-004, DOM-021).
@@ -265,6 +277,15 @@ impl std::fmt::Display for StateError {
                 f,
                 "render watermark regression: proposed {proposed} is below current {current}"
             ),
+            Self::UnsafeChatListShrink {
+                before_count,
+                after_count,
+                uncorroborated_removals,
+            } => write!(
+                f,
+                "unsafe chat-list shrink: {before_count} members to {after_count} with \
+                 {uncorroborated_removals} uncorroborated removals"
+            ),
             Self::CursorOutOfScope { source } => write!(f, "{source}"),
             Self::CursorCorrupt { source } => {
                 write!(f, "stored change cursor failed to parse: {source}")
@@ -302,6 +323,7 @@ impl std::error::Error for StateError {
             | Self::RowNotFound { .. }
             | Self::VersionConflict { .. }
             | Self::WatermarkRegression { .. }
+            | Self::UnsafeChatListShrink { .. }
             | Self::CorruptRow { .. }
             | Self::InvalidTransition { .. }
             | Self::LocalStorage { .. } => None,

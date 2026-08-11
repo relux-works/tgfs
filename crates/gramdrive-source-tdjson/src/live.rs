@@ -134,6 +134,25 @@ use crate::message::{MessageRecord, normalize_message};
 /// TDLib's hard `getChatHistory` page-size ceiling.
 const MAX_PAGE_SIZE: u32 = 100;
 
+/// Maximum number of unresolved chats retained before metadata readiness.
+///
+/// Unknown chats are recovered by the composing snapshot/history pass; this
+/// cap prevents a busy large account from turning readiness latency into an
+/// unbounded in-memory queue.
+pub const MAX_UNTRACKED_CHATS: usize = 256;
+/// Maximum ordered operations retained for any one unresolved chat.
+pub const MAX_UNTRACKED_OPS_PER_CHAT: usize = 256;
+/// Maximum ordered operations retained across all unresolved chats.
+pub const MAX_UNTRACKED_OPS_TOTAL: usize = 4_096;
+/// Maximum normalized changes retained for one durable chat between commits.
+pub const MAX_TRACKED_READY_CHANGES_PER_CHAT: usize = 256;
+/// Maximum normalized changes retained across durable chats between commits.
+pub const MAX_TRACKED_READY_CHANGES_TOTAL: usize = 4_096;
+/// Maximum distinct edit refreshes retained for one durable chat.
+pub const MAX_TRACKED_REFRESHES_PER_CHAT: usize = 256;
+/// Maximum distinct edit refreshes retained across durable chats.
+pub const MAX_TRACKED_REFRESHES_TOTAL: usize = 4_096;
+
 /// One chat in the live plan: identity plus the committed window's newest
 /// bound read back from the state layer (`None` for a chat with no
 /// committed window — its cursor is never advanced here; module docs).
@@ -162,7 +181,8 @@ pub struct LivePlan {
     /// The tracked chats. Duplicate ids are rejected at machine
     /// construction ([`LiveError::Plan`]).
     pub chats: Vec<LiveChat>,
-    /// `getChatHistory` limit per bridge page, clamped to `1..=100`.
+    /// `getChatHistory` limit per bridge page, clamped to `2..=100`.
+    /// Two leaves room for TDLib's inclusive boundary plus one older id.
     pub page_size: u32,
 }
 
@@ -264,6 +284,21 @@ pub enum LiveStep {
     Unresolved {
         /// The unknown chat.
         chat_id: i64,
+        /// Buffered operations overflowed and the durable cursor/history
+        /// must be used to recover current state after the chat is resolved.
+        recovery_required: bool,
+    },
+    /// More distinct unknown chats arrived than the bounded readiness queue
+    /// can identify. The composing snapshot plus resumable crawl is the
+    /// account-wide recovery path; this report makes the fallback explicit.
+    ResyncRequired,
+    /// Edit refresh signals exceeded the bounded tracked-chat queue. The
+    /// caller must invalidate this chat's durable window and schedule a full
+    /// crawl; that crawl is the truthful recovery for edits whose individual
+    /// `getMessage` identity could not be retained.
+    RecoveryRequired {
+        /// Durable chat that needs a full crawl.
+        chat_id: i64,
     },
     /// One chat's gap bridge failed (reported once): its cursor is
     /// frozen for this session, its records still commit.
@@ -361,6 +396,10 @@ struct ChatLive {
     refreshes_rejected: u32,
     /// A bridge failure not yet reported to the caller.
     degraded: Option<UnavailableReason>,
+    /// More distinct edit signals arrived than the bounded refresh queue can
+    /// retain. A full crawl must replace targeted refresh recovery.
+    recovery_required: bool,
+    recovery_reported: bool,
 }
 
 impl ChatLive {
@@ -393,6 +432,24 @@ struct Untracked {
     pending: Vec<UntrackedOp>,
     malformed: u32,
     reported: bool,
+    recovery_required: bool,
+}
+
+/// Observable size of the bounded unresolved-chat queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveBufferUsage {
+    /// Distinct unresolved chats retained by identity.
+    pub chats: usize,
+    /// Ordered operations retained across those chats.
+    pub operations: usize,
+    /// Whether an account-wide snapshot/crawl recovery was requested because
+    /// even the bounded chat-identity set filled.
+    pub resync_required: bool,
+    /// Normalized changes currently awaiting a durable commit for tracked
+    /// chats.
+    pub tracked_ready_changes: usize,
+    /// Distinct targeted edit refreshes retained for tracked chats.
+    pub tracked_refreshes: usize,
 }
 
 /// What the one outstanding request is for.
@@ -419,6 +476,12 @@ struct Outstanding {
 pub struct LiveMachine {
     chats: BTreeMap<i64, ChatLive>,
     untracked: BTreeMap<i64, Untracked>,
+    untracked_ops: usize,
+    tracked_ready_changes: usize,
+    ready_bound_reached: bool,
+    tracked_refreshes: usize,
+    resync_required: bool,
+    resync_reported: bool,
     page_size: u32,
     outstanding: Option<Outstanding>,
     failed: Option<Box<LiveError>>,
@@ -447,7 +510,13 @@ impl LiveMachine {
         Ok(LiveMachine {
             chats,
             untracked: BTreeMap::new(),
-            page_size: plan.page_size.clamp(1, MAX_PAGE_SIZE),
+            untracked_ops: 0,
+            tracked_ready_changes: 0,
+            ready_bound_reached: false,
+            tracked_refreshes: 0,
+            resync_required: false,
+            resync_reported: false,
+            page_size: plan.page_size.clamp(2, MAX_PAGE_SIZE),
             outstanding: None,
             failed: None,
         })
@@ -457,13 +526,74 @@ impl LiveMachine {
     /// [`LiveStep::Idle`] — a cheap check before driving the loop.
     pub fn has_pending(&self) -> bool {
         self.outstanding.is_some()
+            || (self.resync_required && !self.resync_reported)
             || self.untracked.values().any(|chat| !chat.reported)
             || self.chats.values().any(|chat| {
                 chat.has_commit()
                     || chat.degraded.is_some()
+                    || (chat.recovery_required && !chat.recovery_reported)
                     || !chat.refreshes.is_empty()
                     || matches!(chat.boundary(), Boundary::Bridging { .. })
             })
+    }
+
+    /// Current live intake memory usage. This is operational observability,
+    /// not a cursor: the durable snapshot/history machines own recovery after
+    /// either overflow signal becomes true.
+    pub fn buffer_usage(&self) -> LiveBufferUsage {
+        LiveBufferUsage {
+            chats: self.untracked.len(),
+            operations: self.untracked_ops,
+            resync_required: self.resync_required,
+            tracked_ready_changes: self.tracked_ready_changes,
+            tracked_refreshes: self.tracked_refreshes,
+        }
+    }
+
+    /// Feed one update while spilling normalized tracked-chat changes through
+    /// `persist` whenever either ready-change bound is reached. The owned
+    /// session uses this while another TDLib response is pending, so sustained
+    /// live traffic cannot migrate from the runtime's bounded queue into an
+    /// unbounded per-chat vector. One TDLib update remains one intake unit;
+    /// deletions inside it preserve their source order before the spill.
+    pub fn on_update_bounded<E>(
+        &mut self,
+        update: &Value,
+        mut persist: impl FnMut(LiveCommit) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.on_update(update);
+        while self.ready_bound_reached
+            || self.tracked_ready_changes >= MAX_TRACKED_READY_CHANGES_TOTAL
+        {
+            let Some(commit) = self.take_ready_commit() else {
+                break;
+            };
+            persist(commit)?;
+        }
+        Ok(())
+    }
+
+    /// Drains one already-normalized commit without starting network gap or
+    /// refresh work and without consuming unresolved-chat reports. The owned
+    /// session uses this during authorization/snapshot readiness so durable
+    /// chats never accumulate an unbounded ready vector while TDLib is not
+    /// yet available for auxiliary requests.
+    pub fn take_ready_commit(&mut self) -> Option<LiveCommit> {
+        let (&chat_id, chat) = self.chats.iter_mut().find(|(_, chat)| chat.has_commit())?;
+        let released = chat.ready.len();
+        let commit = LiveCommit {
+            chat_id,
+            changes: std::mem::take(&mut chat.ready),
+            advance_newest: chat.advance.take(),
+            skipped_malformed: std::mem::take(&mut chat.skipped_malformed),
+            refreshes_rejected: std::mem::take(&mut chat.refreshes_rejected),
+        };
+        self.tracked_ready_changes = self.tracked_ready_changes.saturating_sub(released);
+        self.ready_bound_reached = self
+            .chats
+            .values()
+            .any(|chat| chat.ready.len() >= MAX_TRACKED_READY_CHANGES_PER_CHAT);
+        Some(commit)
     }
 
     /// Track a chat mid-session — a chat the snapshot did not know, now
@@ -475,11 +605,16 @@ impl LiveMachine {
         if self.chats.contains_key(&chat_id) {
             return false;
         }
-        let buffered = self.untracked.remove(&chat_id).unwrap_or_default();
+        let buffered = self.take_untracked(chat_id).unwrap_or_default();
         let state = ChatLive {
-            boundary: Some(match newest_message_id {
-                None => Boundary::Floating,
-                Some(newest) => Boundary::Unverified { newest },
+            boundary: Some(match (newest_message_id, buffered.recovery_required) {
+                (None, _) => Boundary::Floating,
+                (Some(newest), true) => Boundary::Bridging {
+                    newest,
+                    top: None,
+                    floor: None,
+                },
+                (Some(newest), false) => Boundary::Unverified { newest },
             }),
             skipped_malformed: buffered.malformed,
             ..ChatLive::default()
@@ -493,6 +628,14 @@ impl LiveMachine {
             }
         }
         true
+    }
+
+    /// Discards buffered operations for a chat the composing policy will not
+    /// persist (for example a protected chat). Returns whether the chat had
+    /// untracked buffered state. Tracked chats are never removed: doing so
+    /// could discard an in-flight gap bridge or edit refresh.
+    pub fn ignore_untracked_chat(&mut self, chat_id: i64) -> bool {
+        self.take_untracked(chat_id).is_some()
     }
 
     /// Feed one update from the client's stream (module docs).
@@ -566,21 +709,32 @@ impl LiveMachine {
                 reason,
             })));
         }
+        if self.resync_required && !self.resync_reported {
+            self.resync_reported = true;
+            return Ok(LiveStep::ResyncRequired);
+        }
         if let Some((&chat_id, chat)) = self.untracked.iter_mut().find(|(_, chat)| !chat.reported) {
             chat.reported = true;
-            return Ok(LiveStep::Unresolved { chat_id });
+            return Ok(LiveStep::Unresolved {
+                chat_id,
+                recovery_required: chat.recovery_required,
+            });
         }
         // Commits before fetches: checkpoints land early, pending memory
         // stays bounded.
-        if let Some((&chat_id, chat)) = self.chats.iter_mut().find(|(_, chat)| chat.has_commit()) {
-            let commit = LiveCommit {
-                chat_id,
-                changes: std::mem::take(&mut chat.ready),
-                advance_newest: chat.advance.take(),
-                skipped_malformed: std::mem::take(&mut chat.skipped_malformed),
-                refreshes_rejected: std::mem::take(&mut chat.refreshes_rejected),
-            };
+        if let Some(commit) = self.take_ready_commit() {
             return Ok(LiveStep::Commit(Box::new(commit)));
+        }
+        if let Some((&chat_id, chat)) = self
+            .chats
+            .iter_mut()
+            .find(|(_, chat)| chat.recovery_required && !chat.recovery_reported)
+        {
+            chat.recovery_reported = true;
+            let released = chat.refreshes.len();
+            chat.refreshes.clear();
+            self.tracked_refreshes = self.tracked_refreshes.saturating_sub(released);
+            return Ok(LiveStep::RecoveryRequired { chat_id });
         }
         if let Some(outstanding) = &mut self.outstanding {
             if let Some(backoff) = outstanding.pending_backoff.take() {
@@ -690,7 +844,9 @@ impl LiveMachine {
                         TdError::Td { .. },
                     ) => {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
-                            chat.refreshes.remove(&message_id);
+                            if chat.refreshes.remove(&message_id) {
+                                self.tracked_refreshes = self.tracked_refreshes.saturating_sub(1);
+                            }
                             chat.refreshes_rejected = chat.refreshes_rejected.saturating_add(1);
                         }
                         Ok(())
@@ -726,8 +882,7 @@ impl LiveMachine {
                             chat.skipped_malformed = chat.skipped_malformed.saturating_add(1);
                         }
                         None => {
-                            let chat = self.untracked.entry(chat_id).or_default();
-                            chat.malformed = chat.malformed.saturating_add(1);
+                            self.note_untracked_malformed(chat_id);
                         }
                     }
                 }
@@ -745,6 +900,8 @@ impl LiveMachine {
         };
         chat.live_top = chat.live_top.max(message_id);
         chat.ready.push(LiveChange::Observed(record));
+        self.tracked_ready_changes += 1;
+        self.ready_bound_reached |= chat.ready.len() >= MAX_TRACKED_READY_CHANGES_PER_CHAT;
         match chat.boundary() {
             Boundary::Verified { newest } if message_id > newest => {
                 chat.boundary = Some(Boundary::Verified { newest: message_id });
@@ -772,7 +929,18 @@ impl LiveMachine {
     fn ingest_edit(&mut self, chat_id: i64, message_id: i64) {
         match self.chats.get_mut(&chat_id) {
             Some(chat) => {
-                chat.refreshes.insert(message_id);
+                if chat.refreshes.contains(&message_id) {
+                    return;
+                }
+                if chat.refreshes.len() < MAX_TRACKED_REFRESHES_PER_CHAT
+                    && self.tracked_refreshes < MAX_TRACKED_REFRESHES_TOTAL
+                {
+                    chat.refreshes.insert(message_id);
+                    self.tracked_refreshes += 1;
+                } else {
+                    chat.recovery_required = true;
+                    chat.recovery_reported = false;
+                }
             }
             None => self.buffer_untracked(chat_id, UntrackedOp::EditSignal { message_id }),
         }
@@ -784,24 +952,75 @@ impl LiveMachine {
             Some(chat) => {
                 // A deletion supersedes a pending, not-yet-submitted
                 // refresh: getMessage would only reject.
-                chat.refreshes.remove(&message_id);
+                if chat.refreshes.remove(&message_id) {
+                    self.tracked_refreshes = self.tracked_refreshes.saturating_sub(1);
+                }
                 chat.ready.push(LiveChange::Deleted { message_id });
+                self.tracked_ready_changes += 1;
+                self.ready_bound_reached |= chat.ready.len() >= MAX_TRACKED_READY_CHANGES_PER_CHAT;
             }
             None => self.buffer_untracked(chat_id, UntrackedOp::Deleted { message_id }),
         }
     }
 
     fn buffer_untracked(&mut self, chat_id: i64, op: UntrackedOp) {
-        match self.untracked.entry(chat_id) {
-            Entry::Occupied(mut entry) => entry.get_mut().pending.push(op),
-            Entry::Vacant(entry) => {
-                entry.insert(Untracked {
-                    pending: vec![op],
-                    malformed: 0,
-                    reported: false,
-                });
+        if let Entry::Occupied(mut entry) = self.untracked.entry(chat_id) {
+            let chat = entry.get_mut();
+            if chat.pending.len() < MAX_UNTRACKED_OPS_PER_CHAT
+                && self.untracked_ops < MAX_UNTRACKED_OPS_TOTAL
+            {
+                chat.pending.push(op);
+                self.untracked_ops += 1;
+            } else {
+                chat.recovery_required = true;
+                chat.reported = false;
             }
+            return;
         }
+        if self.untracked.len() >= MAX_UNTRACKED_CHATS
+            || self.untracked_ops >= MAX_UNTRACKED_OPS_TOTAL
+        {
+            self.resync_required = true;
+            self.resync_reported = false;
+            return;
+        }
+        self.untracked.insert(
+            chat_id,
+            Untracked {
+                pending: vec![op],
+                malformed: 0,
+                reported: false,
+                recovery_required: false,
+            },
+        );
+        self.untracked_ops += 1;
+    }
+
+    fn note_untracked_malformed(&mut self, chat_id: i64) {
+        if let Some(chat) = self.untracked.get_mut(&chat_id) {
+            chat.malformed = chat.malformed.saturating_add(1);
+            return;
+        }
+        if self.untracked.len() >= MAX_UNTRACKED_CHATS {
+            self.resync_required = true;
+            self.resync_reported = false;
+            return;
+        }
+        self.untracked.insert(
+            chat_id,
+            Untracked {
+                pending: Vec::new(),
+                malformed: 1,
+                reported: false,
+                recovery_required: false,
+            },
+        );
+    }
+
+    fn take_untracked(&mut self, chat_id: i64) -> Option<Untracked> {
+        let buffered = self.untracked.remove(&chat_id)?;
+        self.untracked_ops = self.untracked_ops.saturating_sub(buffered.pending.len());
+        Some(buffered)
     }
 
     // -- re-fetch outcomes ---------------------------------------------------
@@ -837,33 +1056,55 @@ impl LiveMachine {
         chat.skipped_malformed = chat
             .skipped_malformed
             .saturating_add(page.skipped_malformed);
+        let record_count = page.records.len();
         chat.ready.extend(
             page.records
                 .into_iter()
                 .map(|record| LiveChange::Observed(Box::new(record))),
         );
-        match page.bounds {
+        self.tracked_ready_changes += record_count;
+        self.ready_bound_reached |= chat.ready.len() >= MAX_TRACKED_READY_CHANGES_PER_CHAT;
+        match page.advanced_bounds {
             Some((page_oldest, page_newest)) if page_oldest > newest => {
                 // Not yet connected: records commit, the cursor holds
                 // (contiguity; module docs).
                 chat.boundary = Some(Boundary::Bridging {
                     newest,
-                    top: Some(top.unwrap_or(page_newest)),
+                    top: Some(top.unwrap_or_else(|| {
+                        page.bounds.map(|(_, newest)| newest).unwrap_or(page_newest)
+                    })),
                     floor: Some(page_oldest),
                 });
             }
-            bounds => {
+            Some(_) => {
                 // Connected: an id at or below the committed newest, or
-                // nothing newer exists at all. The cursor rises to the
-                // top of everything the bridge and the live stream saw.
+                // nothing newer exists at all. The cursor rises to the top of
+                // everything the bridge and the live stream saw.
                 let top = top
-                    .or(bounds.map(|(_, page_newest)| page_newest))
+                    .or(page.bounds.map(|(_, page_newest)| page_newest))
                     .unwrap_or(newest);
                 let advanced = newest.max(top).max(chat.live_top);
                 chat.boundary = Some(Boundary::Verified { newest: advanced });
                 if advanced > newest {
                     chat.advance = Some(advanced);
                 }
+            }
+            None if from == 0 || from <= newest => {
+                let advanced = newest.max(top.unwrap_or(newest)).max(chat.live_top);
+                chat.boundary = Some(Boundary::Verified { newest: advanced });
+                if advanced > newest {
+                    chat.advance = Some(advanced);
+                }
+            }
+            None => {
+                chat.boundary = Some(Boundary::Frozen);
+                chat.advance = None;
+                chat.degraded = Some(UnavailableReason::PageContract {
+                    detail: format!(
+                        "chat {chat_id}: inclusive bridge page from {from} did not advance toward \
+                         committed newest {newest}"
+                    ),
+                });
             }
         }
         Ok(())
@@ -872,8 +1113,10 @@ impl LiveMachine {
     /// Fold one edit-refresh answer: the full message, normalized like
     /// any other observation.
     fn on_refresh(&mut self, chat_id: i64, message_id: i64, value: &Value) {
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.refreshes.remove(&message_id);
+        if let Some(chat) = self.chats.get_mut(&chat_id)
+            && chat.refreshes.remove(&message_id)
+        {
+            self.tracked_refreshes = self.tracked_refreshes.saturating_sub(1);
         }
         match normalize_message(value) {
             Ok(record) if record.chat_id == chat_id && record.message_id == message_id => {
@@ -919,6 +1162,8 @@ impl LiveMachine {
 struct BridgePage {
     records: Vec<MessageRecord>,
     bounds: Option<(i64, i64)>,
+    /// Bounds excluding TDLib's one allowed leading `from` overlap.
+    advanced_bounds: Option<(i64, i64)>,
     skipped_malformed: u32,
 }
 
@@ -931,14 +1176,15 @@ fn parse_bridge_page(chat_id: i64, from: i64, entries: &[Value]) -> Result<Bridg
     let mut skipped_malformed: u32 = 0;
     let mut previous: Option<i64> = None;
     let mut bounds: Option<(i64, i64)> = None;
+    let mut advanced_bounds: Option<(i64, i64)> = None;
     for entry in entries {
         let Some(id) = entry.get("id").and_then(Value::as_i64) else {
             skipped_malformed = skipped_malformed.saturating_add(1);
             continue;
         };
-        if from > 0 && id >= from {
+        if from > 0 && id > from {
             return Err(format!(
-                "chat {chat_id}: bridge page from {from} answered id {id} at or above it"
+                "chat {chat_id}: bridge page from {from} answered newer id {id}"
             ));
         }
         if let Some(previous) = previous
@@ -953,6 +1199,12 @@ fn parse_bridge_page(chat_id: i64, from: i64, entries: &[Value]) -> Result<Bridg
             None => (id, id),
             Some((oldest, newest)) => (oldest.min(id), newest.max(id)),
         });
+        if from == 0 || id < from {
+            advanced_bounds = Some(match advanced_bounds {
+                None => (id, id),
+                Some((oldest, newest)) => (oldest.min(id), newest.max(id)),
+            });
+        }
         match normalize_message(entry) {
             Ok(record) => {
                 if record.chat_id != chat_id {
@@ -974,6 +1226,7 @@ fn parse_bridge_page(chat_id: i64, from: i64, entries: &[Value]) -> Result<Bridg
     Ok(BridgePage {
         records,
         bounds,
+        advanced_bounds,
         skipped_malformed,
     })
 }
@@ -1264,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn an_id_at_or_above_the_bridge_floor_is_a_contract_violation() {
+    fn a_boundary_only_bridge_above_newest_freezes_for_no_progress() {
         let mut machine = LiveMachine::new(LivePlan {
             chats: vec![tracked(5, 10)],
             page_size: 2,
@@ -1281,7 +1534,7 @@ mod tests {
         assert_eq!(request["from_message_id"].as_i64(), Some(14));
         machine
             .on_response(Ok(page(5, &[14])))
-            .expect("the violation folds into degradation");
+            .expect("the non-progress page folds into degradation");
         assert!(matches!(
             machine.next_step().expect("a step"),
             LiveStep::Degraded(_)
@@ -1455,7 +1708,13 @@ mod tests {
         }));
         machine.on_update(&delete(999, &[2]));
         match machine.next_step().expect("a step") {
-            LiveStep::Unresolved { chat_id } => assert_eq!(chat_id, 999),
+            LiveStep::Unresolved {
+                chat_id,
+                recovery_required,
+            } => {
+                assert_eq!(chat_id, 999);
+                assert!(!recovery_required);
+            }
             other => panic!("expected unresolved, got {other:?}"),
         }
         // Reported once; nothing else pends while unresolved.
@@ -1477,6 +1736,159 @@ mod tests {
         let request = submit(&mut machine);
         assert_eq!(request["@type"].as_str(), Some("getMessage"));
         assert_eq!(request["message_id"].as_i64(), Some(3));
+    }
+
+    #[test]
+    fn a_policy_rejected_untracked_chat_can_be_discarded_without_a_commit() {
+        let mut machine = machine([]);
+        machine.on_update(&new_message(999, 3, "protected"));
+        assert!(matches!(
+            machine.next_step().expect("a step"),
+            LiveStep::Unresolved {
+                chat_id: 999,
+                recovery_required: false,
+            }
+        ));
+        assert!(machine.ignore_untracked_chat(999));
+        assert!(!machine.ignore_untracked_chat(999));
+        idle(&mut machine);
+    }
+
+    #[test]
+    fn unresolved_buffer_is_bounded_and_overflow_forces_cursor_bridge() {
+        let mut machine = machine([]);
+        for message_id in 1..=(MAX_UNTRACKED_OPS_PER_CHAT as i64 + 50) {
+            machine.on_update(&new_message(999, message_id, "busy"));
+        }
+        let usage = machine.buffer_usage();
+        assert_eq!(usage.chats, 1);
+        assert_eq!(usage.operations, MAX_UNTRACKED_OPS_PER_CHAT);
+        assert!(!usage.resync_required);
+
+        match machine.next_step().expect("overflow report") {
+            LiveStep::Unresolved {
+                chat_id,
+                recovery_required,
+            } => {
+                assert_eq!(chat_id, 999);
+                assert!(recovery_required);
+            }
+            other => panic!("expected unresolved recovery, got {other:?}"),
+        }
+        assert!(machine.track_chat(999, Some(10)));
+        let replay = commit(&mut machine);
+        assert_eq!(replay.changes.len(), MAX_UNTRACKED_OPS_PER_CHAT);
+        let bridge = submit(&mut machine);
+        assert_eq!(bridge["@type"], "getChatHistory");
+        assert_eq!(bridge["chat_id"], 999);
+        assert_eq!(bridge["from_message_id"], 0);
+    }
+
+    #[test]
+    fn sustained_multi_chat_readiness_traffic_has_an_account_wide_bound() {
+        let mut machine = machine([]);
+        for chat_id in 1..=(MAX_UNTRACKED_CHATS as i64 * 4) {
+            machine.on_update(&new_message(chat_id, chat_id * 10, "busy"));
+        }
+        let usage = machine.buffer_usage();
+        assert_eq!(usage.chats, MAX_UNTRACKED_CHATS);
+        assert!(usage.operations <= MAX_UNTRACKED_OPS_TOTAL);
+        assert!(usage.resync_required);
+        assert!(matches!(
+            machine.next_step().expect("explicit recovery report"),
+            LiveStep::ResyncRequired
+        ));
+    }
+
+    #[test]
+    fn tracked_ready_changes_spill_at_fixed_bounds() {
+        let mut machine = machine([LiveChat::new(5)]);
+        let mut spilled = Vec::new();
+        let count = MAX_TRACKED_READY_CHANGES_PER_CHAT * 3 + 17;
+        for message_id in 1..=count as i64 {
+            machine
+                .on_update_bounded(&new_message(5, message_id, "busy"), |commit| {
+                    spilled.push(commit);
+                    Ok::<_, ()>(())
+                })
+                .expect("spill");
+            assert!(
+                machine.buffer_usage().tracked_ready_changes < MAX_TRACKED_READY_CHANGES_PER_CHAT
+            );
+        }
+        if let Some(commit) = machine.take_ready_commit() {
+            spilled.push(commit);
+        }
+        assert_eq!(
+            spilled
+                .iter()
+                .map(|commit| commit.changes.len())
+                .sum::<usize>(),
+            count
+        );
+    }
+
+    #[test]
+    fn tracked_refresh_overflow_is_bounded_and_requests_full_recovery() {
+        let mut machine = machine([tracked(5, 10)]);
+        for message_id in 1..=(MAX_TRACKED_REFRESHES_PER_CHAT as i64 + 50) {
+            machine.on_update(&json!({
+                "@type": "updateMessageContent",
+                "chat_id": 5,
+                "message_id": message_id,
+            }));
+        }
+        let usage = machine.buffer_usage();
+        assert_eq!(usage.tracked_refreshes, MAX_TRACKED_REFRESHES_PER_CHAT);
+        assert!(matches!(
+            machine.next_step().expect("recovery report"),
+            LiveStep::RecoveryRequired { chat_id: 5 }
+        ));
+        assert_eq!(machine.buffer_usage().tracked_refreshes, 0);
+        idle(&mut machine);
+    }
+
+    #[test]
+    fn tracked_multi_chat_buffers_respect_account_wide_bounds() {
+        let chats: Vec<LiveChat> = (1..=32).map(LiveChat::new).collect();
+        let mut ready = machine(chats.clone());
+        let mut spilled_changes = 0;
+        for chat_id in 1..=32 {
+            for message_id in 1..=150 {
+                ready
+                    .on_update_bounded(&new_message(chat_id, message_id, "busy"), |commit| {
+                        spilled_changes += commit.changes.len();
+                        Ok::<_, ()>(())
+                    })
+                    .expect("spill");
+                assert!(
+                    ready.buffer_usage().tracked_ready_changes < MAX_TRACKED_READY_CHANGES_TOTAL
+                );
+            }
+        }
+        if let Some(commit) = ready.take_ready_commit() {
+            spilled_changes += commit.changes.len();
+        }
+        assert!(spilled_changes > 0);
+
+        let mut refreshes = machine(chats);
+        for chat_id in 1..=32 {
+            for message_id in 1..=200 {
+                refreshes.on_update(&json!({
+                    "@type": "updateMessageContent",
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                }));
+            }
+        }
+        assert_eq!(
+            refreshes.buffer_usage().tracked_refreshes,
+            MAX_TRACKED_REFRESHES_TOTAL
+        );
+        assert!(matches!(
+            refreshes.next_step().expect("recovery report"),
+            LiveStep::RecoveryRequired { .. }
+        ));
     }
 
     #[test]

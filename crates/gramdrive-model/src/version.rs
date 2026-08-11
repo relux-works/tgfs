@@ -160,9 +160,130 @@ impl std::fmt::Display for ContentVersion {
     }
 }
 
+/// Composes the provider metadata version of one *directory* node from the
+/// facts a provider actually shows for it (BUG-260728-2qfzbd).
+///
+/// A directory publishes three things beyond its name: when its
+/// correspondence starts, when it last changed, and the exact logical size
+/// of its indexed descendants. All three are provider-visible, so all three
+/// must move the version — a folder whose size grew but whose version did
+/// not is a folder the system keeps showing at the old size.
+///
+/// Deterministic in its inputs and never in the previous version, which is
+/// what lets two different owners — the namespace projection and the render
+/// pipeline's rollup refresh — write the same token for the same state
+/// instead of oscillating between two derivations of each other.
+///
+/// `aggregate_size` is `None` for a directory that owns no rollup at all —
+/// a chat list or a folder catalog, whose children are chats rather than
+/// correspondence. That is a different fact from `Some(0)` ("this subtree is
+/// indexed and empty"), and the seed keeps them apart: an absent rollup
+/// contributes an empty field, which no `u64` rendering can produce. The
+/// rendering of a present rollup is the plain decimal it has always been, so
+/// a directory that owns one keeps the token it already published.
+pub fn directory_metadata_version(
+    base: &str,
+    created_at_ms: Option<i64>,
+    modified_at_ms: Option<i64>,
+    aggregate_size: Option<u64>,
+) -> Result<MetadataVersion, InvalidVersionToken> {
+    let seed = format!(
+        "dir-v2|{base}|{}|{}|{}",
+        created_at_ms.unwrap_or_default(),
+        modified_at_ms.unwrap_or_default(),
+        aggregate_size
+            .map(|size| size.to_string())
+            .unwrap_or_default(),
+    );
+    MetadataVersion::new(format!("namespace-{:016x}", fnv1a64(seed.as_bytes())))
+}
+
+/// FNV-1a over bytes. Not cryptographic and never used as one: it exists to
+/// fold an unbounded deterministic seed into a fixed-width token.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_present_rollup_keeps_the_token_it_already_published() {
+        // Pinned, not recomputed: this token is what tens of thousands of
+        // already-installed chat and month directories carry. Widening the
+        // parameter to `Option<u64>` must not re-encode the present case,
+        // or every one of those rows changes version and re-journals for a
+        // fact that did not move (BUG-260728-2qfzbd). Change this literal
+        // only with a deliberate decision to pay that migration.
+        assert_eq!(
+            directory_metadata_version("Chat", Some(100), Some(200), Some(4096))
+                .expect("token")
+                .as_str(),
+            "namespace-cd68508ce0568ea9"
+        );
+    }
+
+    #[test]
+    fn an_absent_rollup_is_a_different_fact_from_a_zero_one() {
+        // "This directory claims no size" and "this subtree is indexed and
+        // holds no bytes" are different answers, and a directory that
+        // switches between them is a directory whose provider-visible state
+        // changed. The seed keeps them apart.
+        let absent = directory_metadata_version("Chats", Some(0), Some(0), None).expect("token");
+        let zero = directory_metadata_version("Chats", Some(0), Some(0), Some(0)).expect("token");
+        assert_ne!(absent.as_str(), zero.as_str());
+        assert_eq!(absent.as_str(), "namespace-979d38a233e4b2e0");
+        assert_eq!(zero.as_str(), "namespace-84da0b9e2d9bd770");
+    }
+
+    #[test]
+    fn a_directory_version_moves_with_every_fact_a_provider_shows() {
+        let base = directory_metadata_version("Chat", Some(100), Some(200), Some(4096))
+            .expect("token")
+            .as_str()
+            .to_owned();
+        for (label, other) in [
+            (
+                "name",
+                directory_metadata_version("Other", Some(100), Some(200), Some(4096)),
+            ),
+            (
+                "creation",
+                directory_metadata_version("Chat", Some(101), Some(200), Some(4096)),
+            ),
+            (
+                "modification",
+                directory_metadata_version("Chat", Some(100), Some(201), Some(4096)),
+            ),
+            (
+                "size",
+                directory_metadata_version("Chat", Some(100), Some(200), Some(4097)),
+            ),
+        ] {
+            assert_ne!(
+                base,
+                other.expect("token").as_str(),
+                "a folder whose {label} moved but whose version did not is a \
+                 folder the system keeps showing stale"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_version_is_deterministic_and_never_reads_its_predecessor() {
+        // The property both owners of the column depend on: the projection
+        // and the state layer's targeted rollup refresh write the identical
+        // token for identical state, so neither can undo the other.
+        let once = directory_metadata_version("Chat", Some(100), Some(200), Some(4096));
+        let twice = directory_metadata_version("Chat", Some(100), Some(200), Some(4096));
+        assert_eq!(once.expect("token"), twice.expect("token"));
+    }
 
     #[test]
     fn round_trips_token_text() {

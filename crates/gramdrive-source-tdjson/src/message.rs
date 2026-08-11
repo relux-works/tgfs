@@ -62,8 +62,9 @@
 //! [`AttachmentAvailability::Restricted`] (visible placeholder, bytes never
 //! fetched), everything else is fetchable. Expired self-destruct
 //! placeholders (`messageExpiredPhoto` and friends) normalize to
-//! [`MessageContent::Expired`] — explicitly unavailable, no attachment, no
-//! fabricated recoverability (PRD-024). Previews follow the same rule: a
+//! [`MessageContent::Expired`] with a metadata-only attachment and no locator,
+//! so the durable projection remains honest without fabricating recoverability
+//! (PRD-024). Previews follow the same rule: a
 //! [`ThumbnailDescriptor`] and inline [`Minithumbnail`] are captured only for
 //! a fetchable attachment, so a restricted or view-once item carries no
 //! preview bytes or locators at all (POL-4, fail-closed).
@@ -75,6 +76,8 @@
 //! ([`MessageRecord::album_id`]) as the grouping key. Assembling the group
 //! is the consumer's join — the normalizer sees one message at a time.
 
+use gramdrive_model::identity::SchemaFamily;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::wire::parse_int64;
@@ -86,6 +89,9 @@ use crate::wire::parse_int64;
 /// stored value.
 pub const RAW_SCHEMA_VERSION: u32 = 1;
 
+/// Schema family of the durable normalized [`MessageRecord`] JSON payload.
+pub const NORMALIZED_MESSAGE_SCHEMA_FAMILY: SchemaFamily = SchemaFamily(1);
+
 // ---------------------------------------------------------------------------
 // Text and entities
 // ---------------------------------------------------------------------------
@@ -93,7 +99,7 @@ pub const RAW_SCHEMA_VERSION: u32 = 1;
 /// Text with its formatting entities — TDLib's `formattedText`, verbatim.
 /// Offsets are UTF-16 code units, exactly as Telegram defines them; the
 /// renderer owns any re-encoding.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FormattedText {
     /// The plain text.
     pub text: String,
@@ -102,7 +108,7 @@ pub struct FormattedText {
 }
 
 /// One formatting entity: a span of the text plus what decorates it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextEntity {
     /// Span start, in UTF-16 code units.
     pub offset: u32,
@@ -115,7 +121,7 @@ pub struct TextEntity {
 /// The entity vocabulary — TDLib's `TextEntityType`, with unknown types
 /// degrading to [`TextEntityKind::Unknown`] so the span renders as plain
 /// text instead of vanishing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextEntityKind {
     /// A `@username` mention.
     Mention,
@@ -192,7 +198,7 @@ pub enum TextEntityKind {
 /// Who sent a message — TDLib's `MessageSender` (DOM § Message record:
 /// sender identity reference; resolving it to a display name is the chat
 /// metadata layer's job).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SenderRef {
     /// A user.
     User {
@@ -213,7 +219,7 @@ pub enum SenderRef {
 }
 
 /// What a message replies to — TDLib's `MessageReplyTo`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplyTarget {
     /// A reply to another message.
     Message {
@@ -240,7 +246,7 @@ pub enum ReplyTarget {
 }
 
 /// The topic a message belongs to — TDLib's `MessageTopic`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TopicRef {
     /// A forum topic of a supergroup.
     Forum {
@@ -265,7 +271,7 @@ pub enum TopicRef {
 }
 
 /// One reaction tally on a message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     /// What was reacted with.
     pub kind: ReactionKind,
@@ -276,7 +282,7 @@ pub struct Reaction {
 }
 
 /// The reaction vocabulary — TDLib's `ReactionType`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReactionKind {
     /// A plain emoji reaction.
     Emoji {
@@ -300,7 +306,7 @@ pub enum ReactionKind {
 /// How a message self-destructs — TDLib's `MessageSelfDestructType`. Any
 /// present flavor, known or not, marks the message's media view-once:
 /// never persisted, shown as unavailable (POL-4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelfDestruct {
     /// Destroyed a fixed time after viewing.
     Timer {
@@ -321,7 +327,7 @@ pub enum SelfDestruct {
 // ---------------------------------------------------------------------------
 
 /// The attachment flavor vocabulary — the PRD-030 v1 downloadable classes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AttachmentKind {
     /// A photo (its largest available size).
     Photo,
@@ -344,13 +350,16 @@ pub enum AttachmentKind {
 /// Whether an attachment's bytes may ever be fetched (POL-4). Derived at
 /// normalization from the message's protection facts, never parsed from a
 /// flag of its own — so a restricted attachment cannot claim otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttachmentAvailability {
     /// The bytes may be fetched on demand.
     Fetchable,
     /// Telegram restricts saving (`can_be_saved` is false): the attachment
     /// stays a visible placeholder and its bytes never enter the archive.
     Restricted,
+    /// Telegram exposes the attachment shape but no usable file locator (or
+    /// the media has already expired at the source).
+    Unavailable,
     /// View-once / self-destructing media: never persisted, shown as
     /// unavailable.
     ViewOnce,
@@ -360,7 +369,7 @@ pub enum AttachmentAvailability {
 /// `ThumbnailFormat`. Unknown formats degrade to [`ThumbnailFormat::Unknown`]
 /// rather than dropping the thumbnail, matching the module's degrade-don't-omit
 /// rule; the serving layer decides what it can decode (TASK-260715-3nl3mu).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThumbnailFormat {
     /// JPEG.
     Jpeg,
@@ -390,7 +399,7 @@ pub enum ThumbnailFormat {
 /// it is the engine's job (POL-2: thumbnails are eager). Populated only for a
 /// [`AttachmentAvailability::Fetchable`] attachment — a restricted or
 /// view-once attachment never carries one (POL-4, fail-closed).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThumbnailDescriptor {
     /// The preview's image format.
     pub format: ThumbnailFormat,
@@ -414,7 +423,7 @@ pub struct ThumbnailDescriptor {
 /// attachment. `data` is base64 exactly as the tdjson interface encodes bytes;
 /// decoding it is the thumbnail source's job (TASK-260715-3nl3mu), which keeps
 /// this crate free of a base64 dependency and this a pure metadata mapping.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Minithumbnail {
     /// Preview pixel width, when stated.
     pub width: Option<u32>,
@@ -429,24 +438,26 @@ pub struct Minithumbnail {
 /// Attachment identity (chat, message, ordinal) and the deterministic safe
 /// name are bound by the mapping layer ([`crate::attachment`]); v1 message
 /// contents carry at most one attachment, at ordinal zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentDescriptor {
     /// The attachment flavor.
     pub kind: AttachmentKind,
     /// TDLib's file id — the local locator `downloadFile` takes, stable
     /// within one TDLib database.
-    pub file_id: i32,
+    pub file_id: Option<i32>,
     /// Telegram's refreshable remote locator, when known (SYNC-045).
     pub remote_id: Option<String>,
     /// Telegram's stable remote file identifier, when known — the PRD-033
     /// dedup key.
     pub remote_unique_id: Option<String>,
-    /// Original file name, when the message carried one (PRD-032).
+    /// Sender source filename for `messageDocument`, when TDLib exposed one
+    /// (PRD-032). Processed Telegram media never populates this field.
     pub file_name: Option<String>,
     /// MIME type, when the source states one (PRD-032).
     pub mime_type: Option<String>,
-    /// Size in bytes: exact when TDLib knows it, else Telegram's expected
-    /// size, else `None`.
+    /// Exact size in bytes when TDLib knows it. `expected_size` is deliberately
+    /// not promoted into this field because durable metadata must not turn an
+    /// estimate into an exact-byte claim.
     pub size: Option<u64>,
     /// Pixel width, for visual media.
     pub width: Option<u32>,
@@ -467,7 +478,7 @@ pub struct AttachmentDescriptor {
 /// The POL-4 protection facts of one message, as inputs to
 /// [`normalize_content`] — split out so the content-only entry point (the
 /// `updateMessageContent` path) states them explicitly instead of guessing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectionFacts {
     /// Telegram's per-message save permission (`can_be_saved`).
     pub can_be_saved: bool,
@@ -497,7 +508,7 @@ impl ProtectionFacts {
 /// A media class whose self-destructing bytes are already gone — TDLib's
 /// `messageExpired*` placeholders (POL-4: shown as unavailable, nothing to
 /// fetch, no recoverability implied).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpiredKind {
     /// An expired photo.
     Photo,
@@ -513,7 +524,7 @@ pub enum ExpiredKind {
 /// the subset the v1 renderers narrate (PRD-022). Service types outside
 /// this subset degrade to [`MessageContent::Unsupported`] like any other
 /// unmodeled content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServiceAction {
     /// The chat was created (basic group or supergroup/channel).
     ChatCreated {
@@ -593,7 +604,7 @@ pub enum ServiceAction {
 /// A content type this build could not normalize, preserved raw and
 /// versioned for a future migration (DOM § Message record). The one place
 /// raw TDLib JSON is retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedContent {
     /// The TDLib `@type` of the content object.
     pub raw_type: String,
@@ -605,12 +616,29 @@ pub struct UnsupportedContent {
     pub raw_schema_version: u32,
 }
 
+/// Why Telegram forbids retaining a message body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentRestriction {
+    /// Telegram reports `can_be_saved == false`.
+    SaveForbidden,
+    /// The message is self-destructing, view-once, or secret media.
+    Ephemeral,
+}
+
 /// What a message *is* — the PRD-022/PRD-030 v1 content classes, plus the
-/// explicit degradations ([`MessageContent::Expired`],
-/// [`MessageContent::Unsupported`]). Nothing is dropped silently: every
-/// TDLib content object maps onto exactly one variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// explicit degradations ([`MessageContent::Restricted`],
+/// [`MessageContent::Expired`], [`MessageContent::Unsupported`]). Every
+/// allowed TDLib content object maps onto exactly one lossless variant.
+/// Restricted content deliberately maps to a body-free marker so text,
+/// captions, entities, service payloads, reactions, and media locators never
+/// cross the normalization boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageContent {
+    /// Honest body-free placeholder for content Telegram forbids retaining.
+    Restricted {
+        /// The authoritative restriction that removed the body.
+        reason: ContentRestriction,
+    },
     /// A text message.
     Text {
         /// The text with entities.
@@ -674,6 +702,8 @@ pub enum MessageContent {
     Expired {
         /// Which media class expired.
         kind: ExpiredKind,
+        /// Metadata-only placeholder with no locator.
+        attachment: AttachmentDescriptor,
     },
     /// A chat service event delivered as a message.
     Service {
@@ -703,10 +733,11 @@ impl MessageContent {
             | Self::VoiceNote { attachment, .. }
             | Self::VideoNote { attachment }
             | Self::Sticker { attachment, .. } => Some(attachment),
-            Self::Text { .. }
-            | Self::Expired { .. }
+            Self::Restricted { .. }
+            | Self::Text { .. }
             | Self::Service { .. }
             | Self::Unsupported { .. } => None,
+            Self::Expired { attachment, .. } => Some(attachment),
         }
     }
 }
@@ -719,7 +750,7 @@ impl MessageContent {
 /// observation can carry, in provider-neutral vocabulary. This is the
 /// payload the composing caller serializes into the state layer's
 /// append-only `message_events` log.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageRecord {
     /// The chat the message belongs to.
     pub chat_id: i64,
@@ -805,22 +836,35 @@ pub fn normalize_message(message: &Value) -> Result<MessageRecord, MessageError>
             detail: format!("message {message_id} in chat {chat_id} has no content object"),
         });
     };
+    let restricted = protection.self_destructing || !protection.can_be_saved;
     Ok(MessageRecord {
         chat_id,
         message_id,
         sender: sender_ref(message.get("sender_id")),
         sent_at_ms: date.saturating_mul(1000),
         edited_at_ms: edited.map(|date| date.saturating_mul(1000)),
-        reply: message.get("reply_to").map(reply_target),
-        topic: message.get("topic_id").map(topic_ref),
-        album_id: message
-            .get("media_album_id")
-            .and_then(parse_int64)
-            .filter(|id| *id != 0),
-        reactions: message
-            .get("interaction_info")
-            .map(normalize_reactions)
-            .unwrap_or_default(),
+        reply: (!restricted)
+            .then(|| message.get("reply_to").map(reply_target))
+            .flatten(),
+        topic: (!restricted)
+            .then(|| message.get("topic_id").map(topic_ref))
+            .flatten(),
+        album_id: (!restricted)
+            .then(|| {
+                message
+                    .get("media_album_id")
+                    .and_then(parse_int64)
+                    .filter(|id| *id != 0)
+            })
+            .flatten(),
+        reactions: if restricted {
+            Vec::new()
+        } else {
+            message
+                .get("interaction_info")
+                .map(normalize_reactions)
+                .unwrap_or_default()
+        },
         can_be_saved: protection.can_be_saved,
         self_destruct,
         content: normalize_content(content, protection)?,
@@ -924,13 +968,87 @@ pub fn normalize_content(
         "messageExpiredVoiceNote" => Some(expired(ExpiredKind::VoiceNote)),
         _ => service_action(raw_type, content).map(|action| MessageContent::Service { action }),
     };
-    Ok(normalized.unwrap_or_else(|| MessageContent::Unsupported {
+    let normalized = normalized.unwrap_or_else(|| MessageContent::Unsupported {
         content: UnsupportedContent {
             raw_type: raw_type.to_owned(),
             raw_json: content.to_string(),
             raw_schema_version: RAW_SCHEMA_VERSION,
         },
-    }))
+    });
+    let restriction = if protection.self_destructing {
+        Some(ContentRestriction::Ephemeral)
+    } else if !protection.can_be_saved {
+        Some(ContentRestriction::SaveForbidden)
+    } else {
+        None
+    };
+    Ok(match restriction {
+        Some(reason) => redact_restricted_content(normalized, reason),
+        None => normalized,
+    })
+}
+
+/// Removes every copyable body fact and every media locator while preserving
+/// only truthful attachment kind/size/MIME metadata for a restricted provider
+/// placeholder.
+pub fn redact_restricted_content(
+    content: MessageContent,
+    reason: ContentRestriction,
+) -> MessageContent {
+    let empty = || FormattedText {
+        text: String::new(),
+        entities: Vec::new(),
+    };
+    match content {
+        MessageContent::Photo { attachment, .. } => MessageContent::Photo {
+            caption: empty(),
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::Video { attachment, .. } => MessageContent::Video {
+            caption: empty(),
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::Animation { attachment, .. } => MessageContent::Animation {
+            caption: empty(),
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::Audio { attachment, .. } => MessageContent::Audio {
+            caption: empty(),
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::Document { attachment, .. } => MessageContent::Document {
+            caption: empty(),
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::VoiceNote { attachment, .. } => MessageContent::VoiceNote {
+            caption: empty(),
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::VideoNote { attachment } => MessageContent::VideoNote {
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::Sticker { attachment, .. } => MessageContent::Sticker {
+            emoji: String::new(),
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::Expired { kind, attachment } => MessageContent::Expired {
+            kind,
+            attachment: redact_attachment(attachment),
+        },
+        MessageContent::Restricted { .. }
+        | MessageContent::Text { .. }
+        | MessageContent::Service { .. }
+        | MessageContent::Unsupported { .. } => MessageContent::Restricted { reason },
+    }
+}
+
+fn redact_attachment(mut attachment: AttachmentDescriptor) -> AttachmentDescriptor {
+    attachment.file_id = None;
+    attachment.remote_id = None;
+    attachment.remote_unique_id = None;
+    attachment.thumbnail = None;
+    attachment.minithumbnail = None;
+    attachment
 }
 
 /// Extract reaction tallies from a TDLib `messageInteractionInfo` object —
@@ -1180,7 +1298,29 @@ fn entity_kind(value: &Value) -> Option<TextEntityKind> {
 }
 
 fn expired(kind: ExpiredKind) -> MessageContent {
-    MessageContent::Expired { kind }
+    MessageContent::Expired {
+        kind,
+        attachment: AttachmentDescriptor {
+            kind: match kind {
+                ExpiredKind::Photo => AttachmentKind::Photo,
+                ExpiredKind::Video => AttachmentKind::Video,
+                ExpiredKind::VideoNote => AttachmentKind::VideoNote,
+                ExpiredKind::VoiceNote => AttachmentKind::VoiceNote,
+            },
+            file_id: None,
+            remote_id: None,
+            remote_unique_id: None,
+            file_name: None,
+            mime_type: None,
+            size: None,
+            width: None,
+            height: None,
+            duration_secs: None,
+            thumbnail: None,
+            minithumbnail: None,
+            availability: AttachmentAvailability::Unavailable,
+        },
+    }
 }
 
 /// The known service subset; `None` sends the type to `Unsupported`.
@@ -1269,12 +1409,6 @@ fn parse_file(value: &Value) -> Option<FileRef> {
         .get("size")
         .and_then(Value::as_i64)
         .filter(|size| *size > 0)
-        .or_else(|| {
-            value
-                .get("expected_size")
-                .and_then(Value::as_i64)
-                .filter(|size| *size > 0)
-        })
         .and_then(|size| u64::try_from(size).ok());
     let remote = value.get("remote");
     Some(FileRef {
@@ -1295,7 +1429,7 @@ fn media_attachment(
     protection: ProtectionFacts,
 ) -> Option<AttachmentDescriptor> {
     let media = content.get(field)?;
-    let file = parse_file(media.get(file_member(kind))?)?;
+    let file = media.get(file_member(kind)).and_then(parse_file);
     let (width, height) = match kind {
         // A video note is round; TDLib states its diameter as `length`.
         AttachmentKind::VideoNote => {
@@ -1304,16 +1438,21 @@ fn media_attachment(
         }
         _ => (u32_field(media, "width"), u32_field(media, "height")),
     };
-    let availability = protection.availability();
+    let availability = match (protection.availability(), file.as_ref()) {
+        (AttachmentAvailability::Fetchable, None) => AttachmentAvailability::Unavailable,
+        (availability, _) => availability,
+    };
     let (thumbnail, minithumbnail) = previews(media, thumbnail_members(kind), availability);
     Some(AttachmentDescriptor {
         kind,
-        file_id: file.file_id,
-        remote_id: file.remote_id,
-        remote_unique_id: file.remote_unique_id,
-        file_name: nonempty_string(media, "file_name"),
+        file_id: file.as_ref().map(|file| file.file_id),
+        remote_id: file.as_ref().and_then(|file| file.remote_id.clone()),
+        remote_unique_id: file.as_ref().and_then(|file| file.remote_unique_id.clone()),
+        file_name: (kind == AttachmentKind::Document)
+            .then(|| nonempty_string(media, "file_name"))
+            .flatten(),
         mime_type: nonempty_string(media, "mime_type"),
-        size: file.size,
+        size: file.as_ref().and_then(|file| file.size),
         width,
         height,
         duration_secs: u32_field(media, "duration"),
@@ -1343,22 +1482,25 @@ fn photo_attachment(
     protection: ProtectionFacts,
 ) -> Option<AttachmentDescriptor> {
     let photo = photo?;
-    let sizes = photo.get("sizes").and_then(Value::as_array)?;
+    let sizes = photo.get("sizes").and_then(Value::as_array);
     let pixels = |size: &&Value| {
         let width = size.get("width").and_then(Value::as_i64).unwrap_or(0);
         let height = size.get("height").and_then(Value::as_i64).unwrap_or(0);
         width.saturating_mul(height)
     };
-    let best = sizes.iter().max_by_key(pixels)?;
-    let file = parse_file(best.get("photo")?)?;
-    let availability = protection.availability();
+    let best = sizes.and_then(|sizes| sizes.iter().max_by_key(pixels));
+    let file = best.and_then(|best| best.get("photo")).and_then(parse_file);
+    let availability = match (protection.availability(), file.as_ref()) {
+        (AttachmentAvailability::Fetchable, None) => AttachmentAvailability::Unavailable,
+        (availability, _) => availability,
+    };
     // A photo carries no separate `thumbnail` object; its smallest stored size
     // is the preview. Only expose it (and the inline minithumbnail) when the
     // bytes are fetchable at all (POL-4, fail-closed).
     let (thumbnail, minithumbnail) = if availability == AttachmentAvailability::Fetchable {
-        let smallest = sizes.iter().min_by_key(pixels);
+        let smallest = sizes.and_then(|sizes| sizes.iter().min_by_key(pixels));
         let thumbnail = smallest
-            .filter(|size| !std::ptr::eq(*size, best))
+            .filter(|size| best.is_some_and(|best| !std::ptr::eq(*size, best)))
             .and_then(photo_size_thumbnail);
         (thumbnail, minithumbnail(photo.get("minithumbnail")))
     } else {
@@ -1366,14 +1508,14 @@ fn photo_attachment(
     };
     Some(AttachmentDescriptor {
         kind: AttachmentKind::Photo,
-        file_id: file.file_id,
-        remote_id: file.remote_id,
-        remote_unique_id: file.remote_unique_id,
+        file_id: file.as_ref().map(|file| file.file_id),
+        remote_id: file.as_ref().and_then(|file| file.remote_id.clone()),
+        remote_unique_id: file.as_ref().and_then(|file| file.remote_unique_id.clone()),
         file_name: None,
-        mime_type: None,
-        size: file.size,
-        width: u32_field(best, "width"),
-        height: u32_field(best, "height"),
+        mime_type: Some("image/jpeg".to_owned()),
+        size: file.as_ref().and_then(|file| file.size),
+        width: best.and_then(|best| u32_field(best, "width")),
+        height: best.and_then(|best| u32_field(best, "height")),
         duration_secs: None,
         thumbnail,
         minithumbnail,
@@ -1633,13 +1775,13 @@ mod tests {
     }
 
     #[test]
-    fn file_size_prefers_exact_over_expected() {
+    fn file_size_uses_only_tdlibs_exact_size() {
         let exact =
             parse_file(&json!({"id": 7, "size": 100, "expected_size": 90})).expect("file parses");
         assert_eq!(exact.size, Some(100));
-        let expected =
+        let estimate_only =
             parse_file(&json!({"id": 7, "size": 0, "expected_size": 90})).expect("file parses");
-        assert_eq!(expected.size, Some(90));
+        assert_eq!(estimate_only.size, None);
         let unknown =
             parse_file(&json!({"id": 7, "size": 0, "expected_size": 0})).expect("file parses");
         assert_eq!(unknown.size, None);
@@ -1657,7 +1799,7 @@ mod tests {
              "photo": {"id": 3, "size": 1_000, "remote": {"id": "rs", "unique_id": "us"}}}
         ]});
         let attachment = photo_attachment(Some(&photo), OPEN).expect("photo normalizes");
-        assert_eq!(attachment.file_id, 2);
+        assert_eq!(attachment.file_id, Some(2));
         assert_eq!(attachment.remote_unique_id.as_deref(), Some("ux"));
         assert_eq!(
             (attachment.width, attachment.height),
@@ -1782,7 +1924,7 @@ mod tests {
         assert_eq!((mini.width, mini.height), (Some(40), Some(22)));
         assert_eq!(mini.data_base64, "TDs4 z==");
         // The main file locator is unchanged by preview extraction.
-        assert_eq!(attachment.file_id, 5);
+        assert_eq!(attachment.file_id, Some(5));
     }
 
     #[test]
@@ -1858,7 +2000,7 @@ mod tests {
             panic!("expected Photo");
         };
         // The attachment is the largest size; its thumbnail is the smallest.
-        assert_eq!(attachment.file_id, 2);
+        assert_eq!(attachment.file_id, Some(2));
         let thumbnail = attachment.thumbnail.expect("photo thumbnail present");
         assert_eq!(thumbnail.file_id, 3);
         assert_eq!(thumbnail.format, ThumbnailFormat::Jpeg);
@@ -1886,7 +2028,7 @@ mod tests {
         else {
             panic!("expected Photo");
         };
-        assert_eq!(attachment.file_id, 2);
+        assert_eq!(attachment.file_id, Some(2));
         assert_eq!(
             attachment.thumbnail, None,
             "the only size is the attachment itself, not a distinct preview"

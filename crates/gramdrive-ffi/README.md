@@ -15,7 +15,11 @@ STORY-260715-2p879f (workspace-and-bindings), EPIC-260715-1poogc
 (shared-rust-core). UniFFI contract and generation pipeline:
 TASK-260715-265gqq; artifact packaging (XCFramework, Android libraries,
 shipped-target list): TASK-260715-3akqs8; shared-state surface:
-TASK-260715-gnsa2s (STORY-260715-33oacu, macos-engine-host).
+TASK-260715-gnsa2s (STORY-260715-33oacu, macos-engine-host); lifecycle-owned
+history/live composition: TASK-260721-yrcjlo.
+On-demand attachment hydration composition: TASK-260721-1yp75l.
+Non-viewing canonical story ingestion: TASK-260721-3e9bi8.
+Per-account retention and Archive-Mode control: TASK-260721-2tamdj.
 
 ## Binding style: proc-macros, not UDL
 
@@ -90,16 +94,16 @@ where they are used (`.scripts/packaging/README.md`).
   binding-managed thread performs the poll (a Swift cooperative-pool thread,
   a Kotlin dispatcher thread), and wake-ups are delivered through a
   callback. There is no dedicated "FFI thread".
-- **tokio is the core's runtime.** Exported async methods are declared with
-  `async_runtime = "tokio"`, which wraps each future so tokio primitives
-  (timers, future I/O) work regardless of the polling thread; tokio's
-  reactor runs on its own background threads. The engine
-  (STORY-260715-2hs8cf) inherits this decision: internal long-running work
-  is tokio tasks, and the FFI layer awaits them.
-- **Exported futures must never block a thread.** A blocking call inside an
-  exported future stalls a binding thread pool and violates the provider
-  deadline rule (NFR-025). Blocking work goes onto tokio (`spawn_blocking`)
-  and is awaited.
+- **Hydration owns its runtime.** `Hydrator` creates a bounded multi-thread
+  Tokio runtime and its exported demand future immediately submits there.
+  UniFFI/`async-compat` therefore polls only a join handle; SQLite,
+  filesystem, transfer-driver, and retry work cannot run on a Swift
+  cooperative worker or the compatibility runtime's fallback current thread.
+- **Exported futures must never block a binding thread.** A blocking call
+  inside an exported future stalls a binding thread pool and violates the
+  provider deadline rule (NFR-025). Other exported work must use an owned
+  runtime or Tokio blocking boundary and be awaited without synchronous
+  waiting in the binding wrapper.
 - **Callback dispatch** (`ProgressListener` and future callback traits):
   calls arrive synchronously on a background thread owned by the operation —
   by contract never a platform main thread, so hosts must hop to their own
@@ -138,6 +142,82 @@ stays either way.
 
 ## Shared state surface
 
+Contract `0.15.0` includes the `0.9.0` provider-visible date-first/story and
+attachment-fidelity vocabulary and adds the lifecycle-owned
+`NamespaceSession.setChatHistoryPriority` signal plus the defaulted
+`ItemMetadata.chatId` routing identity and the bounded, container-validated
+`SharedStateStore.childrenPage` result. It also exposes the state-backed
+`DriveCore.hydrator`: the owned namespace session registers its TDLib client,
+and hydration composes durable locators, bounded range fetch, resumable
+transfer journal, verification, and atomic content-addressed cache promotion.
+Concurrent opens use a per-item/content-version synchronous admission step to
+establish the cancellation generation before any driver can fetch; network
+awaits and retry delays never hold that lock, so unrelated items remain
+independent and coalesced readers share one cancellable source future.
+Exact-zero objects use a sink-less coordinator subscriber per opener, so
+cancelling one coalesced request detaches only that request and only the last
+live opener may cancel queued or running work.
+Each opener reserves its causal materialization result before its durable
+transfer becomes globally claimable, then binds that reservation to the new
+transfer id. An already-running queue driver may therefore publish or fail
+before the opener finishes binding without losing the result; bindings are
+discarded after a bounded grace of twice the native idle deadline rather than
+retaining historical transfers.
+The additive `ContentPolicyController` keeps retention and Archive Mode as
+separate account-scoped commands. Audit-to-Mirror accepts only the exact typed
+account phrase, commits the SQLite purge before reporting success, and exposes
+any remaining physical-file deletion queue. Production hydrator startup drains
+that journal before returning the account session, while the explicit repair
+hook remains safe to repeat.
+Readers treat engine completion as pending until verified cache publication
+succeeds or fails, and unrelated transfer notifications cannot expose the
+intermediate state. The same state-backed attachment policy resolver gates cache hits and TDLib
+requests, so later protected, deleted, or left-chat state refuses cached bytes
+without touching access accounting. When authoritative protected,
+`can_be_saved=false`, view-once, or restricted facts arrive, the owned session
+also transactionally releases cache rows and pins, unlinks blob ownership, and
+journals physical deletion. Audit deletion remains distinct: it may retain
+already materialized allowed bytes but never starts a download. Only verified whole objects cross this
+boundary; protected or stale content fails before bytes are requested or
+published. The history-priority signal
+only updates the owned worker's bounded scheduler queue: File Provider
+callbacks never acquire a TDLib client or wait for history/media. That queue
+keeps two separate facts. The *live view* is which chats the host says are on
+screen right now, and it alone decides whether an in-flight crawl keeps its
+slice. The *admission ledger* records each accepted visible/requested hint until
+it has actually bought one history turn, and it is what the scheduler plans
+against. The split exists because the File Provider demand lifecycle is much
+faster than one scheduler boundary — the enumerator signals visible when Finder
+reads a chat folder and background again the moment it is invalidated, while the
+worker is still inside another chat's crawl — so a queue that held only the live
+view lost the foreground edge outright and an opened chat never advanced. The
+ledger is bounded (oldest admission evicted first), an admission is retired only
+where the plan demonstrably reached it, and a hint that lands while a plan is
+running survives it. The same
+session starts resumable
+newest-first history only after the root/chat snapshot is durable, applies live
+message updates, and never issues `downloadFile`. Every inclusive TDLib page
+commits its normalized identities and monotonic per-chat window before the next
+request. Provider projection/render work is chat-scoped and published at
+bounded slice boundaries (eight background or sixteen foreground pages);
+snapshot pages likewise keep their restart checkpoint but publish once at the
+snapshot boundary. This keeps deep metadata-only backfill crash-resumable
+without rebuilding the account-wide tree per page or making File Provider
+callbacks wait for TDLib. Exported session teardown is
+named `shutdown`: generated Kotlin objects already implement
+`AutoCloseable.close()`, so exporting a second `close` produces conflicting
+overloads. The native agent keeps its own `close` host seam and delegates it to
+the generated `shutdown` method.
+
+The same owned session composes the bounded story machine after authorization.
+Active membership, profile pages, live updates, exact archive-right checks, and
+rights-gated archive pages commit canonical story facts and their durable cursor
+in one SQLite transaction. Background dispatch is checked against the reviewed
+metadata-only allow-list; it cannot submit `openStory`, a live-view lifecycle
+request, `downloadFile`, or a story mutation. Privacy-safe progress exposes
+phase, bounded counts, eligibility, cursors, retry class, and attempts without
+Telegram text or locators.
+
 `src/shared_state.rs` (TASK-260715-gnsa2s) is how separate host processes —
 on Apple: app, companion agent, File Provider extension — coordinate over
 one durable SQLite database with no shared-memory assumptions
@@ -154,7 +234,7 @@ one durable SQLite database with no shared-memory assumptions
   serialized by the write lock). `role` names the process's rights:
   `Coordinator` (the engine host) may recover from corruption;
   `Provider` (extension, UI) never destroys shared files.
-- **Reads are short snapshots.** `item` / `children` / `child_by_name` /
+- **Reads are short snapshots.** `item` / `children` / `children_page` / `child_by_name` /
   `accounts` / `account` each run as one WAL read snapshot: consistent
   for the call, never blocking the writer, never holding locks between
   calls. The calls are synchronous and touch disk — call from a
@@ -165,6 +245,13 @@ one durable SQLite database with no shared-memory assumptions
   design: durable state is written by the engine in its host process,
   and a foreign write surface would invite the extension to mutate state
   the engine owns (DEC-006).
+- **`children_page(parent, after, limit)`** is the provider-facing bounded
+  listing primitive. It caps each page at 256 records, reads one lookahead row
+  so a full final page does not manufacture an empty continuation, and returns
+  `next_after` only when another page may exist. A supplied anchor must belong
+  to the same parent (a tombstoned anchor remains valid); missing or foreign
+  anchors fail explicitly so native providers restart that container's page
+  walk instead of silently skipping entries.
 - **`data_version()`** is the change probe that pairs with the host's
   change doorbell (on Apple, a Darwin notification — see
   `apple/GramDriveSupport`): on a ring or a poll tick, compare against

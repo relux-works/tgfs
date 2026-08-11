@@ -40,9 +40,11 @@
 //!
 //! `getChatHistory(chat_id, from_message_id, offset: 0, limit,
 //! only_local: false)` answers a `messages` object whose entries descend
-//! strictly by message id, all ids strictly below `from_message_id`
-//! (`0` meaning "from the newest message"). An empty answer means the end
-//! of history in the paged direction. On that contract the machine runs
+//! strictly by message id. TDLib includes `from_message_id` itself as the
+//! first entry when it is still available (`0` means "from the newest
+//! message"), so every continuation page may replay exactly one boundary
+//! record before moving to older ids. A boundary-only answer means the end
+//! of history in the backward direction. On that contract the machine runs
 //! three phases per chat:
 //!
 //! - **Anchor** (no committed window yet): one page from `0`. An empty
@@ -57,8 +59,8 @@
 //!   idempotent replay (SYNC-021) skips them. Re-observed records below
 //!   the boundary are deliberate — a recent edit surfaces that way.
 //! - **Backward** (the backfill): pages from the window's `oldest`,
-//!   moving `oldest` down with each commit until an empty answer marks
-//!   [`HistoryCommit::history_complete`].
+//!   moving `oldest` down with each commit until an empty or boundary-only
+//!   answer marks [`HistoryCommit::history_complete`].
 //!
 //! Every answered page yields exactly one commit; the caller persists the
 //! records and the commit's window/completion facts (the state layer's
@@ -73,9 +75,10 @@
 //! rebuilds the [`CrawlPlan`] with each [`ChatCrawl::window`] /
 //! [`ChatCrawl::history_complete`] filled in; account/namespace scoping
 //! (SYNC-004) is the row key's job. Restart can produce neither
-//! duplicates nor gaps: backward pages fetch strictly below the committed
-//! `oldest`, catch-up commits never advance the window past what they
-//! connected, and replayed batches are idempotent by message identity.
+//! duplicates nor gaps: backward pages accept one inclusive overlap at the
+//! committed `oldest`, catch-up commits never advance the window past what
+//! they connected, and replayed boundary records are idempotent by message
+//! identity.
 //!
 //! # Bounded scheduling and priority
 //!
@@ -111,8 +114,9 @@
 //! per-chat cursors are the recovery path.
 //!
 //! A page that violates the paging contract — a duplicate or ascending
-//! id, an id at or above `from_message_id`, a message of another chat —
-//! also fails that one chat explicitly ([`UnavailableReason::PageContract`],
+//! id, an id above `from_message_id`, a non-leading repeated boundary, or
+//! a message of another chat — also fails that one chat explicitly
+//! ([`UnavailableReason::PageContract`],
 //! the SYNC-003 rule at message granularity): advancing a cursor over a
 //! lying page would corrupt the window's meaning. A malformed message
 //! *object* inside an otherwise sound page degrades instead: it is
@@ -185,8 +189,10 @@ pub struct CrawlPlan {
     /// The chats to crawl. Duplicate ids are rejected at machine
     /// construction ([`CrawlError::Plan`]).
     pub chats: Vec<ChatCrawl>,
-    /// `getChatHistory` limit per page, clamped to `1..=100` (TDLib's
-    /// ceiling); the default is [`CrawlPlan::DEFAULT_PAGE_SIZE`].
+    /// `getChatHistory` limit per page, clamped to `2..=100` (TDLib's
+    /// ceiling). Two is the minimum that can carry both TDLib's inclusive
+    /// boundary and one older record; the default is
+    /// [`CrawlPlan::DEFAULT_PAGE_SIZE`].
     pub page_size: u32,
 }
 
@@ -239,8 +245,9 @@ pub enum UnavailableReason {
         source: TdError,
     },
     /// A page violated the paging contract (duplicate or ascending ids,
-    /// an id at or above `from_message_id`, a message of another chat) —
-    /// advancing the cursor over it would corrupt the window (SYNC-003).
+    /// an id above `from_message_id`, a non-leading repeated boundary, or a
+    /// message of another chat) — advancing the cursor over it would corrupt
+    /// the window (SYNC-003).
     PageContract {
         /// Diagnostic detail; not contractual.
         detail: String,
@@ -482,7 +489,10 @@ impl CrawlMachine {
                     records_emitted: 0,
                 })
                 .collect(),
-            page_size: plan.page_size.clamp(1, MAX_PAGE_SIZE),
+            // With offset zero TDLib includes from_message_id itself. A
+            // one-entry continuation page can therefore never advance, so
+            // reserve at least one response slot for an older record.
+            page_size: plan.page_size.clamp(2, MAX_PAGE_SIZE),
             outstanding: None,
             pending: None,
             failed: None,
@@ -727,20 +737,22 @@ impl CrawlMachine {
                 let Some(window) = &mut chat.window else {
                     return Err(self.fail(malformed("catch-up phase without a window".to_owned())));
                 };
-                match page.bounds {
+                match page.advanced_bounds {
                     Some((page_oldest, page_newest)) if page_oldest > window.newest_message_id => {
                         // Not yet connected: records commit, the window
                         // holds (contiguity, module docs).
                         chat.phase = Phase::CatchUp {
-                            top: Some(top.unwrap_or(page_newest)),
+                            top: Some(top.unwrap_or_else(|| {
+                                page.bounds.map(|(_, newest)| newest).unwrap_or(page_newest)
+                            })),
                             floor: Some(page_oldest),
                         };
                     }
-                    bounds => {
+                    Some(_) => {
                         // Connected: an id at or below the committed
-                        // newest (or nothing newer exists at all).
+                        // newest.
                         let top = top
-                            .or(bounds.map(|(_, page_newest)| page_newest))
+                            .or(page.bounds.map(|(_, page_newest)| page_newest))
                             .unwrap_or(window.newest_message_id);
                         window.newest_message_id = window.newest_message_id.max(top);
                         chat.phase = if chat.history_complete {
@@ -749,20 +761,47 @@ impl CrawlMachine {
                             Phase::Backward
                         };
                     }
+                    None if from == 0 => {
+                        // No message newer than the committed window exists.
+                        chat.phase = if chat.history_complete {
+                            Phase::Complete
+                        } else {
+                            Phase::Backward
+                        };
+                    }
+                    None => {
+                        let chat_id = chat.chat_id;
+                        let newest_message_id = window.newest_message_id;
+                        chat.phase = Phase::Unavailable;
+                        self.pending = Some(Emit::Unavailable(Box::new(ChatUnavailable {
+                            chat_id,
+                            reason: UnavailableReason::PageContract {
+                                detail: format!(
+                                    "chat {chat_id}: inclusive page from {from} did not advance \
+                                     toward committed newest {newest_message_id}"
+                                ),
+                            },
+                        })));
+                        return Ok(());
+                    }
                 }
             }
             Phase::Backward => {
                 let Some(window) = &mut chat.window else {
                     return Err(self.fail(malformed("backward phase without a window".to_owned())));
                 };
-                match page.bounds {
+                match page.advanced_bounds {
                     None => {
+                        // TDLib returns the inclusive boundary itself at
+                        // offset zero. Seeing no id below it is the terminal
+                        // page, not a cursor-contract failure.
                         chat.history_complete = true;
                         chat.phase = Phase::Complete;
                     }
                     Some((page_oldest, _)) => {
-                        // parse_entries proved every id < from, and from
-                        // was this window's oldest.
+                        // parse_entries proved the only id equal to `from`
+                        // can be the leading overlap; page_oldest is strictly
+                        // older than the prior window boundary.
                         window.oldest_message_id = page_oldest;
                     }
                 }
@@ -796,6 +835,10 @@ struct ParsedPage {
     /// included — the cursor must move past a broken object, not refetch
     /// it forever. `None` for an empty page.
     bounds: Option<(i64, i64)>,
+    /// Bounds over ids that advance beyond `from`. For the initial
+    /// `from = 0` page this equals `bounds`; for continuation pages it
+    /// excludes TDLib's one allowed leading boundary overlap.
+    advanced_bounds: Option<(i64, i64)>,
     skipped_malformed: u32,
 }
 
@@ -807,14 +850,15 @@ fn parse_entries(chat_id: i64, from: i64, entries: &[Value]) -> Result<ParsedPag
     let mut skipped_malformed: u32 = 0;
     let mut previous: Option<i64> = None;
     let mut bounds: Option<(i64, i64)> = None;
+    let mut advanced_bounds: Option<(i64, i64)> = None;
     for entry in entries {
         let Some(id) = entry.get("id").and_then(Value::as_i64) else {
             skipped_malformed = skipped_malformed.saturating_add(1);
             continue;
         };
-        if from > 0 && id >= from {
+        if from > 0 && id > from {
             return Err(format!(
-                "chat {chat_id}: page from {from} answered id {id} at or above it"
+                "chat {chat_id}: page from {from} answered newer id {id}"
             ));
         }
         if let Some(previous) = previous
@@ -829,6 +873,12 @@ fn parse_entries(chat_id: i64, from: i64, entries: &[Value]) -> Result<ParsedPag
             None => (id, id),
             Some((oldest, newest)) => (oldest.min(id), newest.max(id)),
         });
+        if from == 0 || id < from {
+            advanced_bounds = Some(match advanced_bounds {
+                None => (id, id),
+                Some((oldest, newest)) => (oldest.min(id), newest.max(id)),
+            });
+        }
         match normalize_message(entry) {
             Ok(record) => {
                 if record.chat_id != chat_id {
@@ -850,6 +900,7 @@ fn parse_entries(chat_id: i64, from: i64, entries: &[Value]) -> Result<ParsedPag
     Ok(ParsedPage {
         records,
         bounds,
+        advanced_bounds,
         skipped_malformed,
     })
 }
@@ -911,7 +962,7 @@ mod tests {
 
     #[test]
     fn page_size_is_clamped_to_tdlib_bounds() {
-        for (asked, granted) in [(0, 1), (50, 50), (100_000, 100)] {
+        for (asked, granted) in [(0, 2), (1, 2), (50, 50), (100_000, 100)] {
             let mut machine = CrawlMachine::new(CrawlPlan {
                 chats: vec![ChatCrawl::new(1)],
                 page_size: asked,
@@ -1220,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn an_id_at_or_above_the_cursor_is_a_contract_violation() {
+    fn the_inclusive_cursor_boundary_completes_and_a_newer_id_is_rejected() {
         let resumed = ChatCrawl {
             window: Some(CrawlWindow {
                 oldest_message_id: 10,
@@ -1229,7 +1280,8 @@ mod tests {
             history_complete: false,
             ..ChatCrawl::new(5)
         };
-        let mut machine = CrawlMachine::new(CrawlPlan::new([resumed])).expect("plan is valid");
+        let mut machine =
+            CrawlMachine::new(CrawlPlan::new([resumed.clone()])).expect("plan is valid");
         submit(&mut machine);
         machine
             .on_response(Ok(page(5, &[12, 10])))
@@ -1239,7 +1291,25 @@ mod tests {
         assert_eq!(request["from_message_id"].as_i64(), Some(10));
         machine
             .on_response(Ok(page(5, &[10])))
-            .expect("the violation folds into unavailability");
+            .expect("the inclusive boundary is a valid terminal page");
+        let terminal = commit(&mut machine);
+        assert!(terminal.history_complete);
+        assert!(matches!(
+            machine.next_step().expect("done"),
+            CrawlStep::Done
+        ));
+
+        let mut machine = CrawlMachine::new(CrawlPlan::new([resumed])).expect("plan is valid");
+        submit(&mut machine);
+        machine
+            .on_response(Ok(page(5, &[12, 10])))
+            .expect("catch-up connects");
+        commit(&mut machine);
+        let request = submit(&mut machine);
+        assert_eq!(request["from_message_id"].as_i64(), Some(10));
+        machine
+            .on_response(Ok(page(5, &[11, 10])))
+            .expect("the newer-than-cursor violation folds into unavailability");
         assert!(matches!(
             machine.next_step().expect("a step"),
             CrawlStep::Unavailable(_)

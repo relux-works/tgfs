@@ -40,6 +40,54 @@ private func withSubstituteDataRootAsync<T>(_ body: (URL) async throws -> T) asy
 
 @Suite("File Provider extension skeleton")
 struct FileProviderExtensionTests {
+    @Test("Opening a chat routes requested priority without source work")
+    func openingChatRoutesRequestedPriority() {
+        withSubstituteDataRoot { dataRoot in
+            let signaler = RecordingHistoryPrioritySignaler()
+            let ext = GramDriveFileProviderExtension(
+                domain: NSFileProviderDomain(
+                    identifier: NSFileProviderDomainIdentifier(rawValue: "account-7"),
+                    displayName: "GramDrive"),
+                dataRoot: { dataRoot },
+                historyPriority: signaler)
+            let chat = ItemMetadata(
+                contractVersion: 2,
+                id: "opaque-chat", parent: "root", kind: .chat, isDirectory: true,
+                displayName: "Chat", safeName: "Chat", metadataVersion: "m1",
+                mimeType: nil, logicalSize: nil, attachmentLogicalKind: nil,
+                attachmentRepresentation: nil, attachmentFidelity: nil,
+                attachmentSourceName: nil, attachmentExactSize: nil, contentVersion: nil,
+                availability: .fetchable, createdAtMs: nil, modifiedAtMs: nil,
+                deletedAtMs: nil, pin: nil, chatId: 900)
+
+            ext.signalHistoryPriority(for: chat, accountId: 7, .requested)
+            #expect(
+                signaler.snapshot()
+                    == [HistoryPriorityRequest(
+                        accountId: 7, chatId: 900, priority: .requested)])
+        }
+    }
+
+    /// Folder enumeration cannot carry the foreground signal on its own —
+    /// macOS answers a read of an already-materialized directory from its own
+    /// replica without calling this extension — so the fetch path is the one
+    /// that has to raise it (BUG-260728-2qfzbd). Without this the extension
+    /// would build a fetcher that silently signals nothing, and only an
+    /// installed run would notice.
+    @Test("The fetch path is wired to the same history-priority seam as enumeration")
+    func fetchPathIsWiredToTheHistoryPrioritySeam() {
+        withSubstituteDataRoot { dataRoot in
+            let signaler = RecordingHistoryPrioritySignaler()
+            let ext = GramDriveFileProviderExtension(
+                domain: NSFileProviderDomain(
+                    identifier: NSFileProviderDomainIdentifier(rawValue: "account-7"),
+                    displayName: "GramDrive"),
+                dataRoot: { dataRoot },
+                historyPriority: signaler)
+            #expect(ext.contentFetcher.historyPriority as? AnyObject === signaler)
+        }
+    }
+
     @Test("A foreign domain identifier is refused typed, never aliased")
     func foreignIdentifierIsRefused() {
         withSubstituteDataRoot { dataRoot in
@@ -158,6 +206,99 @@ struct FileProviderExtensionTests {
                 let nsError = error as NSError
                 #expect(nsError.domain != NSFileProviderError.errorDomain)
             }
+        }
+    }
+}
+
+@Suite("File Provider extension — the read-only write surface (DEC-007)")
+struct FileProviderExtensionModifyTests {
+    @Test("Purely local presentation changes are accepted, not refused")
+    func locallyOwnedFieldsAreAccepted() {
+        // `lastUsedDate`, `tagData` and `favoriteRank` never leave this Mac.
+        // Refusing them makes the system revert the user's own local state —
+        // a chat they just opened would snap back to the index-derived date
+        // this extension publishes (BUG-260728-2qfzbd).
+        #expect(GramDriveFileProviderExtension.isLocallyOwnedModification([.lastUsedDate]))
+        #expect(GramDriveFileProviderExtension.isLocallyOwnedModification([.tagData]))
+        #expect(GramDriveFileProviderExtension.isLocallyOwnedModification([.favoriteRank]))
+        #expect(
+            GramDriveFileProviderExtension.isLocallyOwnedModification([
+                .lastUsedDate, .tagData, .favoriteRank,
+            ]))
+        #expect(
+            GramDriveFileProviderExtension.isLocallyOwnedModification([]),
+            "an empty change set has nothing to send anywhere")
+    }
+
+    @Test("Anything that would have to reach Telegram is still refused")
+    func telegramBoundChangesStayRefused() {
+        for field: NSFileProviderItemFields in [
+            .contents, .filename, .parentItemIdentifier, .creationDate, .contentModificationDate,
+            .fileSystemFlags, .extendedAttributes, .typeAndCreator,
+        ] {
+            #expect(
+                !GramDriveFileProviderExtension.isLocallyOwnedModification(field),
+                "V1 is read-only with respect to Telegram: \(field) must not be accepted")
+        }
+        #expect(
+            !GramDriveFileProviderExtension.isLocallyOwnedModification([.lastUsedDate, .filename]),
+            "one Telegram-bound field poisons an otherwise local change set")
+    }
+
+    @Test("A last-used modification completes without an error and leaves nothing pending")
+    func lastUsedModificationCompletesCleanly() {
+        withSubstituteDataRoot { dataRoot in
+            let ext = makeExtension(domainIdentifier: "account-9", dataRoot: dataRoot)
+            let item = GramDriveFileProviderItem(
+                metadata: ItemMetadata(
+                    contractVersion: 1,
+                    id: "item-1",
+                    parent: "root-9",
+                    kind: .chat,
+                    isDirectory: true,
+                    displayName: "Chat",
+                    safeName: "Chat",
+                    metadataVersion: "m1",
+                    mimeType: nil,
+                    logicalSize: nil,
+                    aggregateSize: 4096,
+                    attachmentLogicalKind: nil,
+                    attachmentRepresentation: nil,
+                    attachmentFidelity: nil,
+                    attachmentSourceName: nil,
+                    attachmentExactSize: nil,
+                    contentVersion: nil,
+                    availability: .fetchable,
+                    createdAtMs: 1_600_000_000_000,
+                    modifiedAtMs: 1_600_000_500_000,
+                    deletedAtMs: nil,
+                    pin: nil,
+                    chatId: 9),
+                accountRootId: "root-9")
+
+            // The handler runs inline: the extension decides locally and
+            // performs no I/O for a purely local presentation change.
+            var completions = 0
+            var returnedItem: NSFileProviderItem?
+            var pending: NSFileProviderItemFields = [.contents]
+            var failure: Error?
+            _ = ext.modifyItem(
+                item,
+                baseVersion: item.itemVersion,
+                changedFields: [.lastUsedDate],
+                contents: nil,
+                request: NSFileProviderRequest()
+            ) { item, fields, _, error in
+                completions += 1
+                returnedItem = item
+                pending = fields
+                failure = error
+            }
+
+            #expect(completions == 1, "the decision is made inline, with no I/O")
+            #expect(failure == nil, "accepting a local-only change is not an error")
+            #expect(returnedItem != nil, "the accepted item is handed back")
+            #expect(pending.isEmpty, "nothing stays pending")
         }
     }
 }

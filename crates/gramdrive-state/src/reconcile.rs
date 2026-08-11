@@ -72,7 +72,8 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::params;
 
-use gramdrive_model::identity::ItemId;
+use gramdrive_model::identity::{AccountKey, ItemId};
+use gramdrive_model::version::ContentVersion;
 
 use crate::error::StateError;
 use crate::repair::{self, RepairKind};
@@ -192,6 +193,19 @@ pub enum Finding {
         /// copy needs re-hydrating"; the pin itself survives either way.
         pinned: bool,
     },
+    /// Audit retained a verified superseded attachment materialization whose
+    /// object is no longer present. The historical metadata remains valid;
+    /// only its byte ownership is cleared, and no download is scheduled.
+    MissingRetainedAttachmentObject {
+        /// Account that retained the superseded bytes.
+        account: AccountKey,
+        /// Canonical attachment item.
+        item: ItemId,
+        /// Historical content version whose object vanished.
+        content_version: ContentVersion,
+        /// Missing on-disk handle.
+        reference: String,
+    },
     /// A `cache_entries` row carries no `materialization_ref`, so there is
     /// nothing to check it against.
     ///
@@ -253,6 +267,8 @@ pub enum Resolution {
     DropStaging,
     /// Drop the cache entry; the pin, if any, survives.
     DropCacheEntry,
+    /// Clear vanished Audit byte ownership while preserving its metadata.
+    DropRetainedMaterialization,
     /// Delete the unclaimed object from local storage.
     DeleteObject,
     /// Nothing automatic; the finding is for a human or another subsystem.
@@ -266,6 +282,7 @@ impl Finding {
             Self::InterruptedTransfer { .. } => Resolution::RequeueTransfer,
             Self::LeakedStaging { .. } => Resolution::DropStaging,
             Self::MissingCacheObject { .. } => Resolution::DropCacheEntry,
+            Self::MissingRetainedAttachmentObject { .. } => Resolution::DropRetainedMaterialization,
             Self::OrphanCacheObject { .. } => Resolution::DeleteObject,
             Self::UnlocatableCacheEntry { .. }
             | Self::ProjectionRebuildPending { .. }
@@ -404,6 +421,9 @@ fn report_only_reason(finding: &Finding) -> &'static str {
             "rebuilding the projection needs the projection builder, which is engine-side"
         }
         Finding::MigrationInterrupted { .. } => "a migration resumes on open, not here",
+        Finding::MissingRetainedAttachmentObject { .. } => {
+            "the retained byte owner is repaired automatically"
+        }
         _ => "no automatic repair",
     }
 }
@@ -487,6 +507,18 @@ fn survey(
                     });
                 }
             }
+        }
+    }
+    for retained in read.retained_attachment_materializations()? {
+        if held.contains_key(retained.reference.as_str()) {
+            claimed.insert(retained.reference);
+        } else {
+            findings.push(Finding::MissingRetainedAttachmentObject {
+                account: retained.account,
+                item: retained.item,
+                content_version: retained.content_version,
+                reference: retained.reference,
+            });
         }
     }
     for object in cache_objects {
@@ -575,6 +607,18 @@ fn apply(
             if tx.read().render_state(item)?.is_some() {
                 tx.mark_render_dirty(item)?;
             }
+            tx.commit()?;
+            Ok(true)
+        }
+        Finding::MissingRetainedAttachmentObject {
+            account,
+            item,
+            content_version,
+            ..
+        } => {
+            let tx = store.write_txn()?;
+            tx.clear_retained_attachment_materialization(*account, item, content_version)?;
+            tx.purge_unreferenced_blobs(*account)?;
             tx.commit()?;
             Ok(true)
         }

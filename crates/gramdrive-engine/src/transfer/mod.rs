@@ -576,6 +576,34 @@ impl TransferMachine {
         Ok(disposal)
     }
 
+    /// Acknowledges a requested cancellation after the host has stopped the
+    /// in-process source future that held the claim.
+    ///
+    /// This is the crash-safe counterpart to dropping an async fetch: the
+    /// caller first raises the durable cancel flag, stops the source future,
+    /// then uses this operation to clear progress and make the row terminal.
+    /// It refuses an unflagged row so it cannot be used as an implicit
+    /// cancellation or bypass the two-phase protocol.
+    pub fn acknowledge_requested_cancel(
+        &self,
+        store: &mut StateStore,
+        id: TransferId,
+        now_ms: i64,
+    ) -> Result<Option<StagingDisposal>, EngineError> {
+        let tx = store.write_txn()?;
+        let fresh = require_transfer(tx.read(), id)?;
+        if !fresh.cancel_requested {
+            return Err(StateError::InvalidArgument {
+                what: "transfer cancellation was not requested",
+            }
+            .into());
+        }
+        let disposal = wipe_staging(&tx, &fresh, now_ms)?;
+        tx.mark_transfer_cancelled(id, now_ms)?;
+        tx.commit()?;
+        Ok(disposal)
+    }
+
     /// Invalidates a claimed transfer's partial data (SYNC-042): wipes
     /// staged progress and finishes the row terminal, with the category
     /// re-derived from the item's current standing (`VersionConflict` when

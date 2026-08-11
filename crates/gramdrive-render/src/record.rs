@@ -27,6 +27,7 @@
 //! build has no named variant for: an unknown kind renders as `other` with its
 //! raw tag preserved, never dropped.
 
+use gramdrive_model::attachment::{AttachmentContractError, validate_attachment_contract};
 use gramdrive_model::identity::{AttachmentIndex, ContentHash, MessageId, SchemaFamily};
 
 /// Per-account edit/delete retention policy (POL-3, DEC-015). It selects the
@@ -137,8 +138,10 @@ pub struct MessageBody {
     /// user message.
     pub service: Option<ServiceAction>,
     /// Whether Telegram forbids saving this message's content
-    /// (`can_be_saved == false`, POL-4). Protected content is still described;
-    /// its bytes are never fetched.
+    /// (`can_be_saved == false`, POL-4). When true, every other body field is
+    /// non-authoritative and both renderers emit only a body-free restricted
+    /// placeholder. This defense-in-depth rule prevents a legacy or malformed
+    /// caller from exporting protected text, metadata, or media.
     pub protected: bool,
 }
 
@@ -281,21 +284,25 @@ pub struct Attachment {
     pub index: AttachmentIndex,
     /// What kind of media this attachment is.
     pub media_kind: MediaKind,
-    /// The original file name, if the source provided one.
-    pub name: Option<String>,
+    /// Telegram representation, orthogonal to logical media kind.
+    pub telegram_representation: TelegramRepresentation,
+    /// Fidelity of the represented bytes.
+    pub fidelity: AttachmentFidelity,
+    /// Sender-provided source name, only for representations that expose one.
+    pub source_name: Option<String>,
     /// The MIME type, if known.
     pub mime_type: Option<String>,
     /// The logical size in bytes, if known.
-    pub size: Option<u64>,
+    pub exact_size: Option<u64>,
     /// Whether and why the bytes are (un)fetchable (POL-4).
     pub availability: Availability,
     /// The content hash of the downloaded bytes, once materialized.
     pub content_hash: Option<ContentHash>,
-    /// The resolved display name of this attachment's file inside its year's
-    /// `media/` directory — the sanitized, collision-suffixed name the naming
+    /// The resolved display name of this attachment's file inside its direct
+    /// `YYYY-MM/` directory — the sanitized, collision-suffixed name the naming
     /// policy assigned (SYNC-012, SYNC-013). `Some` when the attachment has a
     /// file node in the virtual tree (the Markdown renderer links
-    /// `media/<media_name>`); `None` when no file exists to link — a source
+    /// `<media_name>`); `None` when no file exists to link — a source
     /// with no downloadable object, or content the naming layer produced no
     /// entry for.
     ///
@@ -304,6 +311,95 @@ pub struct Attachment {
     /// only the engine holds. The NDJSON renderer links by opaque identity
     /// instead and ignores this field.
     pub media_name: Option<String>,
+}
+
+impl Attachment {
+    /// Validates the cross-layer representation/fidelity/source-name contract.
+    ///
+    /// Renderers call this before emitting any bytes, so malformed input can
+    /// never turn a Telegram-processed variant into an original-file claim.
+    pub fn validate_contract(&self) -> Result<(), AttachmentContractError> {
+        validate_attachment_contract(
+            self.telegram_representation.tag(),
+            self.fidelity.tag(),
+            self.source_name.as_deref(),
+        )
+    }
+}
+
+pub(crate) fn attachment_contract_is_valid(messages: &[MessageHistory]) -> bool {
+    messages.iter().all(|message| {
+        message.revisions.iter().all(|revision| {
+            revision
+                .body
+                .attachments
+                .iter()
+                .all(|attachment| attachment.validate_contract().is_ok())
+        })
+    })
+}
+
+/// Telegram message representation carrying an attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelegramRepresentation {
+    /// A `messageDocument` whose bytes and source filename are original.
+    OriginalDocument,
+    /// Telegram's processed `messagePhoto` representation.
+    Photo,
+    /// Telegram's processed `messageVideo` representation.
+    Video,
+    /// Telegram's processed animation representation.
+    Animation,
+    /// Telegram's audio representation.
+    Audio,
+    /// Telegram's voice-note representation.
+    Voice,
+    /// Telegram's round video-note representation.
+    VideoNote,
+    /// Telegram's sticker representation.
+    Sticker,
+    /// A forward-compatible representation not known to this renderer.
+    Other {
+        /// Original vocabulary token.
+        representation: String,
+    },
+}
+
+impl TelegramRepresentation {
+    pub(crate) fn tag(&self) -> &'static str {
+        match self {
+            Self::OriginalDocument => "original_document",
+            Self::Photo => "message_photo",
+            Self::Video => "message_video",
+            Self::Animation => "message_animation",
+            Self::Audio => "message_audio",
+            Self::Voice => "message_voice",
+            Self::VideoNote => "message_video_note",
+            Self::Sticker => "message_sticker",
+            Self::Other { .. } => "other",
+        }
+    }
+}
+
+/// Truthful fidelity claim for attachment bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentFidelity {
+    /// Exact original document bytes.
+    Original,
+    /// Telegram-generated or metadata-stripped media variant.
+    TelegramVariant,
+    /// Metadata exists but bytes must not be claimed or materialized.
+    MetadataOnly,
+}
+
+impl AttachmentFidelity {
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::TelegramVariant => "telegram_variant",
+            Self::MetadataOnly => "metadata_only",
+        }
+    }
 }
 
 /// The media kind of an [`Attachment`].

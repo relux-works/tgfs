@@ -1,7 +1,7 @@
 # Synchronization and Filesystem Semantics
 
 Status: planning baseline
-Last updated: 2026-07-17
+Last updated: 2026-07-21
 
 ## Source contract
 
@@ -17,20 +17,29 @@ Default logical view:
 
 ```text
 Account/
-  Main/
+  Chats/
+    order.json
     Chat/
-      chat.json
-      messages.ndjson
-      2026/
-        07.md
-        media/
+      .chat.json
+      Active Stories/        # omitted when there are no active stories
+      2026-07/
+        Messages.md
+        Messages.ndjson
+        2026-07-21 09-08-07 sender-name.jpg
+        2026-07-21 10-00-00 Story 42.mp4
+  Stories/                 # Telegram storyListMain; not Main membership
+    order.json
+    Chat/
+      Active Stories/
+      2026-07/              # profile-pinned stories only
   Archive/
-  Telegram Folders/
+    order.json
+  Folders/
 ```
 
-- **SYNC-010 (V1):** The layout is virtual; duplicate appearances reference shared canonical records/blobs.
+- **SYNC-010 (V1):** The layout is virtual and date-first: `Stories` is a distinct top-level view driven by Telegram `storyListMain`, never synthesized Main membership. Its chat appearance is the same canonical chat and remains only while it has an active story or a profile-pinned story. Chats contain hidden `.chat.json`, `Active Stories` only while at least one policy-visible active story exists, and direct `YYYY-MM` folders; there is no year, `Media`, `Files`, or type-directory level. Each month contains bounded `Messages.md`, bounded lossless `Messages.ndjson`, attachments in one chronological namespace, and persistent profile-story appearances. Duplicate appearances reference shared canonical records/blobs.
 - **SYNC-011 (V1):** Numeric order prefixes are an optional presentation mode. Stable-name mode stores exact order in metadata/`order.json` and does not rename folders merely because the Telegram position changed.
-- **SYNC-012 (V1):** Collision suffixes are deterministic from stable identity, not discovery order.
+- **SYNC-012 (V1):** Attachment names begin with account-local `YYYY-MM-DD HH-mm-ss`, then the sender filename only for original document representations or a truthful generated kind name otherwise. Collision suffixes are deterministic from stable identity, not discovery order.
 - **SYNC-013 (V1):** Reserved names, separators, control characters, trailing dots/spaces, Unicode normalization, and path-length budgets are handled for the strictest supported target.
 
 ## Message synchronization
@@ -41,13 +50,13 @@ Account/
 - **SYNC-023 (V1):** Detected gaps trigger source-specific recovery before advancing the durable cursor.
 - **SYNC-024 (V1):** Message edits replace current rendered state and change affected generated-document versions.
 - **SYNC-025 (V1):** Deletions observed after synchronization remove or tombstone current records according to the selected product policy; source deletion and cache eviction remain distinct.
-- **SYNC-026 (V1):** Chat title/list/folder/order changes update appearances without changing canonical chat, attachment, or blob identity.
+- **SYNC-026 (V1):** Chat title/list/folder/order changes update appearances without changing canonical chat, attachment, story, or blob identity. A story is canonical by `(poster_chat_id, story_id)`; active and monthly profile placements are byte-free appearances, and active-to-month is one transition rather than a byte copy.
 
 ## Deterministic rendering
 
-- **SYNC-030 (V1):** NDJSON has an explicit schema version and deterministic field/record order.
-- **SYNC-031 (V1):** Markdown partitioning is bounded, deterministic, timezone-explicit, and reproducible from the same structured inputs and renderer version.
-- **SYNC-032 (V1):** Rendering uses stable attachment paths/links and handles missing/unavailable content explicitly.
+- **SYNC-030 (V1):** Monthly NDJSON has an explicit schema version and deterministic field/record order; the primary chat export is never an unbounded whole-chat file.
+- **SYNC-031 (V1):** Monthly Markdown/NDJSON partitioning is bounded, deterministic, and reproducible. Source timestamps remain absolute UTC; civil partitions and filenames use the separately persisted account display timezone.
+- **SYNC-032 (V1):** Rendering uses stable attachment paths/links and handles missing/unavailable content explicitly. Logical kind, Telegram representation, fidelity, source name, MIME type, exact size, and availability remain orthogonal facts; Telegram media variants never claim an original filename or metadata fidelity.
 - **SYNC-033 (V1):** Atomic publication prevents readers from observing a partially regenerated document.
 - **SYNC-034 (V1):** Renderer fixtures cover Unicode, entities, replies, albums, topics, edits, reactions, service messages, missing senders, and deleted/unavailable media.
 
@@ -80,5 +89,5 @@ Account/
 
 - **SYNC-070 (V1):** Startup recovery reconciles durable transfers, item versions, provider registrations, and missing/extra cache files.
 - **SYNC-071 (V1):** A user-triggered repair rebuilds projections from structured state without changing Telegram data.
-- **SYNC-072 (V1):** Database migration and renderer migration are resumable and crash-safe.
-- **SYNC-073 (V1):** Clock changes do not reorder identity or corrupt cursors; source timestamps remain explicit.
+- **SYNC-072 (V1):** Database migration and renderer migration are forward-only and crash-safe; schema-v3 legacy year/media rows rebuild atomically into the date-first projection without a mixed live layout.
+- **SYNC-073 (V1):** Clock changes do not reorder identity or corrupt cursors; source timestamps remain absolute and the account display timezone is separate persisted presentation policy.

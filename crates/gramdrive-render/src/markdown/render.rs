@@ -78,13 +78,12 @@ pub(super) fn write_document<W: fmt::Write>(
     subtitle(&mut buf, input);
     blocks.emit(&buf)?;
 
-    let offset = input.timezone.seconds();
     let mut current_day: Option<String> = None;
     for message in input.messages {
         if !message_is_rendered(input.retention_mode, message) {
             continue;
         }
-        let day = Civil::from_millis(message.sent_at_ms, offset).date();
+        let day = Civil::in_timezone(message.sent_at_ms, input.timezone.timezone()).date();
         if current_day.as_deref() != Some(day.as_str()) {
             buf.clear();
             buf.push_str("## ");
@@ -144,7 +143,7 @@ fn front_matter(buf: &mut String, input: &MarkdownInput<'_>) {
     fm(buf, "chat_id", &input.chat.chat_id.0.to_string());
     fm(buf, "partition", &partition_label(input.partition));
     fm(buf, "retention_mode", input.retention_mode.tag());
-    fm(buf, "timezone", &input.timezone.label());
+    fm(buf, "timezone", input.timezone.label());
     fm(
         buf,
         "input_watermark_seq",
@@ -152,8 +151,18 @@ fn front_matter(buf: &mut String, input: &MarkdownInput<'_>) {
     );
     fm(
         buf,
+        "render_generation",
+        &input.render_generation.to_string(),
+    );
+    fm(
+        buf,
         "content_version",
-        &content_version_token(input.input_watermark_seq),
+        &content_version_token(
+            input.input_watermark_seq,
+            input.render_generation,
+            input.retention_mode,
+            input.timezone.label(),
+        ),
     );
     buf.push_str("---");
 }
@@ -182,7 +191,7 @@ fn subtitle(buf: &mut String, input: &MarkdownInput<'_>) {
     buf.push('_');
     buf.push_str(&partition_phrase(input.partition));
     buf.push_str(" · times in ");
-    buf.push_str(&input.timezone.label());
+    buf.push_str(input.timezone.label());
     buf.push_str(" · retention: ");
     buf.push_str(input.retention_mode.tag());
     buf.push_str("._");
@@ -215,7 +224,6 @@ fn render_message<W: fmt::Write>(
     input: &MarkdownInput<'_>,
     message: &MessageHistory,
 ) -> fmt::Result {
-    let offset = input.timezone.seconds();
     let audit = matches!(input.retention_mode, RetentionMode::Audit);
 
     // Total, input-order-independent ordering over revisions: event_seq is
@@ -229,6 +237,24 @@ fn render_message<W: fmt::Write>(
 
     header_line(buf, input, message, display);
     blocks.emit(buf)?;
+
+    if display.body.protected {
+        blocks.emit(
+            "_Protected content: Telegram forbids saving; content is not retained (POL\\-4)._",
+        )?;
+        if audit && let Some(deletion) = message.deletion {
+            buf.clear();
+            buf.push_str("_Deleted ");
+            buf.push_str(&stamp(
+                deletion.observed_at_ms,
+                message.sent_at_ms,
+                input.timezone,
+            ));
+            buf.push_str("._");
+            blocks.emit(buf)?;
+        }
+        return Ok(());
+    }
 
     if relationship_line(buf, &display.body) {
         blocks.emit(buf)?;
@@ -248,12 +274,6 @@ fn render_message<W: fmt::Write>(
         blocks.emit(buf)?;
     }
 
-    if display.body.protected {
-        blocks.emit(
-            "_Protected content: Telegram forbids saving; media is not fetched (POL\\-4)._",
-        )?;
-    }
-
     if !display.body.attachments.is_empty() {
         attachments_block(buf, &display.body.attachments);
         blocks.emit(buf)?;
@@ -268,13 +288,17 @@ fn render_message<W: fmt::Write>(
         if let Some(deletion) = message.deletion {
             buf.clear();
             buf.push_str("_Deleted ");
-            buf.push_str(&stamp(deletion.observed_at_ms, message.sent_at_ms, offset));
+            buf.push_str(&stamp(
+                deletion.observed_at_ms,
+                message.sent_at_ms,
+                input.timezone,
+            ));
             buf.push_str("._");
             blocks.emit(buf)?;
         }
         if order.len() > 1 {
             blocks.emit("_Earlier revisions:_")?;
-            earlier_revisions(buf, message, &order, offset);
+            earlier_revisions(buf, message, &order, input.timezone);
             blocks.emit(buf)?;
         }
     }
@@ -290,10 +314,9 @@ fn header_line(
     message: &MessageHistory,
     display: &Revision,
 ) {
-    let offset = input.timezone.seconds();
     buf.clear();
     buf.push_str("**");
-    buf.push_str(&Civil::from_millis(message.sent_at_ms, offset).time());
+    buf.push_str(&Civil::in_timezone(message.sent_at_ms, input.timezone.timezone()).time());
     buf.push_str(" · ");
     buf.push_str(&sender_label(message.sender));
     buf.push_str(" · #");
@@ -301,7 +324,7 @@ fn header_line(
     buf.push_str("**");
     if let Some(edited_ms) = display.edited_at_ms {
         buf.push_str(" · edited ");
-        buf.push_str(&stamp(edited_ms, message.sent_at_ms, offset));
+        buf.push_str(&stamp(edited_ms, message.sent_at_ms, input.timezone));
     }
     // A deletion is only rendered in Audit mode (Mirror purges the message).
     if matches!(input.retention_mode, RetentionMode::Audit) && message.deletion.is_some() {
@@ -349,7 +372,7 @@ fn relationship_line(buf: &mut String, body: &MessageBody) -> bool {
 }
 
 /// Builds the attachments list into `buf`. One tight-list item per attachment,
-/// in index order: media kind, a link into `media/` when a file exists, the
+/// in index order: media kind, a direct sibling link when a file exists, the
 /// size, and an explicit availability note for anything not downloaded (POL-4,
 /// SYNC-032).
 fn attachments_block(buf: &mut String, attachments: &[Attachment]) {
@@ -363,7 +386,7 @@ fn attachments_block(buf: &mut String, attachments: &[Attachment]) {
         buf.push_str("- **");
         buf.push_str(&media_kind_label(&attachment.media_kind));
         buf.push_str("** — ");
-        let link_text = match nonempty(attachment.name.as_deref()) {
+        let link_text = match nonempty(attachment.source_name.as_deref()) {
             Some(name) => text_escaped(name),
             None => "(unnamed)".to_owned(),
         };
@@ -371,13 +394,13 @@ fn attachments_block(buf: &mut String, attachments: &[Attachment]) {
             Some(media_name) => {
                 buf.push('[');
                 buf.push_str(&link_text);
-                buf.push_str("](media/");
+                buf.push_str("](");
                 text::percent_encode_component(media_name, buf);
                 buf.push(')');
             }
             None => buf.push_str(&link_text),
         }
-        if let Some(size) = attachment.size {
+        if let Some(size) = attachment.exact_size {
             buf.push_str(&format!(" ({size} bytes)"));
         }
         buf.push_str(availability_note(
@@ -434,7 +457,12 @@ fn reactions_block(buf: &mut String, reactions: &[Reaction]) {
 
 /// Builds the Audit-mode earlier-revisions list into `buf`: every revision but
 /// the current one, in event_seq order, each flattened to a single line.
-fn earlier_revisions(buf: &mut String, message: &MessageHistory, order: &[usize], offset: i32) {
+fn earlier_revisions(
+    buf: &mut String,
+    message: &MessageHistory,
+    order: &[usize],
+    timezone: &crate::markdown::DisplayTimeZone,
+) {
     buf.clear();
     let prior = &order[..order.len() - 1];
     let mut first = true;
@@ -446,7 +474,7 @@ fn earlier_revisions(buf: &mut String, message: &MessageHistory, order: &[usize]
         let revision = &message.revisions[index];
         let when = revision.edited_at_ms.unwrap_or(message.sent_at_ms);
         buf.push_str("- ");
-        buf.push_str(&stamp(when, message.sent_at_ms, offset));
+        buf.push_str(&stamp(when, message.sent_at_ms, timezone));
         buf.push_str(": ");
         match nonempty(revision.body.text.as_deref()) {
             Some(body_text) => buf.push_str(&text::escape_flattened(body_text)),
@@ -458,9 +486,13 @@ fn earlier_revisions(buf: &mut String, message: &MessageHistory, order: &[usize]
 /// A localized timestamp: the time alone when it falls on the message's own
 /// civil day, otherwise the full date and time — enough to disambiguate an edit
 /// or deletion that landed on a later day, without repeating the date needlessly.
-fn stamp(instant_ms: i64, message_sent_ms: i64, offset: i32) -> String {
-    let civil = Civil::from_millis(instant_ms, offset);
-    let base = Civil::from_millis(message_sent_ms, offset);
+fn stamp(
+    instant_ms: i64,
+    message_sent_ms: i64,
+    timezone: &crate::markdown::DisplayTimeZone,
+) -> String {
+    let civil = Civil::in_timezone(instant_ms, timezone.timezone());
+    let base = Civil::in_timezone(message_sent_ms, timezone.timezone());
     if (civil.year, civil.month, civil.day) == (base.year, base.month, base.day) {
         civil.time()
     } else {

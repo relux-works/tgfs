@@ -48,16 +48,20 @@ The `identity` module owns the typed keys and their opaque serialization —
 TASK-260715-1qz1g5. The model:
 
 - **Canonical keys** (`CanonicalKey`) name source-derived records: account,
-  chat list (Main/Archive/folder), the folder catalog, chat, chat-export
-  year and media directories, message, attachment, generated document
-  (NDJSON/Markdown/JSON), the per-list ordering document (`order.json`), and
-  content-addressed blob. Telegram-derived keys
+  chat list (Main/Archive/folder), the folder catalog, chat, direct month and
+  Active Stories directories, canonical story, message, attachment, generated
+  document (NDJSON/Markdown/JSON), the per-list ordering document
+  (`order.json`), and content-addressed blob. Legacy year/media keys remain
+  parseable only for forward migration. Telegram-derived keys
   are scoped by `AccountScope` = account + `NamespaceVersion` (the epoch that
   retires an account's whole derived namespace at once, DOM-021).
 - **Appearance keys** (`AppearanceKey`) name one *virtual appearance* of a
   canonical item through a chat-list view. One chat in Main, Archive, and a
   folder is three appearances over one canonical key (DOM-002, DOM-022,
   PRD-013). Appearances cannot nest.
+- **Story appearance keys** name byte-free active or monthly placements of
+  one canonical `(poster_chat_id, story_id)` in a chat-list view. They cannot
+  collide with or replace the canonical story key.
 - **`ItemId`** is the opaque, versioned serialization of exactly one key —
   the single namespace every provider resolves through (DOM-024): text form
   for Apple item identifiers and Android document IDs, binary form for
@@ -84,10 +88,12 @@ list kind), chat `0x03` (scope, chat id: i64), message `0x04` (chat fields,
 message id: i64), attachment `0x05` (message fields, index: u32), generated
 document `0x06` (chat fields, partition, format, schema family: u16), blob
 `0x07` (account id: i64, hash), folder catalog `0x08` (scope), year
-directory `0x09` (chat fields, year: u16), media directory `0x0a` (chat
-fields, year: u16), order document `0x0b` (scope, list kind, schema family:
-u16), appearance `0x10` (list kind, then the wrapped canonical key's tag and
-fields). Scope = account id (i64) + namespace
+directory `0x09` (legacy), media directory `0x0a` (legacy), order document
+`0x0b` (scope, list kind, schema family: u16), direct month directory `0x0c`
+(chat fields, year: u16, month: u8), Active Stories `0x0d` (chat fields),
+canonical story `0x0e` (chat fields, story id: i64), appearance `0x10` (list
+kind, then the wrapped canonical key's tag and fields), and story appearance
+`0x11` (view, canonical story, active/month placement). Scope = account id (i64) + namespace
 version (u32). List kind: Main `0x01`, Archive `0x02`, Folder `0x03` +
 folder id (i32). Partition: chat `0x01`, year `0x02` + u16, month `0x03` +
 u16 + u8. Format: NDJSON `0x01`, Markdown `0x02`, JSON `0x03`. Hash:
@@ -181,18 +187,20 @@ normalized source records into the default layout of
 
 ```text
 Account/                      canonical account key
-  Main/                       canonical chat-list key
+  Chats/                      canonical main chat-list key
     order.json                canonical order-document key (POL-1)
     Chat/                     appearance (view × canonical chat)
-      chat.json               appearance over generated doc (JSON, whole chat)
-      messages.ndjson         appearance over generated doc (NDJSON, whole chat)
-      2026/                   appearance over year-directory key
-        07.md                 appearance over generated doc (Markdown, month)
-        media/                appearance over media-directory key
-          <attachment files>  appearances over attachment keys
+      .chat.json              appearance over generated doc (JSON, whole chat)
+      Active Stories/         only with visible active story appearances
+        <active stories>      byte-free appearances over canonical stories
+      2026-07/                appearance over direct month-directory key
+        Messages.md           appearance over generated doc (Markdown, month)
+        Messages.ndjson       appearance over generated doc (NDJSON, month)
+        <attachment files>    appearances over attachment keys
+        <profile stories>     persistent appearances over canonical stories
   Archive/
     order.json
-  Telegram Folders/           canonical folder-catalog key
+  Folders/                    canonical folder-catalog key
     <one dir per folder>      canonical chat-list keys (folder kind, each
                               with its own order.json)
 ```
@@ -212,7 +220,7 @@ The model:
   with no duplicates or gaps, and a boundary from another snapshot fails
   loudly rather than skipping children.
 - **Determinism.** Sibling order derives from stable identity (fixed
-  roots, folder IDs, chat IDs, years, months, message/attachment
+  roots, folder IDs, chat IDs, months, message/attachment/story
   ordinals), never input order — the property suite
   (`tests/tree_properties.rs`) shuffles every input collection and
   requires identical output; `tests/tree_fixture.rs` pins the spec's
@@ -237,7 +245,7 @@ mode) and `resolve_siblings` makes a sibling set collision-free.
 - **One name for the strictest target.** Not one name per platform: the
   same archive is read through the macOS, Windows, Android and Linux
   adapters, and a per-platform name would make one chat a different path
-  per device and break `chat.json` links (SYNC-032). The policy is the
+  per device and break `.chat.json` links (SYNC-032). The policy is the
   union of all four platforms' rules; `Platform::check` models each
   platform faithfully so the corpus can assert one output satisfies all
   of them (PLAT-021).

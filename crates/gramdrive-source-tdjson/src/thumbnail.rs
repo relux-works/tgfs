@@ -30,11 +30,10 @@
 //!   the message, so it costs no network at all.
 //!
 //! The machine prefers the downloadable preview (the checklist's "via TDLib
-//! thumbnail files"), uses the inline blur as a zero-network fallback when
-//! there is no usable downloadable preview, and — because the inline blur is
-//! already tiny — serves it directly when the requested box is small enough
-//! that it already fills it, sparing the round trip (POL-2: eager, small,
-//! bounded).
+//! thumbnail files"), then uses an inline blur as a zero-network fallback.
+//! Both candidates need known non-zero dimensions inside the requested box;
+//! larger or dimensionless candidates answer no thumbnail because this source
+//! does not resize encoded bytes (POL-2: eager, small, bounded).
 //!
 //! # POL-4 is the first gate
 //!
@@ -48,15 +47,16 @@
 //!
 //! # Bounded (AC: "bounded … never force full media download unintentionally")
 //!
-//! Preview downloads are whole-file synchronous downloads of a small file,
-//! but the catalog is the one that maps an item to a *preview* `file_id`, and
-//! a bug there must not turn a thumbnail request into a multi-gigabyte media
-//! download. So [`ThumbnailConfig::max_preview_bytes`] caps it twice: a
-//! preview whose size the catalog already knows to exceed the cap is skipped
-//! before any request (the inline blur, or `None`, answers instead), and a
-//! download whose *response* reports a size past the cap is refused rather
-//! than read. The cap is defense in depth, set well above any real preview;
-//! in normal operation it never trips.
+//! Preview downloads are synchronous but byte-bounded: the request asks for
+//! at most `max_preview_bytes + 1`, where the extra byte distinguishes an
+//! exactly-at-cap preview from an oversized or mis-projected media file.
+//! TDLib automatically cancels a bounded `downloadFile` after that limit, so
+//! a bug mapping an item to the full-media `file_id` cannot hydrate the whole
+//! object before the response is checked. A preview whose catalog size is
+//! already over the cap is skipped without a request; an unknown-size target
+//! that reaches the sentinel byte is refused without being read. The cap is
+//! defense in depth, set well above any real preview; in normal operation it
+//! never trips.
 //!
 //! # Shape: a sans-IO machine and a thin driver
 //!
@@ -118,6 +118,8 @@ use crate::runtime::TdClient;
 /// TDLib caps preview dimensions small — so it only ever trips on a
 /// mis-projected `file_id`, which is exactly what it exists to catch.
 const DEFAULT_MAX_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+/// Largest integer TDLib's JSON API accepts exactly for an `int53` field.
+const TDLIB_INT53_MAX: u64 = (1_u64 << 53) - 1;
 
 // ---------------------------------------------------------------------------
 // The catalog seam
@@ -137,8 +139,8 @@ pub struct ThumbnailTarget {
     /// attachment carries no downloadable preview.
     pub downloadable: Option<ThumbnailDescriptor>,
     /// The inline blurred preview delivered with the message — a zero-network
-    /// fallback (and, for a small enough request, the whole answer). `None`
-    /// when the message carried no minithumbnail.
+    /// fallback when its declared dimensions fit the request. `None` when the
+    /// message carried no minithumbnail.
     pub inline: Option<Minithumbnail>,
 }
 
@@ -282,6 +284,14 @@ impl ThumbnailMachine {
             outstanding: false,
             failed: None,
         };
+        if cap >= TDLIB_INT53_MAX {
+            machine.failed = Some(SourceError::Internal {
+                detail: format!(
+                    "the thumbnail byte bound {cap} cannot be represented as a bounded TDLib int53 request"
+                ),
+            });
+            return machine;
+        }
         match plan(entry, spec, cap) {
             Ok(phase) => machine.phase = phase,
             Err(error) => machine.failed = Some(error),
@@ -328,11 +338,10 @@ impl ThumbnailMachine {
                         "file_id": preview.file_id,
                         "priority": self.priority.get(),
                         "offset": 0,
-                        // A whole-file synchronous download: `limit` 0 is
-                        // TDLib's "to the end of the file". The file is a
-                        // preview, small by construction and capped
-                        // (module docs).
-                        "limit": 0,
+                        // TDLib automatically cancels after this many bytes.
+                        // The sentinel byte proves overflow for a target whose
+                        // size was unknown when the request was planned.
+                        "limit": self.cap + 1,
                         "synchronous": true,
                     }),
                 })
@@ -486,30 +495,32 @@ impl ThumbnailMachine {
             .get("downloaded_prefix_size")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        if size > self.cap || (offset == 0 && prefix > self.cap) {
+            // The request itself stopped at cap + 1, so this rejection happens
+            // before an unknown-size or mis-projected full-media file can be
+            // hydrated in full.
+            return Err(SourceError::Internal {
+                detail: format!(
+                    "the preview exceeds the {}-byte bound (reported size {size}, \
+                     downloaded prefix {prefix}); refusing to read",
+                    self.cap,
+                ),
+            });
+        }
         // The whole file must be local: the completion flag, or a prefix from
-        // the start that reaches the known extent.
+        // the start that reaches the known extent. A bounded oversized
+        // response was rejected above before this coverage check.
         let covered = completed || (size > 0 && offset == 0 && prefix >= size);
         if !covered {
             return Err(SourceError::Unavailable {
                 detail: format!(
-                    "synchronous preview download resolved without the whole file: \
+                    "bounded preview download resolved without the whole file: \
                      size {size}, offset {offset}, prefix {prefix}, completed {completed}"
                 ),
             });
         }
         if size == 0 {
             return Ok(None);
-        }
-        if size > self.cap {
-            // Bounded: a preview past the cap is a mis-projected file id, not
-            // a thumbnail. Refuse rather than read a full-media file.
-            return Err(SourceError::Internal {
-                detail: format!(
-                    "the preview file is {size} bytes, past the {}-byte bound; \
-                     refusing to read (a thumbnail must never hydrate full media)",
-                    self.cap
-                ),
-            });
         }
         match local.get("path").and_then(Value::as_str) {
             Some(path) if !path.is_empty() => {
@@ -542,6 +553,9 @@ fn plan(
     // POL-4: a restricted or view-once attachment is refused as a thumbnail
     // exactly as it is refused as content, and costs zero requests.
     if target.availability != AttachmentAvailability::Fetchable {
+        if target.availability == AttachmentAvailability::Unavailable {
+            return Ok(Phase::Answer(None));
+        }
         return Err(SourceError::Restricted {
             detail: match target.availability {
                 AttachmentAvailability::Restricted => {
@@ -550,50 +564,60 @@ fn plan(
                 AttachmentAvailability::ViewOnce => {
                     "the attachment is view-once (POL-4); its preview is never persisted"
                 }
+                AttachmentAvailability::Unavailable => "unreachable",
                 AttachmentAvailability::Fetchable => "unreachable",
             }
             .to_owned(),
         });
     }
-    let inline = target.inline.as_ref();
-    let inline_thumbnail = inline.and_then(decode_minithumbnail);
     let downloadable = target
         .downloadable
         .as_ref()
-        .and_then(|descriptor| usable_preview(descriptor, cap));
-    // The inline blur already fills the requested box: serve it and skip the
-    // network entirely (POL-2: eager, small, bounded).
-    if let (Some(minithumbnail), Some(thumbnail)) = (inline, &inline_thumbnail)
-        && inline_covers(spec, minithumbnail)
-    {
-        return Ok(Phase::Answer(Some(thumbnail.clone())));
-    }
-    // Otherwise prefer the real downloadable preview; fall back to the inline
-    // blur; then to "no thumbnail".
+        .and_then(|descriptor| usable_preview(descriptor, spec, cap));
+    // Prefer the real downloadable preview when its declared dimensions fit
+    // the requested box; fall back to an equally bounded inline blur, then to
+    // "no thumbnail". Larger and dimensionless candidates are deliberately
+    // not downloaded: this source cannot resize encoded media, and its
+    // contract promises that every returned thumbnail fits `ThumbnailSpec`.
     if let Some(preview) = downloadable {
         return Ok(Phase::Download(preview));
     }
+    let inline_thumbnail = target
+        .inline
+        .as_ref()
+        .filter(|minithumbnail| preview_fits(minithumbnail.width, minithumbnail.height, spec))
+        .and_then(|minithumbnail| decode_minithumbnail(minithumbnail, cap));
     Ok(Phase::Answer(inline_thumbnail))
 }
 
-/// Whether the inline blur's own dimensions already cover the requested box,
-/// so no larger preview is worth a round trip. Unknown dimensions never
-/// cover — a preview of unknown size is not assumed large enough.
-fn inline_covers(spec: ThumbnailSpec, minithumbnail: &Minithumbnail) -> bool {
-    match (minithumbnail.width, minithumbnail.height) {
-        (Some(width), Some(height)) => {
-            width >= spec.max_width_px.get() && height >= spec.max_height_px.get()
-        }
-        _ => false,
-    }
+/// Whether declared preview dimensions are non-zero and within the requested
+/// box. Unknown dimensions fail closed: the actual encoded image is validated
+/// again by the platform boundary, but an unbounded candidate is not worth a
+/// network request in the first place.
+fn preview_fits(width: Option<u32>, height: Option<u32>, spec: ThumbnailSpec) -> bool {
+    matches!(
+        (width, height),
+        (Some(width), Some(height))
+            if width > 0
+                && height > 0
+                && width <= spec.max_width_px.get()
+                && height <= spec.max_height_px.get()
+    )
 }
 
 /// A downloadable preview reduced to what the machine needs, or `None` when
 /// it is not worth downloading: an undecodable format (no MIME to label the
 /// bytes), an empty preview, or one whose known size already exceeds the cap.
 /// A `None` here falls back to the inline blur, not to an error.
-fn usable_preview(descriptor: &ThumbnailDescriptor, cap: u64) -> Option<Preview> {
+fn usable_preview(
+    descriptor: &ThumbnailDescriptor,
+    spec: ThumbnailSpec,
+    cap: u64,
+) -> Option<Preview> {
     let mime = mime_for(&descriptor.format)?;
+    if !preview_fits(descriptor.width, descriptor.height, spec) {
+        return None;
+    }
     if let Some(size) = descriptor.size
         && (size == 0 || size > cap)
     {
@@ -605,18 +629,18 @@ fn usable_preview(descriptor: &ThumbnailDescriptor, cap: u64) -> Option<Preview>
     })
 }
 
-/// The MIME a preview format's bytes carry, or `None` for a format this build
-/// cannot label (an undecodable preview is not served — the normalizer's
-/// [`ThumbnailFormat::Unknown`] leaves the choice here).
+/// The MIME for a preview format File Provider can publish through Image I/O.
+/// Animated/video sticker payloads are not image thumbnails and must be
+/// converted by a future source adapter before they become eligible; returning
+/// `None` here prevents downloading and staging bytes the current pipeline can
+/// never serve.
 fn mime_for(format: &ThumbnailFormat) -> Option<&'static str> {
     Some(match format {
         ThumbnailFormat::Jpeg => "image/jpeg",
         ThumbnailFormat::Png => "image/png",
         ThumbnailFormat::Webp => "image/webp",
         ThumbnailFormat::Gif => "image/gif",
-        ThumbnailFormat::Mpeg4 => "video/mp4",
-        ThumbnailFormat::Webm => "video/webm",
-        ThumbnailFormat::Tgs => "application/x-tgsticker",
+        ThumbnailFormat::Mpeg4 | ThumbnailFormat::Webm | ThumbnailFormat::Tgs => return None,
         ThumbnailFormat::Unknown { .. } => return None,
     })
 }
@@ -625,16 +649,17 @@ fn mime_for(format: &ThumbnailFormat) -> Option<&'static str> {
 /// minithumbnails are JPEG, encoded base64 as tdjson delivers bytes; an
 /// undecodable or empty payload degrades to `None` rather than a broken
 /// preview.
-fn decode_minithumbnail(minithumbnail: &Minithumbnail) -> Option<Thumbnail> {
-    let bytes = decode_base64(&minithumbnail.data_base64)?;
+fn decode_minithumbnail(minithumbnail: &Minithumbnail, cap: u64) -> Option<Thumbnail> {
+    let bytes = decode_base64_bounded(&minithumbnail.data_base64, cap)?;
     Thumbnail::new("image/jpeg", bytes).ok()
 }
 
 /// Decode standard (RFC 4648) base64, tolerating both padded and unpadded
-/// input. `None` on any invalid character or an impossible length. Kept
-/// in-crate so serving the inline blur pulls in no base64 dependency
-/// (module docs).
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
+/// input, under the same byte cap as downloadable previews. The encoded-length
+/// and exact decoded-length checks happen before allocating the output, so a
+/// malicious persisted minithumbnail cannot turn the fallback into an
+/// unbounded agent allocation. `None` on overflow or malformed input.
+fn decode_base64_bounded(input: &str, cap: u64) -> Option<Vec<u8>> {
     fn sextet(byte: u8) -> Option<u8> {
         Some(match byte {
             b'A'..=b'Z' => byte - b'A',
@@ -645,20 +670,41 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
             _ => return None,
         })
     }
-    let mut values = Vec::with_capacity(input.len());
-    for &byte in input.as_bytes() {
-        // Padding: valid only as a trailing run, so stop here — the length of
-        // what precedes it fixes the byte count.
-        if byte == b'=' {
-            break;
-        }
-        values.push(sextet(byte)?);
-    }
-    // A single trailing sextet cannot exist: base64 emits 2, 3, or 4.
-    if values.len() % 4 == 1 {
+    let maximum_encoded_len = (u128::from(cap).saturating_add(2) / 3).saturating_mul(4);
+    if input.len() as u128 > maximum_encoded_len {
         return None;
     }
-    let mut out = Vec::with_capacity(values.len() / 4 * 3 + 2);
+
+    let bytes = input.as_bytes();
+    let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 || bytes[..bytes.len().saturating_sub(padding)].contains(&b'=') {
+        return None;
+    }
+    let value_bytes = &bytes[..bytes.len().saturating_sub(padding)];
+    let remainder = value_bytes.len() % 4;
+    if remainder == 1
+        || (padding > 0 && !bytes.len().is_multiple_of(4))
+        || (padding == 1 && remainder != 3)
+        || (padding == 2 && remainder != 2)
+    {
+        return None;
+    }
+    let decoded_len = value_bytes.len() / 4 * 3
+        + match remainder {
+            0 => 0,
+            2 => 1,
+            3 => 2,
+            _ => return None,
+        };
+    if decoded_len as u128 > u128::from(cap) {
+        return None;
+    }
+
+    let mut values = Vec::with_capacity(value_bytes.len());
+    for &byte in value_bytes {
+        values.push(sextet(byte)?);
+    }
+    let mut out = Vec::with_capacity(decoded_len);
     let mut quads = values.chunks_exact(4);
     for quad in &mut quads {
         out.push((quad[0] << 2) | (quad[1] >> 4));
@@ -668,15 +714,23 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
     let tail = quads.remainder();
     match tail.len() {
         0 => {}
-        2 => out.push((tail[0] << 2) | (tail[1] >> 4)),
+        2 => {
+            if tail[1] & 0x0f != 0 {
+                return None;
+            }
+            out.push((tail[0] << 2) | (tail[1] >> 4));
+        }
         3 => {
+            if tail[2] & 0x03 != 0 {
+                return None;
+            }
             out.push((tail[0] << 2) | (tail[1] >> 4));
             out.push((tail[1] << 4) | (tail[2] >> 2));
         }
         // Unreachable: the `% 4 == 1` guard rejected a 1-sextet tail.
         _ => return None,
     }
-    Some(out)
+    (out.len() == decoded_len).then_some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -802,8 +856,8 @@ mod tests {
             remote_id: Some("r".to_owned()),
             remote_unique_id: Some("u".to_owned()),
             size,
-            width: Some(320),
-            height: Some(240),
+            width: Some(160),
+            height: Some(120),
         }
     }
 
@@ -847,42 +901,102 @@ mod tests {
     #[test]
     fn base64_round_trips_known_vectors() {
         // RFC 4648 test vectors, padded and unpadded.
-        assert_eq!(decode_base64("").as_deref(), Some(&b""[..]));
-        assert_eq!(decode_base64("Zg==").as_deref(), Some(&b"f"[..]));
-        assert_eq!(decode_base64("Zm8=").as_deref(), Some(&b"fo"[..]));
-        assert_eq!(decode_base64("Zm9v").as_deref(), Some(&b"foo"[..]));
-        assert_eq!(decode_base64("aGVsbG8=").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(decode_base64_bounded("", 1024).as_deref(), Some(&b""[..]));
+        assert_eq!(
+            decode_base64_bounded("Zg==", 1024).as_deref(),
+            Some(&b"f"[..])
+        );
+        assert_eq!(
+            decode_base64_bounded("Zm8=", 1024).as_deref(),
+            Some(&b"fo"[..])
+        );
+        assert_eq!(
+            decode_base64_bounded("Zm9v", 1024).as_deref(),
+            Some(&b"foo"[..])
+        );
+        assert_eq!(
+            decode_base64_bounded("aGVsbG8=", 1024).as_deref(),
+            Some(&b"hello"[..])
+        );
         // Unpadded forms decode identically.
-        assert_eq!(decode_base64("Zg").as_deref(), Some(&b"f"[..]));
-        assert_eq!(decode_base64("aGVsbG8").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(
+            decode_base64_bounded("Zg", 1024).as_deref(),
+            Some(&b"f"[..])
+        );
+        assert_eq!(
+            decode_base64_bounded("aGVsbG8", 1024).as_deref(),
+            Some(&b"hello"[..])
+        );
         // Every byte value survives the alphabet's edges (+ and /).
-        assert_eq!(decode_base64("+/8=").as_deref(), Some(&[0xfb, 0xff][..]));
+        assert_eq!(
+            decode_base64_bounded("+/8=", 1024).as_deref(),
+            Some(&[0xfb, 0xff][..])
+        );
     }
 
     #[test]
     fn base64_rejects_invalid_input() {
         // A stray non-alphabet character.
-        assert_eq!(decode_base64("Zm8*"), None);
+        assert_eq!(decode_base64_bounded("Zm8*", 1024), None);
         // A 1-sextet tail is impossible base64.
-        assert_eq!(decode_base64("Zm8vZ"), None);
+        assert_eq!(decode_base64_bounded("Zm8vZ", 1024), None);
         // A space is not in the alphabet (no whitespace tolerance).
-        assert_eq!(decode_base64("Zm 8"), None);
+        assert_eq!(decode_base64_bounded("Zm 8", 1024), None);
+        // Padding is terminal, exact, and canonical.
+        assert_eq!(decode_base64_bounded("Zg=garbage", 1024), None);
+        assert_eq!(decode_base64_bounded("Zg===", 1024), None);
+        assert_eq!(decode_base64_bounded("Zh==", 1024), None);
+    }
+
+    #[test]
+    fn base64_enforces_the_preview_cap_before_allocating_output() {
+        // 341 whole zero triples plus one/two trailing zero bytes.
+        let exact = format!("{}AA==", "AAAA".repeat(341));
+        let cap_plus_one = format!("{}AAA=", "AAAA".repeat(341));
+        assert_eq!(
+            decode_base64_bounded(&exact, 1024).map(|bytes| bytes.len()),
+            Some(1024)
+        );
+        assert_eq!(decode_base64_bounded(&cap_plus_one, 1024), None);
+        assert_eq!(
+            decode_base64_bounded(&"AAAA".repeat(343), 1024),
+            None,
+            "encoded input beyond the maximum representation is rejected up front"
+        );
+    }
+
+    #[test]
+    fn inline_minithumbnail_cap_and_malformed_payloads_never_become_answers() {
+        let exact = format!("{}AA==", "AAAA".repeat(341));
+        let cap_plus_one = format!("{}AAA=", "AAAA".repeat(341));
+        let exact_target = fetchable(None, Some(minithumbnail(40, 30, &exact)));
+        let mut exact_machine = ThumbnailMachine::new(Some(exact_target), spec(256), &config());
+        match exact_machine.next_step() {
+            Ok(ThumbnailStep::Answer(Some(thumbnail))) => {
+                assert_eq!(thumbnail.bytes().len(), 1024);
+            }
+            other => panic!("the at-cap inline preview should be served, got {other:?}"),
+        }
+
+        for payload in [cap_plus_one.as_str(), "Zg=garbage"] {
+            let target = fetchable(None, Some(minithumbnail(40, 30, payload)));
+            let mut machine = ThumbnailMachine::new(Some(target), spec(256), &config());
+            assert_eq!(machine.next_step(), Ok(ThumbnailStep::Answer(None)));
+            assert_eq!(machine.file_id(), None);
+        }
     }
 
     // -- MIME mapping -------------------------------------------------------
 
     #[test]
-    fn every_known_format_maps_to_a_mime_and_unknown_does_not() {
+    fn only_image_io_formats_map_to_a_mime() {
         assert_eq!(mime_for(&ThumbnailFormat::Jpeg), Some("image/jpeg"));
         assert_eq!(mime_for(&ThumbnailFormat::Png), Some("image/png"));
         assert_eq!(mime_for(&ThumbnailFormat::Webp), Some("image/webp"));
         assert_eq!(mime_for(&ThumbnailFormat::Gif), Some("image/gif"));
-        assert_eq!(mime_for(&ThumbnailFormat::Mpeg4), Some("video/mp4"));
-        assert_eq!(mime_for(&ThumbnailFormat::Webm), Some("video/webm"));
-        assert_eq!(
-            mime_for(&ThumbnailFormat::Tgs),
-            Some("application/x-tgsticker")
-        );
+        assert_eq!(mime_for(&ThumbnailFormat::Mpeg4), None);
+        assert_eq!(mime_for(&ThumbnailFormat::Webm), None);
+        assert_eq!(mime_for(&ThumbnailFormat::Tgs), None);
         assert_eq!(
             mime_for(&ThumbnailFormat::Unknown { raw_type: None }),
             None,
@@ -934,7 +1048,7 @@ mod tests {
                 "file_id": FILE_ID,
                 "priority": 5,
                 "offset": 0,
-                "limit": 0,
+                "limit": 1025,
                 "synchronous": true,
             })
         );
@@ -961,6 +1075,34 @@ mod tests {
     }
 
     #[test]
+    fn non_image_formats_are_no_thumbnail_without_a_download() {
+        for format in [
+            ThumbnailFormat::Mpeg4,
+            ThumbnailFormat::Webm,
+            ThumbnailFormat::Tgs,
+        ] {
+            let target = fetchable(Some(descriptor(format, Some(64))), None);
+            let mut machine = ThumbnailMachine::new(Some(target), spec(256), &config());
+            assert_eq!(machine.next_step(), Ok(ThumbnailStep::Answer(None)));
+            assert_eq!(machine.file_id(), None);
+        }
+    }
+
+    #[test]
+    fn unbounded_or_oversize_pixel_descriptors_do_not_download() {
+        let mut oversize = descriptor(ThumbnailFormat::Jpeg, Some(64));
+        oversize.width = Some(320);
+        let mut unknown = descriptor(ThumbnailFormat::Jpeg, Some(64));
+        unknown.height = None;
+        for descriptor in [oversize, unknown] {
+            let target = fetchable(Some(descriptor), None);
+            let mut machine = ThumbnailMachine::new(Some(target), spec(256), &config());
+            assert_eq!(machine.next_step(), Ok(ThumbnailStep::Answer(None)));
+            assert_eq!(machine.file_id(), None);
+        }
+    }
+
+    #[test]
     fn an_oversize_known_preview_is_skipped_for_the_inline_blur() {
         // The downloadable preview's known size is past the cap; the inline
         // blur answers instead, with no network.
@@ -984,19 +1126,15 @@ mod tests {
     }
 
     #[test]
-    fn the_inline_blur_answers_a_box_it_already_covers() {
-        // A 16px box, a 40x30 blur: the blur already fills it, so no network.
+    fn an_inline_blur_larger_than_the_box_is_not_published() {
+        // This adapter cannot resize encoded bytes. A 40x30 blur therefore
+        // cannot truthfully answer a 16x16 contract even though it is local.
         let target = fetchable(
             Some(descriptor(ThumbnailFormat::Jpeg, Some(64))),
             Some(minithumbnail(40, 30, "aGVsbG8=")),
         );
         let mut machine = ThumbnailMachine::new(Some(target), spec(16), &config());
-        match machine.next_step() {
-            Ok(ThumbnailStep::Answer(Some(thumbnail))) => {
-                assert_eq!(thumbnail.bytes(), b"hello");
-            }
-            other => panic!("expected the inline blur, got {other:?}"),
-        }
+        assert_eq!(machine.next_step(), Ok(ThumbnailStep::Answer(None)));
         assert_eq!(machine.file_id(), None);
     }
 
@@ -1037,7 +1175,7 @@ mod tests {
     fn from_descriptor_projects_availability_and_previews() {
         let attachment = AttachmentDescriptor {
             kind: crate::message::AttachmentKind::Video,
-            file_id: 1,
+            file_id: Some(1),
             remote_id: None,
             remote_unique_id: None,
             file_name: None,
@@ -1127,6 +1265,34 @@ mod tests {
         assert!(
             matches!(error, SourceError::Internal { .. }),
             "a preview past the bound is a mis-projection, refused not read"
+        );
+    }
+
+    #[test]
+    fn an_unknown_size_preview_stops_at_the_overflow_sentinel() {
+        let mut machine = download_machine(); // cap 1024
+        let Ok(ThumbnailStep::Submit { payload }) = machine.next_step() else {
+            panic!("unknown-size preview must submit a bounded request");
+        };
+        assert_eq!(payload.get("limit").and_then(Value::as_u64), Some(1025));
+        let response = json!({
+            "@type": "file",
+            "id": FILE_ID,
+            "size": 0,
+            "local": {
+                "@type": "localFile",
+                "path": "/td/partial-full-media.bin",
+                "download_offset": 0,
+                "downloaded_prefix_size": 1025,
+                "is_downloading_completed": false,
+            },
+        });
+        let error = machine
+            .on_response(Ok(response))
+            .expect_err("the sentinel byte proves the target is oversized");
+        assert!(
+            matches!(error, SourceError::Internal { .. }),
+            "an oversized unknown-size locator is refused before any local read"
         );
     }
 

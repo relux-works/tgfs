@@ -7,10 +7,11 @@
 //! expectation. Update an expectation only if the format has never shipped.
 
 use gramdrive_model::identity::{
-    AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
-    CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
-    FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId, ItemKey, MediaDirKey,
-    MessageId, MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
+    AccountId, AccountKey, AccountScope, ActiveStoriesKey, AppearanceKey, AttachmentIndex,
+    AttachmentKey, BlobKey, CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash,
+    DocFormat, DocPartition, FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemId,
+    ItemKey, MediaDirKey, MessageId, MessageKey, MonthDirKey, NamespaceVersion, OrderDocKey,
+    SchemaFamily, StoryAppearanceKey, StoryAppearanceLocation, StoryId, StoryKey, YearDirKey,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -69,6 +70,15 @@ fn goldens() -> Vec<Golden> {
             })),
             bytes_hex: "0102000000000000002a0000000101",
             text: "gdaebaaaaaaaaaaabkaaaaaaib",
+        },
+        Golden {
+            name: "chat_list_stories",
+            key: ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                scope: SCOPE,
+                kind: ChatListKind::Stories,
+            })),
+            bytes_hex: "0102000000000000002a0000000104",
+            text: "gdaebaaaaaaaaaaabkaaaaaaie",
         },
         Golden {
             name: "chat_list_folder",
@@ -141,6 +151,47 @@ fn goldens() -> Vec<Golden> {
             })),
             bytes_hex: "0109000000000000002a00000001ffffff16e1c4ed2e07ea",
             text: "gdaeeqaaaaaaaaaabkaaaaaap7777rnyoe5uxap2q",
+        },
+        Golden {
+            name: "direct_month_dir",
+            key: ItemKey::Canonical(CanonicalKey::MonthDir(MonthDirKey {
+                chat: CHAT,
+                year: 2026,
+                month: 7,
+            })),
+            bytes_hex: "010c000000000000002a00000001ffffff16e1c4ed2e07ea07",
+            text: "gdaegaaaaaaaaaaabkaaaaaap7777rnyoe5uxap2qh",
+        },
+        Golden {
+            name: "active_stories",
+            key: ItemKey::Canonical(CanonicalKey::ActiveStories(ActiveStoriesKey { chat: CHAT })),
+            bytes_hex: "010d000000000000002a00000001ffffff16e1c4ed2e",
+            text: "gdaegqaaaaaaaaaabkaaaaaap7777rnyoe5uxa",
+        },
+        Golden {
+            name: "canonical_story",
+            key: ItemKey::Canonical(CanonicalKey::Story(StoryKey {
+                poster: CHAT,
+                story_id: StoryId(321),
+            })),
+            bytes_hex: "010e000000000000002a00000001ffffff16e1c4ed2e0000000000000141",
+            text: "gdaehaaaaaaaaaaabkaaaaaap7777rnyoe5uxaaaaaaaaaaakb",
+        },
+        Golden {
+            name: "story_appearance_month_main",
+            key: ItemKey::StoryAppearance(StoryAppearanceKey {
+                story: StoryKey {
+                    poster: CHAT,
+                    story_id: StoryId(321),
+                },
+                view: ChatListKind::Main,
+                location: StoryAppearanceLocation::Month {
+                    year: 2026,
+                    month: 7,
+                },
+            }),
+            bytes_hex: "011101000000000000002a00000001ffffff16e1c4ed2e00000000000001410207ea07",
+            text: "gdaeiqcaaaaaaaaaaafiaaaaab77776fxbytws4aaaaaaaaaabiebap2qh",
         },
         Golden {
             name: "media_dir_appearance_in_main",

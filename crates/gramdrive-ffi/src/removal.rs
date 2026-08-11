@@ -264,6 +264,7 @@ mod tests {
                 namespace_version: NamespaceVersion(1),
             }
             .namespace_version,
+            display_timezone: "UTC".to_owned(),
             retention_mode: RetentionMode::Mirror,
             archive_mode: false,
             secret_ref: None,

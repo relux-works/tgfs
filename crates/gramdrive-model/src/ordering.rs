@@ -314,6 +314,7 @@ impl OrderProjection {
         match self.list.kind {
             ChatListKind::Main => out.push_str("{ \"kind\": \"main\" }"),
             ChatListKind::Archive => out.push_str("{ \"kind\": \"archive\" }"),
+            ChatListKind::Stories => out.push_str("{ \"kind\": \"stories\" }"),
             ChatListKind::Folder(folder) => out.push_str(&format!(
                 "{{ \"kind\": \"folder\", \"folder_id\": {} }}",
                 folder.0

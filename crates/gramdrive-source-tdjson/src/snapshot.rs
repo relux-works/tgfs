@@ -455,6 +455,11 @@ impl SnapshotMachine {
     pub fn new(plan: SnapshotPlan) -> Result<SnapshotMachine, SnapshotError> {
         let mut seen = HashSet::new();
         for list in &plan.lists {
+            if *list == ChatListKind::Stories {
+                return Err(SnapshotError::Plan {
+                    detail: "Stories is derived from storyListMain, not getChats".to_owned(),
+                });
+            }
             if !seen.insert(*list) {
                 return Err(SnapshotError::Plan {
                     detail: format!("list {} appears twice", list_token(*list)),
@@ -1011,6 +1016,7 @@ fn list_token(list: ChatListKind) -> String {
     match list {
         ChatListKind::Main => "main".to_owned(),
         ChatListKind::Archive => "archive".to_owned(),
+        ChatListKind::Stories => "stories".to_owned(),
         ChatListKind::Folder(folder) => format!("folder:{}", folder.0),
     }
 }
@@ -1020,6 +1026,7 @@ fn parse_list_token(text: &str) -> Result<ChatListKind, SnapshotError> {
     match text {
         "main" => Ok(ChatListKind::Main),
         "archive" => Ok(ChatListKind::Archive),
+        "stories" => Ok(ChatListKind::Stories),
         _ => match text.strip_prefix("folder:") {
             Some(id) => id
                 .parse::<i32>()

@@ -16,10 +16,11 @@
 //! version byte decoded alongside v1, never a mutation of v1.
 
 use super::{
-    AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey, BlobKey,
-    CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition,
-    FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemKey, MediaDirKey, MessageId,
-    MessageKey, NamespaceVersion, OrderDocKey, SchemaFamily, YearDirKey,
+    AccountId, AccountKey, AccountScope, ActiveStoriesKey, AppearanceKey, AttachmentIndex,
+    AttachmentKey, BlobKey, CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, ContentHash,
+    DocFormat, DocPartition, FolderCatalogKey, FolderId, GeneratedDocKey, IdParseError, ItemKey,
+    MediaDirKey, MessageId, MessageKey, MonthDirKey, NamespaceVersion, OrderDocKey, SchemaFamily,
+    StoryAppearanceKey, StoryAppearanceLocation, StoryId, StoryKey, YearDirKey,
 };
 
 const FORMAT_VERSION: u8 = 0x01;
@@ -38,11 +39,19 @@ const TAG_FOLDER_CATALOG: u8 = 0x08;
 const TAG_YEAR_DIR: u8 = 0x09;
 const TAG_MEDIA_DIR: u8 = 0x0a;
 const TAG_ORDER_DOC: u8 = 0x0b;
+const TAG_MONTH_DIR: u8 = 0x0c;
+const TAG_ACTIVE_STORIES: u8 = 0x0d;
+const TAG_STORY: u8 = 0x0e;
 const TAG_APPEARANCE: u8 = 0x10;
+const TAG_STORY_APPEARANCE: u8 = 0x11;
+
+const STORY_LOCATION_ACTIVE: u8 = 0x01;
+const STORY_LOCATION_MONTH: u8 = 0x02;
 
 const LIST_MAIN: u8 = 0x01;
 const LIST_ARCHIVE: u8 = 0x02;
 const LIST_FOLDER: u8 = 0x03;
+const LIST_STORIES: u8 = 0x04;
 
 const PARTITION_CHAT: u8 = 0x01;
 const PARTITION_YEAR: u8 = 0x02;
@@ -77,6 +86,23 @@ pub(super) fn encode_key(key: &ItemKey) -> Vec<u8> {
             encode_list_kind(&mut out, view);
             encode_canonical(&mut out, item);
         }
+        ItemKey::StoryAppearance(StoryAppearanceKey {
+            story,
+            view,
+            location,
+        }) => {
+            out.push(TAG_STORY_APPEARANCE);
+            encode_list_kind(&mut out, view);
+            encode_story(&mut out, story);
+            match location {
+                StoryAppearanceLocation::Active => out.push(STORY_LOCATION_ACTIVE),
+                StoryAppearanceLocation::Month { year, month } => {
+                    out.push(STORY_LOCATION_MONTH);
+                    out.extend_from_slice(&year.to_be_bytes());
+                    out.push(*month);
+                }
+            }
+        }
     }
     out
 }
@@ -100,6 +126,16 @@ fn encode_canonical(out: &mut Vec<u8>, key: &CanonicalKey) {
             out.push(TAG_CHAT);
             encode_chat(out, chat);
         }
+        CanonicalKey::ActiveStories(ActiveStoriesKey { chat }) => {
+            out.push(TAG_ACTIVE_STORIES);
+            encode_chat(out, chat);
+        }
+        CanonicalKey::MonthDir(MonthDirKey { chat, year, month }) => {
+            out.push(TAG_MONTH_DIR);
+            encode_chat(out, chat);
+            out.extend_from_slice(&year.to_be_bytes());
+            out.push(*month);
+        }
         CanonicalKey::YearDir(YearDirKey { chat, year }) => {
             out.push(TAG_YEAR_DIR);
             encode_chat(out, chat);
@@ -118,6 +154,10 @@ fn encode_canonical(out: &mut Vec<u8>, key: &CanonicalKey) {
             out.push(TAG_ATTACHMENT);
             encode_message(out, message);
             out.extend_from_slice(&index.0.to_be_bytes());
+        }
+        CanonicalKey::Story(story) => {
+            out.push(TAG_STORY);
+            encode_story(out, story);
         }
         CanonicalKey::GeneratedDoc(GeneratedDocKey {
             chat,
@@ -187,10 +227,16 @@ fn encode_message(out: &mut Vec<u8>, message: &MessageKey) {
     out.extend_from_slice(&message.message_id.0.to_be_bytes());
 }
 
+fn encode_story(out: &mut Vec<u8>, story: &StoryKey) {
+    encode_chat(out, &story.poster);
+    out.extend_from_slice(&story.story_id.0.to_be_bytes());
+}
+
 fn encode_list_kind(out: &mut Vec<u8>, kind: &ChatListKind) {
     match kind {
         ChatListKind::Main => out.push(LIST_MAIN),
         ChatListKind::Archive => out.push(LIST_ARCHIVE),
+        ChatListKind::Stories => out.push(LIST_STORIES),
         ChatListKind::Folder(FolderId(id)) => {
             out.push(LIST_FOLDER);
             out.extend_from_slice(&id.to_be_bytes());
@@ -209,13 +255,36 @@ pub(super) fn decode_key(bytes: &[u8]) -> Result<ItemKey, IdParseError> {
         return Err(IdParseError::UnsupportedVersion { version });
     }
     let tag = reader.u8()?;
-    let key = if tag == TAG_APPEARANCE {
-        let view = decode_list_kind(&mut reader)?;
-        let inner_tag = reader.u8()?;
-        let item = decode_canonical(&mut reader, inner_tag, FIELD_CANONICAL_KIND)?;
-        ItemKey::Appearance(AppearanceKey { view, item })
-    } else {
-        ItemKey::Canonical(decode_canonical(&mut reader, tag, FIELD_ITEM_KIND)?)
+    let key = match tag {
+        TAG_APPEARANCE => {
+            let view = decode_list_kind(&mut reader)?;
+            let inner_tag = reader.u8()?;
+            let item = decode_canonical(&mut reader, inner_tag, FIELD_CANONICAL_KIND)?;
+            ItemKey::Appearance(AppearanceKey { view, item })
+        }
+        TAG_STORY_APPEARANCE => {
+            let view = decode_list_kind(&mut reader)?;
+            let story = decode_story(&mut reader)?;
+            let location = match reader.u8()? {
+                STORY_LOCATION_ACTIVE => StoryAppearanceLocation::Active,
+                STORY_LOCATION_MONTH => StoryAppearanceLocation::Month {
+                    year: reader.u16()?,
+                    month: reader.u8()?,
+                },
+                tag => {
+                    return Err(IdParseError::UnknownTag {
+                        tag,
+                        field: "story appearance location",
+                    });
+                }
+            };
+            ItemKey::StoryAppearance(StoryAppearanceKey {
+                story,
+                view,
+                location,
+            })
+        }
+        _ => ItemKey::Canonical(decode_canonical(&mut reader, tag, FIELD_ITEM_KIND)?),
     };
     reader.finish()?;
     Ok(key)
@@ -237,6 +306,14 @@ fn decode_canonical(
             scope: decode_scope(reader)?,
         })),
         TAG_CHAT => Ok(CanonicalKey::Chat(decode_chat(reader)?)),
+        TAG_ACTIVE_STORIES => Ok(CanonicalKey::ActiveStories(ActiveStoriesKey {
+            chat: decode_chat(reader)?,
+        })),
+        TAG_MONTH_DIR => Ok(CanonicalKey::MonthDir(MonthDirKey {
+            chat: decode_chat(reader)?,
+            year: reader.u16()?,
+            month: reader.u8()?,
+        })),
         TAG_YEAR_DIR => Ok(CanonicalKey::YearDir(YearDirKey {
             chat: decode_chat(reader)?,
             year: reader.u16()?,
@@ -251,6 +328,7 @@ fn decode_canonical(
             let index = AttachmentIndex(reader.u32()?);
             Ok(CanonicalKey::Attachment(AttachmentKey { message, index }))
         }
+        TAG_STORY => Ok(CanonicalKey::Story(decode_story(reader)?)),
         TAG_GENERATED_DOC => {
             let chat = decode_chat(reader)?;
             let partition = match reader.u8()? {
@@ -340,11 +418,19 @@ fn decode_message(reader: &mut Reader<'_>) -> Result<MessageKey, IdParseError> {
     })
 }
 
+fn decode_story(reader: &mut Reader<'_>) -> Result<StoryKey, IdParseError> {
+    Ok(StoryKey {
+        poster: decode_chat(reader)?,
+        story_id: StoryId(reader.i64()?),
+    })
+}
+
 fn decode_list_kind(reader: &mut Reader<'_>) -> Result<ChatListKind, IdParseError> {
     match reader.u8()? {
         LIST_MAIN => Ok(ChatListKind::Main),
         LIST_ARCHIVE => Ok(ChatListKind::Archive),
         LIST_FOLDER => Ok(ChatListKind::Folder(FolderId(reader.i32()?))),
+        LIST_STORIES => Ok(ChatListKind::Stories),
         tag => Err(IdParseError::UnknownTag {
             tag,
             field: FIELD_LIST_KIND,

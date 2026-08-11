@@ -5,26 +5,128 @@
 
 ## 2026-08-11
 
-### 0013 — Sparkle key retirement ordering is now regression-protected (TASK-260810-3uh3mc)
+### 0017 — Three-way rework preserves public-main and cumulative runtime changes (TASK-260811-2the0w)
 
-- FIX: The test-channel runbook now makes its retirement prerequisites explicit before any active-CI secret or local Keychain deletion: freeze and verify the V1 bridge, store V2, verify encrypted escrow, and prove an old V1 client can install the bridge and a later V2-only update. It retains escrow until the separately authorized support-window decision.
-- REGRESSION: the focused runbook policy test requires four distinct versioned accounts, public-key lookups and staging files, private export/escrow/setter mappings, public staging cleanup, and both environment-scoped V1-to-V2 retirement blocks. It verifies name-only inventory before/after, old-secret deletion, account-scoped Sparkle Keychain deletion, V2-present/V1-absent evidence, and the no-early-retirement ordering.
+- MERGE: reconciled all six paths concurrently changed by the preserved runtime and `origin/main`: this logbook, `Makefile`, `README.md`, `TransferRegistry`, and its two Swift test suites. The candidate retains the public self-healing Rust bootstrap, update-credential inventory/runbook, deterministic IPC synchronization, and the accepted runtime/Sparkle implementation together.
+- INVARIANT: `TransferRegistry.isDraining` reports the synchronized current drain state while `resumeAdmission()` may reopen it; the public deterministic test is retained without reintroducing delay-based synchronization. `ControlChannelTests` retains serialization, detached blocking IPC, and auth-stream consumer readiness alongside all cycle-15 termination/policy/replacement coverage.
+- SCOPE: the isolated candidate remains based on `origin/main` `f9f5cd2`; the dirty primary worktree is read only. Generated SwiftPM resolution and build products remain excluded before review.
+
+### 0016 — Public-main consolidation retains the reviewed runtime and public CI baseline (TASK-260811-2the0w)
+
+- SCOPE: a new isolated branch starts at public `origin/main` `f9f5cd2`. It overlays the preserved accepted runtime only: Rust crates and migrations, the Swift package and tests, packaging/acceptance tooling, product specifications, and the public README/traceability documentation.
+- EXCLUSIONS: no `.task-board`, planning/research, temporary output, local profiles, credentials, generated SwiftPM resolution, or operator sentinel is included. Existing `origin/main` GitHub Actions and release/runbook files remain the accepted public baseline; dirty-worktree workflow and runbook deletions are deliberately not imported.
+- PRESERVATION: the source primary worktree was read-only for the consolidation. The cycle-15 accepted Sparkle implementation—including exact process identity, bounded committed-exit handling, and matching-build replacement readiness—is copied with its production and regression-test seams.
+- INTEGRITY: consolidation exposed stale three-root assertions beside the already-specified and already-created `Stories` root. The provider readiness count, state-root page, model fixtures, authorization regression, query-plan fixture, and package documentation now consistently expose four roots; this aligns existing behavior to the reviewed public layout without adding a new state or policy.
+
+### 0015 — Sparkle key retirement ordering is regression-protected (TASK-260810-3uh3mc)
+
+- FIX: The test-channel runbook makes retirement prerequisites explicit before active-CI secret or local Keychain deletion: freeze and verify the V1 bridge, store V2, verify encrypted escrow, and prove an old V1 client can install the bridge and a later V2-only update. Escrow remains until the separately authorized support-window decision.
+- REGRESSION: the runbook policy test requires distinct versioned accounts, public-key lookups and staging files, private export/escrow/setter mappings, public staging cleanup, both environment-scoped V1-to-V2 retirement blocks, name-only inventories, old-secret deletion, account-scoped Keychain deletion, V2-present/V1-absent evidence, and no-early-retirement ordering.
 - VALIDATION: focused inventory/runbook suite (11 tests), all 271 script tests, `make updates-secret-inventory`, and `make check-repo` (2/2) exited 0. Credential values were neither accessed nor emitted.
 
-### 0012 — Update credential operations use a value-safe provisioning boundary (TASK-260810-3uh3mc)
+### 0014 — Update credential operations use a value-safe provisioning boundary (TASK-260810-3uh3mc)
 
-- DECISION: the update bootstrap tool receives credential bytes only on stdin or from validated owner-only files and invokes `gh secret set NAME --env ENV` without `--body`; it suppresses `gh` output. It maps exactly six `updates-test` names and one `release` name at bootstrap, with versioned Sparkle generations constrained to their own environment. Its name-only preflight invokes `gh secret list --env ... --json name`.
-- SECURITY: each Sparkle generation has a distinct versioned Keychain account. `generate_keys --account NAME` creates it, `generate_keys --account NAME -p` captures the reviewed public key, and `generate_keys --account NAME -x OWNER_ONLY_FILE` exports it; the export is moved into encrypted offline escrow before base64 is streamed to the setter. No private export is copied between test and stable channels or retained in staging. After the bridge URL is frozen and V2 is verified, documented value-free `gh secret delete` and `security delete-generic-password` commands remove the retired generation from active CI and the local Keychain; escrow retention/destruction remains separately authorized.
+- DECISION: the update bootstrap tool receives credential bytes only on stdin or validated owner-only files and invokes `gh secret set NAME --env ENV` without `--body`; it suppresses `gh` output. It maps six `updates-test` names and one `release` name at bootstrap, with versioned Sparkle generations constrained to their own environment.
+- SECURITY: every Sparkle generation has a distinct versioned Keychain account and its private export goes to encrypted offline escrow before a setter consumes it. Rotation is forward-only through immutable bridge assets; no private export is copied between test and stable channels or retained in staging.
 - SECURITY: `security import -P` necessarily places the `.p12` password in process argv briefly. The runbook records its temporary dedicated-runner isolation and cleanup controls, followed by mandatory Developer ID reissue/revocation after the iteration.
 - RECOVERY: stable trust rotation is URL-generational: V1's old-key-signed bridge embeds V2's key/URL, V1 bytes remain live as immutable checksummed release assets, and old-client evidence is required before/after cutover. A recovery is forward-only, never an in-place DMG mutation or lower-build downgrade.
 - VALIDATION: the focused setter/inventory and Sparkle-command regression suite (10 tests), all 270 script tests, `make updates-secret-inventory`, the 2/2 `make check-repo` gate, and `git diff --check` exited 0 after the prior Sparkle-command correction. The subsequent documentation-only lifecycle correction requires the public-key capture and retirement sequence to be revalidated before review.
+
+### 0013 — Cycle-14 makes process absence tri-state and proves hydration protocol service (TASK-260810-1cf7o7)
+
+- SAFETY: `AgentProcessIdentity.observe()` distinguishes matching, changed-start identity, confirmed `ESRCH` absence, and indeterminate kernel reads. Both the AppKit coordinator and matching-build replacement reuse it; indeterminate reads neither authorize `true` nor target a signal.
+- ROLLBACK: the companion now validates hydration with a bounded `AgentHydrationClient` request bearing an unsupported protocol version and accepts only the typed `.internalError` response. This proves server decode/response without transfer admission or user-content fetch; it replaces the former connect-only probe.
+- EVIDENCE: producer validation is green for the focused coordinator/live-backend/real-agent suites (43 tests), full Swift package suite (477 tests), arm64 release build, `make check-apple` (2/2), packaging suite (65), scoped SwiftFormat lint (0/5), and `git diff --check`. Independent acceptance remains review-owned.
+
+### 0012 — Rollback proof and replacement escalation now use live endpoint/process evidence (TASK-260810-1cf7o7)
+
+- SAFETY: `termination-cancelled` health now carries a serving generation, reopened transfer-admission proof, and restored-namespace proof. The live companion refuses a `false` reply unless the request-correlated health record is Finder-ready and the control status plus hydration listener both answer again.
+- REPLACEMENT: a committed older helper is now escalated with identity-revalidated `SIGTERM` then `SIGKILL` if its watchdog/ordinary exit misses the observation deadline. A changed PID start time is old-process death evidence and is never signalled.
+- REGRESSION: real agent/socket coverage proves the AppKit driver replies once only after the captured agent exits; lease rollback proves transfer admission, namespace restoration, and control recovery. A real stalled process proves the replacement escalation and PID-start mismatch refusal.
+- CYCLE-15 COMPOSITION: `LiveCompanionBackend` now has real subprocess/socket evidence for its older-agent branch: a DEBUG-only explicit fixture reports an older build while holding ordinary exit and the hard-exit watchdog beyond the backend observation bound; the backend observes the exact old identity, rejects a deliberately mismatched start identity without signalling it, escalates the old process, then starts the same agent binary with the app build and requires its running, enumerated-ready hierarchy before `matchingAgentReady`. The temporary data root, settings/profile input, and File Provider-domain sentinel remain unchanged. This is producer evidence; independent acceptance remains review-owned.
+- VALIDATION (cycle 15): focused live-control/real-process suites (25 tests), arm64 release build, packaging suite (65), `make check-apple` (2/2), scoped SwiftFormat lint (0/4), `git diff --check`, and a direct full Swift package run (478 tests) each exited 0. One earlier direct full run exited 1 when the timing-sensitive `anUncorrelatedReadyStateCannotCommitANewerDrain` observed no commit; the identical configured Apple gate and rerun passed, so the transient red is recorded rather than represented as green.
+
+### 0011 — Committed-exit watchdog permit is implemented; acceptance remains review-owned (TASK-260810-1cf7o7)
+
+- FIX: removed the watchdog-free `AgentLifecycle` commit path. The only commit permit now receives an explicit watchdog arm operation under the lifecycle lock; arm failure leaves the ready lease intact, and cancellation restores the serving agent rather than claiming an irreversible commit.
+- SIGNAL SAFETY: startup constructs and installs the `SIGALRM` hard-exit watchdog before engine work. `signal == SIG_ERR` and `pthread_sigmask` failures are retained as installation failures; no later `setitimer` call can manufacture a permit. The installed handler calls only `Darwin._exit(0)`.
+- REGRESSION: deterministic watchdog tests cover signal-install failure, unmask failure, successful timer arm, and lifecycle arm failure followed by rollback-safe cancellation. The source audit is producer evidence only; it must not be read as independent acceptance.
+- STATUS: implemented and locally validated in this task. Independent review remains the authority for whether this establishes the required process-death protocol.
+
+### 0010 — Exact-process termination protocol is the accepted implementation contract (TASK-260811-krfusi)
+
+- DECISION: keep every stallable drain and every rollback-capable resource attached before commit. Commit may linearize only after an agent-owned `SIGALRM` watchdog is armed; after the typed acknowledgement write attempt, orderly teardown closes health last and calls `_exit(0)`, while the watchdog supplies the same kernel-cleanup result if Swift tasks or locks stall.
+- TERMINAL PROOF: the companion captures `instanceID + pid + kernel process start time + build` and registers process observation before commit. AppKit `true` requires death/start-identity change of that exact old process (with endpoint plus kernel-flock release as fallback), so unconditional launchd restart cannot hide the witness. AppKit `false` remains precommit-only and requires the same current-build agent to publish request-correlated running rollback after admission, endpoints, namespaces, and Finder readiness are restored.
+- FALLBACK: after the agent hard-exit deadline, the companion revalidates the kernel start identity before bounded `SIGTERM`/`SIGKILL`; it never signals a reused PID. A commit acknowledgement, live `.stopped` payload, timeout, EOF, or socket pathname gap is not terminal evidence.
+- OVERLAP: the packaged launch agent must replace unconditional `KeepAlive = true` with `KeepAlive.SuccessfulExit = false`; planned exit 0 stays down, crash/signal exits restart, and a later app launch directly starts a missing current-session agent without changing the login preference. The single-instance flock remains held until kernel death.
+- STATUS: this entry records the architecture handoff, not independent evidence that production code satisfies it. `TASK-260810-1cf7o7` is the implementation owner and its outcome must distinguish local evidence from reviewer acceptance. Outcome: `TASK-260811-krfusi_bounded-terminal-protocol.md`.
+
+### 0009 — Accepted Sparkle commit has no safe bounded fallback yet (TASK-260810-1cf7o7)
+
+- REVIEW FINDING: once `acceptTerminationCommit` succeeds, `AgentLifecycle` has atomically detached its serving resources and entered `stopped`. The ordinary cancellation path can recover only from `termination-ready`; it cannot resurrect an accepted commit.
+- REJECTED APPROACH: a companion timeout after commit acceptance must not call the pre-commit cancellation reconciler and return `false` based on a synthetic `termination-cancelled` health sample. Production cannot publish that recovery from `stopped`, so the test would mask a split-brain/half-terminated state.
+- REQUIRED INVARIANT: AppKit may receive `true` only after the old endpoint/process disappearance is proven. It may receive `false` only after a production-capable rollback has restored a usable current agent. A bounded protocol that proves neither result remains an open architecture boundary, not a passing implementation.
+- STATUS: active rework; entry 0008 remains valid for the observable acceptance and normal disappearance path, but its lost-response recovery claim is not accepted until this boundary is resolved and independently reviewed.
+
+### 0008 — Sparkle commit acceptance and replacement now observe teardown (TASK-260810-1cf7o7)
+
+- FIX: the control channel now returns a distinct request-correlated `terminationCommitAccepted` result only after `AgentLifecycle` atomically claims the ready drain. The host finishes teardown only after writing that result; the coordinator and the matching-build replacement both wait for the old endpoint to disappear before allowing AppKit termination or launching the bundled agent.
+- RECOVERY: a rejected commit or cancellation race runs the existing correlated cancellation recovery and never returns a successful reply. A lost commit response is reconciled through the old endpoint's request-correlated stopped/disappearance path rather than being mistaken for completion.
+- RELAUNCH: `LiveCompanionBackend` now performs old-agent `prepare -> ready -> commit -> disappearance -> bundled replacement`, then requires the replacement's exact packaged build plus ready, enumerated File Provider hierarchy before signalling existing enumerators. The update path retains the existing App Group/profile/domain.
+- REGRESSION: lifecycle, socket control, real live-backend replacement, and AppKit reply-gate tests cover accepted/rejected/dropped commits, endpoint disappearance before the true reply, and the old/new matching-build handoff.
+- VALIDATION: full Swift package suite (462), arm64 release build, packaging suite (65), `make check-apple` (2/2), scoped SwiftFormat lint (0/2), and `git diff --check` each exited 0.
+
+### 0007 — Production companion wiring now commits prepared Sparkle termination (TASK-260810-1cf7o7)
+
+- SUPERSEDED: this wiring correctly carried UUID-correlated `prepare`, `cancel`, and `commit`, but the old control acknowledgement did not prove lifecycle commit acceptance or endpoint teardown. Entry 0008 records the observable acceptance and teardown boundary that replaces that incomplete claim.
+- REGRESSION: the earlier socket-level composition test remains useful for request identity and single-reply coverage; the later replacement/lifecycle tests establish the missing completion proof.
+- VALIDATION: focused lifecycle/control/live-control/coordinator suite (75), packaging suite (65), full Swift package suite (459), arm64 release build, `make check-apple` (2/2), scoped SwiftFormat lint (0/2), and `git diff --check` each exited 0.
+
+### 0006 — Sparkle termination now has a finite commit-or-abort lease (TASK-260810-1cf7o7)
+
+- SAFETY: a UUID-correlated `prepare` drains only to `termination-ready`; the agent retains its sockets, App Group state, File Provider domain, and profile until a separate matching `commit`. It cannot exit from an uncommitted prepared state.
+- BOUNDED RECOVERY: cancellation reconciliation now has a real finite bound. If control/health remain unavailable, the coordinator returns one `false` reply without ever sending `commit`; the agent's five-second lease auto-restores transfer admission and authorized namespace owners. This corrects the earlier unbounded-retry claim in entry 0005.
+- COMMIT: a matched `termination-ready` health result sends `commit` only for that UUID. Acknowledged commit permits teardown/relaunch; stale readiness cannot commit a retry request.
+- APPKIT: `ApplicationTerminationRequestDriver` is the tested delegate seam for one real reply across joins and Keep GramDrive Open cancellation.
+- VALIDATION: focused lifecycle/control/coordinator suite (58), full Swift package suite (458), packaging suite (65), arm64 release build, `make check-apple` (2/2), scoped SwiftFormat lint (0/2), and `git diff --check` each exited 0.
+
+### 0005 — Sparkle cancellation never emits an inconclusive reply-false (TASK-260810-1cf7o7)
+
+- SAFETY: cancellation reconciliation no longer turns a local deadline, dropped cancellation acknowledgement, or stalled health socket into `reply(false)`. It re-sends the idempotent UUID-correlated cancellation request on each cancellation interval and waits for either request-matching `termination-cancelled` recovery or endpoint disappearance.
+- EXPLICIT CANCEL: “Keep GramDrive Open” now switches the in-flight coordinator directly into that reconciliation path, so it does not wait for the original drain deadline before the single reply-gate decision.
+- REGRESSION: deterministic coordinator tests hold health in timeout/error readings beyond the cancellation interval, then prove a late correlated recovery yields exactly one false reply and a late stopped/not-running teardown yields exactly one allowed reply.
+- VALIDATION: focused coordinator tests (12), full Swift package suite (454), arm64 release build, packaging tests (65), `make check-apple` (2/2), scoped SwiftFormat lint (0/2), and `git diff --check` each exited 0.
+
+### 0004 — Sparkle termination cancellation now restores a serving agent before reply-false (TASK-260810-1cf7o7)
+
+- RECOVERY: a cancelled or abandoned drain snapshots its active namespace owners, temporarily restores the lifecycle's serving state, reopens transfer admission, recreates those owners, and only then publishes the request-correlated `termination-cancelled` result. The current app can therefore remain usable after “Keep GramDrive Open”; the File Provider domain and Telegram profile are retained.
+- CORRELATION: the companion accepts a cancellation only when its UUID matches the current request. It continues polling a correlated live `stopped` health payload until the endpoint disappears, so irreversible teardown cannot be reported as a failed quit.
+- TIMEOUT: a drain deadline sends the matching cancel command and enters a separate bounded reconciliation phase. It permits termination only after endpoint disappearance, or replies false after request-matching serving recovery; stale cancellation cannot cancel a newer retry.
+- VALIDATION: scoped SwiftFormat lint (0/2 files), focused lifecycle/control/coordinator tests (52), packaging tests (65), full Swift suite (452), arm64 release build, `make check-apple` (2/2), and `git diff --check` each exited 0.
+
+### 0003 — Sparkle review rework closes helper, cancellation, relaunch, and SwiftUI-observation gaps (TASK-260810-1cf7o7)
+
+- SIGNING: Sparkle helper signing is now explicit and ordered: `Installer.xpc`, `Downloader.xpc`, loose `Autoupdate`, `Updater.app`, then `Sparkle.framework`. Re-signing preserves the helpers' entitlements, requirements, and flags; packaging tests assert every target and its order.
+- TERMINATION: an abandoned bounded drain keeps health/control endpoints alive in `termination-cancelled`; the companion replies false exactly once, offers retry/Force Quit guidance, and does not mistake endpoint disappearance for success. Timeout, control failure, abandoned drain, joined requests, and retry cycles are covered.
+- RELAUNCH: only a strictly older numeric build is replaced. The replacement must report the exact packaged `CFBundleVersion`, `.running`, Finder `ready`, and an enumerated first page before it is considered healthy; existing File Provider relays then signal root/affected enumerators without recreating a domain or profile.
+- UI: `SPUUpdater.canCheckForUpdates` is now projected through KVO-backed observable state used by the menu, toolbar, and command action. Tests prove disabled actions do not route and become routable when availability changes.
+- VALIDATION: packaging tests (65), focused Swift regressions (55), full Swift suite (447), arm64 release build, `make check-apple` (2/2), and `git diff --check` all exited 0. Developer-ID notarization remains intentionally outside this task's unsigned packaging boundary.
+
+### 0002 — Sparkle v1 channel trust is embedded and unsigned assembly covers the complete helper tree (TASK-260810-1cf7o7)
+
+- FIX: the GramDrive package pins Sparkle 2.9.5. Packaging embeds its framework, Autoupdate, Updater.app, and Downloader/Installer XPC helpers, signs nested code deepest-first before the framework and outer app, and generates the Sparkle trust keys in the app Info.plist.
+- TRUST BOUNDARY: the fixed reviewed v1 test and stable feed/public-key pairs are checked-in configuration. Packaging accepts no public key via environment or command line, validates that the selected anchor is a 32-byte Base64 EdDSA key, and fails closed for missing or malformed configuration. Private signing seeds were neither read nor recorded.
+- REGRESSION: the packaging suite covers exact packaged test/stable Info.plist pairs, channel separation, malformed/missing key failure, helper presence/signing order, and exactly one companion Frameworks rpath. The termination/control/health suites cover the idempotent bounded update drain, `prepareForTermination`, and packaged agent build reporting.
+- FINDING: the first real unsigned assembly exposed duplicate `@executable_path/../Frameworks` addition when both Sparkle and tdjson were embedded. The packager now adds that shared rpath once after tdjson fixups; agent and File Provider keep their own paths.
+- VALIDATION: `python3 .scripts/tests/test_build_app_bundle.py` (65 tests), `swift build -c release --arch arm64`, `swift test` (440 tests), `make check-apple` (2/2), unsigned test and stable channel assemblies, `python3 -m py_compile`, and `git diff --check` each exited 0. Developer-ID signing/notarization is intentionally not claimed; it is the boundary owned by TASK-260810-fwgmr4.
 
 ### 0001 — Self-hosted CI restores a missing Rust toolchain without shell-profile state (BUG-260720-27inl5)
 
 - ROOT CAUSE: public CI run `31443550054` (`rust-core`) and run `31443550101` (`tdlib` and `apple-build-test`) each invoked `rustup` before any bootstrap. Their clean macOS self-hosted runner had no command on `PATH`, so each job stopped with `rustup: command not found` and exit 127.
 - FIX: every Rust-consuming job in `ci.yml` and `native-ci.yml` now calls one shell bootstrap. It locates or non-interactively installs runner-owned rustup with `--no-modify-path`, reads the channel/profile/components exclusively from `rust-toolchain.toml`, reconciles them idempotently, and adds Cargo's bin directory through `GITHUB_PATH` for later steps.
-- INTEGRITY: a fresh install downloads the fixed rustup 1.29.0 archive for the runner architecture and checks its committed SHA-256 before it is marked executable. The bootstrap never executes a network binary on a checksum mismatch.
-- REGRESSION: a clean-runner mock runs the bootstrap twice with no rustup in the incoming path. It proves exactly one bootstrap download, one integrity verification, repeated reconciliation of Rust 1.91.0 with rustfmt/clippy, a single `GITHUB_PATH` entry, and no executable `source` command. A separate mock forces checksum failure and proves the downloaded installer never runs. A structural test pins all four workflow call sites to the shared bootstrap.
+- REGRESSION: a clean-runner mock runs the bootstrap twice with no rustup in the incoming path. It proves exactly one bootstrap download, repeated reconciliation of Rust 1.91.0 with rustfmt/clippy, a single `GITHUB_PATH` entry, and no executable `source` command. A structural test pins all four workflow call sites to the shared bootstrap.
+- VALIDATION: focused bootstrap tests (2), existing toolchain tests (18), public metadata tests (3), `sh -n`, `actionlint`, and `git diff --check` each exited 0. A malformed dotted-path unittest attempt exited 1 before discovery was corrected; no test ran in that attempt.
+- DELIVERY LIMIT: local work is on dirty `main` with no associated PR, so fresh protected-main and remote `rust-core`/`secret-scan`/native evidence remain unclaimed. The existing public run logs are retained under `.temp/BUG-260720-27inl5/` for reviewer verification.
 
 ## 2026-08-10
 
@@ -2134,3 +2236,34 @@
 - POSTURE: Actions defaults are read-only and cannot approve PR reviews; Pages is unconfigured. GitHub currently reports secret scanning and Dependabot alerts disabled. Ruleset and branch-protection APIs reject the private repo under the present plan, so the runbook requires their restoration immediately after reviewer-approved public conversion.
 - LEGACY RELEASES: `v0.1.0` and `v0.1.1` are classified as private-era releases, not public-launch candidates. Before conversion they must be converted to GitHub drafts, preserving their tags and assets; unauthenticated access to the drafts must be verified after publication. Both versions are explicitly excluded from every Sparkle feed. This reversible draft-only disposition and the visibility change are reviewer-authorized remote operations; deletion, archival, and tag removal are not authorized.
 - LIMIT: The repeat audit scanned 42 of 56 retained Actions logs. Fourteen older logs could not be re-downloaded after repeated attempts because the environment could not resolve GitHub's log blob host; the pre-existing orientation record reports zero findings across all 56. Reviewer evidence must re-run those downloads from a network with GitHub log-host access or accept the existing orientation evidence before conversion.
+
+### 0811 — Sparkle companion integration is fail-closed pending reviewed public keys (TASK-260810-1cf7o7)
+
+- IMPLEMENTATION: SwiftPM pins Sparkle `2.9.5`; the companion owns one `SPUStandardUpdaterController`, exposes `Check for Updates…` in its menu/status/settings-window toolbar, and routes all AppKit termination through a coalesced bounded control drain. The agent acknowledges `prepareForTermination` before it drains/exits, reports numeric packaged `CFBundleVersion` in health, and a newer app replaces only an older agent build without changing the App Group, authorization, or File Provider domain identity.
+- PACKAGING: the bundle assembler copies the complete Sparkle framework with symlinks intact, verifies `Autoupdate`, `Updater.app`, `Downloader.xpc`, and `Installer.xpc`, signs nested code inside-out, records its selected channel/feed in the manifest, and embeds only a build-time test or stable trust anchor. `Version.json` is now the reviewed three-part marketing-version source.
+- CONSTRAINT: no reviewed test/stable Sparkle public EdDSA values are present in source or task resources. The packager therefore refuses a channel build unless the corresponding public key is supplied through its explicit public build input; no placeholder key was introduced. A signed/notarized candidate additionally remains blocked by the existing Developer ID keychain authorization failure recorded above.
+- VALIDATION: `python3 .scripts/tests/test_build_app_bundle.py`, focused `swift test` for termination/control/relaunch, and release `swift build --product gramdrive-companion` exited 0. The initial `swift package resolve` artifact fetch exited 1 on local keychain status `-25308`, but its package pin and artifact became available and subsequent Swift build/test commands succeeded.
+
+### 0811 — Sparkle termination response-loss and cancellation recovery (TASK-260810-1cf7o7)
+
+- SAFETY: `prepareForTermination` now carries a request UUID. The control server records the matching drain only after its acknowledgement write succeeds and before it closes the socket; a companion that loses the response reconciles the request-correlated health state instead of immediately replying `false` while the agent may exit.
+- RECOVERY: an explicit cancel command marks only its matching drain. At the bounded drain boundary the agent keeps its sockets/domain/profile, reopens `TransferRegistry` admission, and restarts its namespace owners before reporting `termination-cancelled`. The AppKit delegate exposes a non-blocking “Keep GramDrive Open” sheet action and uses an exactly-once reply gate for joined, cancelled, and late completion paths.
+- VALIDATION: focused lifecycle/control/coordinator/transfer suite (56 tests), full `swift test --package-path apple/GramDriveSupport` (450 tests), packaging tests (65), arm64 release build, `make check-apple`, and `git diff --check` all exited 0. Developer-ID signing/notarization remains owned by TASK-260810-fwgmr4; this task verifies unsigned package contents and signing order through the packaging suite.
+
+### 0811 — SwiftLint is not a clean Apple delivery gate in the current worktree (TASK-260810-1cf7o7)
+
+- EVIDENCE: `swiftlint lint --strict apple/GramDriveSupport` is red with 1,577 violations, including Sparkle source under `.build/checkouts`; the task-runtime source/test scope is red with 49 violations in existing large/legacy files. `make check-apple` remains the configured Apple gate and passed its Swift build/test steps.
+- DECISION NEEDED: preserve the accepted dirty worktree and leave the board lint item unchecked, or approve a separately scoped SwiftLint baseline/exclusion/refactor policy. Suppressing warnings or reformatting unrelated runtime files solely to clear a handoff checklist would hide the quality boundary rather than validate this update work.
+
+### 0811 — Scoped SwiftFormat lint unblock preserves cancellation coverage (TASK-260810-1cf7o7)
+
+- LINT: SwiftFormat 0.60.1 formatted and linted only the task-owned `CompanionTerminationCoordinator.swift` and `CompanionTerminationCoordinatorTests.swift`; scoped lint exited 0. No unrelated dirty-worktree file was changed.
+- REGRESSION: the explicit-cancellation fixture had defaulted to `.notRunning` after one `.draining` reading, allowing the drain to succeed before cancellation. It now continues reporting `.draining` until the cancellation callback supplies the request-correlated `.terminationCancelled` snapshot; production behavior is unchanged.
+- VALIDATION: focused coordinator suite (8 tests), full `swift test --package-path apple/GramDriveSupport` (450 tests), and `git diff --check` all exited 0.
+
+### 0811 — Sparkle committed termination now has a process-identity witness (TASK-260810-1cf7o7)
+
+- SAFETY: health now carries an immutable UUID plus `pid` and kernel start time. The companion captures that identity before sending control bytes; the lifecycle rejects stale prepare/cancel/commit commands, retains listeners through the irreversible claim, and no longer publishes a live `.stopped` health state.
+- TERMINATION: the agent retains an owned committed-exit watchdog while its bounded endpoint teardown runs. The companion permits AppKit termination only after endpoint disappearance, or after identity-checked TERM/KILL escalation observes the exact old process gone; PID reuse is never signalled as the old helper.
+- REPLACEMENT: an older agent's dropped prepare acknowledgement is reconciled through the request-correlated ready health phase before a commit/replacement proceeds. This retains the existing App Group, Telegram authorization, and File Provider domain rather than recreating them.
+- VALIDATION: focused lifecycle/control/coordinator/replacement tests (80), full `swift test --package-path apple/GramDriveSupport` (464), packaging tests (65), arm64 release build, `make check-apple`, scoped SwiftFormat (0/2 needing changes), and `git diff --check` exited 0.

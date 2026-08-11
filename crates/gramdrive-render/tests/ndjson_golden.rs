@@ -55,7 +55,9 @@ fn corpus_mirror_matches_golden() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Mirror,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let document = ndjson::render_messages(&input);
@@ -75,7 +77,9 @@ fn corpus_audit_matches_golden() {
         chat: fixture_chat(),
         partition: DocPartition::Chat,
         retention_mode: RetentionMode::Audit,
+        display_timezone: "UTC",
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let document = ndjson::render_messages(&input);
@@ -103,7 +107,9 @@ fn golden_files_are_stable_under_rerender() {
             chat: fixture_chat(),
             partition: DocPartition::Chat,
             retention_mode: mode,
+            display_timezone: "UTC",
             input_watermark_seq: 13,
+            render_generation: 0,
             messages: &messages,
         };
         let expected = std::fs::read_to_string(golden_path(name)).expect("golden exists");

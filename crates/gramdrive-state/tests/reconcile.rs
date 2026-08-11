@@ -195,6 +195,7 @@ fn seed(store: &mut StateStore, years: &[u16]) {
     tx.upsert_chat(&chat_record(CHAT)).expect("chat");
     let root = common::account_root_id();
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: root.clone(),
         parent: None,
         display_name: "Root".to_owned(),
@@ -209,6 +210,7 @@ fn seed(store: &mut StateStore, years: &[u16]) {
     .expect("root");
     for year in years {
         tx.upsert_item(&ItemRecord {
+            aggregate_size: None,
             id: doc_id(*year),
             parent: Some(root.clone()),
             display_name: format!("{year}.ndjson"),
@@ -287,6 +289,7 @@ fn kinds(findings: &[Finding]) -> Vec<&'static str> {
             Finding::InterruptedTransfer { .. } => "interrupted_transfer",
             Finding::LeakedStaging { .. } => "leaked_staging",
             Finding::MissingCacheObject { .. } => "missing_cache_object",
+            Finding::MissingRetainedAttachmentObject { .. } => "missing_retained_attachment_object",
             Finding::UnlocatableCacheEntry { .. } => "unlocatable_cache_entry",
             Finding::OrphanCacheObject { .. } => "orphan_cache_object",
             Finding::ProjectionRebuildPending { .. } => "projection_rebuild_pending",

@@ -1,0 +1,201 @@
+{
+  "task_id": "TASK-260721-2e6sbq",
+  "schema": {
+    "repository": "https://github.com/tdlib/td.git",
+    "commit": "022d60202e446ad1287b9fb68e687c8a0760788b",
+    "relative_path": "td/generate/scheme/td_api.tl",
+    "sha256": "69375dc681a4f43498849b14a1342baf89eb19363b83cd96f8922f4258d2069d"
+  },
+  "schema_declarations": {
+    "localFile": "localFile path:string can_be_downloaded:Bool can_be_deleted:Bool is_downloading_active:Bool is_downloading_completed:Bool download_offset:int53 downloaded_prefix_size:int53 downloaded_size:int53 = LocalFile;",
+    "remoteFile": "remoteFile id:string unique_id:string is_uploading_active:Bool is_uploading_completed:Bool uploaded_size:int53 = RemoteFile;",
+    "file": "file id:int32 size:int53 expected_size:int53 local:localFile remote:remoteFile = File;",
+    "thumbnail": "thumbnail format:ThumbnailFormat width:int32 height:int32 file:file = Thumbnail;",
+    "photoSize": "photoSize type:string photo:file width:int32 height:int32 progressive_sizes:vector<int32> = PhotoSize;",
+    "photo": "photo has_stickers:Bool minithumbnail:minithumbnail sizes:vector<photoSize> = Photo;",
+    "storyVideo": "storyVideo duration:double width:int32 height:int32 has_stickers:Bool is_animation:Bool minithumbnail:minithumbnail thumbnail:thumbnail preload_prefix_size:int32 cover_frame_timestamp:double video:file = StoryVideo;",
+    "storyContentPhoto": "storyContentPhoto photo:photo = StoryContent;",
+    "storyContentVideo": "storyContentVideo video:storyVideo alternative_video:storyVideo = StoryContent;",
+    "storyContentLive": "storyContentLive group_call_id:int32 is_rtmp_stream:Bool = StoryContent;",
+    "storyContentUnsupported": "storyContentUnsupported = StoryContent;",
+    "storyInfo": "storyInfo story_id:int32 date:int32 is_for_close_friends:Bool is_live:Bool = StoryInfo;",
+    "groupCallJoinParameters": "groupCallJoinParameters audio_source_id:int32 payload:string is_muted:Bool is_my_video_enabled:Bool = GroupCallJoinParameters;",
+    "groupCallVideoQualityThumbnail": "groupCallVideoQualityThumbnail = GroupCallVideoQuality;",
+    "groupCallVideoQualityMedium": "groupCallVideoQualityMedium = GroupCallVideoQuality;",
+    "groupCallVideoQualityFull": "groupCallVideoQualityFull = GroupCallVideoQuality;",
+    "groupCallStream": "groupCallStream channel_id:int32 scale:int32 time_offset:int53 = GroupCallStream;",
+    "groupCallStreams": "groupCallStreams streams:vector<groupCallStream> = GroupCallStreams;",
+    "internalLinkTypeLiveStory": "internalLinkTypeLiveStory story_poster_username:string = InternalLinkType;",
+    "chatActiveStories": "chatActiveStories chat_id:int53 list:StoryList order:int53 can_be_archived:Bool max_read_story_id:int32 stories:vector<storyInfo> = ChatActiveStories;",
+    "story": "story id:int32 poster_chat_id:int53 poster_id:MessageSender date:int32 is_being_posted:Bool is_being_edited:Bool is_edited:Bool is_posted_to_chat_page:Bool is_visible_only_for_self:Bool can_be_added_to_album:Bool can_be_deleted:Bool can_be_edited:Bool can_be_forwarded:Bool can_be_replied:Bool can_set_privacy_settings:Bool can_toggle_is_posted_to_chat_page:Bool can_get_statistics:Bool can_get_interactions:Bool has_expired_viewers:Bool repost_info:storyRepostInfo interaction_info:storyInteractionInfo chosen_reaction_type:ReactionType privacy_settings:StoryPrivacySettings content:StoryContent areas:vector<storyArea> caption:formattedText album_ids:vector<int32> = Story;",
+    "stories": "stories total_count:int32 stories:vector<story> pinned_story_ids:vector<int32> = Stories;",
+    "fileTypePhotoStory": "fileTypePhotoStory = FileType;",
+    "fileTypeThumbnail": "fileTypeThumbnail = FileType;",
+    "fileTypeVideoStory": "fileTypeVideoStory = FileType;",
+    "userTypeRegular": "userTypeRegular = UserType;",
+    "userTypeBot": "userTypeBot can_be_edited:Bool can_join_groups:Bool can_read_all_group_messages:Bool has_main_web_app:Bool has_topics:Bool allows_users_to_create_topics:Bool can_manage_bots:Bool is_inline:Bool inline_query_placeholder:string supports_guest_queries:Bool is_guard:Bool need_location:Bool can_connect_to_business:Bool can_be_added_to_attachment_menu:Bool active_user_count:int32 = UserType;",
+    "user": "user id:int53 first_name:string last_name:string usernames:usernames phone_number:string status:UserStatus profile_photo:profilePhoto accent_color_id:int32 background_custom_emoji_id:int64 upgraded_gift_colors:upgradedGiftColors profile_accent_color_id:int32 profile_background_custom_emoji_id:int64 emoji_status:emojiStatus is_contact:Bool is_mutual_contact:Bool is_close_friend:Bool verification_status:verificationStatus is_premium:Bool is_support:Bool restriction_info:restrictionInfo active_story_state:ActiveStoryState restricts_new_chats:Bool paid_message_star_count:int53 have_access:Bool type:UserType language_code:string added_to_attachment_menu:Bool = User;",
+    "messageSenderUser": "messageSenderUser user_id:int53 = MessageSender;",
+    "chatAdministratorRights": "chatAdministratorRights can_manage_chat:Bool can_change_info:Bool can_post_messages:Bool can_edit_messages:Bool can_delete_messages:Bool can_invite_users:Bool can_restrict_members:Bool can_pin_messages:Bool can_manage_topics:Bool can_promote_members:Bool can_manage_video_chats:Bool can_post_stories:Bool can_edit_stories:Bool can_delete_stories:Bool can_manage_direct_messages:Bool can_manage_tags:Bool is_anonymous:Bool = ChatAdministratorRights;",
+    "chatMemberStatusCreator": "chatMemberStatusCreator is_anonymous:Bool is_member:Bool = ChatMemberStatus;",
+    "chatMemberStatusAdministrator": "chatMemberStatusAdministrator can_be_edited:Bool rights:chatAdministratorRights = ChatMemberStatus;",
+    "chatMemberStatusMember": "chatMemberStatusMember member_until_date:int32 = ChatMemberStatus;",
+    "chatMember": "chatMember member_id:MessageSender tag:string inviter_user_id:int53 joined_chat_date:int32 status:ChatMemberStatus = ChatMember;",
+    "getMe": "getMe = User;",
+    "getChatMember": "getChatMember chat_id:int53 member_id:MessageSender = ChatMember;",
+    "getStory": "getStory story_poster_chat_id:int53 story_id:int32 only_local:Bool = Story;",
+    "loadActiveStories": "loadActiveStories story_list:StoryList = Ok;",
+    "getChatActiveStories": "getChatActiveStories chat_id:int53 = ChatActiveStories;",
+    "getChatPostedToChatPageStories": "getChatPostedToChatPageStories chat_id:int53 from_story_id:int32 limit:int32 = Stories;",
+    "getChatArchivedStories": "getChatArchivedStories chat_id:int53 from_story_id:int32 limit:int32 = Stories;",
+    "openStory": "openStory story_poster_chat_id:int53 story_id:int32 = Ok;",
+    "closeStory": "closeStory story_poster_chat_id:int53 story_id:int32 = Ok;",
+    "getGroupCall": "getGroupCall group_call_id:int32 = GroupCall;",
+    "joinLiveStory": "joinLiveStory group_call_id:int32 join_parameters:groupCallJoinParameters = Text;",
+    "leaveGroupCall": "leaveGroupCall group_call_id:int32 = Ok;",
+    "getGroupCallStreams": "getGroupCallStreams group_call_id:int32 = GroupCallStreams;",
+    "getGroupCallStreamSegment": "getGroupCallStreamSegment group_call_id:int32 time_offset:int53 scale:int32 channel_id:int32 video_quality:GroupCallVideoQuality = Data;",
+    "setStoryReaction": "setStoryReaction story_poster_chat_id:int53 story_id:int32 reaction_type:ReactionType update_recent_reactions:Bool = Ok;",
+    "reportStory": "reportStory story_poster_chat_id:int53 story_id:int32 option_id:bytes text:string = ReportStoryResult;",
+    "activateStoryStealthMode": "activateStoryStealthMode = Ok;",
+    "postStory": "postStory chat_id:int53 content:InputStoryContent areas:inputStoryAreas caption:formattedText privacy_settings:StoryPrivacySettings album_ids:vector<int32> active_period:int32 from_story_full_id:storyFullId is_posted_to_chat_page:Bool protect_content:Bool = Story;",
+    "startLiveStory": "startLiveStory chat_id:int53 privacy_settings:StoryPrivacySettings protect_content:Bool is_rtmp_stream:Bool enable_messages:Bool paid_message_star_count:int53 = StartLiveStoryResult;",
+    "editStory": "editStory story_poster_chat_id:int53 story_id:int32 content:InputStoryContent areas:inputStoryAreas caption:formattedText = Ok;",
+    "editStoryCover": "editStoryCover story_poster_chat_id:int53 story_id:int32 cover_frame_timestamp:double = Ok;",
+    "setStoryPrivacySettings": "setStoryPrivacySettings story_id:int32 privacy_settings:StoryPrivacySettings = Ok;",
+    "toggleStoryIsPostedToChatPage": "toggleStoryIsPostedToChatPage story_poster_chat_id:int53 story_id:int32 is_posted_to_chat_page:Bool = Ok;",
+    "deleteStory": "deleteStory story_poster_chat_id:int53 story_id:int32 = Ok;",
+    "setChatActiveStoriesList": "setChatActiveStoriesList chat_id:int53 story_list:StoryList = Ok;",
+    "setChatPinnedStories": "setChatPinnedStories chat_id:int53 story_ids:vector<int32> = Ok;",
+    "downloadFile": "downloadFile file_id:int32 priority:int32 offset:int53 limit:int53 synchronous:Bool = File;",
+    "cancelDownloadFile": "cancelDownloadFile file_id:int32 only_if_pending:Bool = Ok;",
+    "getRemoteFile": "getRemoteFile remote_file_id:string file_type:FileType = File;",
+    "updateStory": "updateStory story:story = Update;",
+    "updateStoryDeleted": "updateStoryDeleted story_poster_chat_id:int53 story_id:int32 = Update;",
+    "updateStoryPostSucceeded": "updateStoryPostSucceeded story:story old_story_id:int32 = Update;",
+    "updateStoryPostFailed": "updateStoryPostFailed story:story error:error error_type:CanPostStoryResult = Update;",
+    "updateChatActiveStories": "updateChatActiveStories active_stories:chatActiveStories = Update;",
+    "updateStoryListChatCount": "updateStoryListChatCount story_list:StoryList chat_count:int32 = Update;",
+    "updateFile": "updateFile file:file = Update;"
+  },
+  "schema_absences": {
+    "constructors": [
+      "viewStories"
+    ],
+    "tokens": [
+      "expire_date"
+    ]
+  },
+  "request_policy": {
+    "background_metadata_allowed": [
+      "getMe",
+      "getChatMember",
+      "loadActiveStories",
+      "getChatActiveStories",
+      "getStory",
+      "getChatPostedToChatPageStories",
+      "getChatArchivedStories"
+    ],
+    "explicit_hydration_only": [
+      "getRemoteFile",
+      "downloadFile",
+      "cancelDownloadFile"
+    ],
+    "explicit_live_metadata_only": [
+      "getGroupCall"
+    ],
+    "explicit_live_viewer_only": [
+      "joinLiveStory",
+      "leaveGroupCall",
+      "getGroupCallStreams",
+      "getGroupCallStreamSegment"
+    ],
+    "forbidden_in_background_discovery": [
+      "openStory",
+      "closeStory",
+      "getGroupCall",
+      "joinLiveStory",
+      "leaveGroupCall",
+      "getGroupCallStreams",
+      "getGroupCallStreamSegment",
+      "setStoryReaction",
+      "reportStory",
+      "activateStoryStealthMode",
+      "postStory",
+      "startLiveStory",
+      "editStory",
+      "editStoryCover",
+      "setStoryPrivacySettings",
+      "toggleStoryIsPostedToChatPage",
+      "deleteStory",
+      "setChatActiveStoriesList",
+      "setChatPinnedStories"
+    ]
+  },
+  "locator_file_type_policy": {
+    "photo-size": "fileTypePhotoStory",
+    "video-primary": "fileTypeVideoStory",
+    "video-alternative": "fileTypeVideoStory",
+    "video-thumbnail": "fileTypeThumbnail",
+    "minithumbnail": "no_file_locator",
+    "unknown": null
+  },
+  "archive_capability_policy": {
+    "owner": {
+      "current_user_type": "userTypeRegular",
+      "target_chat_id": "getMe.id",
+      "eligible": true
+    },
+    "bot_account": {
+      "current_user_type": "userTypeBot",
+      "eligible": false,
+      "placeholder": "archive_unavailable_account_type"
+    },
+    "manageable_creator": {
+      "member_id_type": "messageSenderUser",
+      "status_type": "chatMemberStatusCreator",
+      "eligible": true
+    },
+    "manageable_administrator": {
+      "member_id_type": "messageSenderUser",
+      "status_type": "chatMemberStatusAdministrator",
+      "required_right": "rights.can_edit_stories",
+      "eligible": true
+    },
+    "ordinary": {
+      "eligible": false,
+      "placeholder": "archive_unavailable_rights"
+    },
+    "unavailable": {
+      "eligible": false,
+      "placeholder": "archive_eligibility_unknown"
+    }
+  },
+  "required_wire_fixtures": [
+    "active-list-update",
+    "active-photo-full-story",
+    "live-story-metadata-placeholder",
+    "live-story-group-call-metadata-request",
+    "live-story-join-request",
+    "live-story-leave-request",
+    "live-story-streams-request",
+    "live-story-stream-segment-request",
+    "profile-transition-update",
+    "profile-page-page",
+    "archived-page",
+    "protected-story-placeholder",
+    "story-inaccessible-update",
+    "download-completed-update",
+    "remote-file-photo-story",
+    "remote-file-video-story",
+    "remote-file-thumbnail",
+    "remote-file-unknown",
+    "archive-rights-owner",
+    "archive-rights-owner-bot",
+    "archive-rights-creator",
+    "archive-rights-manageable",
+    "archive-rights-admin-no-edit",
+    "archive-rights-ordinary",
+    "archive-rights-unavailable"
+  ]
+}

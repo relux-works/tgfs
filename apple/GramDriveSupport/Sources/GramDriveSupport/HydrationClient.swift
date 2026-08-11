@@ -8,18 +8,40 @@ import Foundation
 /// A protocol so the fetch logic is exercisable without sockets or an
 /// agent; ``AgentHydrationClient`` is the real transport.
 public protocol HydrationRequesting: Sendable {
-    /// Performs one hydration. Progress callbacks arrive on an arbitrary
-    /// background thread, strictly before the call returns.
+    /// Performs one non-generated hydration. Progress callbacks arrive on an
+    /// arbitrary background thread, strictly before the call returns.
     ///
     /// Throws ``HydrationFailure`` when the agent answered with a terminal
     /// failure, ``HydrationTransportError`` when the channel itself failed,
-    /// and `CancellationError` when the surrounding task was cancelled —
-    /// cancellation also tears the connection down, which is how the agent
-    /// learns to stop the transfer.
+    /// and `CancellationError` when the surrounding task was cancelled.
+    /// Before `done`, cancellation tears the connection down so the agent
+    /// stops the transfer. Generated documents must use
+    /// ``hydrateAndMaterialize(_:onProgress:materialize:)``: their transferred
+    /// descriptor is scoped to its synchronous callback and is never returned
+    /// as a stale raw handle.
     func hydrate(
         _ request: HydrationRequest,
         onProgress: @escaping @Sendable (HydrationProgress) -> Void
     ) async throws -> HydratedContent
+
+    /// Materializes generated content while its transferred descriptor is
+    /// still owned by the client. The real client invokes `materialize` before
+    /// closing that descriptor; test doubles use the safe default below.
+    func hydrateAndMaterialize(
+        _ request: HydrationRequest,
+        onProgress: @escaping @Sendable (HydrationProgress) -> Void,
+        materialize: @escaping @Sendable (HydratedContent) throws -> URL
+    ) async throws -> URL
+}
+
+public extension HydrationRequesting {
+    func hydrateAndMaterialize(
+        _ request: HydrationRequest,
+        onProgress: @escaping @Sendable (HydrationProgress) -> Void,
+        materialize: @escaping @Sendable (HydratedContent) throws -> URL
+    ) async throws -> URL {
+        try materialize(try await hydrate(request, onProgress: onProgress))
+    }
 }
 
 /// Why the hydration channel itself failed (as opposed to the agent
@@ -36,7 +58,7 @@ public enum HydrationTransportError: Error, Equatable {
     case protocolViolation(detail: String)
 }
 
-/// The real hydration client: blocking socket I/O on a utility queue —
+/// The real hydration client: blocking socket I/O on a user-initiated queue —
 /// never on the cooperative pool — bridged into async, with cancellation
 /// delivered as `shutdown(2)` so a blocked read unblocks promptly.
 public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendable {
@@ -44,7 +66,7 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
     private let idleTimeout: Duration
     private let queue = DispatchQueue(
         label: "com.reluxworks.gramdrive.hydration.client",
-        qos: .utility,
+        qos: .userInitiated,
         attributes: .concurrent)
 
     /// - Parameters:
@@ -66,13 +88,41 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
         onProgress: @escaping @Sendable (HydrationProgress) -> Void
     ) async throws -> HydratedContent {
         let connection = HydrationConnection()
-        return try await withTaskCancellationHandler {
+        return try await exchange(
+            request, over: connection, onProgress: onProgress, terminal: { content in
+                guard content.leaseID == nil else {
+                    throw HydrationTransportError.protocolViolation(
+                        detail: "generated content requires scoped materialization")
+                }
+                return content
+            })
+    }
+
+    public func hydrateAndMaterialize(
+        _ request: HydrationRequest,
+        onProgress: @escaping @Sendable (HydrationProgress) -> Void,
+        materialize: @escaping @Sendable (HydratedContent) throws -> URL
+    ) async throws -> URL {
+        let connection = HydrationConnection()
+        return try await exchange(
+            request, over: connection, onProgress: onProgress, terminal: materialize)
+    }
+
+    // MARK: - Blocking exchange
+
+    private func exchange<Output: Sendable>(
+        _ request: HydrationRequest,
+        over connection: HydrationConnection,
+        onProgress: @escaping @Sendable (HydrationProgress) -> Void,
+        terminal: @escaping @Sendable (HydratedContent) throws -> Output
+    ) async throws -> Output {
+        try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
                     continuation.resume(
                         with: Result {
-                            try self.exchange(
-                                request, over: connection, onProgress: onProgress)
+                            try self.exchangeBlocking(
+                                request, over: connection, onProgress: onProgress, terminal: terminal)
                         })
                 }
             }
@@ -81,13 +131,12 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
         }
     }
 
-    // MARK: - Blocking exchange
-
-    private func exchange(
+    private func exchangeBlocking<Output>(
         _ request: HydrationRequest,
         over connection: HydrationConnection,
-        onProgress: @escaping @Sendable (HydrationProgress) -> Void
-    ) throws -> HydratedContent {
+        onProgress: @escaping @Sendable (HydrationProgress) -> Void,
+        terminal: @escaping @Sendable (HydratedContent) throws -> Output
+    ) throws -> Output {
         let path = try resolveSocketURL().path
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
@@ -126,8 +175,34 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
             fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         try send(HydrationWire.encodeLine(request), on: fd, connection: connection)
-        return try readEvents(
+        let content = try readEvents(
             on: fd, path: path, connection: connection, onProgress: onProgress)
+        // The descriptor received with a generated terminal event belongs to
+        // this process now. It survives an agent crash/restart, but it must
+        // never outlive the synchronous materialization callback.
+        defer {
+            if let transferred = content.transferredFileDescriptor {
+                close(transferred)
+            }
+        }
+        // Claim the post-`done` phase before exposing the staged path to the
+        // callback. A cancellation that won before this point remains a wire
+        // cancel and no caller can touch the path; one that arrives after it
+        // is recorded but cannot close the socket until the callback has
+        // stopped using the source.
+        guard connection.beginMaterialization() else { throw CancellationError() }
+        let output: Output
+        do {
+            output = try terminal(content)
+        } catch {
+            if connection.isCancelled { throw CancellationError() }
+            throw error
+        }
+        // The callback may have completed its clone after its task was
+        // cancelled. The bytes were still protected through that operation,
+        // but its caller must observe cancellation rather than a late success.
+        if connection.isCancelled { throw CancellationError() }
+        return output
     }
 
     private func send(_ data: Data, on fd: Int32, connection: HydrationConnection) throws {
@@ -154,6 +229,12 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
     ) throws -> HydratedContent {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 32 * 1024)
+        var receivedDescriptors: [Int32] = []
+        defer {
+            for descriptor in receivedDescriptors {
+                close(descriptor)
+            }
+        }
         while true {
             while let lineEnd = buffer.firstIndex(of: 0x0A) {
                 let line = buffer.subdata(in: buffer.startIndex..<lineEnd)
@@ -167,7 +248,17 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
                 switch event {
                 case .progress(let progress):
                     onProgress(progress)
-                case .done(let content):
+                case .done(var content):
+                    if content.leaseID != nil {
+                        guard receivedDescriptors.count == 1 else {
+                            throw HydrationTransportError.protocolViolation(
+                                detail: "generated terminal event missing transferred descriptor")
+                        }
+                        content.transferredFileDescriptor = receivedDescriptors.removeFirst()
+                    } else if !receivedDescriptors.isEmpty {
+                        throw HydrationTransportError.protocolViolation(
+                            detail: "unexpected transferred descriptor")
+                    }
                     return content
                 case .failure(let failure):
                     throw failure
@@ -176,7 +267,20 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
             guard buffer.count <= HydrationContract.maxEventLineBytes else {
                 throw HydrationTransportError.protocolViolation(detail: "event line too long")
             }
-            let count = read(fd, &chunk, chunk.count)
+            let received: (count: Int, fileDescriptor: Int32?)
+            do {
+                received = try UnixFileDescriptorTransfer.receive(into: &chunk, on: fd)
+            } catch let UnixSocketError.failed(_, code) {
+                if connection.isCancelled { throw CancellationError() }
+                if code == EAGAIN || code == EWOULDBLOCK {
+                    throw HydrationTransportError.timedOut(path: path)
+                }
+                throw UnixSocketError.failed(operation: "recvmsg", code: code)
+            }
+            let count = received.count
+            if let descriptor = received.fileDescriptor {
+                receivedDescriptors.append(descriptor)
+            }
             if count == 0 {
                 if connection.isCancelled { throw CancellationError() }
                 throw HydrationTransportError.protocolViolation(
@@ -202,7 +306,11 @@ public final class AgentHydrationClient: HydrationRequesting, @unchecked Sendabl
 ///
 /// The connection owns the descriptor once adopted. During the exchange,
 /// `cancel()` shuts the live descriptor down, which unblocks a blocked read
-/// with EOF and is the wire's cancel to the server. As the exchange unwinds,
+/// with EOF and is the wire's cancel to the server. Once a terminal `done`
+/// has been claimed for materialization, cancellation is instead remembered
+/// until that synchronous callback returns, so it cannot let the server
+/// release a generated-file lease under an in-progress `copyItem`. As the
+/// exchange unwinds,
 /// `finish()` closes the descriptor exactly once and retires it under the
 /// lock; a `cancel()` racing that unwind then finds no descriptor and skips
 /// `shutdown()`, so it can never hit a number the OS has already handed to
@@ -215,6 +323,7 @@ final class HydrationConnection: @unchecked Sendable {
     private var descriptor: Int32?
     private var cancelled = false
     private var closed = false
+    private var materializing = false
 
     /// Hands the descriptor to the connection. Returns `false` when the
     /// call was cancelled before the socket existed — the caller then closes
@@ -233,6 +342,17 @@ final class HydrationConnection: @unchecked Sendable {
         return cancelled
     }
 
+    /// Enters the post-`done` phase atomically with cancellation. Returning
+    /// `false` means cancellation won before any staged path was handed to a
+    /// caller, so the exchange must stop without invoking materialization.
+    func beginMaterialization() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled, !closed else { return false }
+        materializing = true
+        return true
+    }
+
     /// Closes the adopted descriptor exactly once and retires it from the
     /// connection's view, so a later `cancel()` is a no-op rather than a
     /// `shutdown()` on a potentially reused descriptor number.
@@ -242,6 +362,7 @@ final class HydrationConnection: @unchecked Sendable {
         descriptor = nil
         let wasClosed = closed
         closed = true
+        materializing = false
         lock.unlock()
         if !wasClosed, let fd {
             close(fd)
@@ -252,7 +373,10 @@ final class HydrationConnection: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         cancelled = true
-        if !closed, let descriptor {
+        // A cancellation during pre-terminal I/O is the wire cancel. Once the
+        // materializer owns the staged path, defer that close to `finish()`;
+        // its return is the ownership boundary observed by the server.
+        if !closed, !materializing, let descriptor {
             shutdown(descriptor, SHUT_RDWR)
         }
     }

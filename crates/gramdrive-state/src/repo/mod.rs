@@ -50,31 +50,54 @@ mod backfill;
 mod cache;
 mod changes;
 mod chats;
+mod content_progress;
 mod cursors;
+mod folders;
 mod item_changes;
 mod items;
+mod provider_health;
 mod ranges;
 mod render;
+mod stories;
 mod transfers;
 
 pub use accounts::AccountRecord;
-pub use accounts::RetentionChange;
 pub use accounts::RetentionMode;
 pub use accounts::SourceKind;
-pub use attachments::{AttachmentAvailability, AttachmentFacts, AttachmentState, BlobRecord};
+pub use accounts::{
+    ArchiveModeChange, AuditToMirrorConfirmation, DisplayTimezoneChange, RetentionChange,
+};
+pub use attachments::{
+    AttachmentAvailability, AttachmentFacts, AttachmentFidelity, AttachmentLogicalKind,
+    AttachmentProjection, AttachmentState, BlobRecord, RetainedAttachmentVersion,
+    TelegramRepresentation,
+};
 pub use backfill::BackfillControlRecord;
 pub use cache::{
-    CacheEntryRecord, CacheKind, CacheTotals, CacheUsage, CacheVerification, EvictionCandidate,
-    PinOrigin, PinRecord,
+    ArchiveBackfillProgressRecord, CacheEntryRecord, CacheKind, CacheTotals, CacheUsage,
+    CacheVerification, EvictionCandidate, PinOrigin, PinRecord, RetentionPurgeRecord,
 };
 pub use changes::{
     AppliedChanges, ChatSyncRecord, MessageChange, MessageEventKind, MessageEventRecord,
     MessagePayload, MessageRevision, MessageState, SyncWindow,
 };
-pub use chats::{ChatListEntry, ChatRecord, ChatType};
+pub use chats::{ChatListCommitAudit, ChatListEntry, ChatRecord, ChatType};
+pub use content_progress::{ChatContentPhase, ChatContentProgressRecord};
+pub use folders::{FolderRecord, NamespaceBootstrapRecord};
 pub use item_changes::{ChangeJournalState, ItemChangeRecord};
-pub use items::{FileFacts, ItemAvailability, ItemKind, ItemRecord, item_kind};
-pub use render::{RenderOutput, RenderPublish, RenderStateRecord};
+pub use items::{
+    FileFacts, ItemAvailability, ItemKind, ItemRecord, TombstoneProvenance, item_kind,
+};
+pub use provider_health::{ProviderFetchHealthCounters, ProviderFetchHealthObservation};
+pub use render::{
+    MonthRenderSnapshot, RenderCatalogEntry, RenderEventInput, RenderMessageInput, RenderOutput,
+    RenderPublish, RenderSkipReason, RenderStateRecord,
+};
+pub use stories::{
+    StoryAppearanceRecord, StoryArchiveEligibility, StoryContentLocatorRecord, StoryContentState,
+    StoryFacts, StoryListProgressRecord, StoryLocatorFileType, StoryState, StorySyncPhase,
+    StorySyncProgressRecord, StoryTombstone,
+};
 pub use transfers::{
     EnqueueOutcome, FailureCategory, TransferFailure, TransferId, TransferRecord, TransferState,
 };

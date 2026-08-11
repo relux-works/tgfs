@@ -96,6 +96,7 @@ fn arb_chat(chat_id: i64, folder_ids: Vec<i32>) -> impl Strategy<Value = ChatRec
                 memberships,
                 message_months: months.into_iter().collect(),
                 attachments,
+                stories: Vec::new(),
             },
         )
 }

@@ -56,6 +56,7 @@ fn file_id() -> ItemId {
 
 fn dir_item(id: &ItemId, parent: Option<&ItemId>, safe_name: &str) -> ItemRecord {
     ItemRecord {
+        aggregate_size: None,
         id: id.clone(),
         parent: parent.cloned(),
         display_name: safe_name.to_owned(),
@@ -71,6 +72,7 @@ fn dir_item(id: &ItemId, parent: Option<&ItemId>, safe_name: &str) -> ItemRecord
 
 fn file_item(id: &ItemId, parent: &ItemId, safe_name: &str) -> ItemRecord {
     ItemRecord {
+        aggregate_size: None,
         id: id.clone(),
         parent: Some(parent.clone()),
         display_name: safe_name.to_owned(),

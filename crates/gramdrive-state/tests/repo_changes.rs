@@ -16,9 +16,12 @@ mod common;
 use common::{account_record, chat_record, revision, scope};
 use gramdrive_state::model::cursor::ChangeCursor;
 use gramdrive_state::model::identity::{
-    AccountId, AccountKey, AccountScope, ChatId, MessageId, NamespaceVersion, SchemaFamily,
+    AccountId, AccountKey, AccountScope, ChatId, ChatListKey, ChatListKind, MessageId,
+    NamespaceVersion, SchemaFamily,
 };
-use gramdrive_state::repo::{ChatSyncRecord, MessageChange, MessageEventKind, SyncWindow};
+use gramdrive_state::repo::{
+    ChatListEntry, ChatSyncRecord, MessageChange, MessageEventKind, SyncWindow,
+};
 use gramdrive_state::{StateError, StateStore};
 
 const CHAT: i64 = 100;
@@ -31,6 +34,18 @@ fn store() -> StateStore {
     let tx = store.write_txn().expect("write txn");
     tx.upsert_account(&account_record()).expect("account");
     tx.upsert_chat(&chat_record(CHAT)).expect("chat");
+    tx.upsert_chat_list_entry(
+        &ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Main,
+        },
+        &ChatListEntry {
+            chat_id: ChatId(CHAT),
+            sort_order: 2,
+            pinned: false,
+        },
+    )
+    .expect("membership");
     tx.commit().expect("commit");
     store
 }
@@ -383,6 +398,105 @@ fn empty_stream_names_are_refused() {
     }
 }
 
+/// The starvation this bug is named for: a chat that keeps receiving
+/// messages must not lose its place in the backward-crawl rotation
+/// (BUG-260728-2qfzbd).
+///
+/// Live delivery stamps `last_sync_at_ms` through `record_chat_sync`, and
+/// while the backlog ordered on that column the busiest correspondences were
+/// the ones that never crawled backward — on a real profile the reported
+/// chat sat at an unmoved frontier for over an hour. The order must move
+/// only when a turn is actually handed out.
+#[test]
+fn live_traffic_does_not_move_a_chat_down_the_backfill_rotation() {
+    let mut store = store();
+    let waiting = common::chat_key(CHAT);
+    let busy = common::chat_key(CHAT + 1);
+
+    let tx = store.write_txn().expect("write txn");
+    tx.upsert_chat(&chat_record(CHAT + 1)).expect("chat");
+    for chat_id in [CHAT, CHAT + 1] {
+        tx.upsert_chat_list_entry(
+            &ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Main,
+            },
+            &ChatListEntry {
+                chat_id: ChatId(chat_id),
+                sort_order: 1,
+                pinned: false,
+            },
+        )
+        .expect("membership");
+    }
+    // The busy chat's turn was the longer ago of the two, so it is the one
+    // due for history next.
+    tx.record_backfill_turn(&busy, 1_000).expect("turn");
+    tx.record_backfill_turn(&waiting, 2_000).expect("turn");
+    // Both have been observed; the busy one much more recently, because
+    // messages keep arriving in it. This is the stamp `apply_live_commit`
+    // writes, and the one the old ordering mistook for scheduling state.
+    for (chat, observed_at) in [(&waiting, 5_000), (&busy, 30_000)] {
+        tx.record_chat_sync(
+            chat,
+            &ChatSyncRecord {
+                window: Some(SyncWindow {
+                    oldest: MessageId(10),
+                    newest: MessageId(10 + observed_at),
+                }),
+                history_complete: false,
+                last_sync_at_ms: Some(observed_at),
+            },
+        )
+        .expect("live sync");
+    }
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    assert_eq!(
+        read.backfill_backlog(&scope(), 10, i64::MAX)
+            .expect("backlog"),
+        vec![ChatId(CHAT + 1), ChatId(CHAT)],
+        "the chat due for history leads even though it is the noisiest: \
+         live delivery is not a turn and must not reorder the queue"
+    );
+    drop(read);
+
+    // Taking a turn is the only thing that moves a chat to the back.
+    let tx = store.write_txn().expect("write txn");
+    tx.record_backfill_turn(&busy, 40_000).expect("turn");
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    assert_eq!(
+        read.backfill_backlog(&scope(), 10, i64::MAX)
+            .expect("backlog"),
+        vec![ChatId(CHAT), ChatId(CHAT + 1)]
+    );
+}
+
+/// A turn stamped for a chat with no cursor row is a no-op, not an error:
+/// rows are created by the chat trigger, and a chat without one is not in
+/// the backlog to be scheduled.
+#[test]
+fn a_backfill_turn_for_an_unknown_chat_changes_nothing() {
+    let mut store = store();
+    let missing = common::chat_key(CHAT + 99);
+    let tx = store.write_txn().expect("write txn");
+    tx.record_backfill_turn(&missing, 1_000).expect("turn");
+    tx.commit().expect("commit");
+
+    let read = store.read_txn().expect("read");
+    assert_eq!(read.chat_sync_state(&missing).expect("state"), None);
+    assert!(
+        !read
+            .backfill_backlog(&scope(), 10, i64::MAX)
+            .expect("backlog")
+            .contains(&ChatId(CHAT + 99)),
+        "stamping a turn must not conjure a schedulable chat"
+    );
+}
+
 #[test]
 fn sync_windows_move_with_state_and_feed_the_backlog() {
     let mut store = store();
@@ -391,6 +505,18 @@ fn sync_windows_move_with_state_and_feed_the_backlog() {
 
     let tx = store.write_txn().expect("write txn");
     tx.upsert_chat(&chat_record(CHAT + 1)).expect("chat");
+    tx.upsert_chat_list_entry(
+        &ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Main,
+        },
+        &ChatListEntry {
+            chat_id: ChatId(CHAT + 1),
+            sort_order: 1,
+            pinned: false,
+        },
+    )
+    .expect("membership");
 
     // An inverted window is a caller bug, refused before SQL.
     match tx.record_chat_sync(
@@ -435,12 +561,17 @@ fn sync_windows_move_with_state_and_feed_the_backlog() {
         },
     )
     .expect("sync state");
+    // The rotation key is the turn, not the sync: stamping one moves this
+    // chat behind the chat that has never had a turn.
+    tx.record_backfill_turn(&chat, 1_000).expect("turn");
     tx.commit().expect("commit");
 
     let read = store.read_txn().expect("read");
     assert_eq!(read.chat_sync_state(&chat).expect("state"), Some(record));
-    // Never-synced chats lead the backlog (NULL sorts first).
-    let backlog = read.backfill_backlog(&scope(), 10).expect("backlog");
+    // Never-turned chats lead the backlog (NULL sorts first).
+    let backlog = read
+        .backfill_backlog(&scope(), 10, i64::MAX)
+        .expect("backlog");
     assert_eq!(backlog, vec![ChatId(CHAT + 1), ChatId(CHAT)]);
     drop(read);
 
@@ -460,7 +591,9 @@ fn sync_windows_move_with_state_and_feed_the_backlog() {
     .expect("sync state");
     tx.commit().expect("commit");
     let read = store.read_txn().expect("read");
-    let backlog = read.backfill_backlog(&scope(), 10).expect("backlog");
+    let backlog = read
+        .backfill_backlog(&scope(), 10, i64::MAX)
+        .expect("backlog");
     assert_eq!(backlog, vec![ChatId(CHAT + 1)]);
 }
 

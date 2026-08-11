@@ -44,7 +44,7 @@ struct EnumeratorWiringTests {
 
     @Test("A parseable domain with no configured account answers noSuchItem")
     func unconfiguredAccount() {
-        withExtension(domainIdentifier: "account-7") { ext in
+        _ = withExtension(domainIdentifier: "account-7") { ext in
             #expect(throws: NSFileProviderError(.noSuchItem)) {
                 _ = try ext.makeEnumerator(for: .workingSet)
             }

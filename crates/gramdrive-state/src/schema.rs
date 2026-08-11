@@ -25,7 +25,7 @@ use crate::migrate::{self, BASELINE_VERSION};
 ///
 /// Tied to [`crate::migrate::MIGRATIONS`] by a const assertion there: this
 /// number and that list are one fact, and the build fails if they disagree.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// The v1 DDL, applied verbatim inside one transaction. The file is frozen:
 /// schema changes are new migration scripts, never edits here (NFR-041).

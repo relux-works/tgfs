@@ -28,9 +28,10 @@ use gramdrive_engine::model::identity::{
 };
 use gramdrive_engine::model::version::{ContentVersion, MetadataVersion};
 use gramdrive_engine::state::repo::{
-    AccountRecord, AttachmentAvailability, AttachmentFacts, CacheVerification, ChatRecord,
-    ChatType, FailureCategory, FileFacts, ItemAvailability, ItemRecord, MessageChange,
-    MessageRevision, PinOrigin, RetentionMode, SourceKind, TransferId,
+    AccountRecord, AttachmentAvailability, AttachmentFacts, AttachmentFidelity,
+    AttachmentLogicalKind, CacheVerification, ChatRecord, ChatType, FailureCategory, FileFacts,
+    ItemAvailability, ItemRecord, MessageChange, MessageRevision, PinOrigin, RetentionMode,
+    SourceKind, TelegramRepresentation, TransferId,
 };
 use gramdrive_engine::state::{LocalStorage, StateStore, StorageError, StoredObject};
 use gramdrive_engine::transfer::{
@@ -107,6 +108,7 @@ fn seed_base(store: &mut StateStore) {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -128,6 +130,7 @@ fn seed_base(store: &mut StateStore) {
     })
     .expect("chat");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: fixture::account_root_id(scope()),
         parent: None,
         display_name: "Root".to_owned(),
@@ -170,11 +173,15 @@ fn seed_attachment(
     .expect("message");
     tx.upsert_attachment(&AttachmentFacts {
         key: attachment_key(message, index),
-        original_name: Some(name.to_owned()),
+        logical_kind: AttachmentLogicalKind::Document,
+        telegram_representation: TelegramRepresentation::OriginalDocument,
+        fidelity: AttachmentFidelity::Original,
+        source_name: Some(name.to_owned()),
         mime_type: None,
-        logical_size,
+        exact_size: logical_size,
         content_version: version(content_version),
         telegram_unique_id: None,
+        telegram_local_file_id: None,
         telegram_file_id: None,
         file_reference: None,
         availability: AttachmentAvailability::Fetchable,
@@ -182,6 +189,7 @@ fn seed_attachment(
     })
     .expect("attachment");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: attachment_item(message, index),
         parent: Some(fixture::account_root_id(scope())),
         display_name: name.to_owned(),
@@ -635,7 +643,7 @@ fn whole_attachment_verifies_hashes_and_publishes() {
         .expect("present");
     assert_eq!(attachment.blob_hash, Some(sha256(&bytes)));
     assert_eq!(attachment.last_verified_at_ms, Some(2_000));
-    assert_eq!(attachment.facts.original_name.as_deref(), Some("photo.jpg"));
+    assert_eq!(attachment.facts.source_name.as_deref(), Some("photo.jpg"));
 }
 
 #[test]
@@ -725,13 +733,13 @@ fn identical_content_deduplicates_but_keeps_per_attachment_provenance() {
         .expect("a")
         .expect("present")
         .facts
-        .original_name;
+        .source_name;
     let name_b = read
         .attachment(&attachment_key(6, 0))
         .expect("b")
         .expect("present")
         .facts
-        .original_name;
+        .source_name;
     assert_eq!(name_a.as_deref(), Some("first.bin"));
     assert_eq!(name_b.as_deref(), Some("second.bin"));
 }

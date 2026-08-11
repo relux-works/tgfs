@@ -1,15 +1,253 @@
+import Darwin
 import Foundation
 import GramDriveAgentCore
+@testable import GramDriveCompanion
 import GramDriveSupport
 import Testing
-
-@testable import GramDriveCompanion
 
 /// The live command path end to end (BUG-260720-3i74u1): the ensurer's
 /// probe-start-wait contract, and the live backend + authorization session
 /// against a real control/health server pair with scripted engine seams.
-@Suite struct LiveControlTests {
+struct LiveControlTests {
     // MARK: - Fixtures
+
+    @Test func onlyAnOlderNumericAgentIsEligibleForReplacement() {
+        #expect(LiveCompanionBackend.isOlderBuild("136", than: "137"))
+        #expect(!LiveCompanionBackend.isOlderBuild("137", than: "137"))
+        #expect(!LiveCompanionBackend.isOlderBuild("138", than: "137"))
+        #expect(!LiveCompanionBackend.isOlderBuild("legacy", than: "137"))
+        #expect(LiveCompanionBackend.buildCompatibility(agent: "137", app: "137") == .matching)
+        #expect(LiveCompanionBackend.buildCompatibility(agent: "138", app: "137") == .incompatible)
+        #expect(LiveCompanionBackend.buildCompatibility(agent: "legacy", app: "137") == .incompatible)
+    }
+
+    @Test func replacementRequiresMatchingBuildAndAnEnumeratedReadyHierarchy() {
+        var snapshot = Self.snapshot()
+        snapshot.finderContentState = .ready
+        snapshot.finderFirstPageItemCount = 0
+        #expect(LiveCompanionBackend.isReadyReplacement(snapshot))
+
+        snapshot.finderFirstPageItemCount = nil
+        #expect(!LiveCompanionBackend.isReadyReplacement(snapshot))
+        snapshot.finderFirstPageItemCount = 1
+        snapshot.finderContentState = .preparing
+        #expect(!LiveCompanionBackend.isReadyReplacement(snapshot))
+        snapshot.finderContentState = .ready
+        snapshot.bundleVersion = "not-a-build"
+        #expect(!LiveCompanionBackend.isReadyReplacement(snapshot))
+        snapshot.bundleVersion = "999999"
+        #expect(!LiveCompanionBackend.isReadyReplacement(snapshot))
+    }
+
+    @Test func replacementCommitsTheOlderAgentBeforeStartingTheMatchingHierarchy() async throws {
+        let layout = try Self.tempLayout()
+        let appBuild = "137"
+        let transport = ReplacementTransport(oldBuild: "136", replacementBuild: appBuild)
+        try transport.startOldAgent(layout: layout)
+        defer {
+            transport.stop()
+            try? FileManager.default.removeItem(at: layout.dataRoot)
+        }
+        let replacementStarted = LockedBool()
+        let starter = ScriptedStarter {
+            replacementStarted.set(true)
+            try transport.startReplacement(layout: layout)
+        }
+        let backend = LiveCompanionBackend(
+            layout: layout,
+            healthTimeout: .milliseconds(50),
+            starter: starter,
+            startupTimeout: .seconds(1),
+            controlRetryInterval: .milliseconds(1),
+            appBuild: appBuild,
+            matchingAgentReady: { transport.didObserveMatchingHierarchy() }
+        )
+
+        let result = await backend.fetchHealth()
+
+        guard case let .running(snapshot) = result else {
+            Issue.record("replacement did not report a running matching agent: \(result)")
+            return
+        }
+        #expect(LiveCompanionBackend.isReadyReplacement(snapshot, appBuild: appBuild))
+        #expect(transport.terminationActions == [.prepare, .commit])
+        #expect(transport.terminationRequestIDs.count == 2)
+        #expect(transport.terminationRequestIDs[0] == transport.terminationRequestIDs[1])
+        #expect(replacementStarted.value)
+        #expect(transport.matchingHierarchyObserved)
+    }
+
+    @Test func replacementReconcilesADroppedCommitAcknowledgementBeforeStarting() async throws {
+        let layout = try Self.tempLayout()
+        let appBuild = "137"
+        let transport = ReplacementTransport(
+            oldBuild: "136", replacementBuild: appBuild, dropCommitAcknowledgement: true
+        )
+        try transport.startOldAgent(layout: layout)
+        defer {
+            transport.stop()
+            try? FileManager.default.removeItem(at: layout.dataRoot)
+        }
+        let replacementStarted = LockedBool()
+        let starter = ScriptedStarter {
+            replacementStarted.set(true)
+            try transport.startReplacement(layout: layout)
+        }
+        let backend = LiveCompanionBackend(
+            layout: layout,
+            healthTimeout: .milliseconds(50),
+            starter: starter,
+            startupTimeout: .seconds(1),
+            controlRetryInterval: .milliseconds(1),
+            appBuild: appBuild,
+            matchingAgentReady: { transport.didObserveMatchingHierarchy() }
+        )
+
+        let result = await backend.fetchHealth()
+
+        guard case let .running(snapshot) = result else {
+            Issue.record("replacement did not reconcile the dropped commit acknowledgement: \(result)")
+            return
+        }
+        #expect(LiveCompanionBackend.isReadyReplacement(snapshot, appBuild: appBuild))
+        #expect(transport.terminationActions == [.prepare, .commit])
+        #expect(replacementStarted.value)
+        #expect(transport.matchingHierarchyObserved)
+    }
+
+    @Test func replacementEscalationRevalidatesIdentityBeforeEverySignal() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // Ignore TERM so the production fallback must reach its exact-identity
+        // SIGKILL phase. The loop avoids a child process that could outlive this
+        // focused process-identity test.
+        process.arguments = ["-c", "trap '' TERM; while :; do :; done"]
+        try process.run()
+        defer {
+            if process.isRunning { process.terminate() }
+        }
+
+        let identity = try Self.processIdentity(for: process.processIdentifier)
+        var reused = identity
+        reused.kernelStartMicroseconds += 1
+        #expect(await LiveCompanionBackend.terminateExactProcess(reused, pollInterval: .milliseconds(1)))
+        #expect(Self.processStillMatches(identity), "a start-time mismatch must never signal a reused PID")
+
+        #expect(await LiveCompanionBackend.terminateExactProcess(identity, pollInterval: .milliseconds(5)))
+        #expect(!Self.processStillMatches(identity))
+    }
+
+    @Test func realOlderAgentReplacementEscalatesAndStartsTheMatchingSameBinarySuccessor() async throws {
+        let layout = try Self.tempLayout()
+        let appBuild = "137"
+        let preservedDomainInput = layout.dataRoot.appendingPathComponent("file-provider-domain-id")
+        try Data("domain-preserved".utf8).write(to: preservedDomainInput)
+        try AgentSettingsStore(fileURL: layout.settingsFile).save(AgentSettings(launchAtLogin: true))
+
+        let agentExecutable = try Self.agentExecutable()
+        let oldProcess = try Self.startRealAgent(
+            executable: agentExecutable,
+            layout: layout,
+            reportedBuild: "136",
+            extraArguments: [
+                "--test-committed-exit-delay-ms", "10000",
+                "--test-termination-hard-exit-watchdog-ms", "10000",
+            ]
+        )
+        let successor = ProcessBox()
+        defer {
+            Self.stopIfNeeded(oldProcess)
+            Self.stopIfNeeded(successor.process)
+            try? FileManager.default.removeItem(at: layout.dataRoot)
+        }
+
+        let oldSnapshot = try Self.waitForRealHealth(socketURL: layout.healthSocket)
+        let oldIdentity = try #require(oldSnapshot.processIdentity)
+        #expect(oldIdentity.isValidTerminationIdentity)
+        #expect(oldSnapshot.bundleVersion == "136")
+
+        var reusedIdentity = oldIdentity
+        reusedIdentity.kernelStartMicroseconds += 1
+        #expect(
+            await LiveCompanionBackend.terminateExactProcess(
+                reusedIdentity, pollInterval: .milliseconds(1)
+            )
+        )
+        #expect(
+            Self.processStillMatches(oldIdentity),
+            "a mismatched kernel start identity must never signal the old agent"
+        )
+
+        let replacementStarted = LockedBool()
+        let starter = ProcessStarter {
+            replacementStarted.set(true)
+            let process = try Self.startRealAgent(
+                executable: agentExecutable,
+                layout: layout,
+                reportedBuild: appBuild
+            )
+            successor.process = process
+        }
+        let hierarchyReady = LockedBool()
+        let backend = LiveCompanionBackend(
+            layout: layout,
+            healthTimeout: .milliseconds(50),
+            starter: starter,
+            startupTimeout: .seconds(1),
+            controlRetryInterval: .milliseconds(5),
+            appBuild: appBuild,
+            matchingAgentReady: { hierarchyReady.set(true) }
+        )
+
+        let replacementStart = ContinuousClock.now
+        let result = await backend.fetchHealth()
+
+        guard case let .running(snapshot) = result else {
+            Issue.record("real replacement did not report a matching running agent: \(result)")
+            return
+        }
+        let successorIdentity = try #require(snapshot.processIdentity)
+        #expect(!Self.processStillMatches(oldIdentity))
+        #expect(successorIdentity.isValidTerminationIdentity)
+        #expect(successorIdentity != oldIdentity)
+        #expect(snapshot.bundleVersion == appBuild)
+        #expect(LiveCompanionBackend.isReadyReplacement(snapshot, appBuild: appBuild))
+        #expect(snapshot.launchAtLogin == true)
+        #expect(try Data(contentsOf: preservedDomainInput) == Data("domain-preserved".utf8))
+        #expect(replacementStarted.value)
+        #expect(starter.startCount == 1)
+        #expect(hierarchyReady.value)
+        #expect(
+            replacementStart.duration(to: ContinuousClock.now) < .seconds(5),
+            "the backend must use its exact-identity escalation before the test watchdog can exit the old process"
+        )
+    }
+
+    @Test func currentBuildRollbackRecoveryAcceptsAnAlreadyServingMatchingAgent() async throws {
+        let layout = try Self.tempLayout()
+        var readySnapshot = Self.snapshot()
+        readySnapshot.bundleVersion = "137"
+        readySnapshot.finderContentState = .ready
+        readySnapshot.finderFirstPageItemCount = 0
+        let snapshot = readySnapshot
+        let health = try AgentHealthServer.start(socketURL: layout.healthSocket) { snapshot }
+        defer {
+            health.stop()
+            try? FileManager.default.removeItem(at: layout.dataRoot)
+        }
+        let starter = ScriptedStarter()
+        let backend = LiveCompanionBackend(
+            layout: layout,
+            healthTimeout: .milliseconds(50),
+            starter: starter,
+            startupTimeout: .seconds(1),
+            controlRetryInterval: .milliseconds(1),
+            appBuild: "137"
+        )
+
+        #expect(await backend.recoverCurrentBuildForTerminationRollback())
+        #expect(starter.askedPreferences.isEmpty)
+    }
 
     private static func tempLayout() throws -> AgentRuntimeLayout {
         let url = FileManager.default.temporaryDirectory
@@ -19,12 +257,104 @@ import Testing
         return layout
     }
 
+    private static func processIdentity(for pid: Int32) throws -> AgentProcessIdentity {
+        var info = proc_bsdinfo()
+        let count = proc_pidinfo(
+            pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        guard count == MemoryLayout<proc_bsdinfo>.size else {
+            throw ProcessIdentityError.unavailable
+        }
+        return AgentProcessIdentity(
+            instanceID: UUID(), pid: pid,
+            kernelStartSeconds: Int64(info.pbi_start_tvsec),
+            kernelStartMicroseconds: Int64(info.pbi_start_tvusec)
+        )
+    }
+
+    private static func processStillMatches(_ identity: AgentProcessIdentity) -> Bool {
+        var info = proc_bsdinfo()
+        let count = proc_pidinfo(
+            identity.pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        return count == MemoryLayout<proc_bsdinfo>.size
+            && Int64(info.pbi_start_tvsec) == identity.kernelStartSeconds
+            && Int64(info.pbi_start_tvusec) == identity.kernelStartMicroseconds
+    }
+
+    private static func agentExecutable() throws -> URL {
+        let source = URL(fileURLWithPath: #filePath)
+        let packageRoot = source
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let buildRoot = packageRoot.appendingPathComponent(".build", isDirectory: true)
+        let candidates = try FileManager.default.contentsOfDirectory(
+            at: buildRoot, includingPropertiesForKeys: nil
+        )
+        .map { $0.appendingPathComponent("debug/gramdrive-agent") }
+        guard let executable = candidates.first(where: {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }) else {
+            throw ProcessIdentityError.agentExecutableMissing
+        }
+        return executable
+    }
+
+    private static func startRealAgent(
+        executable: URL,
+        layout: AgentRuntimeLayout,
+        reportedBuild: String,
+        extraArguments: [String] = []
+    ) throws -> Process {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [
+            "run",
+            "--data-root", layout.dataRoot.path,
+            "--drain-grace-ms", "25",
+            "--drain-cancel-wait-ms", "25",
+            "--test-reported-bundle-version", reportedBuild,
+            "--test-finder-hierarchy-ready", "true",
+        ] + extraArguments
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        return process
+    }
+
+    private static func waitForRealHealth(socketURL: URL) throws -> AgentHealthSnapshot {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if let snapshot = try? AgentHealthClient.fetch(socketURL: socketURL, timeout: .milliseconds(100)) {
+                return snapshot
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        throw ProcessIdentityError.agentHealthUnavailable
+    }
+
+    private static func stopIfNeeded(_ process: Process?) {
+        guard let process, process.isRunning else { return }
+        _ = Darwin.kill(process.processIdentifier, SIGKILL)
+    }
+
+    private enum ProcessIdentityError: Error {
+        case unavailable
+        case agentExecutableMissing
+        case agentHealthUnavailable
+    }
+
     private static func snapshot(accounts: [AccountHealthSummary]? = nil) -> AgentHealthSnapshot {
         AgentHealthSnapshot(
             payloadVersion: 1,
             agentVersion: AgentVersion.current,
+            bundleVersion: AgentBuildVersion.current,
             contractVersion: "0.6.0",
             pid: 7,
+            processIdentity: AgentProcessIdentity(
+                instanceID: UUID(), pid: Int32.max, kernelStartSeconds: 1, kernelStartMicroseconds: 1
+            ),
             state: .running,
             startedAtMs: 0,
             launchAtLogin: nil,
@@ -38,7 +368,8 @@ import Testing
             lastSleepMs: nil,
             lastWakeMs: nil,
             recentEvents: [],
-            accounts: accounts)
+            accounts: accounts
+        )
     }
 
     /// A running agent stand-in: real health + control servers over the
@@ -64,7 +395,9 @@ import Testing
                     reloadSettings: { AgentSettings() },
                     authorizer: authorizer,
                     remover: remover,
-                    repairer: repairer))
+                    repairer: repairer
+                )
+            )
         }
 
         func stop() {
@@ -105,7 +438,8 @@ import Testing
         let ensurer = AgentEnsurer(
             probe: { .running(Self.snapshot()) },
             starter: starter,
-            loginItemPreferred: { true })
+            loginItemPreferred: { true }
+        )
         #expect(await ensurer.ensureRunning() == .alreadyRunning)
         #expect(starter.askedPreferences.isEmpty)
     }
@@ -118,7 +452,8 @@ import Testing
             starter: starter,
             loginItemPreferred: { false },
             pollInterval: .milliseconds(10),
-            startupTimeout: .seconds(5))
+            startupTimeout: .seconds(5)
+        )
         #expect(await ensurer.ensureRunning() == .started)
         #expect(starter.askedPreferences == [false], "the preference is honored, not upgraded")
     }
@@ -131,7 +466,8 @@ import Testing
             starter: starter,
             loginItemPreferred: { false },
             pollInterval: .milliseconds(10),
-            startupTimeout: .milliseconds(100))
+            startupTimeout: .milliseconds(100)
+        )
         guard case .failed = await ensurer.ensureRunning() else {
             Issue.record("a throwing starter must fail the ensure")
             return
@@ -144,11 +480,62 @@ import Testing
             starter: ScriptedStarter(),
             loginItemPreferred: { false },
             pollInterval: .milliseconds(10),
-            startupTimeout: .milliseconds(80))
+            startupTimeout: .milliseconds(80)
+        )
         guard case .failed = await ensurer.ensureRunning() else {
             Issue.record("an agent that never answers must fail the ensure")
             return
         }
+    }
+
+    @Test func bundledAgentPathMatchesThePackagedContentsMacOSLayout() {
+        let appExecutable = URL(
+            fileURLWithPath: "/Applications/GramDrive.app/Contents/MacOS/GramDrive"
+        )
+        #expect(
+            BundledAgentStarter.bundledAgentExecutable(relativeTo: appExecutable)?.path
+                == "/Applications/GramDrive.app/Contents/MacOS/gramdrive-agent"
+        )
+        #expect(BundledAgentStarter.bundledAgentExecutable(relativeTo: nil) == nil)
+    }
+
+    @Test func bundledStarterOwnsOneDirectSessionProcessAcrossRepeatedStarts() throws {
+        let starter = BundledAgentStarter(
+            loginItem: PassiveLoginItemService(),
+            agentExecutable: URL(fileURLWithPath: "/usr/bin/yes")
+        )
+        defer { starter.stopOwnedAgent() }
+
+        try starter.startAgent(loginItemPreferred: false)
+        let firstPID = try #require(starter.ownedProcessIdentifier)
+        try starter.startAgent(loginItemPreferred: false)
+
+        #expect(starter.ownedProcessIdentifier == firstPID)
+        starter.stopOwnedAgent()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while starter.ownedProcessIdentifier != nil, ContinuousClock.now < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        #expect(starter.ownedProcessIdentifier == nil)
+
+        try starter.startAgent(loginItemPreferred: false)
+        let relaunchedPID = try #require(starter.ownedProcessIdentifier)
+        #expect(relaunchedPID != firstPID)
+    }
+
+    @Test func enabledLoginItemAlsoStartsTheMissingCurrentSessionAgent() throws {
+        let loginItem = PassiveLoginItemService()
+        loginItem.status = .enabled
+        let starter = BundledAgentStarter(
+            loginItem: loginItem,
+            agentExecutable: URL(fileURLWithPath: "/usr/bin/yes")
+        )
+        defer { starter.stopOwnedAgent() }
+
+        try starter.startAgent(loginItemPreferred: true)
+
+        #expect(loginItem.status == .enabled)
+        #expect(starter.ownedProcessIdentifier != nil)
     }
 
     // MARK: - The live authorization session
@@ -157,7 +544,8 @@ import Testing
         let layout = try Self.tempLayout()
         let hosted = ScriptedCompanionHostedSession()
         let agent = try FakeAgent(
-            layout: layout, authorizer: ScriptedCompanionAuthorizer(session: hosted))
+            layout: layout, authorizer: ScriptedCompanionAuthorizer(session: hosted)
+        )
         defer { agent.stop() }
 
         hosted.emit(ControlAuthState(kind: "starting"))
@@ -178,7 +566,8 @@ import Testing
 
         hosted.answer = AgentAuthSubmitAnswer(
             outcome: "rejected",
-            rejection: ControlAuthRejection(kind: "rate-limited", retryAfterSeconds: 17))
+            rejection: ControlAuthRejection(kind: "rate-limited", retryAfterSeconds: 17)
+        )
         let rejected = await session.submit(.submitCode("00000"))
         #expect(rejected == .rejected(.rateLimited(retryAfterSeconds: 17)))
 
@@ -187,12 +576,18 @@ import Testing
             ControlAuthState(
                 kind: "wait-code",
                 codeInfo: ControlAuthCodeInfo(
-                    phoneNumber: "+9996612222", codeLength: 5, resendTimeoutSeconds: 60)))
+                    phoneNumber: "+9996612222", codeLength: 5, resendTimeoutSeconds: 60
+                )
+            )
+        )
         #expect(
             await states.next()
                 == .waitCode(
                     CompanionCodeInfo(
-                        phoneNumber: "+9996612222", codeLength: 5, resendTimeoutSeconds: 60)))
+                        phoneNumber: "+9996612222", codeLength: 5, resendTimeoutSeconds: 60
+                    )
+                )
+        )
 
         // Finalizing renders as machinery; ready carries through; a foreign
         // state fails safe.
@@ -201,7 +596,9 @@ import Testing
         hosted.emit(
             ControlAuthState(
                 kind: "ready",
-                account: ControlAccountIdentity(accountId: 777, displayName: "Test User")))
+                account: ControlAccountIdentity(accountId: 777, displayName: "Test User")
+            )
+        )
         #expect(await states.next() == .ready)
         hosted.emit(ControlAuthState(kind: "brand-new-step"))
         #expect(await states.next() == .unsupported(kind: "brand-new-step"))
@@ -230,11 +627,83 @@ import Testing
         defer { agentBox.agent?.stop() }
         let backend = LiveCompanionBackend(
             layout: layout, healthTimeout: .seconds(2), starter: starter,
-            startupTimeout: .seconds(5))
+            startupTimeout: .seconds(5)
+        )
 
         #expect(await backend.requestRepair() == .completed)
         #expect(repairer.runCount == 1)
         #expect(starter.askedPreferences == [false], "no settings file: login item defaults off")
+    }
+
+    @Test func concurrentColdStartStatusReadsStartExactlyOneAgent() async throws {
+        let layout = try Self.tempLayout()
+        let agentBox = AgentBox()
+        let starter = ScriptedStarter(onStart: {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.05) {
+                agentBox.agent = try? FakeAgent(layout: layout)
+            }
+        })
+        defer {
+            agentBox.agent?.stop()
+            try? FileManager.default.removeItem(at: layout.dataRoot)
+        }
+        let backend = LiveCompanionBackend(
+            layout: layout,
+            healthTimeout: .seconds(2),
+            starter: starter,
+            startupTimeout: .seconds(5)
+        )
+
+        async let launchRead = backend.fetchHealth()
+        async let repeatedActivationRead = backend.fetchHealth()
+        let readings = await [launchRead, repeatedActivationRead]
+
+        #expect(readings.allSatisfy { if case .running = $0 { true } else { false } })
+        #expect(starter.askedPreferences == [false], "cold-start activation must be coalesced")
+    }
+
+    /// Regression for the notarized v0.1.1 clean-first-launch failure: health
+    /// could answer before `control.sock` existed, so the first auth connect
+    /// failed even though the just-spawned agent stayed healthy. The backend
+    /// must wait boundedly for the late control listener, without replaying a
+    /// request after it has reached a listener.
+    @Test func backendRetriesAuthConnectWhileControlSocketBecomesReady() async throws {
+        let layout = try Self.tempLayout()
+        let health = try AgentHealthServer.start(socketURL: layout.healthSocket) {
+            Self.snapshot()
+        }
+        let hosted = ScriptedCompanionHostedSession()
+        hosted.emit(ControlAuthState(kind: "starting"))
+        let control = ControlServerBox()
+        defer {
+            control.server?.stop()
+            health.stop()
+            try? FileManager.default.removeItem(at: layout.dataRoot)
+        }
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.15) {
+            control.server = try? ControlServer.start(
+                socketURL: layout.controlSocket,
+                handlers: ControlServerHandlers(
+                    status: { Self.snapshot() },
+                    reloadSettings: { AgentSettings() },
+                    authorizer: ScriptedCompanionAuthorizer(session: hosted)
+                )
+            )
+        }
+
+        let backend = LiveCompanionBackend(
+            layout: layout,
+            healthTimeout: .seconds(1),
+            starter: ScriptedStarter(),
+            startupTimeout: .seconds(2),
+            controlRetryInterval: .milliseconds(10)
+        )
+        let session = backend.makeAuthorizationSession()
+        let states = StateCollector(session.states)
+
+        #expect(await session.start() == .started)
+        #expect(await states.next() == .starting)
     }
 
     @Test func backendReportsAgentNotRunningWhenStartFails() async throws {
@@ -244,12 +713,19 @@ import Testing
             layout: layout,
             healthTimeout: .seconds(1),
             starter: ScriptedStarter(onStart: { throw Boom() }),
-            startupTimeout: .milliseconds(100))
+            startupTimeout: .milliseconds(100)
+        )
 
         #expect(await backend.requestRepair() == .unavailable(.agentNotRunning))
+        #expect(
+            await backend.fetchContentPolicy(accountId: 777)
+                == .unavailable(.agentNotRunning)
+        )
         let removal = await backend.removeAccount(
             RemovalConfirmation(
-                accountLabel: "A", typedConfirmation: "A", acknowledgedIrreversible: true))
+                accountLabel: "A", typedConfirmation: "A", acknowledgedIrreversible: true
+            )
+        )
         #expect(removal == .unavailable(.agentNotRunning))
         let auth = backend.makeAuthorizationSession()
         #expect(await auth.start() == .unavailable(.agentNotRunning))
@@ -263,26 +739,32 @@ import Testing
             layout: layout,
             accounts: [
                 AccountHealthSummary(
-                    accountId: 777_000_123, displayName: "Test User", authState: "authorized")
+                    accountId: 777_000_123, displayName: "Test User", authState: "authorized"
+                ),
             ],
-            remover: remover)
+            remover: remover
+        )
         defer { agent.stop() }
         let backend = LiveCompanionBackend(
             layout: layout,
             healthTimeout: .seconds(2),
             starter: ScriptedStarter(),
             startupTimeout: .seconds(5),
-            accountDomainCleanup: { cleanup.record($0) })
+            accountDomainCleanup: { cleanup.record($0) }
+        )
 
         let outcome = await backend.removeAccount(
             RemovalConfirmation(
                 accountLabel: "This account",
                 typedConfirmation: "this account",
-                acknowledgedIrreversible: true))
+                acknowledgedIrreversible: true
+            )
+        )
         #expect(outcome == .completed)
         #expect(
             remover.requests
-                == [ControlRemovalRequest(accountId: 777_000_123, revokeSession: true)])
+                == [ControlRemovalRequest(accountId: 777_000_123, revokeSession: true)]
+        )
         #expect(cleanup.accountIds == [777_000_123], "the domain half runs after the engine half")
     }
 
@@ -292,11 +774,14 @@ import Testing
         defer { agent.stop() }
         let backend = LiveCompanionBackend(
             layout: layout, healthTimeout: .seconds(2), starter: ScriptedStarter(),
-            startupTimeout: .seconds(5))
+            startupTimeout: .seconds(5)
+        )
 
         let outcome = await backend.removeAccount(
             RemovalConfirmation(
-                accountLabel: "A", typedConfirmation: "A", acknowledgedIrreversible: true))
+                accountLabel: "A", typedConfirmation: "A", acknowledgedIrreversible: true
+            )
+        )
         #expect(outcome == .failed(.notFound))
     }
 }
@@ -311,6 +796,7 @@ private final class FlagBox: @unchecked Sendable {
         defer { lock.unlock() }
         return flag
     }
+
     func set() {
         lock.lock()
         flag = true
@@ -318,10 +804,38 @@ private final class FlagBox: @unchecked Sendable {
     }
 }
 
+private final class PassiveLoginItemService: LoginItemService {
+    var status: LoginItemStatus = .notRegistered
+    func register() throws {
+        status = .enabled
+    }
+
+    func unregister() throws {
+        status = .notRegistered
+    }
+}
+
 private final class AgentBox: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: LiveControlTests.FakeAgent?
     var agent: LiveControlTests.FakeAgent? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+        set {
+            lock.lock()
+            stored = newValue
+            lock.unlock()
+        }
+    }
+}
+
+private final class ControlServerBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: ControlServer?
+    var server: ControlServer? {
         get {
             lock.lock()
             defer { lock.unlock() }
@@ -343,6 +857,7 @@ private final class CleanupRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         return ids
     }
+
     func record(_ id: Int64) {
         lock.lock()
         ids.append(id)
@@ -358,10 +873,12 @@ private final class RecordingRepairer: AgentRepairing, @unchecked Sendable {
         defer { lock.unlock() }
         return runs
     }
+
     func repair() async -> ControlCommandOutcome {
         recordRun()
         return .completed
     }
+
     private func recordRun() {
         lock.lock()
         runs += 1
@@ -377,10 +894,12 @@ private final class RecordingRemover: AgentAccountRemoving, @unchecked Sendable 
         defer { lock.unlock() }
         return received
     }
+
     func remove(_ request: ControlRemovalRequest) async -> ControlCommandOutcome {
         record(request)
         return .completed
     }
+
     private func record(_ request: ControlRemovalRequest) {
         lock.lock()
         received.append(request)
@@ -409,7 +928,9 @@ private final class ScriptedCompanionHostedSession: AgentAuthSessionHosting, @un
         (stream, continuation) = AsyncStream.makeStream(of: ControlAuthState.self)
     }
 
-    var states: AsyncStream<ControlAuthState> { stream }
+    var states: AsyncStream<ControlAuthState> {
+        stream
+    }
 
     var submitted: [ControlAuthInput] {
         lock.lock()
@@ -497,5 +1018,225 @@ private final class StateCollector: @unchecked Sendable {
         lock.lock()
         finished = true
         lock.unlock()
+    }
+}
+
+private final class LockedBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = false
+
+    var value: Bool {
+        lock.withLock { stored }
+    }
+
+    func set(_ value: Bool) {
+        lock.withLock { stored = value }
+    }
+}
+
+private final class ProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Process?
+
+    var process: Process? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
+private final class ProcessStarter: AgentStarting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var starts = 0
+    private let onStart: @Sendable () throws -> Void
+
+    init(onStart: @escaping @Sendable () throws -> Void) {
+        self.onStart = onStart
+    }
+
+    var startCount: Int {
+        lock.withLock { starts }
+    }
+
+    func startAgent(loginItemPreferred _: Bool) throws {
+        lock.withLock { starts += 1 }
+        try onStart()
+    }
+}
+
+/// Real socket-hosted old/new agent stand-in for the update handoff. The
+/// control callback models the production lifecycle boundary: prepare reaches
+/// ready, commit is accepted only for that UUID, then the old endpoints are
+/// removed before the bundled replacement starts.
+private final class ReplacementTransport: @unchecked Sendable {
+    private let lock = NSLock()
+    private let oldBuild: String
+    private let replacementBuild: String
+    private var current = AgentHealthSnapshot(
+        payloadVersion: 3,
+        agentVersion: "0.1.0",
+        bundleVersion: nil,
+        contractVersion: "1.0.0",
+        pid: 1,
+        processIdentity: AgentProcessIdentity(
+            instanceID: UUID(), pid: Int32.max, kernelStartSeconds: 1, kernelStartMicroseconds: 1
+        ),
+        state: .running,
+        startedAtMs: 1,
+        launchAtLogin: nil,
+        stateSchemaVersion: nil,
+        dataVersion: nil,
+        pendingTransferCount: 0,
+        lastSourceUpdateMs: nil,
+        changeCursor: nil,
+        cachePressure: nil,
+        providerRegistrationState: nil,
+        lastSleepMs: nil,
+        lastWakeMs: nil,
+        recentEvents: []
+    )
+    private var requests: [ControlTerminationRequest] = []
+    private var oldHealth: AgentHealthServer?
+    private var oldControl: ControlServer?
+    private var replacementHealth: AgentHealthServer?
+    private var hierarchyObserved = false
+
+    private let dropCommitAcknowledgement: Bool
+
+    init(oldBuild: String, replacementBuild: String, dropCommitAcknowledgement: Bool = false) {
+        self.oldBuild = oldBuild
+        self.replacementBuild = replacementBuild
+        self.dropCommitAcknowledgement = dropCommitAcknowledgement
+        current.bundleVersion = oldBuild
+    }
+
+    var snapshot: AgentHealthSnapshot {
+        lock.withLock { current }
+    }
+
+    var terminationActions: [ControlTerminationRequest.Action] {
+        lock.withLock { requests.map(\.action) }
+    }
+
+    var terminationRequestIDs: [UUID] {
+        lock.withLock { requests.map(\.requestID) }
+    }
+
+    var matchingHierarchyObserved: Bool {
+        lock.withLock { hierarchyObserved }
+    }
+
+    func startOldAgent(layout: AgentRuntimeLayout) throws {
+        let health = try AgentHealthServer.start(socketURL: layout.healthSocket) { self.snapshot }
+        let control = try ControlServer.start(
+            socketURL: layout.controlSocket,
+            handlers: ControlServerHandlers(
+                status: { self.snapshot },
+                reloadSettings: { AgentSettings() },
+                prepareForTermination: { self.prepare($0) },
+                acceptTerminationCommit: { self.accept($0) },
+                finishAcceptedTerminationCommit: { [weak self] _ in self?.stopOldAgent() }
+            )
+        )
+        lock.withLock {
+            oldHealth = health
+            oldControl = control
+        }
+    }
+
+    func startReplacement(layout: AgentRuntimeLayout) throws {
+        lock.withLock {
+            current = Self.snapshot(build: replacementBuild, state: .running, ready: true)
+        }
+        let health = try AgentHealthServer.start(socketURL: layout.healthSocket) { self.snapshot }
+        lock.withLock { replacementHealth = health }
+    }
+
+    func didObserveMatchingHierarchy() {
+        lock.withLock { hierarchyObserved = true }
+    }
+
+    func stop() {
+        let servers = lock.withLock { () -> (AgentHealthServer?, ControlServer?, AgentHealthServer?) in
+            defer {
+                oldHealth = nil
+                oldControl = nil
+                replacementHealth = nil
+            }
+            return (oldHealth, oldControl, replacementHealth)
+        }
+        servers.0?.stop()
+        servers.1?.stop()
+        servers.2?.stop()
+    }
+
+    private func prepare(_ request: ControlTerminationRequest) {
+        lock.withLock {
+            requests.append(request)
+            current.terminationRequestID = request.requestID
+            current.state = request.action == .cancel ? .terminationCancelled : .terminationReady
+        }
+    }
+
+    private func accept(_ request: ControlTerminationRequest) -> Bool {
+        let accepted = lock.withLock {
+            guard current.terminationRequestID == request.requestID, current.state == .terminationReady else {
+                return false
+            }
+            requests.append(request)
+            current.state = .stopped
+            return true
+        }
+        if accepted, dropCommitAcknowledgement {
+            // Close the active connection after the lifecycle claimed the matching
+            // commit but before ControlServer can send its event. This is the real
+            // response-loss boundary the backend must reconcile by observing the
+            // old health endpoint rather than starting a replacement immediately.
+            lock.withLock { oldControl }?.stop()
+        }
+        return accepted
+    }
+
+    private func stopOldAgent() {
+        let server = lock.withLock { () -> AgentHealthServer? in
+            let server = oldHealth
+            oldHealth = nil
+            return server
+        }
+        // This callback runs on the old control server's active connection;
+        // leave that server to the outer test cleanup after it has finished its
+        // own response path. The production lifecycle performs the same ordering.
+        server?.stop()
+    }
+
+    private static func snapshot(
+        build: String,
+        state: AgentRunState,
+        ready: Bool
+    ) -> AgentHealthSnapshot {
+        AgentHealthSnapshot(
+            payloadVersion: 3,
+            agentVersion: "0.1.0",
+            bundleVersion: build,
+            contractVersion: "1.0.0",
+            pid: 1,
+            processIdentity: AgentProcessIdentity(
+                instanceID: UUID(), pid: Int32.max, kernelStartSeconds: 1, kernelStartMicroseconds: 1
+            ),
+            state: state,
+            startedAtMs: 1,
+            launchAtLogin: nil,
+            stateSchemaVersion: nil,
+            dataVersion: nil,
+            pendingTransferCount: 0,
+            lastSourceUpdateMs: nil,
+            changeCursor: nil,
+            cachePressure: nil,
+            providerRegistrationState: nil,
+            lastSleepMs: nil,
+            lastWakeMs: nil,
+            recentEvents: [],
+            finderContentState: ready ? .ready : nil,
+            finderFirstPageItemCount: ready ? 0 : nil
+        )
     }
 }

@@ -4,9 +4,9 @@
 use std::num::NonZeroU64;
 
 use gramdrive_model::hash::Sha256;
-use gramdrive_model::identity::{
-    AccountKey, AttachmentKey, CanonicalKey, ContentHash, ItemId, ItemKey,
-};
+#[cfg(test)]
+use gramdrive_model::identity::AttachmentKey;
+use gramdrive_model::identity::{AccountKey, CanonicalKey, ContentHash, ItemId, ItemKey};
 use gramdrive_state::StateStore;
 use gramdrive_state::repo::{
     CacheEntryRecord, CacheKind, CacheVerification, FailureCategory, TransferId, TransferRecord,
@@ -122,7 +122,8 @@ impl Default for PromotionConfig {
 #[must_use = "a promotion outcome may carry a staging disposal the host must honor"]
 pub enum Promotion {
     /// Bytes verified, materialized, and published. The cache now serves the
-    /// item; the blob is recorded and, for an attachment, linked. The staging
+    /// item; the blob is recorded and linked to its canonical attachment or
+    /// story when present. The staging
     /// object was consumed by the promote (or, on `deduplicated`, is the
     /// host's to drop) — no disposal is owed here.
     Materialized {
@@ -134,9 +135,8 @@ pub enum Promotion {
         materialization_ref: String,
         /// Whether the content-addressed object already existed (dedup).
         deduplicated: bool,
-        /// Whether an attachment row was linked to the blob (false for a
-        /// non-attachment item, or an attachment the projection has not
-        /// recorded yet).
+        /// Whether a canonical attachment/story row was linked to the blob
+        /// (the legacy field name is retained for API compatibility).
         attachment_linked: bool,
     },
     /// A verified cache entry for this item at this version already exists:
@@ -328,13 +328,17 @@ impl Promoter {
         // one blob row and its first-seen time.
         tx.record_blob(account, hash, size, now_ms)?;
 
-        // Per-attachment provenance (SYNC-052): the attachment keeps its own
-        // identity, name, and version; only the verified bytes are shared.
-        // Skip a link the projection cannot back rather than stranding the
-        // materialization on a bookkeeping gap.
-        let attachment_linked = match attachment_key(&canonical) {
-            Some(key) if tx.read().attachment(&key)?.is_some() => {
+        // Canonical provenance (SYNC-052): appearances keep their own tree
+        // identity while attachments/stories retain one canonical verified
+        // blob link. A story moving from Active Stories into a month therefore
+        // keeps the same bytes without copying or re-downloading them.
+        let attachment_linked = match canonical {
+            CanonicalKey::Attachment(key) if tx.read().attachment(&key)?.is_some() => {
                 tx.link_attachment_blob(&key, hash, now_ms)?;
+                true
+            }
+            CanonicalKey::Story(key) if tx.read().story(&key)?.is_some() => {
+                tx.link_story_blob(&key, hash, now_ms)?;
                 true
             }
             _ => false,
@@ -430,6 +434,7 @@ fn canonical_key(item: &ItemId) -> CanonicalKey {
     match item.key() {
         ItemKey::Canonical(canonical) => canonical,
         ItemKey::Appearance(appearance) => appearance.item,
+        ItemKey::StoryAppearance(appearance) => CanonicalKey::Story(appearance.story),
     }
 }
 
@@ -441,10 +446,13 @@ fn canonical_account(key: &CanonicalKey) -> AccountKey {
         CanonicalKey::ChatList(key) => key.scope.account,
         CanonicalKey::FolderCatalog(key) => key.scope.account,
         CanonicalKey::Chat(key) => key.scope.account,
+        CanonicalKey::ActiveStories(key) => key.chat.scope.account,
+        CanonicalKey::MonthDir(key) => key.chat.scope.account,
         CanonicalKey::YearDir(key) => key.chat.scope.account,
         CanonicalKey::MediaDir(key) => key.chat.scope.account,
         CanonicalKey::Message(key) => key.chat.scope.account,
         CanonicalKey::Attachment(key) => key.message.chat.scope.account,
+        CanonicalKey::Story(key) => key.poster.scope.account,
         CanonicalKey::GeneratedDoc(key) => key.chat.scope.account,
         CanonicalKey::OrderDoc(key) => key.list.scope.account,
         CanonicalKey::Blob(key) => key.account,
@@ -453,6 +461,7 @@ fn canonical_account(key: &CanonicalKey) -> AccountKey {
 
 /// The attachment key an item names, if it is an attachment — the provenance
 /// link target. Only attachments carry one.
+#[cfg(test)]
 fn attachment_key(key: &CanonicalKey) -> Option<AttachmentKey> {
     match key {
         CanonicalKey::Attachment(key) => Some(*key),

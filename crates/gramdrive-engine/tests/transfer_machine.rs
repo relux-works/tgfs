@@ -86,6 +86,7 @@ fn range(start: u64, end: u64) -> ByteRange {
 
 fn doc_record(year: u16, facts: Option<FileFacts>) -> ItemRecord {
     ItemRecord {
+        aggregate_size: None,
         id: doc_id(year),
         parent: Some(account_root_id()),
         display_name: format!("{year}.ndjson"),
@@ -117,6 +118,7 @@ fn seed(store: &mut StateStore, years: &[u16]) {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -138,6 +140,7 @@ fn seed(store: &mut StateStore, years: &[u16]) {
     })
     .expect("chat");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: account_root_id(),
         parent: None,
         display_name: "Root".to_owned(),

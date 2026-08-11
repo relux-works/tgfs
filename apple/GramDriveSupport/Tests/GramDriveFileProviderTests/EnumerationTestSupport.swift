@@ -1,8 +1,27 @@
+import Darwin
 import FileProvider
 import Foundation
 import GramDriveCore
+import GramDriveSupport
 
 @testable import GramDriveFileProvider
+
+final class RecordingHistoryPrioritySignaler: HistoryPrioritySignaling, @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [HistoryPriorityRequest] = []
+
+    func signal(_ request: HistoryPriorityRequest) {
+        lock.lock()
+        requests.append(request)
+        lock.unlock()
+    }
+
+    func snapshot() -> [HistoryPriorityRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+}
 
 // MARK: - The scripted store
 
@@ -33,6 +52,10 @@ final class ScriptedStore: SharedStateStoreProtocol, @unchecked Sendable {
     /// order — one script per call, sustaining "the tree moved between
     /// pages" without threads.
     private var childrenScripts: [() -> Void] = []
+    private var nextChildrenError: Error?
+    private var changeScripts: [() -> Void] = []
+    private var nextChangeError: Error?
+    private var observedItemQos: [qos_class_t] = []
 
     init(account: AccountInfo, journalInstance: String = "life-1") {
         self.accountsById = [account.accountId: account]
@@ -72,6 +95,27 @@ final class ScriptedStore: SharedStateStoreProtocol, @unchecked Sendable {
     func scriptBeforeNextChildrenCall(_ mutation: @escaping () -> Void) {
         lock.lock()
         childrenScripts.append(mutation)
+        lock.unlock()
+    }
+
+    /// Fails exactly the next page read, then recovers for a retry.
+    func failNextChildrenCall(with error: Error) {
+        lock.lock()
+        nextChildrenError = error
+        lock.unlock()
+    }
+
+    /// Queues work at the start of the next change-journal page read.
+    func scriptBeforeNextChangeCall(_ mutation: @escaping () -> Void) {
+        lock.lock()
+        changeScripts.append(mutation)
+        lock.unlock()
+    }
+
+    /// Fails exactly the next change-journal page read.
+    func failNextChangeCall(with error: Error) {
+        lock.lock()
+        nextChangeError = error
         lock.unlock()
     }
 
@@ -137,8 +181,11 @@ final class ScriptedStore: SharedStateStoreProtocol, @unchecked Sendable {
     func children(parent: String, after: String?, limit: UInt32) throws -> [ItemMetadata] {
         lock.lock()
         let script = childrenScripts.isEmpty ? nil : childrenScripts.removeFirst()
+        let error = nextChildrenError
+        nextChildrenError = nil
         lock.unlock()
         script?()
+        if let error { throw error }
 
         lock.lock()
         defer { lock.unlock() }
@@ -150,24 +197,66 @@ final class ScriptedStore: SharedStateStoreProtocol, @unchecked Sendable {
             .map { $0 }
     }
 
+    func childrenPage(parent: String, after: String?, limit: UInt32) throws -> ItemPage {
+        guard limit > 0 else {
+            throw DriveError.InvalidArgument(detail: "child page limit must be positive")
+        }
+        if let after {
+            lock.lock()
+            let valid = itemsById[after]?.parent == parent
+            lock.unlock()
+            guard valid else {
+                throw DriveError.NotFound(detail: "foreign child page anchor")
+            }
+        }
+        let pageSize = min(limit, GramDriveEnumerator.defaultPageSize)
+        let children = try children(
+            parent: parent,
+            after: after,
+            limit: pageSize + 1)
+        let hasMore = children.count > Int(pageSize)
+        let items = Array(children.prefix(Int(pageSize)))
+        return ItemPage(items: items, nextAfter: hasMore ? items.last?.id : nil)
+    }
+
     func dataVersion() throws -> Int64 {
         lock.lock()
         defer { lock.unlock() }
         return stampedDataVersion
     }
 
+    func ensureRootStructure() throws -> RootStructureReadiness {
+        throw DriveError.InvalidArgument(detail: "scripted provider is read-only")
+    }
+
     func item(id: String) throws -> ItemMetadata? {
         lock.lock()
         defer { lock.unlock() }
+        observedItemQos.append(qos_class_self())
         return itemsById[id]
+    }
+
+    var itemQos: [qos_class_t] {
+        lock.lock()
+        defer { lock.unlock() }
+        return observedItemQos
     }
 
     func itemChangesSince(
         accountId: Int64, afterSequence: Int64, limit: UInt32
     ) throws -> [ItemChange] {
         lock.lock()
+        let script = changeScripts.isEmpty ? nil : changeScripts.removeFirst()
+        let error = nextChangeError
+        nextChangeError = nil
+        lock.unlock()
+        script?()
+        if let error { throw error }
+
+        lock.lock()
         defer { lock.unlock() }
-        return journal
+        return
+            journal
             .filter { $0.sequence > afterSequence }
             .sorted { $0.sequence < $1.sequence }
             .prefix(Int(limit))
@@ -190,6 +279,21 @@ final class ScriptedStore: SharedStateStoreProtocol, @unchecked Sendable {
         .provider
     }
 
+    func providerFetchHealth() throws -> ProviderFetchHealthCounters {
+        ProviderFetchHealthCounters(
+            callbackCount: 0,
+            successCount: 0,
+            engineFailureCount: 0,
+            providerMappingCount: 0,
+            noSuchItemCount: 0,
+            retryableCount: 0)
+    }
+
+    func recordProviderFetchHealth(observation: ProviderFetchHealthObservation) throws {
+        _ = observation
+        throw DriveError.InvalidArgument(detail: "scripted provider is read-only")
+    }
+
     func schemaVersion() throws -> Int64 {
         2
     }
@@ -199,7 +303,9 @@ final class ScriptedStore: SharedStateStoreProtocol, @unchecked Sendable {
 
 /// Records everything an enumeration delivers. The enumerator answers
 /// synchronously, so tests assert immediately after the call.
-final class RecordingEnumerationObserver: NSObject, NSFileProviderEnumerationObserver {
+final class RecordingEnumerationObserver: NSObject, NSFileProviderEnumerationObserver,
+    @unchecked Sendable
+{
     private(set) var batches: [[any NSFileProviderItem]] = []
     private(set) var finishedPages: [NSFileProviderPage?] = []
     private(set) var finishError: Error?
@@ -212,6 +318,8 @@ final class RecordingEnumerationObserver: NSObject, NSFileProviderEnumerationObs
     var enumeratedIdentifiers: [String] {
         batches.flatMap { $0.map(\.itemIdentifier.rawValue) }
     }
+
+    var finishCallCount: Int { finishedPages.count + (finishError == nil ? 0 : 1) }
 
     func didEnumerate(_ updatedItems: [any NSFileProviderItem]) {
         batches.append(updatedItems)
@@ -227,7 +335,7 @@ final class RecordingEnumerationObserver: NSObject, NSFileProviderEnumerationObs
 }
 
 /// Records everything a change enumeration delivers.
-final class RecordingChangeObserver: NSObject, NSFileProviderChangeObserver {
+final class RecordingChangeObserver: NSObject, NSFileProviderChangeObserver, @unchecked Sendable {
     private(set) var updatedBatches: [[any NSFileProviderItem]] = []
     private(set) var deletedBatches: [[NSFileProviderItemIdentifier]] = []
     private(set) var finishes: [(anchor: NSFileProviderSyncAnchor, moreComing: Bool)] = []
@@ -244,6 +352,8 @@ final class RecordingChangeObserver: NSObject, NSFileProviderChangeObserver {
     var deletedIdentifiers: [String] {
         deletedBatches.flatMap { $0.map(\.rawValue) }
     }
+
+    var finishCallCount: Int { finishes.count + (finishError == nil ? 0 : 1) }
 
     func didUpdate(_ updatedItems: [any NSFileProviderItem]) {
         updatedBatches.append(updatedItems)

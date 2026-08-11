@@ -42,6 +42,13 @@ public protocol DomainRegistrar: Sendable {
 public struct SystemDomainRegistrar: DomainRegistrar {
     public init() {}
 
+    private func platformDomain(_ domain: DesiredDomain) -> NSFileProviderDomain {
+        NSFileProviderDomain(
+            identifier: NSFileProviderDomainIdentifier(rawValue: domain.identifier),
+            displayName: domain.displayName
+        )
+    }
+
     public func registeredDomains() async throws -> [RegisteredDomain] {
         try await NSFileProviderManager.domains().map { domain in
             RegisteredDomain(
@@ -52,11 +59,25 @@ public struct SystemDomainRegistrar: DomainRegistrar {
     }
 
     public func register(_ domain: DesiredDomain) async throws {
-        try await NSFileProviderManager.add(
-            NSFileProviderDomain(
-                identifier: NSFileProviderDomainIdentifier(rawValue: domain.identifier),
-                displayName: domain.displayName
-            )
-        )
+        try await NSFileProviderManager.add(platformDomain(domain))
     }
+
+    /// Resolves the system's user-visible root for one registered domain.
+    /// The containing app uses this after reconciliation so onboarding only
+    /// reports success when its Finder action targets the actual drive root.
+    public func userVisibleRootURL(for domain: DesiredDomain) async throws -> URL {
+        guard let manager = NSFileProviderManager(for: platformDomain(domain)) else {
+            throw SystemDomainRegistrarError.managerUnavailable
+        }
+        return try await manager.getUserVisibleURL(for: .rootContainer)
+    }
+
+    /// Manager used by the containing app's durable-state change relay.
+    public func changeSignaler(for domain: DesiredDomain) -> (any ProviderChangeSignaling)? {
+        NSFileProviderManager(for: platformDomain(domain))
+    }
+}
+
+public enum SystemDomainRegistrarError: Error, Equatable, Sendable {
+    case managerUnavailable
 }

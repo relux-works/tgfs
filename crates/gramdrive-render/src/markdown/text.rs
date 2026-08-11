@@ -123,12 +123,12 @@ fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Appends the percent-encoded form of a single path component to `out`, for
-/// use as the destination of a Markdown link into `media/`.
+/// use as the destination of a Markdown link to a sibling attachment.
 ///
 /// RFC 3986 unreserved characters (`A-Za-z0-9-._~`) pass through; every other
 /// byte — including spaces, parentheses, `/`, and all non-ASCII — is
 /// percent-encoded with uppercase hex. Encoding `/` too keeps the value a
-/// single component, so a crafted file name cannot walk out of `media/`.
+/// single component, so a crafted file name cannot walk out of its month.
 pub(super) fn percent_encode_component(name: &str, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &byte in name.as_bytes() {
@@ -211,7 +211,7 @@ mod tests {
         percent_encode_component("IMG 0001 (1).jpg", &mut out);
         assert_eq!(out, "IMG%200001%20%281%29.jpg");
         out.clear();
-        // Path separators are encoded, so a name cannot escape `media/`.
+        // Path separators are encoded, so a name cannot escape its month.
         percent_encode_component("../secret", &mut out);
         assert_eq!(out, "..%2Fsecret");
         out.clear();

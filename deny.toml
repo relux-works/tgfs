@@ -185,6 +185,12 @@ allow-build-scripts = [
     "wasm-bindgen",
     "wasm-bindgen-shared",
     "rustversion",
+    # Jiff's no-pointer-atomic portability fallback. These cfg/build probes are
+    # present in the all-target dependency graph but are not compiled for the
+    # supported macOS target; they do not generate timezone data or use the
+    # network (TASK-260721-1dzolg).
+    "portable-atomic",
+    "portable-atomic-util",
 ]
 
 # ---------------------------------------------------------------------------

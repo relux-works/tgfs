@@ -41,6 +41,10 @@ gramdrive-source = { workspace = true }
 # build dependency of uniffi's cargo-metadata feature, and its build script
 # is already named in deny.toml [bans.build].
 serde_json = { workspace = true }
+# Normalized message payloads cross into the durable state repository as a
+# versioned JSON schema. Derives keep that representation exhaustive as the
+# typed vocabulary evolves; tdjson wire parsing itself remains serde_json.
+serde = { workspace = true }
 
 [dev-dependencies]
 # The snapshot integration suite (tests/chat_snapshot.rs) proves the whole

@@ -45,8 +45,9 @@
 mod render;
 
 pub use crate::record::{
-    Attachment, Availability, Deletion, Entity, EntityKind, MediaKind, MessageBody, MessageHistory,
-    Reaction, ReactionKey, RetentionMode, Revision, Sender, ServiceAction,
+    Attachment, AttachmentFidelity, Availability, Deletion, Entity, EntityKind, MediaKind,
+    MessageBody, MessageHistory, Reaction, ReactionKey, RetentionMode, Revision, Sender,
+    ServiceAction, TelegramRepresentation,
 };
 
 use std::fmt;
@@ -59,10 +60,10 @@ use gramdrive_model::identity::{
 pub const SCHEMA_ID: &str = "gramdrive.messages";
 
 /// Record-schema version of the NDJSON output, frozen for format v1 (SYNC-030).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Version of this renderer implementation, frozen for v1 (DOM-006).
-pub const RENDERER_VERSION: u32 = 1;
+pub const RENDERER_VERSION: u32 = 4;
 
 /// Schema family of the `messages.ndjson` generated document (DOM-023). Part of
 /// its stable identity; distinct from the family of any other generated doc.
@@ -81,9 +82,14 @@ pub struct MessagesInput<'a> {
     pub partition: DocPartition,
     /// The account's retention mode, which selects the POL-3 projection.
     pub retention_mode: RetentionMode,
+    /// Persisted display timezone used by the paired civil partition and
+    /// recorded explicitly as provenance; source timestamps remain UTC.
+    pub display_timezone: &'a str,
     /// The event-log watermark these records reflect: the document is current
     /// as of every event at or below this sequence (SYNC-024).
     pub input_watermark_seq: i64,
+    /// Monotonic account policy generation pinned with the input snapshot.
+    pub render_generation: i64,
     /// The message histories to render, in canonical order.
     pub messages: &'a [MessageHistory],
 }
@@ -91,9 +97,9 @@ pub struct MessagesInput<'a> {
 /// The stable identity of the `messages.ndjson` document for a chat partition
 /// (DOM-023). Independent of the chat title, renderer version, and watermark.
 ///
-/// The engine uses this to key the document's `render_state` and item rows; the
-/// header embeds its text form so a reader can join a rendered file back to the
-/// item it projects.
+/// Provider-visible `render_state` and item rows use appearance ids. This
+/// canonical id is embedded in the header as the stable logical document key
+/// shared by those appearances.
 pub fn document_id(chat: ChatKey, partition: DocPartition) -> ItemId {
     ItemKey::Canonical(CanonicalKey::GeneratedDoc(GeneratedDocKey {
         chat,
@@ -105,15 +111,23 @@ pub fn document_id(chat: ChatKey, partition: DocPartition) -> ItemId {
 }
 
 /// The composite content-version token for a document rendered at
-/// `input_watermark_seq` (DOM-006): the renderer and schema versions plus the
-/// watermark. Two renders that agree on all three produce byte-identical bytes,
-/// so equal tokens mean equal content.
+/// `input_watermark_seq` (DOM-006): renderer/schema versions, watermark, and
+/// every byte-shaping account policy input. Equal tokens therefore witness the
+/// same retention projection, timezone, and monotonic policy generation.
 ///
 /// Returned as text; the engine wraps it in `gramdrive_model::version::ContentVersion`
 /// when it publishes. The token is always a valid version token (a fixed ASCII
 /// prefix and decimal integers), so no fallible construction happens here.
-pub fn content_version_token(input_watermark_seq: i64) -> String {
-    format!("{SCHEMA_ID}/s{SCHEMA_VERSION}/r{RENDERER_VERSION}/w{input_watermark_seq}")
+pub fn content_version_token(
+    input_watermark_seq: i64,
+    render_generation: i64,
+    retention_mode: RetentionMode,
+    display_timezone: &str,
+) -> String {
+    format!(
+        "{SCHEMA_ID}/s{SCHEMA_VERSION}/r{RENDERER_VERSION}/w{input_watermark_seq}/g{render_generation}/retention-{}/tz-{display_timezone}",
+        retention_mode.tag()
+    )
 }
 
 /// Renders a complete `messages.ndjson` document to a string.
@@ -136,6 +150,9 @@ pub fn render_messages(input: &MessagesInput<'_>) -> String {
 /// largest record rather than the document size. Propagates any error the sink
 /// returns.
 pub fn write_messages<W: fmt::Write>(out: &mut W, input: &MessagesInput<'_>) -> fmt::Result {
+    if !crate::record::attachment_contract_is_valid(input.messages) {
+        return Err(fmt::Error);
+    }
     let mut line = String::new();
     render::header_line(&mut line, input);
     out.write_str(&line)?;

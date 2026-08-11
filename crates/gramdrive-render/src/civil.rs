@@ -1,4 +1,4 @@
-//! Deterministic, dependency-free civil-time conversion (SYNC-031, POL-6).
+//! Deterministic civil-time conversion from persisted IANA zones (SYNC-031).
 //!
 //! One instant-to-calendar computation, shared by every consumer that must
 //! agree on where a message falls: the Markdown renderer groups messages by
@@ -10,10 +10,10 @@
 //! unrepresentable.
 //!
 //! Like the rest of the renderer it is a pure transform of its input — no
-//! locale, no clock, no time-zone database — so equal inputs yield identical
-//! output and the core stays free of the supply-chain surface a calendar crate
-//! would add (POL-6). Civil dates are computed in a fixed offset east of UTC,
-//! which is exactly the "timezone-explicit" the archive declares per account.
+//! locale and no clock. IANA transition data is required because the persisted
+//! account policy is a zone name rather than a fixed offset.
+
+use jiff::{Timestamp, tz::TimeZone};
 
 /// A civil date and wall-clock time, already resolved into a fixed UTC offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +52,26 @@ impl Civil {
         }
     }
 
+    /// Converts a Telegram millisecond instant through an IANA timezone.
+    ///
+    /// TDLib dates are signed 32-bit seconds and fit Jiff's civil range. The
+    /// UTC fallback keeps corrupt out-of-contract rows non-panicking so repair
+    /// can still inspect them.
+    pub(crate) fn in_timezone(instant_ms: i64, timezone: &TimeZone) -> Self {
+        let Ok(timestamp) = Timestamp::from_millisecond(instant_ms) else {
+            return Self::from_millis(instant_ms, 0);
+        };
+        let datetime = timestamp.to_zoned(timezone.clone()).datetime();
+        Self {
+            year: i64::from(datetime.year()),
+            month: u32::try_from(datetime.month()).unwrap_or_default(),
+            day: u32::try_from(datetime.day()).unwrap_or_default(),
+            hour: u32::try_from(datetime.hour()).unwrap_or_default(),
+            minute: u32::try_from(datetime.minute()).unwrap_or_default(),
+            second: u32::try_from(datetime.second()).unwrap_or_default(),
+        }
+    }
+
     /// `YYYY-MM-DD`.
     pub(crate) fn date(&self) -> String {
         format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
@@ -80,6 +100,27 @@ impl Civil {
 pub fn year_month(instant_ms: i64, offset_seconds: i32) -> (i64, u32) {
     let civil = Civil::from_millis(instant_ms, offset_seconds);
     (civil.year, civil.month)
+}
+
+/// The civil `(year, month)` a millisecond instant falls in for an IANA zone.
+pub fn year_month_in_timezone(instant_ms: i64, timezone: &TimeZone) -> (i64, u32) {
+    let civil = Civil::in_timezone(instant_ms, timezone);
+    (civil.year, civil.month)
+}
+
+/// Cross-platform-safe account-local attachment timestamp prefix.
+///
+/// The result is always `YYYY-MM-DD HH-mm-ss`: source timestamps stay absolute
+/// while only their filename presentation follows the persisted account zone.
+pub fn filename_timestamp_in_timezone(instant_ms: i64, timezone: &TimeZone) -> String {
+    let civil = Civil::in_timezone(instant_ms, timezone);
+    format!(
+        "{} {:02}-{:02}-{:02}",
+        civil.date(),
+        civil.hour,
+        civil.minute,
+        civil.second
+    )
 }
 
 /// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`.
@@ -157,5 +198,14 @@ mod tests {
     fn year_month_resolves_before_the_epoch() {
         // Floor division keeps a pre-1970 instant in its true month.
         assert_eq!(year_month(-1, 0), (1969, 12));
+    }
+
+    #[test]
+    fn filename_timestamp_is_safe_and_uses_the_named_zone() {
+        let timezone = TimeZone::get("Asia/Tbilisi").expect("bundled timezone");
+        assert_eq!(
+            filename_timestamp_in_timezone(1_700_000_000_000, &timezone),
+            "2023-11-15 02-13-20"
+        );
     }
 }

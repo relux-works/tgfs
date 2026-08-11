@@ -11,8 +11,9 @@ use gramdrive_model::identity::{
     SchemaFamily,
 };
 use gramdrive_render::markdown::{
-    self, Attachment, Availability, Deletion, MarkdownInput, MediaKind, MessageBody,
-    MessageHistory, RetentionMode, Revision, Sender, ServiceAction, UtcOffset,
+    self, Attachment, AttachmentFidelity, Availability, Deletion, DisplayTimeZone, MarkdownInput,
+    MediaKind, MessageBody, MessageHistory, RetentionMode, Revision, Sender, ServiceAction,
+    TelegramRepresentation, UtcOffset,
 };
 use support::{corpus, fixture_chat};
 
@@ -64,12 +65,14 @@ fn text_message(id: i64, sent_at_ms: i64, text: &str) -> MessageHistory {
 }
 
 fn render(mode: RetentionMode, timezone: UtcOffset, messages: &[MessageHistory]) -> String {
+    let timezone = DisplayTimeZone::fixed(timezone);
     markdown::render_transcript(&MarkdownInput {
         chat: fixture_chat(),
         partition: november_2023(),
         retention_mode: mode,
-        timezone,
+        timezone: &timezone,
         input_watermark_seq: 13,
+        render_generation: 0,
         messages,
     })
 }
@@ -82,8 +85,8 @@ fn front_matter_and_title_are_byte_exact() {
     let expected_head = format!(
         "---\n\
 schema: gramdrive.transcript\n\
-schema_version: 1\n\
-renderer_version: 1\n\
+schema_version: 2\n\
+renderer_version: 4\n\
 schema_family: 1\n\
 document_id: {doc_id}\n\
 account_id: 7\n\
@@ -93,7 +96,8 @@ partition: 2023-11\n\
 retention_mode: mirror\n\
 timezone: UTC\n\
 input_watermark_seq: 13\n\
-content_version: gramdrive.transcript/s1/r1/w13\n\
+render_generation: 0\n\
+content_version: gramdrive.transcript/s2/r4/w13/g0/retention-mirror/tz-UTC\n\
 ---\n\n\
 # Chat -1001234567890\n\n\
 _Transcript for 2023-11 · times in UTC · retention: mirror._\n\n\
@@ -116,6 +120,72 @@ fn empty_month_still_self_describes() {
         !document.contains("## "),
         "no day heading for an empty month"
     );
+}
+
+#[test]
+fn protected_latest_revision_suppresses_all_current_and_audit_plaintext() {
+    let mut historical = empty_body();
+    historical.text = Some("audit-secret-before-protection".to_owned());
+    historical.service = Some(ServiceAction::Other {
+        kind: "audit-secret-service".to_owned(),
+    });
+    let mut protected = empty_body();
+    protected.protected = true;
+    protected.text = Some("current-secret".to_owned());
+    protected.reply_to = Some(MessageId(99));
+    protected.topic_id = Some(77);
+    protected.album_id = Some(88);
+    protected.attachments = vec![Attachment {
+        index: AttachmentIndex(0),
+        media_kind: MediaKind::Document,
+        telegram_representation: TelegramRepresentation::OriginalDocument,
+        fidelity: AttachmentFidelity::Original,
+        source_name: Some("secret-filename.pdf".to_owned()),
+        mime_type: Some("secret/mime".to_owned()),
+        exact_size: Some(42),
+        availability: Availability::Restricted,
+        content_hash: None,
+        media_name: Some("secret-media-name.pdf".to_owned()),
+    }];
+    protected.service = Some(ServiceAction::Other {
+        kind: "current-secret-service".to_owned(),
+    });
+    let messages = vec![MessageHistory {
+        message_id: MessageId(7),
+        sender: Some(Sender { id: 42 }),
+        sent_at_ms: REFERENCE_MS,
+        revisions: vec![
+            Revision {
+                event_seq: 1,
+                edited_at_ms: None,
+                observed_at_ms: REFERENCE_MS,
+                payload_schema: SchemaFamily(1),
+                body: historical,
+            },
+            Revision {
+                event_seq: 2,
+                edited_at_ms: Some(REFERENCE_MS + 1),
+                observed_at_ms: REFERENCE_MS + 1,
+                payload_schema: SchemaFamily(1),
+                body: protected,
+            },
+        ],
+        deletion: None,
+    }];
+    let document = render(RetentionMode::Audit, UtcOffset::UTC, &messages);
+
+    assert!(document.contains("Telegram forbids saving"));
+    for secret in [
+        "audit-secret-before-protection",
+        "audit-secret-service",
+        "current-secret",
+        "secret-filename.pdf",
+        "secret/mime",
+        "secret-media-name.pdf",
+        "current-secret-service",
+    ] {
+        assert!(!document.contains(secret), "leaked {secret}");
+    }
 }
 
 #[test]
@@ -267,15 +337,17 @@ fn missing_sender_is_labeled() {
 }
 
 #[test]
-fn attachments_link_to_media_paths_and_state_is_explicit() {
+fn attachments_link_to_direct_month_siblings_and_state_is_explicit() {
     let mut body = empty_body();
     body.attachments = vec![
         Attachment {
             index: AttachmentIndex(0),
             media_kind: MediaKind::Photo,
-            name: Some("holiday photo.jpg".to_owned()),
+            telegram_representation: TelegramRepresentation::OriginalDocument,
+            fidelity: AttachmentFidelity::Original,
+            source_name: Some("holiday photo.jpg".to_owned()),
             mime_type: Some("image/jpeg".to_owned()),
-            size: Some(2_048),
+            exact_size: Some(2_048),
             availability: Availability::Fetchable,
             content_hash: Some(ContentHash::Sha256([0x11; 32])),
             media_name: Some("holiday photo.jpg".to_owned()),
@@ -283,9 +355,11 @@ fn attachments_link_to_media_paths_and_state_is_explicit() {
         Attachment {
             index: AttachmentIndex(1),
             media_kind: MediaKind::Document,
-            name: Some("secret.pdf".to_owned()),
+            telegram_representation: TelegramRepresentation::OriginalDocument,
+            fidelity: AttachmentFidelity::Original,
+            source_name: Some("secret.pdf".to_owned()),
             mime_type: None,
-            size: None,
+            exact_size: None,
             availability: Availability::Restricted,
             content_hash: None,
             media_name: None,
@@ -294,18 +368,47 @@ fn attachments_link_to_media_paths_and_state_is_explicit() {
     let messages = vec![message_with(200, REFERENCE_MS, body)];
     let document = render(RetentionMode::Mirror, UtcOffset::UTC, &messages);
 
-    // The downloaded photo links into media/, with the file name percent-encoded
+    // The downloaded photo links directly to its month sibling, percent-encoded
     // in the destination and Markdown-escaped in the visible text.
     assert!(
-        document.contains(
-            "- **photo** — [holiday photo\\.jpg](media/holiday%20photo.jpg) (2048 bytes)"
-        )
+        document.contains("- **photo** — [holiday photo\\.jpg](holiday%20photo.jpg) (2048 bytes)")
     );
     // The restricted document is described but not linked, with an explicit note.
     assert!(
         document.contains("- **document** — secret\\.pdf — _restricted by Telegram; not fetched_")
     );
-    assert!(!document.contains("media/secret.pdf"));
+    assert!(!document.contains("](secret.pdf)"));
+}
+
+#[test]
+fn malformed_processed_attachment_is_rejected_before_markdown_output() {
+    let mut messages = corpus();
+    let attachment = messages
+        .iter_mut()
+        .flat_map(|message| &mut message.revisions)
+        .flat_map(|revision| &mut revision.body.attachments)
+        .next()
+        .expect("fixture attachment");
+    attachment.telegram_representation = TelegramRepresentation::Video;
+    attachment.fidelity = AttachmentFidelity::TelegramVariant;
+    attachment.source_name = Some("claimed-original.mp4".to_owned());
+    let timezone = DisplayTimeZone::fixed(UtcOffset::UTC);
+    let input = MarkdownInput {
+        chat: fixture_chat(),
+        partition: DocPartition::Month {
+            year: 2023,
+            month: 11,
+        },
+        retention_mode: RetentionMode::Mirror,
+        timezone: &timezone,
+        input_watermark_seq: 13,
+        render_generation: 0,
+        messages: &messages,
+    };
+    let mut document = String::new();
+    assert!(markdown::write_transcript(&mut document, &input).is_err());
+    assert!(document.is_empty());
+    assert!(markdown::render_transcript(&input).is_empty());
 }
 
 #[test]
@@ -398,12 +501,14 @@ fn identical_input_is_byte_identical_and_revision_order_independent() {
 #[test]
 fn streaming_matches_the_string_form() {
     let messages = corpus();
+    let timezone = DisplayTimeZone::fixed(UtcOffset::from_seconds(2 * 3_600).expect("valid"));
     let input = MarkdownInput {
         chat: fixture_chat(),
         partition: november_2023(),
         retention_mode: RetentionMode::Audit,
-        timezone: UtcOffset::from_seconds(2 * 3_600).expect("valid"),
+        timezone: &timezone,
         input_watermark_seq: 13,
+        render_generation: 0,
         messages: &messages,
     };
     let mut streamed = String::new();
@@ -428,10 +533,11 @@ fn document_id_is_a_markdown_generated_doc() {
 }
 
 #[test]
-fn content_version_token_folds_schema_renderer_and_watermark() {
+fn content_version_token_folds_schema_renderer_watermark_and_policy() {
+    let timezone = DisplayTimeZone::fixed(UtcOffset::UTC);
     assert_eq!(
-        markdown::content_version_token(42),
-        "gramdrive.transcript/s1/r1/w42"
+        markdown::content_version_token(42, 7, RetentionMode::Audit, timezone.label()),
+        "gramdrive.transcript/s2/r4/w42/g7/retention-audit/tz-UTC"
     );
 }
 

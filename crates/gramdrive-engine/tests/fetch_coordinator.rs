@@ -165,6 +165,7 @@ fn seed_store(store: &mut StateStore, photo_size: Option<u64>) {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,
@@ -189,6 +190,7 @@ fn seed_store(store: &mut StateStore, photo_size: Option<u64>) {
     })
     .expect("chat");
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: root_id(),
         parent: None,
         display_name: "Root".to_owned(),
@@ -210,6 +212,7 @@ fn seed_store(store: &mut StateStore, photo_size: Option<u64>) {
 
 fn file_record(id: ItemId, name: &str, size: Option<u64>, content_version: &str) -> ItemRecord {
     ItemRecord {
+        aggregate_size: None,
         id,
         parent: Some(root_id()),
         display_name: name.to_owned(),
@@ -1154,7 +1157,7 @@ fn durable_cancel_mid_transfer_stops_promptly_and_disposes_staging() {
     let mut store = StateStore::open(&db.path).expect("open");
     seed_store(&mut store, Some(64));
     let source = FakeSource::new(script(vec![Fault::on(Operation::Fetch).delay(4)]));
-    let mut coordinator = FetchCoordinator::new(machine(), config(16, 1, 1));
+    let coordinator = FetchCoordinator::new(machine(), config(16, 1, 1));
     let mut staging = MemoryStagingHost::default();
     let clock = TestClock::new(1_000);
 
@@ -1304,6 +1307,30 @@ fn close_unsubscribes_and_reports_remaining_readers() {
     let report = run_report(&mut rig);
     assert!(matches!(report.end, AttemptEnd::Promoted { .. }));
     assert!(report.readers.is_empty());
+}
+
+#[test]
+fn sinkless_subscribers_share_cancellation_ownership() {
+    let mut rig = rig_with(script(vec![]), config(16, 1, 1));
+    let now = rig.clock.now();
+    let first = rig
+        .coordinator
+        .subscribe(&mut rig.store, &photo_id(), &[], Priority::FOREGROUND, now)
+        .expect("first subscription");
+    let second = rig
+        .coordinator
+        .subscribe(&mut rig.store, &photo_id(), &[], Priority::FOREGROUND, now)
+        .expect("second subscription");
+    assert_eq!(second.transfer, first.transfer);
+    assert!(second.coalesced);
+    assert_eq!(rig.coordinator.reader_count(first.transfer), 2);
+
+    let closed = rig.coordinator.close(first.reader).expect("close first");
+    assert_eq!(closed.remaining_readers, 1);
+    assert_eq!(rig.coordinator.reader_count(first.transfer), 1);
+    let closed = rig.coordinator.close(second.reader).expect("close second");
+    assert_eq!(closed.remaining_readers, 0);
+    assert_eq!(rig.coordinator.reader_count(first.transfer), 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -161,9 +161,9 @@ impl FixtureServer {
         }
     }
 
-    /// Answer one `getChatHistory` request the way TDLib does: ids
-    /// strictly below `from_message_id` (`0`: from the newest), strictly
-    /// descending, at most `limit` of them.
+    /// Answer one `getChatHistory` request the way TDLib does with offset
+    /// zero: start exactly at `from_message_id` (`0`: from the newest), then
+    /// descend, returning at most `limit` entries.
     fn respond(&mut self, request: &Value) -> Result<Value, TdError> {
         assert_eq!(
             request["@type"].as_str(),
@@ -204,7 +204,7 @@ impl FixtureServer {
             .messages
             .iter()
             .rev()
-            .filter(|(id, _)| from == 0 || **id < from)
+            .filter(|(id, _)| from == 0 || **id <= from)
             .take(limit)
             .map(|(_, message)| message.clone())
             .collect();
@@ -231,6 +231,7 @@ fn store_with_chats(chat_ids: &[i64]) -> StateStore {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,

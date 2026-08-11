@@ -20,12 +20,22 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use gramdrive_state::model::identity::{
+    AccountId, AccountKey, AccountScope, AppearanceKey, AttachmentIndex, AttachmentKey,
+    CanonicalKey, ChatId, ChatKey, ChatListKey, ChatListKind, DocFormat, DocPartition,
+    GeneratedDocKey, ItemKey, MediaDirKey, MessageId, MessageKey, NamespaceVersion, SchemaFamily,
+    YearDirKey,
+};
 use gramdrive_state::{RepairKind, SCHEMA_VERSION, StateError, StateStore};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 /// Representative rows of a v1 database — the fixture a v2 migration will be
 /// written against. See `fixtures/v1_seed.sql`.
 const V1_SEED_SQL: &str = include_str!("../fixtures/v1_seed.sql");
+const V1_SCHEMA_SQL: &str = include_str!("../src/schema/v1.sql");
+const JOURNAL_SQL: &str = include_str!("../src/schema/journal.sql");
+const V2_SCHEMA_SQL: &str = include_str!("../src/schema/v2.sql");
+const V3_SCHEMA_SQL: &str = include_str!("../src/schema/v3.sql");
 
 /// A unique database path under the OS temp directory, cleaned by
 /// [`TempDb::drop`]. Uniqueness comes from the process id and a counter —
@@ -77,6 +87,470 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
         == 1
 }
 
+fn seed_legacy_v3(path: &std::path::Path) -> LegacyIds {
+    let conn = Connection::open(path).expect("open v3 fixture");
+    conn.execute_batch(V1_SCHEMA_SQL).expect("v1 schema");
+    conn.execute_batch(JOURNAL_SQL).expect("journal");
+    conn.execute_batch(V2_SCHEMA_SQL).expect("v2 schema");
+    conn.execute_batch(V3_SCHEMA_SQL).expect("v3 schema");
+    conn.execute_batch(
+        "INSERT INTO schema_history (version, applied_at_ms) VALUES (2, 2), (3, 3);
+         PRAGMA user_version = 3;",
+    )
+    .expect("stamp v3");
+
+    let scope = AccountScope {
+        account: AccountKey {
+            account_id: AccountId(7),
+        },
+        namespace_version: NamespaceVersion(1),
+    };
+    let chat = ChatKey {
+        scope,
+        chat_id: ChatId(100),
+    };
+    let message = MessageKey {
+        chat,
+        message_id: MessageId(500),
+    };
+    let view = ChatListKind::Main;
+    let account = ItemKey::Canonical(CanonicalKey::Account(scope.account)).id();
+    let list = ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey { scope, kind: view })).id();
+    let chat_item = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: CanonicalKey::Chat(chat),
+    })
+    .id();
+    let year_key = CanonicalKey::YearDir(YearDirKey { chat, year: 2026 });
+    let year = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: year_key,
+    })
+    .id();
+    let media_key = CanonicalKey::MediaDir(MediaDirKey { chat, year: 2026 });
+    let media = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: media_key,
+    })
+    .id();
+    let whole_key = CanonicalKey::GeneratedDoc(GeneratedDocKey {
+        chat,
+        partition: DocPartition::Chat,
+        format: DocFormat::Ndjson,
+        schema_family: SchemaFamily(1),
+    });
+    let whole_ndjson = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: whole_key,
+    })
+    .id();
+    let month_markdown_key = CanonicalKey::GeneratedDoc(GeneratedDocKey {
+        chat,
+        partition: DocPartition::Month {
+            year: 2026,
+            month: 7,
+        },
+        format: DocFormat::Markdown,
+        schema_family: SchemaFamily(1),
+    });
+    let month_markdown = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: month_markdown_key,
+    })
+    .id();
+    let attachment_key = CanonicalKey::Attachment(AttachmentKey {
+        message,
+        index: AttachmentIndex(0),
+    });
+    let attachment = ItemKey::Appearance(AppearanceKey {
+        view,
+        item: attachment_key,
+    })
+    .id();
+
+    conn.execute(
+        "INSERT INTO accounts (account_id, source_kind, display_name, auth_state,
+                               namespace_version, created_at_ms, updated_at_ms)
+         VALUES (7, 'local_tdlib', 'Authorized', 'authorized', 1, 1, 1)",
+        [],
+    )
+    .expect("account");
+    conn.execute(
+        "INSERT INTO chats (account_id, namespace_version, chat_id, chat_type, title,
+                            metadata_version)
+         VALUES (7, 1, 100, 'private', 'Chat', 'chat-v3')",
+        [],
+    )
+    .expect("chat");
+    conn.execute(
+        "INSERT INTO message_events (account_id, namespace_version, chat_id, message_id,
+                                     event_kind, observed_at_ms, payload_schema, payload)
+         VALUES (7, 1, 100, 500, 'observed', 1, 1, X'01')",
+        [],
+    )
+    .expect("event");
+    conn.execute(
+        "INSERT INTO messages (account_id, namespace_version, chat_id, message_id,
+                               sent_at_ms, latest_event_seq)
+         VALUES (7, 1, 100, 500, unixepoch('2026-07-21 09:08:07') * 1000, 1)",
+        [],
+    )
+    .expect("message");
+    conn.execute(
+        "INSERT INTO attachments (account_id, namespace_version, chat_id, message_id,
+             attachment_index, original_name, mime_type, logical_size, content_version)
+         VALUES (7, 1, 100, 500, 0, 'photo.jpg', 'image/jpeg', 1234, 'bytes-v3')",
+        [],
+    )
+    .expect("attachment facts");
+
+    let insert_item = |id: &[u8],
+                       kind: &str,
+                       parent: Option<&[u8]>,
+                       canonical: Option<&[u8]>,
+                       name: &str,
+                       directory: bool,
+                       mime: Option<&str>,
+                       content: Option<&str>| {
+        conn.execute(
+            "INSERT INTO items (item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name, is_directory,
+                 mime_type, metadata_version, content_version)
+             VALUES (?1, 7, 1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, 'projection-v3', ?9)",
+            params![
+                id,
+                kind,
+                parent,
+                canonical,
+                canonical.map(|_| "main"),
+                name,
+                directory,
+                mime,
+                content,
+            ],
+        )
+        .expect("item");
+    };
+    insert_item(
+        account.as_bytes(),
+        "account",
+        None,
+        None,
+        "Authorized",
+        true,
+        None,
+        None,
+    );
+    insert_item(
+        list.as_bytes(),
+        "chat_list",
+        Some(account.as_bytes()),
+        None,
+        "Chats",
+        true,
+        None,
+        None,
+    );
+    let chat_canonical = ItemKey::Canonical(CanonicalKey::Chat(chat)).id();
+    insert_item(
+        chat_item.as_bytes(),
+        "chat",
+        Some(list.as_bytes()),
+        Some(chat_canonical.as_bytes()),
+        "Chat",
+        true,
+        None,
+        None,
+    );
+    let year_canonical = ItemKey::Canonical(year_key).id();
+    insert_item(
+        year.as_bytes(),
+        "year_dir",
+        Some(chat_item.as_bytes()),
+        Some(year_canonical.as_bytes()),
+        "2026",
+        true,
+        None,
+        None,
+    );
+    let media_canonical = ItemKey::Canonical(media_key).id();
+    insert_item(
+        media.as_bytes(),
+        "media_dir",
+        Some(year.as_bytes()),
+        Some(media_canonical.as_bytes()),
+        "media",
+        true,
+        None,
+        None,
+    );
+    let whole_canonical = ItemKey::Canonical(whole_key).id();
+    insert_item(
+        whole_ndjson.as_bytes(),
+        "generated_doc",
+        Some(chat_item.as_bytes()),
+        Some(whole_canonical.as_bytes()),
+        "messages.ndjson",
+        false,
+        Some("application/x-ndjson"),
+        Some("whole-v3"),
+    );
+    let markdown_canonical = ItemKey::Canonical(month_markdown_key).id();
+    insert_item(
+        month_markdown.as_bytes(),
+        "generated_doc",
+        Some(year.as_bytes()),
+        Some(markdown_canonical.as_bytes()),
+        "07.md",
+        false,
+        Some("text/markdown"),
+        Some("month-v3"),
+    );
+    let attachment_canonical = ItemKey::Canonical(attachment_key).id();
+    insert_item(
+        attachment.as_bytes(),
+        "attachment",
+        Some(media.as_bytes()),
+        Some(attachment_canonical.as_bytes()),
+        "photo.jpg",
+        false,
+        Some("image/jpeg"),
+        Some("bytes-v3"),
+    );
+
+    LegacyIds {
+        scope,
+        chat,
+        chat_item,
+        year,
+        media,
+        whole_ndjson,
+        month_markdown,
+        attachment,
+    }
+}
+
+struct LegacyIds {
+    scope: AccountScope,
+    chat: ChatKey,
+    chat_item: gramdrive_state::model::identity::ItemId,
+    year: gramdrive_state::model::identity::ItemId,
+    media: gramdrive_state::model::identity::ItemId,
+    whole_ndjson: gramdrive_state::model::identity::ItemId,
+    month_markdown: gramdrive_state::model::identity::ItemId,
+    attachment: gramdrive_state::model::identity::ItemId,
+}
+
+#[test]
+fn schema_v3_legacy_projection_migrates_atomically_to_date_first() {
+    use gramdrive_state::model::identity::{ActiveStoriesKey, MonthDirKey};
+
+    let db = TempDb::new();
+    let legacy = seed_legacy_v3(&db.path);
+    let store = StateStore::open(&db.path).expect("migrate v3 to v4");
+    assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+
+    let identity_counts: (i64, i64, i64) = store
+        .connection()
+        .query_row(
+            "SELECT (SELECT count(*) FROM accounts), (SELECT count(*) FROM chats),
+                    (SELECT count(*) FROM messages)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("identity counts");
+    assert_eq!(identity_counts, (1, 1, 1));
+    assert_eq!(
+        store
+            .connection()
+            .query_row(
+                "SELECT display_timezone FROM accounts WHERE account_id = 7",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .expect("timezone"),
+        "UTC"
+    );
+    assert_eq!(
+        store
+            .connection()
+            .query_row(
+                "SELECT render_generation FROM accounts WHERE account_id = 7",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("render generation"),
+        0
+    );
+
+    let active = ItemKey::Appearance(AppearanceKey {
+        view: ChatListKind::Main,
+        item: CanonicalKey::ActiveStories(ActiveStoriesKey { chat: legacy.chat }),
+    })
+    .id();
+    let month = ItemKey::Appearance(AppearanceKey {
+        view: ChatListKind::Main,
+        item: CanonicalKey::MonthDir(MonthDirKey {
+            chat: legacy.chat,
+            year: 2026,
+            month: 7,
+        }),
+    })
+    .id();
+    for (id, kind, name) in [
+        (&legacy.chat_item, "chat", "Chat"),
+        (&active, "active_stories", "Active Stories"),
+        (&month, "month_dir", "2026-07"),
+    ] {
+        let row: (String, String, Option<i64>) = store
+            .connection()
+            .query_row(
+                "SELECT kind, display_name, deleted_at_ms FROM items WHERE item_id = ?1",
+                [id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("live item");
+        assert_eq!(row, (kind.to_owned(), name.to_owned(), None));
+    }
+    for id in [&legacy.year, &legacy.media, &legacy.whole_ndjson] {
+        let deleted: Option<i64> = store
+            .connection()
+            .query_row(
+                "SELECT deleted_at_ms FROM items WHERE item_id = ?1",
+                [id.as_bytes()],
+                |row| row.get(0),
+            )
+            .expect("legacy tombstone");
+        assert!(deleted.is_some());
+    }
+
+    let markdown: (Vec<u8>, String) = store
+        .connection()
+        .query_row(
+            "SELECT parent_item_id, display_name FROM items WHERE item_id = ?1",
+            [legacy.month_markdown.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("markdown");
+    assert_eq!(
+        markdown,
+        (month.as_bytes().to_vec(), "Messages.md".to_owned())
+    );
+    let monthly_ndjson = ItemKey::Appearance(AppearanceKey {
+        view: ChatListKind::Main,
+        item: CanonicalKey::GeneratedDoc(GeneratedDocKey {
+            chat: legacy.chat,
+            partition: DocPartition::Month {
+                year: 2026,
+                month: 7,
+            },
+            format: DocFormat::Ndjson,
+            schema_family: SchemaFamily(1),
+        }),
+    })
+    .id();
+    assert_eq!(
+        store
+            .connection()
+            .query_row(
+                "SELECT display_name FROM items WHERE item_id = ?1 AND deleted_at_ms IS NULL",
+                [monthly_ndjson.as_bytes()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("monthly NDJSON"),
+        "Messages.ndjson"
+    );
+    let attachment: (Vec<u8>, String) = store
+        .connection()
+        .query_row(
+            "SELECT parent_item_id, display_name FROM items WHERE item_id = ?1",
+            [legacy.attachment.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("attachment item");
+    assert_eq!(attachment.0, month.as_bytes());
+    assert_eq!(attachment.1, "2026-07-21 09-08-07 photo.jpg");
+    let facts: (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    ) = store
+        .connection()
+        .query_row(
+            "SELECT logical_kind, telegram_representation, fidelity, source_name,
+                    mime_type, exact_size FROM attachments",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("attachment facts");
+    assert_eq!(
+        facts,
+        (
+            "unknown".to_owned(),
+            "unknown_legacy".to_owned(),
+            "unknown_legacy".to_owned(),
+            Some("photo.jpg".to_owned()),
+            Some("image/jpeg".to_owned()),
+            Some(1234)
+        )
+    );
+    assert_eq!(legacy.scope.account.account_id, AccountId(7));
+
+    let live_legacy: i64 = store
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM items WHERE deleted_at_ms IS NULL
+           AND kind IN ('year_dir', 'media_dir')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("legacy live count");
+    assert_eq!(live_legacy, 0);
+    let migrated_content: (Option<i64>, Option<i64>, bool, String, bool) = store
+        .connection()
+        .query_row(
+            "SELECT s.oldest_loaded_message_id, s.newest_loaded_message_id,
+                    s.history_complete, p.phase, p.retryable
+             FROM chat_sync_state s
+             JOIN chat_content_progress p USING (account_id, namespace_version, chat_id)
+             WHERE s.account_id = 7 AND s.namespace_version = 1 AND s.chat_id = 100",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("v5 content migration");
+    assert_eq!(
+        migrated_content,
+        (None, None, false, "pending".to_owned(), false)
+    );
+    let violations: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .expect("foreign key check");
+    assert_eq!(violations, 0);
+}
+
 #[test]
 fn the_v1_fixture_opens_at_the_current_version_with_its_rows_intact() {
     let db = TempDb::new();
@@ -87,6 +561,14 @@ fn the_v1_fixture_opens_at_the_current_version_with_its_rows_intact() {
     // is migrated, and nothing is disturbed.
     let store = StateStore::open(&db.path).expect("reopen the fixture");
     assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+    assert!(
+        table_exists(store.connection(), "retention_purge_queue"),
+        "v11 crash-resumable retention journal must migrate with the file"
+    );
+    assert!(
+        table_exists(store.connection(), "retained_attachment_versions"),
+        "v12 Audit attachment-version owners must migrate with the file"
+    );
 
     let messages: i64 = store
         .connection()

@@ -12,6 +12,7 @@ private func account(id: Int64, name: String = "Ivan") -> AccountInfo {
         displayName: name,
         authState: "authorized",
         namespaceVersion: 1,
+        displayTimezone: "UTC",
         rootItemId: "root-\(id)"
     )
 }

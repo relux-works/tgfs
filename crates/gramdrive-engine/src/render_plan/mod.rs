@@ -10,13 +10,13 @@
 //! # What a chat produces
 //!
 //! The [`catalog`] fixes the documents a chat has (the tree layout in
-//! `.spec/sync-and-filesystem-semantics.md`): one lossless whole-chat
-//! `messages.ndjson` and one human-readable `YYYY/MM.md` transcript per calendar
-//! month. A change therefore regenerates the NDJSON (always) and the transcript
-//! of each touched month (only) — the "only affected partitions regenerate"
-//! criterion (SYNC-024). Months are computed with the renderer's own calendar
-//! (`gramdrive_render::civil`), so the planner and the renderer never disagree
-//! about which month a message near a boundary belongs to.
+//! `.spec/sync-and-filesystem-semantics.md`): one bounded `Messages.md` and
+//! `Messages.ndjson` pair in each direct `YYYY-MM` partition. A change therefore
+//! regenerates both files of each touched month, and no unrelated month — the
+//! "only affected partitions regenerate" criterion (SYNC-024). Months are
+//! computed with the persisted account IANA timezone and the renderer's own
+//! calendar (`gramdrive_render::civil`), so the planner and renderer agree at
+//! timezone and daylight-saving boundaries.
 //!
 //! # Marking and planning
 //!
@@ -29,14 +29,11 @@
 //!
 //! # Atomic, resumable publication
 //!
-//! The planner never writes rendered bytes. A [`RenderJob`] is executed by
-//! rendering the partition up to its watermark and calling `gramdrive_state`'s
-//! `publish_render`, whose in-transaction watermark re-check is what makes an
-//! interrupted regeneration safe: a render that never publishes leaves the prior
-//! version readable, one that raced newer events publishes but stays dirty, and
-//! a partial file is never promoted into place (SYNC-033). The planner's role is
-//! to name the work and converge — after a clean publish, the same document
-//! yields no further job.
+//! The planner never writes rendered bytes. [`crate::render_pipeline`] composes
+//! both files from one pinned snapshot, promotes one immutable version
+//! directory, then publishes every appearance and journal signal in one SQLite
+//! transaction. Its month-scoped watermark check leaves a raced month dirty
+//! without rebuilding unrelated partitions (SYNC-033).
 
 mod catalog;
 mod plan;

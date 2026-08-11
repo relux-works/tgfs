@@ -56,7 +56,7 @@ mod pace;
 
 use std::collections::HashSet;
 
-use gramdrive_model::identity::{AccountScope, ChatId, ChatKey};
+use gramdrive_model::identity::{AccountScope, ChatId, ChatKey, ItemId};
 use gramdrive_state::StateStore;
 use gramdrive_state::repo::BackfillControlRecord;
 
@@ -180,6 +180,8 @@ pub enum MediaSuspend {
     Paused,
     /// A flood wait is in effect; even archive media honors it (NFR-033).
     FloodWait,
+    /// The account-wide request spacer has not elapsed yet.
+    RequestPacing,
     /// The account is not in Archive Mode, so there is no eager-media scope.
     /// Media still hydrates on demand (the default, POL-2).
     ArchiveModeOff,
@@ -396,7 +398,7 @@ impl BackfillScheduler {
             .into_iter()
             .chain(demand.requested.iter().map(|c| c.0))
             .collect();
-        let backlog = tx.backfill_backlog(&scope, self.config.backlog_scan)?;
+        let backlog = tx.backfill_backlog(&scope, self.config.backlog_scan, now_ms)?;
         let has_background = backlog.iter().any(|c| !foreground.contains(&c.0));
 
         if conditions.background_permitted() {
@@ -446,8 +448,11 @@ impl BackfillScheduler {
         if control.paused {
             return Ok(suspend(MediaSuspend::Paused));
         }
-        if let Some((_, WaitReason::FloodWait)) = pace::gate(&control, now_ms) {
-            return Ok(suspend(MediaSuspend::FloodWait));
+        if let Some((_, reason)) = pace::gate(&control, now_ms) {
+            return Ok(suspend(match reason {
+                WaitReason::FloodWait => MediaSuspend::FloodWait,
+                WaitReason::Spacing => MediaSuspend::RequestPacing,
+            }));
         }
 
         let archive_on = tx
@@ -474,11 +479,30 @@ impl BackfillScheduler {
         }
 
         // Metadata-first: any incomplete history holds eager media.
-        if !tx.backfill_backlog(&scope, 1)?.is_empty() {
+        if !tx.backfill_backlog(&scope, 1, now_ms)?.is_empty() {
             return Ok(suspend(MediaSuspend::MetadataPending));
         }
 
         Ok(MediaPolicy::Eager)
+    }
+
+    /// Returns a bounded eager-hydration worklist when Archive Mode and host
+    /// conditions permit it. Retention mode is intentionally absent from the
+    /// decision: Audit never creates download demand, while Archive Mode does
+    /// so independently for the same allowed persistent items.
+    pub fn archive_media_worklist(
+        &self,
+        store: &mut StateStore,
+        scope: AccountScope,
+        conditions: HostConditions,
+        now_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<ItemId>, EngineError> {
+        if self.media_policy(store, scope, conditions, now_ms)? != MediaPolicy::Eager {
+            return Ok(Vec::new());
+        }
+        let tx = store.read_txn()?;
+        Ok(tx.archive_backfill_candidates(scope.account, limit)?)
     }
 
     /// Arm the request spacer after the host issues a provider request for a
@@ -558,7 +582,7 @@ impl BackfillScheduler {
         let control = tx
             .backfill_control(scope)?
             .unwrap_or_else(|| BackfillControlRecord::fresh(now_ms));
-        let backlog = tx.backfill_backlog(&scope, self.config.backlog_scan)?;
+        let backlog = tx.backfill_backlog(&scope, self.config.backlog_scan, now_ms)?;
         let pending_until_ms = pace::effective_deadline(&control).filter(|&until| until > now_ms);
         Ok(BackfillObservation {
             paused: control.paused,
@@ -605,6 +629,15 @@ fn chat_needs_history(
     chat_id: ChatId,
 ) -> Result<bool, EngineError> {
     let key = ChatKey { scope, chat_id };
+    let Some(chat) = tx.chat(&key)? else {
+        return Ok(false);
+    };
+    if chat.deleted_at_ms.is_some() || chat.is_protected {
+        return Ok(false);
+    }
+    if !tx.chat_has_list_membership(&key)? {
+        return Ok(false);
+    }
     Ok(match tx.chat_sync_state(&key)? {
         None => true,
         Some(record) => !record.history_complete,

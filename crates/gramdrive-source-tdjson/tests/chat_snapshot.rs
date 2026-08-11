@@ -196,6 +196,7 @@ fn list_json(list: ChatListKind) -> Value {
     match list {
         ChatListKind::Main => json!({"@type": "chatListMain"}),
         ChatListKind::Archive => json!({"@type": "chatListArchive"}),
+        ChatListKind::Stories => panic!("Stories is derived from storyListMain"),
         ChatListKind::Folder(folder) => {
             json!({"@type": "chatListFolder", "chat_folder_id": folder.0})
         }
@@ -454,6 +455,7 @@ fn store_with_account() -> StateStore {
         display_name: "Test Account".to_owned(),
         auth_state: "authorized".to_owned(),
         namespace_version: scope().namespace_version,
+        display_timezone: "UTC".to_owned(),
         retention_mode: RetentionMode::Mirror,
         archive_mode: false,
         secret_ref: None,

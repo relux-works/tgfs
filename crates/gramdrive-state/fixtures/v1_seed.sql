@@ -131,7 +131,7 @@ INSERT INTO change_cursors
 VALUES
     (7, 1, 'chat_list', 'cursor-token-42', 1704067230000);
 
-INSERT INTO chat_sync_state
+INSERT OR REPLACE INTO chat_sync_state
     (account_id, namespace_version, chat_id, oldest_loaded_message_id,
      newest_loaded_message_id, history_complete, last_sync_at_ms)
 VALUES

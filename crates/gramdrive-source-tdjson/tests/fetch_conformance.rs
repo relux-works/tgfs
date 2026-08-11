@@ -62,8 +62,8 @@ use gramdrive_source::{
 use gramdrive_source_tdjson::message::AttachmentAvailability;
 use gramdrive_source_tdjson::mock::{MockTdJson, SentRequest};
 use gramdrive_source_tdjson::{
-    CatalogEntry, DownloadConfig, DownloadPriority, FetchCatalog, FileTarget, TdDownloader,
-    TdRuntime, TdThumbnailer, ThumbnailCatalog, ThumbnailConfig, ThumbnailTarget,
+    CatalogEntry, DownloadConfig, DownloadPriority, FetchCatalog, FileTarget, RefreshTarget,
+    TdDownloader, TdRuntime, TdThumbnailer, ThumbnailCatalog, ThumbnailConfig, ThumbnailTarget,
 };
 use gramdrive_testkit::FakeSource;
 use gramdrive_testkit::conformance::{
@@ -196,8 +196,12 @@ impl FetchCatalog for ConformanceCatalog {
 fn file_target(version: &ContentVersion, size: u64) -> FileTarget {
     FileTarget {
         file_id: FILE_ID,
-        chat_id: CHAT_ID,
-        message_id: MESSAGE_ID,
+        remote_id: None,
+        remote_file_type: None,
+        refresh: RefreshTarget::Message {
+            chat_id: CHAT_ID,
+            message_id: MESSAGE_ID,
+        },
         availability: AttachmentAvailability::Fetchable,
         remote_unique_id: Some(UNIQUE_ID.to_owned()),
         size: Some(size),

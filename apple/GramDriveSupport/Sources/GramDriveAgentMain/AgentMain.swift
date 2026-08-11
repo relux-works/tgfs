@@ -67,6 +67,33 @@ enum AgentMain {
         // agent. Ignored process-wide before any engine work starts, so a
         // dead peer surfaces as EPIPE to the writer that hit it.
         signal(SIGPIPE, SIG_IGN)
+        let commitExitWatchdog = CommitExitWatchdog()
+        guard commitExitWatchdog.install() else {
+            fail("cannot install committed-exit watchdog", code: 3)
+        }
+        #if DEBUG
+            let testTerminationCommitLease = integerOption(options, "test-termination-commit-lease-ms")
+                .map { Duration.milliseconds($0) }
+            let testCommittedExitDelay = integerOption(options, "test-committed-exit-delay-ms")
+                .map { Duration.milliseconds($0) }
+            let testTerminationHardExitWatchdog = integerOption(
+                options, "test-termination-hard-exit-watchdog-ms"
+            ).map { Duration.milliseconds($0) }
+            let testFinderHierarchyReady =
+                boolOption(options, "test-finder-hierarchy-ready") ?? false
+            if testFinderHierarchyReady {
+                AgentRuntimeTestOverrides.installFinderHierarchyReady()
+            }
+            if let testReportedBundleVersion = options["test-reported-bundle-version"],
+               !AgentBuildVersion.installTestReportedBuild(testReportedBundleVersion)
+            {
+                fail("test-reported-bundle-version must be numeric", code: 64)
+            }
+        #else
+            let testTerminationCommitLease: Duration? = nil
+            let testCommittedExitDelay: Duration? = nil
+            let testTerminationHardExitWatchdog: Duration? = nil
+        #endif
         // The engine-backed control seams (BUG-260720-3i74u1): sign-in,
         // removal, and repair over the FFI's authorization surface, with
         // secrets from the OS keychain. Test-DC selection exists for the
@@ -74,13 +101,34 @@ enum AgentMain {
         // GRAMDRIVE_TELEGRAM_TEST_DC env), never in a user-facing launch.
         let useTestDc =
             boolOption(options, "telegram-test-dc")
-            ?? (ProcessInfo.processInfo.environment["GRAMDRIVE_TELEGRAM_TEST_DC"] == "1")
+                ?? (ProcessInfo.processInfo.environment["GRAMDRIVE_TELEGRAM_TEST_DC"] == "1")
         let vault = KeychainSecretVault()
         let authConfiguration = CoreAuthConfiguration(dataRoot: dataRoot, useTestDc: useTestDc)
         let lifecycleRef = LifecycleRef()
+        let terminationExit = TerminationExitGate(
+            watchdog: commitExitWatchdog,
+            testCommittedExitDelay: testCommittedExitDelay,
+            hardExitWatchdogDelay: testTerminationHardExitWatchdog ?? .seconds(2)
+        )
+        let contentPolicy: CoreContentPolicyController
+        do {
+            contentPolicy = try CoreContentPolicyController(dataRoot: dataRoot)
+        } catch {
+            fail("cannot open content policy controller: \(error)", code: 3)
+        }
         let seams = AgentControlSeams(
-            authorizer: CoreAuthorizer(configuration: authConfiguration, vault: vault),
-            remover: CoreAccountRemover(configuration: authConfiguration, vault: vault),
+            authorizer: CoreAuthorizer(
+                configuration: authConfiguration,
+                vault: vault,
+                beforeSession: { lifecycleRef.lifecycle?.stopAllNamespaces() },
+                afterSession: { lifecycleRef.lifecycle?.restartNamespaces() }
+            ),
+            remover: CoreAccountRemover(
+                configuration: authConfiguration,
+                vault: vault,
+                beforeRemoval: { lifecycleRef.lifecycle?.stopNamespace(accountId: $0) },
+                afterFailure: { lifecycleRef.lifecycle?.restartNamespaces() }
+            ),
             repairer: CoreRepairRunner(
                 configuration: authConfiguration,
                 vault: vault,
@@ -90,16 +138,37 @@ enum AgentMain {
                         throw AgentStartError.storage(detail: "durable state is not open")
                     }
                     return accounts
-                }))
+                },
+                beforeRepair: { lifecycleRef.lifecycle?.stopAllNamespaces() },
+                afterRepair: { lifecycleRef.lifecycle?.restartNamespaces() }
+            ),
+            contentPolicy: contentPolicy
+        )
         let configuration = AgentConfiguration(
             dataRoot: dataRoot,
-            drainGracePeriod: .milliseconds(integerOption(options, "drain-grace-ms") ?? 10_000),
+            drainGracePeriod: .milliseconds(integerOption(options, "drain-grace-ms") ?? 10000),
             drainCancelWait: .milliseconds(
-                integerOption(options, "drain-cancel-wait-ms") ?? 5_000),
+                integerOption(options, "drain-cancel-wait-ms") ?? 5000
+            ),
             powerEvents: WorkspacePowerEventSource(),
-            controlSeams: seams)
+            controlSeams: seams,
+            namespaceBootstrapper: CoreNamespaceBootstrapper(
+                configuration: authConfiguration, vault: vault
+            ),
+            onTerminationAccepted: { request in
+                terminationExit.request(request)
+            },
+            onTerminationCommitAccepted: { request in
+                terminationExit.acceptCommit(request)
+            },
+            onTerminationCommitAcknowledged: { request in
+                terminationExit.finishAcceptedCommit(request)
+            },
+            terminationCommitLease: testTerminationCommitLease ?? .seconds(5)
+        )
         let lifecycle = AgentLifecycle(configuration: configuration)
         lifecycleRef.lifecycle = lifecycle
+        terminationExit.bind(lifecycle)
         do {
             try lifecycle.start()
         } catch AgentStartError.alreadyRunning {
@@ -110,7 +179,8 @@ enum AgentMain {
 
         emit(
             "agent: state=running pid=\(ProcessInfo.processInfo.processIdentifier) "
-                + "socket=\(lifecycle.runtimeLayout.healthSocket.path)")
+                + "socket=\(lifecycle.runtimeLayout.healthSocket.path)"
+        )
 
         if let probeMs = integerOption(options, "probe-transfer-ms") {
             hostProbeTransfer(on: lifecycle, milliseconds: probeMs)
@@ -146,7 +216,8 @@ enum AgentMain {
                     chunkBytes: 1,
                     chunkDelayMs: chunkDelayMs,
                     listener: SilentProgressListener(),
-                    token: token)
+                    token: token
+                )
                 emit("probe-transfer: completed")
             } catch {
                 emit("probe-transfer: cancelled")
@@ -163,7 +234,12 @@ enum AgentMain {
                     let outcome = await lifecycle.shutdown(reason: .terminate)
                     emit(
                         "agent: drained completed=\(outcome.completed) "
-                            + "cancelled=\(outcome.cancelled) abandoned=\(outcome.abandoned)")
+                            + "cancelled=\(outcome.cancelled) abandoned=\(outcome.abandoned)"
+                    )
+                    guard outcome.abandoned == 0 else {
+                        emit("agent: termination-cancelled")
+                        return
+                    }
                     emit("agent: state=stopped")
                     exit(0)
                 }
@@ -173,24 +249,137 @@ enum AgentMain {
         }
     }
 
-    // Signal sources must outlive main()'s scope; dispatchMain() never
-    // returns, so a static retain list is the containing scope.
-    nonisolated(unsafe) private static var retainedSources: [any DispatchSourceProtocol] = []
+    /// Signal sources must outlive main()'s scope; dispatchMain() never
+    /// returns, so a static retain list is the containing scope.
+    private nonisolated(unsafe) static var retainedSources: [any DispatchSourceProtocol] = []
+
+    /// Coordinates the one process exit following a control acknowledgement.
+    /// It deliberately starts only after the server writes `commandDone`, so the
+    /// companion never mistakes a disappearing socket for accepted work.
+    private final class TerminationExitGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private let watchdog: CommitExitWatchdog
+        private let testCommittedExitDelay: Duration?
+        private let hardExitWatchdogDelay: Duration
+        private weak var lifecycle: AgentLifecycle?
+        private var requested = false
+
+        init(
+            watchdog: CommitExitWatchdog,
+            testCommittedExitDelay: Duration? = nil,
+            hardExitWatchdogDelay: Duration = .seconds(2)
+        ) {
+            self.watchdog = watchdog
+            self.testCommittedExitDelay = testCommittedExitDelay
+            self.hardExitWatchdogDelay = hardExitWatchdogDelay
+        }
+
+        func bind(_ lifecycle: AgentLifecycle) {
+            lock.lock()
+            self.lifecycle = lifecycle
+            lock.unlock()
+        }
+
+        func request(_ request: ControlTerminationRequest) {
+            if request.action == .cancel {
+                lock.lock()
+                let lifecycle = self.lifecycle
+                lock.unlock()
+                lifecycle?.cancelTermination(request)
+                return
+            }
+            guard request.action == .prepare || request.action == .cancel else { return }
+            lock.lock()
+            guard
+                let lifecycle,
+                !requested || lifecycle.currentState == .terminationCancelled
+            else {
+                lock.unlock()
+                return
+            }
+            requested = true
+            lock.unlock()
+            lifecycle.beginTermination(request)
+            Task {
+                let outcome = await lifecycle.shutdown(
+                    reason: request.reason == .update ? .update : .terminate
+                )
+                emit(
+                    "agent: drained completed=\(outcome.completed) "
+                        + "cancelled=\(outcome.cancelled) abandoned=\(outcome.abandoned)"
+                )
+                guard outcome.abandoned == 0, lifecycle.currentState != .terminationCancelled else {
+                    emit("agent: termination-cancelled")
+                    self.clearRequest()
+                    return
+                }
+                // A completed drain is still reversible. The companion must observe
+                // request-correlated readiness and explicitly commit before this
+                // process tears down its endpoints or exits. The lifecycle lease
+                // cancels and restores serving state if no commit arrives.
+                guard lifecycle.currentState == .terminationReady else {
+                    emit("agent: termination-cancelled")
+                    self.clearRequest()
+                    return
+                }
+                emit("agent: termination-ready")
+            }
+        }
+
+        func acceptCommit(_ request: ControlTerminationRequest) -> Bool {
+            lock.lock()
+            let lifecycle = self.lifecycle
+            lock.unlock()
+            // The lifecycle holds its commit lock across this arm + claim, so a
+            // cancellation cannot land between the two halves of the permit.
+            return lifecycle?.acceptTerminationCommit(request, armWatchdog: {
+                self.watchdog.arm(after: self.hardExitWatchdogDelay)
+            }) ?? false
+        }
+
+        func finishAcceptedCommit(_ request: ControlTerminationRequest) {
+            lock.lock()
+            let lifecycle = self.lifecycle
+            lock.unlock()
+            guard let lifecycle, lifecycle.finishAcceptedTerminationCommit(request) else { return }
+            // The watchdog stays armed. No async teardown is allowed after commit:
+            // normal exit and watchdog fallback both rely on kernel cleanup.
+            #if DEBUG
+                if let testCommittedExitDelay {
+                    let components = testCommittedExitDelay.components
+                    let microseconds = max(
+                        0,
+                        components.seconds * 1_000_000
+                            + Int64(components.attoseconds / 1_000_000_000_000)
+                    )
+                    _ = Darwin.usleep(useconds_t(min(microseconds, Int64(UInt32.max))))
+                }
+            #endif
+            Darwin._exit(0)
+        }
+
+        private func clearRequest() {
+            lock.lock()
+            requested = false
+            lock.unlock()
+        }
+    }
 
     // MARK: - health
 
     private static func fetchHealth(dataRoot: URL, options: [String: String]) {
         let layout = AgentRuntimeLayout(dataRoot: dataRoot)
-        let timeoutMs = integerOption(options, "timeout-ms") ?? 5_000
+        let timeoutMs = integerOption(options, "timeout-ms") ?? 5000
         do {
             let snapshot = try AgentHealthClient.fetch(
                 socketURL: layout.healthSocket,
-                timeout: .milliseconds(timeoutMs))
+                timeout: .milliseconds(timeoutMs)
+            )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(snapshot)
             emit(String(decoding: data, as: UTF8.self))
-        } catch AgentHealthClientError.agentUnavailable(let path) {
+        } catch let AgentHealthClientError.agentUnavailable(path) {
             fail("agent unavailable at \(path)", code: 4)
         } catch {
             fail("health fetch failed: \(error)", code: 4)
@@ -223,9 +412,10 @@ enum AgentMain {
         }
         if let container = options["container"] {
             return AppGroup.dataRootURL(
-                containerURL: URL(fileURLWithPath: container, isDirectory: true))
+                containerURL: URL(fileURLWithPath: container, isDirectory: true)
+            )
         }
-        return AppGroup.dataRootURL(containerURL: try AppGroup.containerURL())
+        return try AppGroup.dataRootURL(containerURL: AppGroup.containerURL())
     }
 
     private static func integerOption(_ options: [String: String], _ key: String) -> Int? {
@@ -254,8 +444,8 @@ enum AgentMain {
 
         var description: String {
             switch self {
-            case .unexpected(let argument): return "unexpected argument '\(argument)'"
-            case .missingValue(let option): return "option '\(option)' needs a value"
+            case let .unexpected(argument): return "unexpected argument '\(argument)'"
+            case let .missingValue(option): return "option '\(option)' needs a value"
             }
         }
     }
@@ -264,7 +454,7 @@ enum AgentMain {
 /// Progress sink for the hosted boundary probe; the probe's purpose here
 /// is being drainable, not being watched.
 private final class SilentProgressListener: ProgressListener {
-    func onProgress(progress: TransferProgress) {}
+    func onProgress(progress _: TransferProgress) {}
 }
 
 /// Breaks the seam/lifecycle construction cycle: the repair seam needs the

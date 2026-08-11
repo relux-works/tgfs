@@ -52,6 +52,7 @@ pub use gramdrive_state as state;
 pub mod backfill;
 pub mod cache;
 pub mod fetch;
+pub mod render_pipeline;
 pub mod render_plan;
 pub mod transfer;
 

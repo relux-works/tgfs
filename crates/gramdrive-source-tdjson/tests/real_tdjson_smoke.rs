@@ -55,8 +55,12 @@ fn download_adapter_payloads() -> Vec<Value> {
     };
     let target = FileTarget {
         file_id: 1,
-        chat_id: 1,
-        message_id: 1,
+        remote_id: None,
+        remote_file_type: None,
+        refresh: gramdrive_source_tdjson::download::RefreshTarget::Message {
+            chat_id: 1,
+            message_id: 1,
+        },
         availability: AttachmentAvailability::Fetchable,
         remote_unique_id: None,
         size: None,

@@ -26,16 +26,15 @@
 //!
 //! # Names (PRD-032)
 //!
-//! The original filename Telegram sent is preserved verbatim in the descriptor;
-//! [`MappedAttachment::safe_name`] is the deterministic projection of it onto a
-//! filesystem, via the naming policy ([`gramdrive_model::naming`]). Media that
-//! Telegram names (documents, audio, most video) is sanitized from that name;
-//! media it does not (photos, voice/video notes, stickers) gets a stable
-//! kind-and-MIME default (`photo.jpg`, `voice.ogg`, …). Two attachments can land
-//! on the same safe name — every photo defaults to `photo.jpg` — and that is
-//! not a collision to settle here: the media directory settles siblings with
-//! identity-derived suffixes ([`gramdrive_model::naming::resolve_siblings`]),
-//! exactly as it does for untitled chats.
+//! A sender filename is preserved only for `messageDocument`, whose Telegram
+//! representation is an original document even when its MIME logically denotes
+//! an image, video, or audio file. Processed Telegram media never promotes its
+//! transport filename to a source filename and instead gets a truthful
+//! kind-and-MIME default (`photo.jpg`, `video.mp4`, `voice.ogg`, …). The mapped
+//! leaf is sanitized by [`gramdrive_model::naming`]. Its account-timezone date
+//! prefix is added by the projection layer, and direct-month sibling collisions
+//! are settled by stable attachment identity through
+//! [`gramdrive_model::naming::resolve_siblings`].
 //!
 //! # Capabilities (POL-4)
 //!
@@ -49,9 +48,107 @@
 use gramdrive_model::identity::{
     AccountScope, AttachmentIndex, AttachmentKey, ChatId, ChatKey, MessageId, MessageKey,
 };
-use gramdrive_model::naming::{NameKind, SafeName, sanitize};
+use gramdrive_model::naming::{SafeName, attachment_leaf_name};
 
-use crate::message::{AttachmentDescriptor, AttachmentKind, MessageRecord};
+use crate::message::{
+    AttachmentAvailability, AttachmentDescriptor, AttachmentKind, MessageContent, MessageRecord,
+};
+
+/// Logical media kind, independent from Telegram's message representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentLogicalKind {
+    /// Still image bytes.
+    Photo,
+    /// Video bytes.
+    Video,
+    /// Looping animation bytes.
+    Animation,
+    /// Music or general audio bytes.
+    Audio,
+    /// Voice-note audio bytes.
+    Voice,
+    /// Round video-note bytes.
+    VideoNote,
+    /// Sticker bytes.
+    Sticker,
+    /// General document bytes.
+    Document,
+}
+
+impl AttachmentLogicalKind {
+    /// Stable state/render vocabulary token.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Photo => "photo",
+            Self::Video => "video",
+            Self::Animation => "animation",
+            Self::Audio => "audio",
+            Self::Voice => "voice",
+            Self::VideoNote => "video_note",
+            Self::Sticker => "sticker",
+            Self::Document => "document",
+        }
+    }
+}
+
+/// Telegram message representation that exposed the attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramRepresentation {
+    /// `messageDocument`, including image/video MIME documents.
+    OriginalDocument,
+    /// Telegram-processed `messagePhoto`.
+    Photo,
+    /// Telegram-processed `messageVideo`.
+    Video,
+    /// Telegram-processed `messageAnimation`.
+    Animation,
+    /// Telegram `messageAudio`.
+    Audio,
+    /// Telegram `messageVoiceNote`.
+    Voice,
+    /// Telegram `messageVideoNote`.
+    VideoNote,
+    /// Telegram `messageSticker`.
+    Sticker,
+}
+
+impl TelegramRepresentation {
+    /// Stable state/render vocabulary token.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::OriginalDocument => "original_document",
+            Self::Photo => "message_photo",
+            Self::Video => "message_video",
+            Self::Animation => "message_animation",
+            Self::Audio => "message_audio",
+            Self::Voice => "message_voice",
+            Self::VideoNote => "message_video_note",
+            Self::Sticker => "message_sticker",
+        }
+    }
+}
+
+/// Truthful fidelity of the represented bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentFidelity {
+    /// Exact original document bytes.
+    Original,
+    /// Telegram-generated/transcoded variant bytes.
+    TelegramVariant,
+    /// Metadata is retained but bytes are not fetchable.
+    MetadataOnly,
+}
+
+impl AttachmentFidelity {
+    /// Stable state/render vocabulary token.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::TelegramVariant => "telegram_variant",
+            Self::MetadataOnly => "metadata_only",
+        }
+    }
+}
 
 /// One attachment mapped to its DOM § Attachment record: stable identity and
 /// deterministic safe name bound over the source's raw [`AttachmentDescriptor`].
@@ -62,6 +159,14 @@ pub struct MappedAttachment {
     pub key: AttachmentKey,
     /// The deterministic filesystem-safe display name (PRD-032).
     pub safe_name: SafeName,
+    /// Logical media kind, orthogonal to Telegram representation.
+    pub logical_kind: AttachmentLogicalKind,
+    /// Telegram representation that exposed the attachment.
+    pub telegram_representation: TelegramRepresentation,
+    /// Truthful fidelity claim for the represented bytes.
+    pub fidelity: AttachmentFidelity,
+    /// Sender filename only for an original-document representation.
+    pub source_name: Option<String>,
     /// The Telegram album (media group) this attachment's message belongs to,
     /// when any — shared provenance across an album's distinct items.
     pub album_id: Option<i64>,
@@ -103,11 +208,13 @@ pub fn map_message_attachments(
                 message,
                 index: AttachmentIndex(0),
             };
+            let representation = representation_of(&record.content);
             map_attachment(
                 descriptor.clone(),
                 key,
                 record.album_id,
                 record.can_be_saved,
+                representation,
             )
         })
         .into_iter()
@@ -124,96 +231,98 @@ pub fn map_attachment(
     key: AttachmentKey,
     album_id: Option<i64>,
     can_be_saved: bool,
+    telegram_representation: TelegramRepresentation,
 ) -> MappedAttachment {
-    let safe_name = safe_attachment_name(&descriptor);
+    let logical_kind = logical_kind_of(&descriptor, telegram_representation);
+    let source_name = (telegram_representation == TelegramRepresentation::OriginalDocument)
+        .then(|| descriptor.file_name.clone())
+        .flatten();
+    let fidelity = if descriptor.availability != AttachmentAvailability::Fetchable {
+        AttachmentFidelity::MetadataOnly
+    } else if telegram_representation == TelegramRepresentation::OriginalDocument {
+        AttachmentFidelity::Original
+    } else {
+        AttachmentFidelity::TelegramVariant
+    };
+    let safe_name = attachment_leaf_name(
+        logical_kind.tag(),
+        telegram_representation.tag(),
+        source_name.as_deref(),
+        descriptor.mime_type.as_deref(),
+    );
     MappedAttachment {
         key,
         safe_name,
+        logical_kind,
+        telegram_representation,
+        fidelity,
+        source_name,
         album_id,
         can_be_saved,
         descriptor,
     }
 }
 
-/// The deterministic safe filename of an attachment: its original name
-/// sanitized, or a stable kind-and-MIME default when Telegram sent no name.
-fn safe_attachment_name(descriptor: &AttachmentDescriptor) -> SafeName {
-    let raw = descriptor
-        .file_name
-        .clone()
-        .unwrap_or_else(|| default_file_name(descriptor.kind, descriptor.mime_type.as_deref()));
-    sanitize(&raw, NameKind::File)
-}
-
-/// The fallback name for an attachment Telegram did not name — a kind stem plus
-/// a best-effort extension. Never unique on its own; the media directory
-/// disambiguates siblings (module docs).
-fn default_file_name(kind: AttachmentKind, mime: Option<&str>) -> String {
-    let stem = match kind {
-        AttachmentKind::Photo => "photo",
-        AttachmentKind::Video => "video",
-        AttachmentKind::Animation => "animation",
-        AttachmentKind::Audio => "audio",
-        AttachmentKind::Document => "document",
-        AttachmentKind::VoiceNote => "voice",
-        AttachmentKind::VideoNote => "video_note",
-        AttachmentKind::Sticker => "sticker",
-    };
-    match default_extension(kind, mime) {
-        Some(extension) => format!("{stem}.{extension}"),
-        None => stem.to_owned(),
+fn representation_of(content: &MessageContent) -> TelegramRepresentation {
+    match content {
+        MessageContent::Document { .. } => TelegramRepresentation::OriginalDocument,
+        MessageContent::Photo { .. }
+        | MessageContent::Expired {
+            kind: crate::message::ExpiredKind::Photo,
+            ..
+        } => TelegramRepresentation::Photo,
+        MessageContent::Video { .. }
+        | MessageContent::Expired {
+            kind: crate::message::ExpiredKind::Video,
+            ..
+        } => TelegramRepresentation::Video,
+        MessageContent::Animation { .. } => TelegramRepresentation::Animation,
+        MessageContent::Audio { .. } => TelegramRepresentation::Audio,
+        MessageContent::VoiceNote { .. }
+        | MessageContent::Expired {
+            kind: crate::message::ExpiredKind::VoiceNote,
+            ..
+        } => TelegramRepresentation::Voice,
+        MessageContent::VideoNote { .. }
+        | MessageContent::Expired {
+            kind: crate::message::ExpiredKind::VideoNote,
+            ..
+        } => TelegramRepresentation::VideoNote,
+        MessageContent::Sticker { .. } => TelegramRepresentation::Sticker,
+        _ => TelegramRepresentation::OriginalDocument,
     }
 }
 
-/// The extension for a nameless attachment: the MIME type when it names a format
-/// we recognize, else the fixed Telegram convention for the kind. Nameless
-/// documents and audio of an unknown MIME get no extension — a wrong one is
-/// worse than none for a type a platform then cannot resolve (SYNC-032).
-fn default_extension(kind: AttachmentKind, mime: Option<&str>) -> Option<&'static str> {
-    if let Some(extension) = mime.and_then(mime_extension) {
-        return Some(extension);
-    }
-    match kind {
-        AttachmentKind::Photo => Some("jpg"),
-        AttachmentKind::VoiceNote => Some("ogg"),
-        AttachmentKind::Video | AttachmentKind::Animation | AttachmentKind::VideoNote => {
-            Some("mp4")
+fn logical_kind_of(
+    descriptor: &AttachmentDescriptor,
+    representation: TelegramRepresentation,
+) -> AttachmentLogicalKind {
+    if representation == TelegramRepresentation::OriginalDocument {
+        let mime = descriptor
+            .mime_type
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if mime.starts_with("image/") {
+            return AttachmentLogicalKind::Photo;
         }
-        AttachmentKind::Sticker => Some("webp"),
-        AttachmentKind::Audio | AttachmentKind::Document => None,
+        if mime.starts_with("video/") {
+            return AttachmentLogicalKind::Video;
+        }
+        if mime.starts_with("audio/") {
+            return AttachmentLogicalKind::Audio;
+        }
     }
-}
-
-/// Extension for the common attachment MIME types. Only the cases a nameless
-/// attachment actually carries need to be right; the media directory settles
-/// any collision the fallback produces, so this is deliberately not a full
-/// MIME database.
-fn mime_extension(mime: &str) -> Option<&'static str> {
-    // Strip any `; charset=…` parameter and fold case before matching.
-    let essence = mime
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    Some(match essence.as_str() {
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "video/mp4" => "mp4",
-        "video/webm" => "webm",
-        "video/quicktime" => "mov",
-        "audio/mpeg" => "mp3",
-        "audio/ogg" | "audio/opus" => "ogg",
-        "audio/flac" => "flac",
-        "audio/mp4" | "audio/x-m4a" | "audio/m4a" => "m4a",
-        "audio/wav" | "audio/x-wav" => "wav",
-        "application/pdf" => "pdf",
-        "application/zip" => "zip",
-        "application/x-tgsticker" => "tgs",
-        _ => return None,
-    })
+    match descriptor.kind {
+        AttachmentKind::Photo => AttachmentLogicalKind::Photo,
+        AttachmentKind::Video => AttachmentLogicalKind::Video,
+        AttachmentKind::Animation => AttachmentLogicalKind::Animation,
+        AttachmentKind::Audio => AttachmentLogicalKind::Audio,
+        AttachmentKind::Document => AttachmentLogicalKind::Document,
+        AttachmentKind::VoiceNote => AttachmentLogicalKind::Voice,
+        AttachmentKind::VideoNote => AttachmentLogicalKind::VideoNote,
+        AttachmentKind::Sticker => AttachmentLogicalKind::Sticker,
+    }
 }
 
 #[cfg(test)]
@@ -370,38 +479,59 @@ mod tests {
 
     #[test]
     fn nameless_extension_follows_mime_then_kind() {
-        assert_eq!(default_file_name(AttachmentKind::Photo, None), "photo.jpg");
         assert_eq!(
-            default_file_name(AttachmentKind::VoiceNote, None),
+            attachment_leaf_name("photo", "message_photo", None, None).as_str(),
+            "photo.jpg"
+        );
+        assert_eq!(
+            attachment_leaf_name("voice", "message_voice", None, None).as_str(),
             "voice.ogg"
         );
         assert_eq!(
-            default_file_name(AttachmentKind::VideoNote, None),
+            attachment_leaf_name("video_note", "message_video_note", None, None).as_str(),
             "video_note.mp4"
         );
         // A sticker's format is in its MIME: static webp vs. animated tgs vs.
         // video webm.
         assert_eq!(
-            default_file_name(AttachmentKind::Sticker, Some("application/x-tgsticker")),
+            attachment_leaf_name(
+                "sticker",
+                "message_sticker",
+                None,
+                Some("application/x-tgsticker")
+            )
+            .as_str(),
             "sticker.tgs"
         );
         assert_eq!(
-            default_file_name(AttachmentKind::Sticker, Some("video/webm")),
+            attachment_leaf_name("sticker", "message_sticker", None, Some("video/webm")).as_str(),
             "sticker.webm"
         );
         assert_eq!(
-            default_file_name(AttachmentKind::Sticker, None),
+            attachment_leaf_name("sticker", "message_sticker", None, None).as_str(),
             "sticker.webp"
         );
         // A MIME with parameters still resolves, case-insensitively.
         assert_eq!(
-            default_file_name(AttachmentKind::Audio, Some("AUDIO/MPEG; charset=binary")),
+            attachment_leaf_name(
+                "audio",
+                "message_audio",
+                None,
+                Some("AUDIO/MPEG; charset=binary")
+            )
+            .as_str(),
             "audio.mp3"
         );
         // An unknown MIME on a kind with no fixed convention: no extension
         // rather than a wrong one.
         assert_eq!(
-            default_file_name(AttachmentKind::Document, Some("application/x-unknowable")),
+            attachment_leaf_name(
+                "document",
+                "original_document",
+                None,
+                Some("application/x-unknowable")
+            )
+            .as_str(),
             "document"
         );
     }

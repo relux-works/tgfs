@@ -11,7 +11,13 @@ state is authoritative.
 STORY-260715-16ik2x (metadata-state-store), EPIC-260715-1poogc
 (shared-rust-core). Populated by TASK-260715-1ceq7h (schema),
 TASK-260715-18l9xz (migrations), TASK-260715-1opnb2 (repositories),
-TASK-260715-21clwh (reconciliation).
+TASK-260715-21clwh (reconciliation), TASK-260721-1hm7dx (schema-v4
+date-first content contract), TASK-260721-yrcjlo (schema-v5 chat-content
+progress and lifecycle composition), TASK-260721-1dzolg (schema-v6 render
+policy generation), TASK-260721-ddqgxa (schema-v7 TDLib attachment locator
+and durable attachment projection), and TASK-260721-3e9bi8 (schema-v8
+canonical story lifecycle and resumable discovery), plus TASK-260721-2tamdj
+(transactional retention and Archive-Mode ownership).
 
 ## Dependencies
 
@@ -20,10 +26,30 @@ amalgamation (version rationale in the workspace `Cargo.toml`).
 Platform-specific code: forbidden — the database location is chosen by the
 embedding host. See `crates/README.md`.
 
-## The schema (v2)
+## The schema (v14)
 
-`src/schema/v1.sql` is the baseline and `src/schema/v2.sql` the one
-migration so far (the item change journal, TASK-260715-rhcnhc); each file
+`src/schema/v1.sql` is the baseline; v2 adds the item change journal, v3 the
+Telegram folder/bootstrap metadata, v4 the date-first content contract, and v5
+the privacy-safe per-chat content progress plus seeded resumable windows. v6
+adds the monotonic account render generation used when policy changes bytes at
+an unchanged message watermark. v7 separates TDLib's numeric local file id
+from its refreshable remote locator and stable remote unique id. v8 adds
+explicit story content/privacy state, active/profile reconciliation generations,
+minimal inaccessible tombstones, and per-chat bounded/resumable story cursors.
+v9 adds typed byte-free story content locators, profile pin order on the month
+appearance, and account-level resumable `storyListMain` loading progress.
+v10 gives active and monthly appearances of the same canonical story distinct
+provider identities. v11 adds an account-scoped purge queue so a committed
+Audit-to-Mirror transaction can resume physical cache deletion after a crash;
+owned hydrator startup drains it automatically. v12 retains allowed Audit
+attachment revisions without retaining download authority. v13 seeds and
+schedules history only for current chat-list members while preserving dormant
+cursors. v14 orders dirty generated documents by durable publication progress,
+so a repeatedly changing low-sorting chat rotates behind never-published and
+less-advanced months. Authoritative attachment
+restriction cleanup reuses the same transaction journal while releasing only
+the affected account's cache, pin, and blob ownership.
+Each file
 carries the full rationale per table — this is the map. `StateStore::open` applies it atomically to a fresh file
 (`PRAGMA user_version` 0 → 1), migrates an older file forward, recognizes a
 current file, and refuses — with a named `StateError` category — a file from
@@ -32,17 +58,18 @@ every connection; file databases run in WAL with `synchronous=NORMAL`.
 
 | Area | Tables | What holds it together |
 |---|---|---|
-| Accounts | `accounts` | Per-account POL-3 retention mode, POL-2 archive-mode toggle, current namespace epoch (DOM-021); secrets are references, never material |
+| Accounts | `accounts` | Per-account display timezone (separate from absolute source timestamps), retention/archive policy, monotonic render generation, current namespace epoch; secrets are references, never material |
 | Canonical chat facts | `chats`, `chat_list_entries` | Keyed by (account, namespace, chat id); list membership and exact Telegram order live apart from presentation, and POL-1's `order.json` regenerates from them without a scan |
-| The message log | `message_events`, `messages` | The append-only canonical store (POL-3, DEC-015): appends only, enforced by trigger — the one sanctioned update is the Mirror-mode payload purge; `messages` is the current-state projection, whose FK refuses to purge the event backing it. `AUTOINCREMENT` keeps sequence numbers watermark-safe forever |
-| Attachments and bytes | `attachments`, `blobs` | Attachment identity is (chat, message, ordinal); Telegram locators are refreshable metadata, never identity (DOM-007, SYNC-045); blobs are content-addressed per account and linked only after verification |
-| Provider projection | `items` | Every provider-visible node under its stable binary `ItemId` (DEC-008): canonical structural roots and appearance rows in one table (DOM-002/022), a real parent self-FK for the tree, live-sibling name uniqueness (SYNC-012), one appearance per (canonical, view) |
+| The message log | `message_events`, `messages` | The append-only canonical store (POL-3, DEC-015): appends only, enforced by trigger — the sanctioned payload purge enforces Mirror and authoritative Telegram restrictions while retaining event identity as a sync tombstone; `messages` is the current-state projection, whose FK refuses to purge the event backing it. `AUTOINCREMENT` keeps sequence numbers watermark-safe forever |
+| Attachments and bytes | `attachments`, `blobs` | Logical kind, Telegram representation, fidelity, source name, MIME, exact size, and availability are orthogonal; locators remain refreshable, and blobs link only after verification |
+| Stories | `stories`, `story_content_locators`, `story_appearances`, `story_tombstones`, `story_sync_progress`, `story_list_progress` | Canonical `(poster_chat_id, story_id)` owns the optional blob and one typed primary content source; byte-free active/month appearances transition without copying content and retain first-page profile pin order, restricted stories atomically lose locators and bytes, completed profile generations remove stale rows retention-safely, and privacy-safe per-chat/account cursors resume bounded scans after a crash |
+| Provider projection | `items` | Every provider-visible node under its stable binary `ItemId` (DEC-008): canonical structural roots and appearance rows in one table (DOM-002/022), a real parent self-FK for the tree, live-sibling name uniqueness (SYNC-012), one appearance per (canonical, view); Archive pins follow allowed attachment appearances, and protection atomically restricts items and removes those pins. `logical_size` stays a file's own bytes while `aggregate_size` carries a directory's exact indexed-descendant rollup, so a chat folder's size is answerable from one item read and neither fact can ever be mistaken for the other |
 | Item change journal | `item_change_journal`, `item_changes` | Durable change enumeration for provider sync anchors (PLAT-MAC-004): one coalesced row per item at its latest `AUTOINCREMENT` sequence — bounded by item count, never rewound — refreshed by the item write paths only on provider-visible change, so an engine re-baseline replays nothing; the identity row names the database life so anchors from a quarantined file expire explicitly |
 | Hydration | `transfers` | Durable transfer journal pinned to a content version (SYNC-042), JSON-validated ranges, the SYNC-044 failure taxonomy, a partial index over live states for the queue head |
-| Cache | `cache_entries`, `pins` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; `pins` is durable offline intent independent of materialization |
-| Sync positions | `change_cursors`, `chat_sync_state` | One durable feed position per (account, stream) — scope verification stays with `ChangeCursor::require_scope` (SYNC-004); per-chat resumable history windows (SYNC-021) |
+| Cache | `cache_entries`, `pins`, `retention_purge_queue` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; `pins` is durable offline intent independent of materialization; destructive retention queues physical deletion before dropping cache ownership |
+| Sync positions | `change_cursors`, `chat_sync_state`, `chat_content_progress` | One durable feed position per (account, stream) — scope verification stays with `ChangeCursor::require_scope` (SYNC-004); a chat gets bounded resumable history and privacy-safe pending/ready/retry/protected state when its first live Telegram list membership makes it provider-eligible, while an existing cursor survives later membership removal/reappearance (SYNC-021). The backward-crawl rotation is keyed on `last_backfill_at_ms` — when a chat was last handed a turn — and never on `last_sync_at_ms`, which live delivery also stamps: ordering on the latter let incoming messages reset a chat's place in the queue, so the busiest correspondences were the ones that never crawled backward |
 | Backfill control | `backfill_control` | The engine backfill scheduler's durable per-scope pause switch, request spacer, and honored flood-wait deadline — a restart resumes neither paused work nor a violated flood wait (SYNC-043/SYNC-005 pause, SEC-031 spacer, NFR-033 flood, NFR-031/SYNC-070 restart durability) |
-| Rendering | `render_state` | Renderer/schema versions, the event-sequence input watermark, and a dirty worklist behind a covering partial index (SYNC-024, SYNC-030..033) |
+| Rendering | `message_events`, `items`, `render_state`, `cache_entries` | One-transaction monthly snapshots pin message watermark plus account policy generation; paired appearance catalog; renderer/schema versions and dirty worklist; publication rechecks policy and ignores unrelated-month event races while item facts/cache locators/change-journal rows advance atomically (SYNC-024, SYNC-030..033) |
 | Versioning | `schema_history` + `user_version` | The pragma answers "what is current"; the table answers "how did we get here" for the migration runner (SYNC-072) |
 
 ## Migrations
@@ -51,9 +78,11 @@ Forward-only (NFR-013). `v1.sql` creates version 1 and is frozen; every
 version after it is a `Migration` in `src/migrate.rs`, applied in order by
 `StateStore::open`. There is no downgrade: an older build meeting a newer
 file refuses it rather than guessing what the newer schema's data means in
-an older shape. `MIGRATIONS` is empty today — `SCHEMA_VERSION` is still the
-baseline — and a const assertion fails the build if that list and the
-version ever disagree.
+an older shape. `MIGRATIONS` contains the contiguous v2–v11 steps, and a const
+assertion fails the build if that list and the version ever disagree. The v4
+atomic rebuild retires live legacy year/media/whole-chat rows, creates direct
+months and both bounded documents, and preserves existing account/chat/item
+identities as live rows or migration tombstones.
 
 Crash safety (SYNC-072) rests on one rule: `PRAGMA user_version` advances
 only in the same transaction as the work that earns it, so the version is
@@ -62,6 +91,7 @@ never a claim the data cannot back.
 | Step | For | On interruption |
 |---|---|---|
 | `MigrationStep::Sql` | DDL and bounded data work — one transaction | Rolls back whole; the next open starts it over |
+| `MigrationStep::AtomicRebuild` | Bounded table/projection rebuild requiring temporary FK suspension | Commits schema, projection, version, and history together; foreign keys are checked before acceptance |
 | `MigrationStep::Resumable` | Data too large for one transaction (a backfill across 110k messages) | Committed chunks stay; `migration_progress` holds the last checkpoint and the next open resumes from it |
 
 A resumable step commits each chunk's data changes together with the
@@ -108,19 +138,21 @@ runs inside an explicit transaction:
 
 | Area | Operations | The invariant they carry |
 |---|---|---|
-| Accounts | upsert / read / `bump_namespace` | upsert never rewinds the namespace epoch — only `bump_namespace` moves it, forward (DOM-021) |
+| Accounts | upsert / read / typed retention transitions / Archive-Mode lifecycle / `bump_namespace` | display timezone persists independently; generic upsert cannot bypass retention purge, Archive ownership, or timezone repartition; Audit-to-Mirror is account-confirmed and transactional; Archive Mode stays independent; byte-shaping transitions advance `render_generation` |
 | Chats and lists | `upsert_chat`, `replace_chat_list`, ordered `chat_list` | one list replaced whole per snapshot; read order is pinned-first, Telegram order descending (POL-1, DEC-013) |
 | Items | upsert / read / `children_page` / `child_by_name` / `appearances_of` / `tombstone_item` / `update_item_content` | identity columns (kind, scope, canonical link, view) derive from the `ItemId` itself, so the caller cannot write them inconsistently; content updates are compare-and-set on `ContentVersion` (DOM-003) |
 | Changes | `apply_message_changes`, event/message reads, sync windows | idempotent by Telegram identity (SYNC-021): exact replays, post-deletion revisions, and stale pre-edit revisions are skipped, so at-least-once delivery has exactly-once effect |
 | Cursors | `put_cursor` / `cursor` / `clear_cursor` | scope-checked both ways against the account's *current* epoch — a retired-epoch cursor is an explicit `CursorOutOfScope`, never a silent apply (SYNC-004); atomicity with state is the shared transaction (SYNC-022) |
-| Attachments and blobs | `upsert_attachment`, `record_blob`, `link_attachment_blob` | a locator refresh rewrites metadata only and can never detach verified bytes (SYNC-045); blob links require the blob row first |
+| Chat content progress | `put_chat_content_progress` / `chat_content_progress` | exposes only stable failure categories and retry facts; raw Telegram errors or chat content never enter operational progress |
+| Attachments and blobs | `upsert_attachment`, `record_blob`, `link_attachment_blob` | orthogonal fidelity/representation facts round-trip; a locator refresh cannot detach verified bytes |
+| Stories | `upsert_story_with_locators`, `replace_active_stories`, `set_story_appearance`, `clear_profile_pin_order`, `finish_profile_scan`, `mark_story_inaccessible`, `put_story_sync_progress`, `start_story_list_pass`, `advance_story_list_progress`, `link_story_blob` | one canonical typed content source and byte link, atomic active→month placement, authoritative active expiry, durable pin reorder, generation-safe profile removal, bounded account/per-chat progress, and fail-closed protected-content enforcement |
 | Transfers | enqueue / claim / progress / suspend / resume / fail / cancel / done | coalescing per (item, version) (SYNC-046); two-phase cancel observed at work boundaries; `mark_transfer_done` re-checks the item's content version inside the promoting transaction (SYNC-042) |
-| Cache and pins | entry upsert / touch / verify / evict / usage, `pin_item` / `unpin_item` | eviction eligibility (unpinned + verified) is in the DELETE itself — an ineligible evict is a `false`, not a removal (SYNC-051/052) |
+| Cache and pins | entry upsert / touch / verify / evict / usage, `pin_item` / `unpin_item`, Archive worklist, retention-purge queue/ack | eviction eligibility (unpinned + verified) is in the DELETE itself; Archive candidates are allowed persistent items only; purge acknowledgements are idempotent and account-scoped |
 | Render | `ensure_render_state`, `mark_render_dirty`, `dirty_render_items`, `publish_render` | watermarks only advance; a publication re-checks the event log in its own transaction and stays dirty if events arrived while rendering (SYNC-024) |
 
 SYNC-022's atomic checkpoint is compositional, not a special API: call
-`apply_message_changes`, `record_chat_sync`, and `put_cursor` under one
-`write_txn` and they commit or vanish together.
+`apply_message_changes`, `record_chat_sync`, `put_chat_content_progress`, and
+`put_cursor` under one `write_txn` and they commit or vanish together.
 
 ## Reconciliation
 

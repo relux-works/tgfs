@@ -1,7 +1,7 @@
 # Product Specification
 
 Status: planning baseline
-Last updated: 2026-07-17
+Last updated: 2026-07-21
 
 ## Product statement
 
@@ -42,7 +42,7 @@ The user opens a dataless media/document placeholder. The provider fetches the r
 
 ### J4 — Read exported conversation text
 
-The user opens monthly Markdown or lossless NDJSON files generated from current synchronized message records. A rerun with unchanged source records produces byte-identical output.
+The user opens `Messages.md` or lossless `Messages.ndjson` inside a direct `YYYY-MM` chat folder. A rerun with unchanged source records produces byte-identical output.
 
 ### J5 — Keep content offline
 
@@ -71,17 +71,17 @@ New messages, edits, deletes, chat title changes, archive moves, and ordering ch
 
 ### Chat exports
 
-- **PRD-020 (V1):** Expose lossless current-state message data as NDJSON with stable schema versioning.
+- **PRD-020 (V1):** Expose lossless current-state message data as bounded monthly `Messages.ndjson` with stable schema versioning; do not expose one unbounded primary chat export.
 - **PRD-021 (V1):** Expose bounded human-readable Markdown files, partitioned by month by default.
 - **PRD-022 (V1):** Include message identity, time, sender, text/caption entities, replies, topics, albums, reactions, edits, service actions, and attachment references when accessible.
 - **PRD-023 (V1):** Generated exports are deterministic views and are never the canonical editable source.
-- **PRD-024 (V1):** Clearly represent unavailable, deleted-after-observation, protected, or unsupported content without fabricating recoverability.
+- **PRD-024 (V1):** Clearly represent unavailable, deleted-after-observation, protected, or unsupported content without fabricating recoverability. Active stories are not marked viewed by discovery; profile-page stories persist in their posting month as appearances of one canonical story, while unposted active stories disappear at expiration.
 
 ### Media and files
 
 - **PRD-030 (V1):** Enumerate accessible and saveable documents, photos, video, audio, voice, animation, stickers, and other downloadable message attachments supported by the source.
 - **PRD-031 (V1):** Hydrate content on demand and support cancellation and resume where the source and provider permit it.
-- **PRD-032 (V1):** Preserve original filename/MIME/size metadata while exposing a deterministic safe filename.
+- **PRD-032 (V1):** Preserve original filename/MIME/exact size only when Telegram exposes an original document representation. Processed Telegram media variants use truthful generated names and explicit fidelity; all attachments expose deterministic date-first safe filenames.
 - **PRD-033 (V1):** Deduplicate stored content internally without merging distinct virtual items or losing Telegram provenance.
 - **PRD-034 (V1):** Respect Telegram protected-content and `can_be_saved` restrictions.
 

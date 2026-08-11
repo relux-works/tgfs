@@ -21,6 +21,26 @@ use gramdrive_state::StateStore;
 use gramdrive_state::model::identity::{ChatListKind, FolderId};
 use rusqlite::params;
 
+#[test]
+fn live_generated_documents_have_a_parent_scoped_catalog_index() {
+    let store = StateStore::open_in_memory().expect("open in-memory store");
+    let sql: String = store
+        .connection()
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'index' AND name = 'items_live_generated_docs_by_parent'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("chat render catalog index");
+
+    assert!(sql.contains("ON items (parent_item_id, item_id)"));
+    assert!(
+        sql.contains("WHERE kind = 'generated_doc' AND deleted_at_ms IS NULL"),
+        "the catalog index contains only live generated documents"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Foreign keys
 // ---------------------------------------------------------------------------
@@ -126,6 +146,89 @@ fn item_kind_vocabulary_is_closed() {
         params![ACCOUNT_ID, NAMESPACE, account_root_id().as_bytes()],
     );
     expect_rejected(result, "CHECK");
+}
+
+#[test]
+fn legacy_layout_kinds_are_tombstones_only() {
+    let store = store_with_account();
+    for (id, kind) in [(0x20u8, "year_dir"), (0x21u8, "media_dir")] {
+        let result = store.connection().execute(
+            "INSERT INTO items (item_id, account_id, namespace_version, kind, parent_item_id,
+                                display_name, safe_name, is_directory, metadata_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?4, 1, 'm1')",
+            params![
+                [id].as_slice(),
+                ACCOUNT_ID,
+                NAMESPACE,
+                kind,
+                account_root_id().as_bytes(),
+            ],
+        );
+        expect_rejected(result, "CHECK");
+
+        store
+            .connection()
+            .execute(
+                "INSERT INTO items (item_id, account_id, namespace_version, kind,
+                                    parent_item_id, display_name, safe_name, is_directory,
+                                    metadata_version, deleted_at_ms, tombstone_provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?4, 1, 'm1', 1000, 'reconcile')",
+                params![
+                    [id].as_slice(),
+                    ACCOUNT_ID,
+                    NAMESPACE,
+                    kind,
+                    account_root_id().as_bytes(),
+                ],
+            )
+            .expect("historical tombstone remains readable");
+    }
+}
+
+#[test]
+fn processed_attachment_claims_are_truthful_at_the_schema_boundary() {
+    let store = store_with_account();
+    let conn = store.connection();
+    insert_chat(conn, 100);
+    let event = insert_observed_event(conn, 100, 5);
+    insert_message(conn, 100, 5, event);
+
+    for (index, representation, fidelity, source_name) in [
+        (0, "message_photo", "original", None),
+        (
+            1,
+            "message_video",
+            "telegram_variant",
+            Some("claimed-original.mp4"),
+        ),
+        (2, "original_document", "telegram_variant", None),
+        (3, "unknown_legacy", "original", None),
+    ] {
+        let result = conn.execute(
+            "INSERT INTO attachments (
+                 account_id, namespace_version, chat_id, message_id, attachment_index,
+                 content_version, telegram_representation, fidelity, source_name
+             ) VALUES (?1, ?2, 100, 5, ?3, 'c1', ?4, ?5, ?6)",
+            params![
+                ACCOUNT_ID,
+                NAMESPACE,
+                index,
+                representation,
+                fidelity,
+                source_name,
+            ],
+        );
+        expect_rejected(result, "CHECK");
+    }
+
+    conn.execute(
+        "INSERT INTO attachments (
+             account_id, namespace_version, chat_id, message_id, attachment_index,
+             content_version, telegram_representation, fidelity, source_name
+         ) VALUES (?1, ?2, 100, 5, 4, 'c1', 'message_photo', 'telegram_variant', NULL)",
+        params![ACCOUNT_ID, NAMESPACE],
+    )
+    .expect("truthful processed attachment");
 }
 
 #[test]
@@ -283,19 +386,27 @@ fn sync_window_bounds_are_ordered_and_paired() {
     let store = store_with_account();
     let conn = store.connection();
     insert_chat(conn, 100);
+    conn.execute(
+        "INSERT INTO chat_list_entries (
+             account_id, namespace_version, list_kind, folder_id,
+             chat_id, sort_order, pinned
+         ) VALUES (?1, ?2, 'main', 0, 100, 1, 0)",
+        params![ACCOUNT_ID, NAMESPACE],
+    )
+    .expect("make chat eligible for a sync window");
 
     let result = conn.execute(
-        "INSERT INTO chat_sync_state (account_id, namespace_version, chat_id,
-                                      oldest_loaded_message_id, newest_loaded_message_id)
-         VALUES (?1, ?2, 100, 50, 10)",
+        "UPDATE chat_sync_state
+         SET oldest_loaded_message_id = 50, newest_loaded_message_id = 10
+         WHERE account_id = ?1 AND namespace_version = ?2 AND chat_id = 100",
         params![ACCOUNT_ID, NAMESPACE],
     );
     expect_rejected(result, "CHECK");
 
     let result = conn.execute(
-        "INSERT INTO chat_sync_state (account_id, namespace_version, chat_id,
-                                      oldest_loaded_message_id, newest_loaded_message_id)
-         VALUES (?1, ?2, 100, 10, NULL)",
+        "UPDATE chat_sync_state
+         SET oldest_loaded_message_id = 10, newest_loaded_message_id = NULL
+         WHERE account_id = ?1 AND namespace_version = ?2 AND chat_id = 100",
         params![ACCOUNT_ID, NAMESPACE],
     );
     expect_rejected(result, "CHECK");
@@ -315,9 +426,16 @@ fn live_siblings_may_not_share_a_name() {
         conn.execute(
             "INSERT INTO items (item_id, account_id, namespace_version, kind, parent_item_id,
                                 display_name, safe_name, is_directory, metadata_version,
-                                deleted_at_ms)
-             VALUES (?1, ?2, ?3, 'chat', ?4, 'Team', 'Team', 1, 'm1', ?5)",
-            params![item, ACCOUNT_ID, NAMESPACE, root.as_bytes(), deleted],
+                                deleted_at_ms, tombstone_provenance)
+             VALUES (?1, ?2, ?3, 'chat', ?4, 'Team', 'Team', 1, 'm1', ?5, ?6)",
+            params![
+                item,
+                ACCOUNT_ID,
+                NAMESPACE,
+                root.as_bytes(),
+                deleted,
+                deleted.map(|_| "reconcile"),
+            ],
         )
     };
 

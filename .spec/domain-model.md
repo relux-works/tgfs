@@ -1,7 +1,7 @@
 # Domain Model
 
 Status: planning baseline
-Last updated: 2026-07-17
+Last updated: 2026-07-21
 
 ## Invariants
 
@@ -20,7 +20,7 @@ Last updated: 2026-07-17
 
 Represents one configured source identity.
 
-Key fields: `account_id`, source kind, display name, authorization state, namespace version, created/updated timestamps. Secrets are references to platform secure storage, never database plaintext fields.
+Key fields: `account_id`, source kind, display name, authorization state, namespace version, display timezone, and created/updated timestamps. The IANA display timezone controls civil partitions and names; Telegram source timestamps remain absolute UTC. Secrets are references to platform secure storage, never database plaintext fields.
 
 ### Source
 
@@ -33,7 +33,7 @@ Provider-neutral file or directory metadata:
 - `item_id`
 - `account_id`
 - `parent_id` for one virtual appearance
-- `kind` (`root`, `list`, `folder_view`, `chat`, `year`, `month`, `media_dir`, `file`, `generated_file`)
+- `kind` (`root`, `list`, `folder_view`, `chat`, `active_stories`, `month`, `attachment`, `canonical_story`, `story_appearance`, `generated_file`); legacy `year`/`media_dir` kinds are migration-only tombstone vocabulary and never live layout
 - display and safe names
 - MIME type and logical size
 - metadata/content version
@@ -71,7 +71,11 @@ Historical revisions that were never observed are not implied.
 
 ### Attachment
 
-A virtual downloadable object tied to a message and attachment index. It records original metadata, logical content identity, Telegram locator/file ID/reference, safe display name, size, MIME type, availability/saveability, and last verification time.
+A virtual downloadable object tied to a message and attachment index. Logical kind, Telegram representation, fidelity, sender source name, MIME type, exact size, availability/saveability, and locator/file reference are orthogonal facts. `messageDocument` may preserve original name/MIME/exact bytes; processed Telegram photo/video representations carry generated names and cannot claim original fidelity. The safe display name begins with an account-local civil timestamp and is not identity.
+
+### Story
+
+A canonical Telegram story is keyed by `(poster_chat_id, story_id)` and owns at most one verified blob link. A story appearance is byte-free placement either in `Active Stories` or persistently in the posting month. Moving from active to the profile-page timeline removes the active appearance in the same transaction. Restricted or `can_be_forwarded=false` stories never link bytes.
 
 ### Blob
 
@@ -92,8 +96,8 @@ Maps an item/version to materialized bytes and tracks size, access time, pin int
 ## Identity scheme
 
 - **DOM-020:** IDs must be opaque at the provider boundary and stable across database rebuilds from unchanged source data.
-- **DOM-021:** Telegram-derived canonical keys include account ID, peer/chat ID, message ID, attachment index, and source namespace version as applicable.
-- **DOM-022:** Virtual appearance IDs additionally include list/folder view identity; moving between views creates/removes appearances without changing canonical chat identity.
+- **DOM-021:** Telegram-derived canonical keys include account ID, peer/chat ID, message ID, attachment index, story ID, and source namespace version as applicable.
+- **DOM-022:** Virtual appearance IDs additionally include list/folder view identity and, for stories, active/month placement; moving between views or story placements creates/removes appearances without changing canonical chat/story identity or duplicating bytes.
 - **DOM-023:** Generated-file IDs include chat identity, partition key, format, and schema family, but not the current chat title.
 - **DOM-024:** Windows file identity payloads, Apple item identifiers, Android document IDs, and Linux inode mapping all resolve through the same stable `ItemId` namespace.
 

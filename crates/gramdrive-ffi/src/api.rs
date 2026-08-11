@@ -6,7 +6,7 @@
 //! for growing it without breaking native consumers are in README.md
 //! (§ Versioning policy).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The version of this FFI contract, independent of crate versions.
 ///
@@ -32,7 +32,35 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // SecretVault keychain seam, probe_authorization for stored-session
     // status — and the SEC-004 account removal driver (crate::removal).
     // Additive, hence minor.
-    minor: 6,
+    // 0.7.0: coordinator-only ensure_root_structure and its readiness
+    // record — bounded, local first-page repair for File Provider.
+    // 0.8.0: long-lived metadata-only Telegram namespace bootstrap and
+    // progress callback (`crate::namespace`). Additive, hence minor.
+    // 0.9.0: date-first month/story kinds, persisted display timezone,
+    // and orthogonal attachment representation/fidelity metadata.
+    // 0.10.0: lifecycle-owned chat-content coordination plus foreground
+    // history priority signals on NamespaceSession; exported session teardown
+    // is named `shutdown` because UniFFI objects reserve Kotlin `close()` for
+    // AutoCloseable. Additive over the usable cross-language surface.
+    // 0.11.0: provider metadata exposes its owning chat identity so a thin
+    // File Provider process can send bounded scheduling hints to the owned
+    // agent session without parsing opaque item ids or touching TDLib.
+    // 0.12.0: bounded shared-state child pages return an explicit continuation
+    // anchor and reject anchors from another container. Additive, hence minor.
+    // 0.13.0: state-backed attachment hydration, verified cache result, and
+    // restricted/version-conflict error categories. Additive, hence minor.
+    // 0.14.0: per-account retention/Archive-Mode policy controller with
+    // account-scoped destructive confirmation and resumable purge status.
+    // 0.15.0: native host-condition reporting for production Archive
+    // hydration plus retained attachment-version counts in destructive
+    // transition reports. Additive, hence minor.
+    // 0.16.0: directories publish the exact logical size of their indexed
+    // descendants (ItemMetadata.aggregate_size), so a host can answer a
+    // folder-size query from metadata alone. Additive, hence minor.
+    // 0.17.0: generated-document hydration carries an opaque hand-off lease
+    // until the native File Provider clone has completed. Additive, hence
+    // minor.
+    minor: 17,
     patch: 0,
 };
 
@@ -116,6 +144,16 @@ pub enum DriveError {
         /// Diagnostic detail; not contractual.
         detail: String,
     },
+    /// Source policy forbids saving these bytes (POL-4).
+    Restricted {
+        /// Diagnostic detail; not contractual.
+        detail: String,
+    },
+    /// The caller's pinned content version is no longer current.
+    VersionConflict {
+        /// Diagnostic detail; not contractual.
+        detail: String,
+    },
     /// The operation was cancelled — via its [`CancellationToken`] or from
     /// the Rust side (e.g. core shutdown). See README.md (§ Cancellation).
     Cancelled {
@@ -146,6 +184,8 @@ impl std::fmt::Display for DriveError {
             Self::SourceUnavailable { detail } => write!(f, "source unavailable: {detail}"),
             Self::Storage { detail } => write!(f, "storage failure: {detail}"),
             Self::Integrity { detail } => write!(f, "integrity failure: {detail}"),
+            Self::Restricted { detail } => write!(f, "restricted: {detail}"),
+            Self::VersionConflict { detail } => write!(f, "version conflict: {detail}"),
             Self::Cancelled { detail } => write!(f, "cancelled: {detail}"),
             Self::Internal { detail } => write!(f, "internal error: {detail}"),
         }
@@ -254,6 +294,7 @@ pub struct CoreConfig {
 #[derive(Debug, uniffi::Object)]
 pub struct DriveCore {
     config: CoreConfig,
+    hydrator: OnceLock<Arc<crate::hydration::Hydrator>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -270,12 +311,25 @@ impl DriveCore {
                 detail: "data_dir must be a non-empty directory path".to_owned(),
             });
         }
-        Ok(Arc::new(Self { config }))
+        Ok(Arc::new(Self {
+            config,
+            hydrator: OnceLock::new(),
+        }))
     }
 
     /// The data directory this core was constructed with.
     pub fn data_dir(&self) -> String {
         self.config.data_dir.clone()
+    }
+
+    /// The shared hydration service for this data root.
+    pub fn hydrator(&self) -> Result<Arc<crate::hydration::Hydrator>, DriveError> {
+        if let Some(hydrator) = self.hydrator.get() {
+            return Ok(Arc::clone(hydrator));
+        }
+        let hydrator = crate::hydration::Hydrator::shared(&self.config.data_dir)?;
+        let _ = self.hydrator.set(Arc::clone(&hydrator));
+        Ok(self.hydrator.get().map(Arc::clone).unwrap_or(hydrator))
     }
 
     /// Boundary conformance probe: a synthetic transfer that exercises the

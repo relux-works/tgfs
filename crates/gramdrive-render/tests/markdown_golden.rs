@@ -14,9 +14,10 @@
 mod support;
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 use gramdrive_model::identity::DocPartition;
-use gramdrive_render::markdown::{self, MarkdownInput, RetentionMode, UtcOffset};
+use gramdrive_render::markdown::{self, DisplayTimeZone, MarkdownInput, RetentionMode, UtcOffset};
 use support::{corpus, fixture_chat};
 
 /// The corpus falls entirely inside November 2023 (its reference instant,
@@ -59,12 +60,15 @@ fn assert_golden(name: &str, actual: &str) {
 }
 
 fn input<'a>(messages: &'a [markdown::MessageHistory], mode: RetentionMode) -> MarkdownInput<'a> {
+    static UTC: LazyLock<DisplayTimeZone> =
+        LazyLock::new(|| DisplayTimeZone::fixed(UtcOffset::UTC));
     MarkdownInput {
         chat: fixture_chat(),
         partition: november_2023(),
         retention_mode: mode,
-        timezone: UtcOffset::UTC,
+        timezone: &UTC,
         input_watermark_seq: 13,
+        render_generation: 0,
         messages,
     }
 }

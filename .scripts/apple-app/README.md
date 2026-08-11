@@ -11,7 +11,9 @@ tag-triggered GitHub `release.yml` that *invokes* this script is a separate task
 (TASK-260715-3bhbkv); this directory owns the pipeline, not the CI wiring.
 
 ```sh
-make package                 # stage the core first (dependency; .scripts/packaging)
+GRAMDRIVE_TDLIB_ARTIFACT_DIR=.temp/tdlib/out make package
+                             # stage the live tdjson-linked core first
+# The packager defaults to test; use --update-channel stable for a stable candidate.
 make package-app             # build + sign + verify the app and dmg (no notarization)
 make package-app-notarize    # the full path: also notarize + staple via gramdrive-notary
 ```
@@ -27,6 +29,8 @@ commit, and its signature would be stale the moment the toolchain moved.
   GramDrive.app/                     the signed, hardened-runtime bundle
     Contents/
       Info.plist                     com.reluxworks.gramdrive
+      Frameworks/Sparkle.framework   Sparkle 2.9.5 plus Autoupdate, Updater.app,
+                                     Downloader.xpc, and Installer.xpc
       PkgInfo                        APPL????
       MacOS/GramDrive                the menu-bar companion shell
       MacOS/gramdrive-agent          the launchd-run engine-hosting agent
@@ -42,6 +46,17 @@ commit, and its signature would be stale the moment the toolchain moved.
 ```
 
 ## The three properties this pipeline exists to guarantee
+
+## Sparkle channels
+
+The packager embeds one trust channel at build time; there is no runtime
+test/stable selector. `--update-channel test` (the default) embeds only the
+reviewed v1 GitHub Release feed and its reviewed public EdDSA key.
+`--update-channel stable` embeds only the reviewed v1 Pages feed and its
+different reviewed public EdDSA key. Both feed/key pairs are checked-in public
+configuration, validated before assembly, and never read from environment or
+CLI input. `Version.json` is the reviewed three-part marketing version source,
+while the numeric `CFBundleVersion` remains the commit count.
 
 ### Signed and verifiable
 
@@ -124,16 +139,21 @@ invented here (macOS 14+ arm64, POL-5/DEC-017):
 
 ## The appex entry point (why there is an executable target)
 
-SwiftPM cannot emit an `.appex` or an `NSExtensionMain` entry point. The
-`GramDriveFileProviderExtensionApp` executable target
-(`apple/GramDriveSupport/Sources/GramDriveFileProviderExtensionApp/main.swift`)
-is that missing entry point: it calls `NSExtensionMain` (exported from
-Foundation) and touches the principal class's metatype so the linker keeps it in
-the image. Packaging wraps the built binary in the `.appex` bundle and the
-Info.plist whose `NSExtension` dictionary names the principal class
-`GramDriveFileProvider.GramDriveFileProviderExtension` — the Swift-mangled
-Objective-C runtime name the system resolves by string. Verified with `nm`: the
-binary references `_NSExtensionMain` and keeps
+SwiftPM cannot emit an `.appex`, so the package builds
+`GramDriveFileProviderExtensionApp` as an executable target and the packaging
+script wraps its binary in the extension bundle. `Package.swift` passes
+`-e _NSExtensionMain` to the linker, making Foundation's extension runtime the
+Mach-O entry point just as it is for an Xcode App Extension product.
+
+`apple/GramDriveSupport/Sources/GramDriveFileProviderExtensionApp/main.swift`
+must not call `NSExtensionMain`: doing so would recursively re-enter the
+extension runtime before File Provider can deliver a callback. Its only runtime
+role is to touch the principal class's metatype so the linker retains the class
+that the system later resolves by name. The packaging script supplies the
+`.appex` wrapper and Info.plist whose `NSExtension` dictionary names that class
+as `GramDriveFileProvider.GramDriveFileProviderExtension`, its Swift-mangled
+Objective-C runtime name. Verified with the binary inspection gates: the Mach-O
+imports `_NSExtensionMain`, uses it as `LC_MAIN`, and retains
 `_OBJC_CLASS_$__TtC21GramDriveFileProvider30GramDriveFileProviderExtension`.
 
 ## Requirements

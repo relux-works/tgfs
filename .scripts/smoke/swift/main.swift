@@ -41,9 +41,17 @@ final class RecordingListener: ProgressListener, @unchecked Sendable {
 
 let version = contractVersion()
 check(
-    version == ContractVersion(major: 0, minor: 3, patch: 0),
-    "contract version is 0.3.0"
+    version == ContractVersion(major: 0, minor: 12, patch: 0),
+    "contract version is 0.12.0"
 )
+
+let dateFirstKinds: [ItemKind] = [
+    .activeStories,
+    .monthDir,
+    .canonicalStory,
+    .storyAppearance,
+]
+check(dateFirstKinds.count == 4, "date-first item kinds compile in Swift")
 
 // -- Constructor validation error round-trips ---------------------------
 

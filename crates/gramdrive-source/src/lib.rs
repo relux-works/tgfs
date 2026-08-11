@@ -71,7 +71,7 @@ pub use page::{
     ChangePage, InvalidPageToken, ItemChange, ItemPage, MAX_PAGE_TOKEN_BYTES, PageRequest,
     PageToken,
 };
-pub use source::{DriveSource, SourceFuture};
+pub use source::{ContentSource, DriveSource, SourceFuture};
 
 #[cfg(test)]
 mod tests {

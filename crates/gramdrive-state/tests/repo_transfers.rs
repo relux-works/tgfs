@@ -47,6 +47,7 @@ fn store_with_docs(years: &[u16]) -> StateStore {
     tx.upsert_chat(&chat_record(CHAT)).expect("chat");
     let root = common::account_root_id();
     tx.upsert_item(&ItemRecord {
+        aggregate_size: None,
         id: root.clone(),
         parent: None,
         display_name: "Root".to_owned(),
@@ -61,6 +62,7 @@ fn store_with_docs(years: &[u16]) -> StateStore {
     .expect("root");
     for year in years {
         tx.upsert_item(&ItemRecord {
+            aggregate_size: None,
             id: doc_id(*year),
             parent: Some(root.clone()),
             display_name: format!("{year}.ndjson"),

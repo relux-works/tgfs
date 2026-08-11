@@ -1,6 +1,7 @@
 import FileProvider
 import Foundation
 import GramDriveCore
+import GramDriveSupport
 import Testing
 
 @testable import GramDriveFileProvider
@@ -17,26 +18,58 @@ private func makeAccount(namespaceVersion: UInt32 = 1) -> AccountInfo {
         displayName: "Test Account",
         authState: "authorized",
         namespaceVersion: namespaceVersion,
+        displayTimezone: "UTC",
         rootItemId: rootId
     )
 }
 
 private func directory(
-    id: String, parent: String = rootId, safeName: String? = nil, version: String = "m1"
+    id: String,
+    parent: String = rootId,
+    safeName: String? = nil,
+    version: String = "m1",
+    kind: ItemKind = .chat
 ) -> ItemMetadata {
     ItemMetadata(
-        id: id, parent: parent, kind: .chat, isDirectory: true,
+        contractVersion: 1,
+        id: id, parent: parent, kind: kind, isDirectory: true,
         displayName: safeName ?? id, safeName: safeName ?? id, metadataVersion: version,
-        mimeType: nil, logicalSize: nil, contentVersion: nil,
+        mimeType: nil, logicalSize: nil, attachmentLogicalKind: nil,
+        attachmentRepresentation: nil, attachmentFidelity: nil,
+        attachmentSourceName: nil, attachmentExactSize: nil, contentVersion: nil,
         availability: .fetchable, createdAtMs: 1_000, modifiedAtMs: 1_000, deletedAtMs: nil
     )
 }
 
+private func generatedDocument(
+    id: String,
+    parent: String,
+    name: String,
+    metadataVersion: String = "m1",
+    contentVersion: String = "c1",
+    size: UInt64 = 64,
+    modifiedAtMs: Int64 = 2_000
+) -> ItemMetadata {
+    ItemMetadata(
+        contractVersion: 2,
+        id: id, parent: parent, kind: .generatedDoc, isDirectory: false,
+        displayName: name, safeName: name, metadataVersion: metadataVersion,
+        mimeType: name.hasSuffix(".json") ? "application/json" : "text/markdown",
+        logicalSize: size, attachmentLogicalKind: nil,
+        attachmentRepresentation: nil, attachmentFidelity: nil,
+        attachmentSourceName: nil, attachmentExactSize: nil,
+        contentVersion: contentVersion, availability: .fetchable,
+        createdAtMs: 1_000, modifiedAtMs: modifiedAtMs, deletedAtMs: nil)
+}
+
 private func rootItem() -> ItemMetadata {
     ItemMetadata(
+        contractVersion: 1,
         id: rootId, parent: nil, kind: .account, isDirectory: true,
         displayName: "Test Account", safeName: "Test Account", metadataVersion: "m1",
-        mimeType: nil, logicalSize: nil, contentVersion: nil,
+        mimeType: nil, logicalSize: nil, attachmentLogicalKind: nil,
+        attachmentRepresentation: nil, attachmentFidelity: nil,
+        attachmentSourceName: nil, attachmentExactSize: nil, contentVersion: nil,
         availability: .fetchable, createdAtMs: 1_000, modifiedAtMs: 1_000, deletedAtMs: nil
     )
 }
@@ -99,13 +132,74 @@ private func mintedAnchor(_ enumerator: GramDriveEnumerator) -> NSFileProviderSy
 
 @Suite("Enumerator item listing")
 struct EnumeratorListingTests {
+    @Test("Chat enumeration raises visible priority and invalidation releases it")
+    func chatPriorityLifecycle() {
+        let store = seededStore()
+        let signaler = RecordingHistoryPrioritySignaler()
+        let request = HistoryPriorityRequest(
+            accountId: accountId, chatId: 900, priority: .visible)
+        let enumerator = GramDriveEnumerator(
+            store: store,
+            accountId: accountId,
+            container: .rootContainer,
+            historyPriority: signaler,
+            chatPriorityRequest: request)
+        let observer = RecordingEnumerationObserver()
+        enumerator.enumerateItems(
+            for: observer,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        #expect(observer.finishError == nil)
+        #expect(signaler.snapshot() == [request])
+
+        enumerator.invalidate()
+        #expect(
+            signaler.snapshot()
+                == [
+                    request,
+                    HistoryPriorityRequest(
+                        accountId: accountId, chatId: 900, priority: .background),
+                ])
+    }
+
+    @Test("Reopening an already-listed chat raises visible priority from the change feed")
+    func chatPriorityFromChangeEnumeration() {
+        // The system answers a reopen of a folder it has already listed from
+        // the change feed. Without a hint here, the second open of a chat
+        // produced only `invalidate()`'s release — it *removed* demand for the
+        // chat the user had just opened (BUG-260728-2qfzbd).
+        let store = seededStore()
+        let signaler = RecordingHistoryPrioritySignaler()
+        let request = HistoryPriorityRequest(
+            accountId: accountId, chatId: 900, priority: .visible)
+        let enumerator = GramDriveEnumerator(
+            store: store,
+            accountId: accountId,
+            container: .rootContainer,
+            historyPriority: signaler,
+            chatPriorityRequest: request)
+        let anchor = mintedAnchor(enumerator)
+
+        let changes = RecordingChangeObserver()
+        enumerator.enumerateChanges(for: changes, from: anchor)
+        #expect(changes.finishError == nil)
+        #expect(signaler.snapshot() == [request])
+
+        enumerator.invalidate()
+        #expect(
+            signaler.snapshot().last
+                == HistoryPriorityRequest(
+                    accountId: accountId, chatId: 900, priority: .background),
+            "the release still follows, so the live view stays truthful")
+    }
+
     @Test("Pages compose the exact child set in stable order, no duplicates, no gaps")
     func pagesCompose() throws {
         let store = seededStore()
         let (identifiers, observers) = try listAll(enumerator(over: store))
         #expect(identifiers == ["c-a", "c-b", "c-c", "c-d"])
-        #expect(observers.count == 3, "4 children at page size 2: two full pages, one final")
-        #expect((observers.last?.finishedPages.last ?? nil) == nil, "the last page ends the listing")
+        #expect(observers.count == 2, "lookahead identifies the second full page as final")
+        #expect(
+            (observers.last?.finishedPages.last ?? nil) == nil, "the last page ends the listing")
     }
 
     @Test("Both initial-page sentinels start from the beginning")
@@ -124,10 +218,14 @@ struct EnumeratorListingTests {
     }
 
     @Test("A foreign page answers pageExpired — the explicit restart, never a guess")
-    func foreignPage() {
+    func foreignPage() throws {
         let store = seededStore()
         let garbage = NSFileProviderPage(rawValue: Data("not a cursor".utf8))
-        let foreignContainer = EnumerationPageCursor.page(parent: "some-other-dir", after: "x")
+        let foreignContainer = EnumerationPageCursor.page(
+            parent: "some-other-dir",
+            after: "x",
+            account: makeAccount(),
+            journal: try store.changeJournalState())
         for page in [garbage, foreignContainer] {
             let observer = RecordingEnumerationObserver()
             enumerator(over: store).enumerateItems(for: observer, startingAt: page)
@@ -198,6 +296,74 @@ struct EnumeratorListingTests {
         #expect((observer.finishedPages.last ?? nil) != nil, "a capped full page continues")
     }
 
+    @Test("Caller configuration cannot exceed the provider's hard page cap")
+    func hardPageCap() {
+        let store = ScriptedStore(account: makeAccount())
+        store.apply(rootItem())
+        for index in 0..<300 {
+            store.apply(directory(id: String(format: "child-%03d", index)))
+        }
+        let observer = RecordingEnumerationObserver()
+        GramDriveEnumerator(
+            store: store,
+            accountId: accountId,
+            container: .rootContainer,
+            pageSize: .max
+        ).enumerateItems(
+            for: observer,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        #expect(observer.enumeratedIdentifiers.count == 256)
+        #expect((observer.finishedPages.last ?? nil) != nil)
+    }
+
+    @Test("A chat's first local page exposes fixed entries and every known direct month")
+    func dateFirstChatPage() {
+        let store = seededStore()
+        let chat = directory(id: "chat", safeName: "Chat")
+        store.apply(chat)
+        store.apply(generatedDocument(id: "chat-json", parent: chat.id, name: ".chat.json"))
+        store.apply(
+            directory(
+                id: "active-stories", parent: chat.id, safeName: "Active Stories",
+                kind: .activeStories))
+        store.apply(
+            directory(id: "month-2026-06", parent: chat.id, safeName: "2026-06", kind: .monthDir))
+        store.apply(
+            directory(id: "month-2026-07", parent: chat.id, safeName: "2026-07", kind: .monthDir))
+
+        let first = RecordingEnumerationObserver()
+        GramDriveEnumerator(
+            store: store,
+            accountId: accountId,
+            container: NSFileProviderItemIdentifier(chat.id),
+            pageSize: 256
+        ).enumerateItems(
+            for: first,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+
+        #expect(first.finishError == nil)
+        #expect(
+            Set(first.batches.flatMap { $0.map(\.filename) }) == [
+                ".chat.json", "Active Stories", "2026-06", "2026-07",
+            ])
+        #expect((first.finishedPages.last ?? nil) == nil)
+        let chatJSON = first.batches.flatMap { $0 }.first { $0.filename == ".chat.json" }
+        #expect(chatJSON?.documentSize == 64)
+        #expect(chatJSON?.creationDate == Date(timeIntervalSince1970: 1))
+        #expect(chatJSON?.contentModificationDate == Date(timeIntervalSince1970: 2))
+
+        let relaunched = RecordingEnumerationObserver()
+        GramDriveEnumerator(
+            store: store,
+            accountId: accountId,
+            container: NSFileProviderItemIdentifier(chat.id),
+            pageSize: 256
+        ).enumerateItems(
+            for: relaunched,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        #expect(relaunched.enumeratedIdentifiers == first.enumeratedIdentifiers)
+    }
+
     @Test("Every listing callback completes before the call returns")
     func synchronousCompletion() {
         // The deadline half of the AC, pinned structurally: nothing is ever
@@ -209,6 +375,125 @@ struct EnumeratorListingTests {
             for: observer,
             startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
         #expect(observer.finishedPages.count == 1 || observer.finishError != nil)
+    }
+
+    @Test("A stalled local page times out exactly once and a fresh request retries")
+    func timeoutAndRetry() {
+        let store = seededStore()
+        store.scriptBeforeNextChildrenCall {
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        let enumerator = GramDriveEnumerator(
+            store: store, accountId: accountId, container: .rootContainer,
+            pageSize: 2, enumerationTimeout: 0.01)
+
+        let timedOut = RecordingEnumerationObserver()
+        enumerator.enumerateItems(
+            for: timedOut,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        #expect((timedOut.finishError as? NSFileProviderError)?.code == .cannotSynchronize)
+        #expect(timedOut.finishCallCount == 1, "the late page result must be discarded")
+        #expect(timedOut.enumeratedIdentifiers.isEmpty)
+
+        let retry = RecordingEnumerationObserver()
+        enumerator.enumerateItems(
+            for: retry,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        #expect(retry.finishError == nil)
+        #expect(retry.enumeratedIdentifiers == ["c-a", "c-b"])
+        #expect(retry.finishCallCount == 1)
+    }
+
+    @Test("Invalidation cancels a stalled page exactly once; a new enumerator recovers")
+    func cancellationAndRelaunch() {
+        let store = seededStore()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let returned = DispatchSemaphore(value: 0)
+        store.scriptBeforeNextChildrenCall {
+            entered.signal()
+            release.wait()
+        }
+        let first = GramDriveEnumerator(
+            store: store, accountId: accountId, container: .rootContainer,
+            pageSize: 2, enumerationTimeout: 1)
+        let cancelled = RecordingEnumerationObserver()
+        DispatchQueue.global(qos: .utility).async {
+            first.enumerateItems(
+                for: cancelled,
+                startingAt: NSFileProviderPage(
+                    NSFileProviderPage.initialPageSortedByName as Data))
+            returned.signal()
+        }
+        #expect(entered.wait(timeout: .now() + 30) == .success)
+        first.invalidate()
+        release.signal()
+        #expect(returned.wait(timeout: .now() + 30) == .success)
+        #expect((cancelled.finishError as? CocoaError)?.code == .userCancelled)
+        #expect(cancelled.finishCallCount == 1)
+
+        let relaunched = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(
+            for: relaunched,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        #expect(relaunched.finishError == nil)
+        #expect(relaunched.enumeratedIdentifiers == ["c-a", "c-b"])
+    }
+
+    @Test("A classified storage failure is actionable and retryable")
+    func failureAndRetry() {
+        let store = seededStore()
+        store.failNextChildrenCall(with: DriveError.Storage(detail: "test failure"))
+        let page = NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data)
+        let first = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(for: first, startingAt: page)
+        #expect((first.finishError as? NSFileProviderError)?.code == .cannotSynchronize)
+        #expect(first.finishCallCount == 1)
+
+        let retry = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(for: retry, startingAt: page)
+        #expect(retry.finishError == nil)
+        #expect(retry.enumeratedIdentifiers == ["c-a", "c-b"])
+    }
+
+    @Test("A page expires after namespace or database-life replacement, but survives relaunch")
+    func durableAndExpiredPageContexts() {
+        let store = seededStore()
+        let first = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(
+            for: first,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        let page = first.finishedPages.last ?? nil
+        #expect(page != nil)
+
+        let relaunched = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(for: relaunched, startingAt: page!)
+        #expect(relaunched.finishError == nil)
+        #expect(relaunched.enumeratedIdentifiers == ["c-c", "c-d"])
+
+        store.replaceAccount(makeAccount(namespaceVersion: 2))
+        let bumped = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(for: bumped, startingAt: page!)
+        #expect((bumped.finishError as? NSFileProviderError)?.code == .pageExpired)
+
+        store.replaceAccount(makeAccount())
+        store.restartJournalLife(instance: "life-2")
+        let replaced = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(for: replaced, startingAt: page!)
+        #expect((replaced.finishError as? NSFileProviderError)?.code == .pageExpired)
+    }
+
+    @Test("An unauthorized account fails listing with the typed reauthorization error")
+    func unauthorizedListing() {
+        let store = seededStore()
+        var account = makeAccount()
+        account.authState = "waiting_for_phone_number"
+        store.replaceAccount(account)
+        let observer = RecordingEnumerationObserver()
+        enumerator(over: store).enumerateItems(
+            for: observer,
+            startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+        #expect((observer.finishError as? NSFileProviderError)?.code == .notAuthenticated)
     }
 }
 
@@ -313,7 +598,10 @@ struct EnumeratorChangeTests {
             anchor = finish.anchor
             if !finish.moreComing { break }
         }
-        #expect(seen == [NSFileProviderItemIdentifier.rootContainer.rawValue, "c-a", "c-b", "c-c", "c-d"])
+        #expect(
+            seen == [
+                NSFileProviderItemIdentifier.rootContainer.rawValue, "c-a", "c-b", "c-c", "c-d",
+            ])
         #expect(rounds == 3, "5 changes at batch size 2: two full batches, one short")
 
         // The final anchor is the journal's high-water mark: enumerating
@@ -322,7 +610,9 @@ struct EnumeratorChangeTests {
         changeEnumerator.enumerateChanges(for: quiet, from: anchor)
         #expect(quiet.updatedBatches.isEmpty && quiet.deletedBatches.isEmpty)
         #expect(quiet.finishes.last?.moreComing == false)
-        #expect(EnumerationSyncAnchor.decode(quiet.finishes.last!.anchor)?.sequence == store.latestSequence)
+        #expect(
+            EnumerationSyncAnchor.decode(quiet.finishes.last!.anchor)?.sequence
+                == store.latestSequence)
     }
 
     @Test("The account root folds onto rootContainer in the change feed")
@@ -423,5 +713,124 @@ struct EnumeratorChangeTests {
         #expect(observer.finishError == nil)
         #expect(observer.updatedIdentifiers == ["c-e"])
         #expect(observer.deletedIdentifiers == ["c-a"])
+    }
+
+    @Test("A stalled change page times out exactly once and retry succeeds")
+    func changeTimeoutAndRetry() {
+        let store = seededStore()
+        let changeEnumerator = GramDriveEnumerator(
+            store: store,
+            accountId: accountId,
+            container: .workingSet,
+            pageSize: 2,
+            enumerationTimeout: 0.01)
+        let anchor = EnumerationSyncAnchor(
+            accountId: accountId,
+            namespaceVersion: 1,
+            journalInstance: "life-1",
+            sequence: 0
+        ).rawAnchor()
+        store.scriptBeforeNextChangeCall {
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+
+        let timedOut = RecordingChangeObserver()
+        changeEnumerator.enumerateChanges(for: timedOut, from: anchor)
+        #expect((timedOut.finishError as? NSFileProviderError)?.code == .cannotSynchronize)
+        #expect(timedOut.finishCallCount == 1)
+        #expect(timedOut.updatedIdentifiers.isEmpty)
+
+        let retry = RecordingChangeObserver()
+        changeEnumerator.enumerateChanges(for: retry, from: anchor)
+        #expect(retry.finishError == nil)
+        #expect(
+            retry.updatedIdentifiers == [
+                NSFileProviderItemIdentifier.rootContainer.rawValue, "c-a",
+            ])
+        #expect(retry.finishCallCount == 1)
+    }
+
+    @Test("Invalidation cancels a stalled change page exactly once")
+    func changeCancellation() {
+        let store = seededStore()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let returned = DispatchSemaphore(value: 0)
+        store.scriptBeforeNextChangeCall {
+            entered.signal()
+            release.wait()
+        }
+        let changeEnumerator = GramDriveEnumerator(
+            store: store,
+            accountId: accountId,
+            container: .workingSet,
+            enumerationTimeout: 1)
+        let observer = RecordingChangeObserver()
+        let anchor = EnumerationSyncAnchor(
+            accountId: accountId,
+            namespaceVersion: 1,
+            journalInstance: "life-1",
+            sequence: 0
+        ).rawAnchor()
+        DispatchQueue.global(qos: .utility).async {
+            changeEnumerator.enumerateChanges(for: observer, from: anchor)
+            returned.signal()
+        }
+        #expect(entered.wait(timeout: .now() + 30) == .success)
+        changeEnumerator.invalidate()
+        release.signal()
+        #expect(returned.wait(timeout: .now() + 30) == .success)
+        #expect((observer.finishError as? CocoaError)?.code == .userCancelled)
+        #expect(observer.finishCallCount == 1)
+        #expect(observer.updatedIdentifiers.isEmpty)
+    }
+
+    @Test("Storage and offline change failures map to distinct recoverable provider errors")
+    func typedChangeFailures() {
+        let store = seededStore()
+        let changeEnumerator = enumerator(over: store, container: .workingSet)
+        let anchor = EnumerationSyncAnchor(
+            accountId: accountId,
+            namespaceVersion: 1,
+            journalInstance: "life-1",
+            sequence: 0
+        ).rawAnchor()
+
+        store.failNextChangeCall(with: DriveError.Storage(detail: "disk unavailable"))
+        let storage = RecordingChangeObserver()
+        changeEnumerator.enumerateChanges(for: storage, from: anchor)
+        #expect((storage.finishError as? NSFileProviderError)?.code == .cannotSynchronize)
+
+        store.failNextChangeCall(with: DriveError.SourceUnavailable(detail: "offline"))
+        let offline = RecordingChangeObserver()
+        changeEnumerator.enumerateChanges(for: offline, from: anchor)
+        #expect((offline.finishError as? NSFileProviderError)?.code == .serverUnreachable)
+    }
+
+    @Test("A render publication enumerates only the generated appearance it changed")
+    func affectedGeneratedItemsOnly() {
+        let store = seededStore()
+        store.apply(generatedDocument(id: "messages-md", parent: "c-a", name: "Messages.md"))
+        store.apply(
+            generatedDocument(
+                id: "messages-ndjson", parent: "c-a", name: "Messages.ndjson"))
+        let anchor = mintedAnchor(enumerator(over: store))
+        store.apply(
+            generatedDocument(
+                id: "messages-md",
+                parent: "c-a",
+                name: "Messages.md",
+                metadataVersion: "m2",
+                contentVersion: "c2",
+                size: 96,
+                modifiedAtMs: 3_000))
+
+        let observer = RecordingChangeObserver()
+        enumerator(over: store, container: .workingSet).enumerateChanges(
+            for: observer,
+            from: anchor)
+        #expect(observer.finishError == nil)
+        #expect(observer.updatedIdentifiers == ["messages-md"])
+        #expect(observer.deletedIdentifiers.isEmpty)
     }
 }
