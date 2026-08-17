@@ -26,9 +26,17 @@ public struct AuthorizationView: View {
     @State private var code = ""
     @State private var password = ""
     @FocusState private var focusedField: InputField?
+    private let showAccount: (() -> Void)?
+    private let removeAccount: (() -> Void)?
 
-    public init(model: AuthorizationViewModel) {
+    public init(
+        model: AuthorizationViewModel,
+        showAccount: (() -> Void)? = nil,
+        removeAccount: (() -> Void)? = nil
+    ) {
         self.model = model
+        self.showAccount = showAccount
+        self.removeAccount = removeAccount
     }
 
     public var body: some View {
@@ -53,7 +61,7 @@ public struct AuthorizationView: View {
                 }
             }
             Section {
-                Button(model.state == .idle ? "Start Sign In" : "Restart") {
+                Button(primaryActionTitle) {
                     Task { await model.begin() }
                 }
                 .disabled(model.isSubmitting)
@@ -87,7 +95,19 @@ public struct AuthorizationView: View {
     private var stateSection: some View {
         switch model.state {
         case .idle:
-            Section { Text("Not signed in. Start to authorize a Telegram account.") }
+            Section {
+                switch model.healthState {
+                case .authorizationRequired:
+                    Text("Telegram authorization is required. Start Sign In to reconnect.")
+                case .unavailable:
+                    Label(
+                        "Authorization status is unavailable. Refresh or start Sign In to retry.",
+                        systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+                case .unknown, .authorized:
+                    Text("Not signed in. Start to authorize a Telegram account.")
+                }
+            }
         case .starting, .configuring:
             Section { ProgressView(model.isCancelling ? "Cancelling…" : "Connecting…") }
         case .waitPhoneNumber:
@@ -170,6 +190,18 @@ public struct AuthorizationView: View {
             Section {
                 Label("Signed in.", systemImage: "checkmark.seal.fill")
                     .foregroundStyle(.green)
+                if model.healthState == .unavailable {
+                    Label(
+                        "Current authorization could not be verified. Refresh Account status to retry.",
+                        systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+                }
+                if let showAccount {
+                    Button("View Account") { showAccount() }
+                }
+                if let removeAccount {
+                    Button("Remove Account", role: .destructive) { removeAccount() }
+                }
             }
         case .loggingOut:
             Section { ProgressView("Logging out…") }
@@ -191,6 +223,14 @@ public struct AuthorizationView: View {
                     systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
             }
+        }
+    }
+
+    private var primaryActionTitle: String {
+        switch model.state {
+        case .idle: return "Start Sign In"
+        case .ready: return "Sign In Again"
+        default: return "Restart"
         }
     }
 

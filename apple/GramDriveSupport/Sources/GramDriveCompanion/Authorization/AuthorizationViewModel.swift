@@ -1,4 +1,18 @@
 import Foundation
+import GramDriveAgentCore
+
+/// The authorization conclusion the Sign In screen can safely derive from
+/// agent health when no live authorization session owns the screen.
+public enum AuthorizationHealthState: Equatable, Sendable {
+    /// No health reconciliation has run in this companion process yet.
+    case unknown
+    /// At least one live account namespace is definitively authorized.
+    case authorized
+    /// The agent definitively observed that authorization is required.
+    case authorizationRequired
+    /// Health cannot currently establish either terminal authorization result.
+    case unavailable
+}
 
 /// Drives one authorization flow and renders its state.
 ///
@@ -32,6 +46,9 @@ public final class AuthorizationViewModel {
     /// Kept separate from ordinary input submission so the view can show
     /// accurate progress without mislabeling phone/code/password requests.
     public private(set) var isCancelling: Bool = false
+    /// The latest health-derived authorization conclusion. This supplements
+    /// the rendered auth state; it never overrides an active session stream.
+    public private(set) var healthState: AuthorizationHealthState = .unknown
 
     private let backend: any CompanionBackend
     private let teardownTimeout: Duration
@@ -52,6 +69,56 @@ public final class AuthorizationViewModel {
     /// Whether the flow has finished successfully.
     public var isAuthorized: Bool { state == .ready }
 
+    /// Reconciles the screen from agent health without opening an auth control
+    /// channel. A live session remains the authority until its stream ends.
+    public func reconcile(with readout: HealthReadout) {
+        guard activeFlowID == nil, !isCancelling else { return }
+
+        let nextHealthState = Self.healthState(from: readout)
+        healthState = nextHealthState
+        unavailable = nil
+        lastRejection = nil
+        lastInvalidInput = nil
+
+        switch nextHealthState {
+        case .authorized:
+            applyIfChanged(.ready)
+        case .authorizationRequired:
+            applyIfChanged(.idle)
+        case .unavailable:
+            // A transient inability to observe health is weaker evidence than
+            // an already established ready state. Keep signed-in UI stable,
+            // but expose the unavailable observation alongside it.
+            if state != .ready { applyIfChanged(.idle) }
+        case .unknown:
+            break
+        }
+    }
+
+    /// Privacy-safe projection: account identity and display names never leave
+    /// the health snapshot. Definitive observations outrank indeterminate ones.
+    public nonisolated static func healthState(
+        from readout: HealthReadout
+    ) -> AuthorizationHealthState {
+        guard case .running(let snapshot) = readout,
+              let accounts = snapshot.accounts
+        else { return .unavailable }
+        if accounts.contains(where: { $0.observedAuthorization == .authorized }) {
+            return .authorized
+        }
+        if accounts.contains(where: { $0.observedAuthorization == .authorizationRequired }) {
+            return .authorizationRequired
+        }
+        if accounts.isEmpty
+            || accounts.contains(where: {
+                $0.observedAuthorization == nil && $0.authState != "authorized"
+            })
+        {
+            return .authorizationRequired
+        }
+        return .unavailable
+    }
+
     /// Starts a fresh authorization session and begins rendering its states.
     public func begin() async {
         guard !isSubmitting else { return }
@@ -69,6 +136,7 @@ public final class AuthorizationViewModel {
             if activeFlowID == flowID {
                 unavailable = teardownFailure ?? .dropped
                 state = .idle
+                activeFlowID = nil
             }
             return
         }
@@ -83,6 +151,7 @@ public final class AuthorizationViewModel {
             unavailable = reason
             state = .idle
             clearSession(sessionID)
+            activeFlowID = nil
         case .started:
             let states = session.states
             consumeTask = Task { [weak self] in
@@ -90,6 +159,7 @@ public final class AuthorizationViewModel {
                     guard !Task.isCancelled else { return }
                     self?.apply(next, for: sessionID)
                 }
+                self?.finishFlow(flowID, sessionID: sessionID)
             }
         }
     }
@@ -157,6 +227,7 @@ public final class AuthorizationViewModel {
         if !completed {
             unavailable = .timedOut
             _ = await endExistingSession()
+            activeFlowID = nil
             state = .idle
         }
     }
@@ -175,6 +246,16 @@ public final class AuthorizationViewModel {
             lastRejection = nil
             lastInvalidInput = nil
         }
+    }
+
+    private func applyIfChanged(_ next: CompanionAuthState) {
+        guard state != next else { return }
+        apply(next)
+    }
+
+    private func finishFlow(_ flowID: UUID, sessionID: UUID) {
+        guard activeFlowID == flowID, activeSessionID == sessionID else { return }
+        activeFlowID = nil
     }
 
     /// Ends an existing control-channel session before opening another one.
@@ -259,6 +340,7 @@ public final class AuthorizationViewModel {
         lastRejection = nil
         lastInvalidInput = nil
         unavailable = nil
+        healthState = .unknown
     }
 }
 
