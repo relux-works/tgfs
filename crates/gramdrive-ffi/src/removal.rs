@@ -30,7 +30,8 @@ use serde_json::json;
 
 use crate::api::DriveError;
 use crate::auth::{
-    AuthSessionConfig, ScopeGuard, SecretVault, VaultSecrets, shared_runtime, shared_state_store,
+    AuthSessionConfig, ScopeGuard, SecretVault, VaultSecrets, recover_auth_finalization_locked,
+    shared_runtime, shared_state_store,
 };
 
 /// How long the terminate stage waits for TDLib to confirm the close.
@@ -78,6 +79,7 @@ pub(crate) fn remove_over(
     }
     let account = AccountId(account_id);
     let _guard = ScopeGuard::acquire(&config.data_dir, account)?;
+    recover_auth_finalization_locked(config, vault, account)?;
 
     let layout = config.storage_layout();
     let mode = if revoke_session {

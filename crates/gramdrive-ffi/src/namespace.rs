@@ -79,7 +79,8 @@ use serde_json::json;
 
 use crate::api::DriveError;
 use crate::auth::{
-    AuthSessionConfig, ScopeGuard, SecretVault, VaultSecrets, shared_runtime, td_to_drive_error,
+    AuthSessionConfig, ScopeGuard, SecretVault, VaultSecrets, recover_auth_finalization_locked,
+    shared_runtime, td_to_drive_error,
 };
 use crate::hydration::Hydrator;
 use crate::shared_state::{shared_state_layout, upsert_fixed_root_structure};
@@ -442,6 +443,7 @@ impl NamespaceSession {
         let runtime = shared_runtime()?;
         let account = AccountId(account_id);
         let guard = ScopeGuard::acquire(&config.data_dir, account)?;
+        recover_auth_finalization_locked(&config, &vault, account)?;
         let secrets = VaultSecrets::read_only(Arc::clone(&vault));
         let tdlib_config = config.tdlib_config(account, &secrets)?;
         let (client, updates) = runtime.create_client().map_err(td_to_drive_error)?;

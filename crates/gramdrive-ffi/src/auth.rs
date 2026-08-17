@@ -61,7 +61,8 @@ use gramdrive_source_tdjson::error::TdError;
 use gramdrive_source_tdjson::runtime::{TdClient, TdRuntime, UpdateRecvError, UpdateStream};
 use gramdrive_state::StateStore;
 use gramdrive_state::repo::{
-    AccountRecord, ItemAvailability, ItemRecord, RetentionMode, SourceKind,
+    AccountRecord, AuthFinalizationPhase, AuthFinalizationRecord, ItemAvailability, ItemRecord,
+    RetentionMode, SourceKind, WriteTxn,
 };
 use serde_json::{Value, json};
 
@@ -781,6 +782,12 @@ impl AuthSession {
         config.validate()?;
         let guard = ScopeGuard::acquire(&config.data_dir, SIGN_IN_SLOT)?;
 
+        // A process may have stopped after preparing or committing an older
+        // replacement. Converge that decision before touching the one global
+        // sign-in slot: prepared work restores its incumbent, while committed
+        // work only removes rollback artifacts.
+        recover_all_auth_finalizations(&config, &vault)?;
+
         // A stale slot is a crashed or abandoned sign-in; a fresh flow must
         // never resume it half-way.
         let layout = config.storage_layout();
@@ -998,6 +1005,25 @@ fn persist_account(
     shared: &Arc<SessionShared>,
     identity: &SignedInIdentity,
 ) -> Result<(), &'static str> {
+    persist_account_with_hook(shared, identity, |_| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizationStep {
+    JournalPrepared,
+    KeyBackedUp,
+    StorageBackedUp,
+    StorageInstalled,
+    KeyInstalled,
+    SuccessorProven,
+    StateCommitted,
+}
+
+fn persist_account_with_hook(
+    shared: &Arc<SessionShared>,
+    identity: &SignedInIdentity,
+    mut after_step: impl FnMut(FinalizationStep) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let account = AccountId(identity.account_id);
     let layout = shared.config.storage_layout();
 
@@ -1012,30 +1038,260 @@ fn persist_account(
     let _account_guard = ScopeGuard::acquire(&shared.config.data_dir, account)
         .map_err(|_| "finalize-account-busy")?;
 
-    // Key first: after this, the moved database is openable under the real
-    // account id even if a crash interrupts between the steps below.
-    shared
+    // Resolve any older attempt for this identity before creating a fresh
+    // decision record. This is idempotent and happens while the account scope
+    // is exclusively owned.
+    recover_auth_finalization_locked(&shared.config, &shared.vault, account)
+        .map_err(|_| "finalize-recovery")?;
+
+    let backup_account = rollback_key_account(account);
+    let backup_dir = auth_backup_dir(&layout, account);
+    let target_dir = layout.account_dir(account);
+    let staged_dir = layout.account_dir(SIGN_IN_SLOT);
+    let incumbent_key = shared
         .vault
-        .store_database_key(account.0, shared.database_key.clone())
+        .database_key(account.0)
         .map_err(|_| "finalize-vault")?;
+    let had_tdlib_state = target_dir.exists();
+    let had_account_row =
+        account_row_exists(&shared.config.data_dir, account).map_err(|_| "finalize-state")?;
+    let record = AuthFinalizationRecord {
+        account,
+        phase: AuthFinalizationPhase::Prepared,
+        had_account_row,
+        had_database_key: incumbent_key.is_some(),
+        had_tdlib_state,
+    };
 
-    // A previous installation of the same account is superseded by this
-    // fresh, authorized database.
-    layout
-        .wipe_account(account)
-        .map_err(|_| "finalize-storage")?;
-    std::fs::rename(
-        layout.account_dir(SIGN_IN_SLOT),
-        layout.account_dir(account),
-    )
-    .map_err(|_| "finalize-storage")?;
+    prepare_auth_finalization(&shared.config.data_dir, record).map_err(|_| "finalize-state")?;
 
-    write_account_row(&shared.config.data_dir, account, &identity.display_name)
-        .map_err(|_| "finalize-state")?;
+    let transaction = (|| {
+        after_step(FinalizationStep::JournalPrepared)?;
 
-    // The slot key is spent; a failure to drop it is untidy, not unsafe.
-    drop(shared.vault.delete_database_key(SIGN_IN_SLOT.0));
+        if let Some(key) = incumbent_key {
+            shared
+                .vault
+                .store_database_key(backup_account.0, key)
+                .map_err(|_| "finalize-vault")?;
+        }
+        after_step(FinalizationStep::KeyBackedUp)?;
+
+        if had_tdlib_state {
+            if backup_dir.exists() {
+                return Err("finalize-recovery");
+            }
+            std::fs::rename(&target_dir, &backup_dir).map_err(|_| "finalize-storage")?;
+            sync_directory(layout.root()).map_err(|_| "finalize-storage")?;
+        }
+        after_step(FinalizationStep::StorageBackedUp)?;
+
+        std::fs::rename(&staged_dir, &target_dir).map_err(|_| "finalize-storage")?;
+        sync_directory(layout.root()).map_err(|_| "finalize-storage")?;
+        after_step(FinalizationStep::StorageInstalled)?;
+
+        shared
+            .vault
+            .store_database_key(account.0, shared.database_key.clone())
+            .map_err(|_| "finalize-vault")?;
+        after_step(FinalizationStep::KeyInstalled)?;
+
+        // Proof before the decision: the staged TDLib database is in the
+        // stable directory and the stable keychain alias resolves to its key.
+        if !layout.account_paths(account).database_directory().is_dir()
+            || shared
+                .vault
+                .database_key(account.0)
+                .map_err(|_| "finalize-vault")?
+                .as_deref()
+                != Some(shared.database_key.as_slice())
+        {
+            return Err("finalize-proof");
+        }
+        after_step(FinalizationStep::SuccessorProven)?;
+
+        // The one explicit commit point: the provider-visible successor row
+        // and the journal decision become durable in the same SQLite commit.
+        commit_account_finalization(&shared.config.data_dir, account, &identity.display_name)
+            .map_err(|_| "finalize-state")?;
+        after_step(FinalizationStep::StateCommitted)?;
+        Ok(())
+    })();
+
+    if let Err(code) = transaction {
+        let phase = auth_finalization(&shared.config.data_dir, account)
+            .map_err(|_| "finalize-recovery")?
+            .map(|record| record.phase);
+        if phase == Some(AuthFinalizationPhase::Prepared) {
+            recover_auth_finalization_locked(&shared.config, &shared.vault, account)
+                .map_err(|_| "finalize-recovery")?;
+        }
+        return Err(code);
+    }
+
+    // Cleanup is intentionally post-proof and idempotent. A cleanup error
+    // leaves the committed journal in place for restart recovery; it never
+    // turns a committed successor into a reported failed sign-in.
+    drop(recover_auth_finalization_locked(
+        &shared.config,
+        &shared.vault,
+        account,
+    ));
     Ok(())
+}
+
+fn rollback_key_account(account: AccountId) -> AccountId {
+    debug_assert!(account.0 > 0);
+    AccountId(-account.0)
+}
+
+fn auth_backup_dir(layout: &StorageLayout, account: AccountId) -> std::path::PathBuf {
+    layout
+        .root()
+        .join(format!(".account-{}.auth-backup", account.0))
+}
+
+fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn account_row_exists(data_dir: &str, account: AccountId) -> Result<bool, DriveError> {
+    let mut store = shared_state_store(data_dir)?;
+    let txn = store.read_txn().map_err(storage_error)?;
+    Ok(txn
+        .account(AccountKey {
+            account_id: account,
+        })
+        .map_err(storage_error)?
+        .is_some())
+}
+
+fn auth_finalization(
+    data_dir: &str,
+    account: AccountId,
+) -> Result<Option<AuthFinalizationRecord>, DriveError> {
+    let mut store = shared_state_store(data_dir)?;
+    let txn = store.read_txn().map_err(storage_error)?;
+    txn.auth_finalization(account).map_err(storage_error)
+}
+
+fn prepare_auth_finalization(
+    data_dir: &str,
+    record: AuthFinalizationRecord,
+) -> Result<(), DriveError> {
+    let mut store = shared_state_store(data_dir)?;
+    let txn = store.write_txn().map_err(storage_error)?;
+    txn.prepare_auth_finalization(record)
+        .map_err(storage_error)?;
+    txn.commit().map_err(storage_error)
+}
+
+fn clear_auth_finalization(data_dir: &str, account: AccountId) -> Result<(), DriveError> {
+    let mut store = shared_state_store(data_dir)?;
+    let txn = store.write_txn().map_err(storage_error)?;
+    txn.clear_auth_finalization(account)
+        .map_err(storage_error)?;
+    txn.commit().map_err(storage_error)
+}
+
+pub(crate) fn recover_all_auth_finalizations(
+    config: &AuthSessionConfig,
+    vault: &Arc<dyn SecretVault>,
+) -> Result<(), DriveError> {
+    if !shared_state_database_exists(&config.data_dir)? {
+        return Ok(());
+    }
+    let records = {
+        let mut store = shared_state_store(&config.data_dir)?;
+        let txn = store.read_txn().map_err(storage_error)?;
+        txn.auth_finalizations().map_err(storage_error)?
+    };
+    for record in records {
+        let _guard = ScopeGuard::acquire(&config.data_dir, record.account)?;
+        recover_auth_finalization_locked(config, vault, record.account)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_auth_finalization_locked(
+    config: &AuthSessionConfig,
+    vault: &Arc<dyn SecretVault>,
+    account: AccountId,
+) -> Result<(), DriveError> {
+    if !shared_state_database_exists(&config.data_dir)? {
+        return Ok(());
+    }
+    let Some(record) = auth_finalization(&config.data_dir, account)? else {
+        return Ok(());
+    };
+    let layout = config.storage_layout();
+    let target_dir = layout.account_dir(account);
+    let backup_dir = auth_backup_dir(&layout, account);
+    let backup_account = rollback_key_account(account);
+
+    match record.phase {
+        AuthFinalizationPhase::Prepared => {
+            if record.had_database_key {
+                if let Some(key) = vault.database_key(backup_account.0)? {
+                    vault.store_database_key(account.0, key)?;
+                    vault.delete_database_key(backup_account.0)?;
+                }
+            } else {
+                vault.delete_database_key(account.0)?;
+            }
+
+            if backup_dir.exists() {
+                layout
+                    .wipe_account(account)
+                    .map_err(|error| DriveError::Storage {
+                        detail: format!("auth recovery could not remove staged state: {error}"),
+                    })?;
+                std::fs::rename(&backup_dir, &target_dir).map_err(|error| DriveError::Storage {
+                    detail: format!("auth recovery could not restore incumbent state: {error}"),
+                })?;
+                sync_directory(layout.root()).map_err(|error| DriveError::Storage {
+                    detail: format!("auth recovery could not sync restored state: {error}"),
+                })?;
+            } else if !record.had_tdlib_state {
+                layout
+                    .wipe_account(account)
+                    .map_err(|error| DriveError::Storage {
+                        detail: format!("auth recovery could not remove new state: {error}"),
+                    })?;
+            }
+        }
+        AuthFinalizationPhase::Committed => {
+            // A committed decision is only cleaned after all three successor
+            // resources are still present. Never erase the rollback material
+            // when the committed side cannot be proven.
+            if !account_row_exists(&config.data_dir, account)? {
+                return Err(DriveError::Integrity {
+                    detail: "committed auth finalization has no account row".to_owned(),
+                });
+            }
+            if !target_dir.is_dir() || vault.database_key(account.0)?.is_none() {
+                return Err(DriveError::Integrity {
+                    detail: "committed auth finalization is missing TDLib state or key".to_owned(),
+                });
+            }
+            match std::fs::remove_dir_all(&backup_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(DriveError::Storage {
+                        detail: format!("auth recovery could not remove state backup: {error}"),
+                    });
+                }
+            }
+            vault.delete_database_key(backup_account.0)?;
+            vault.delete_database_key(SIGN_IN_SLOT.0)?;
+        }
+    }
+
+    clear_auth_finalization(&config.data_dir, account)
+}
+
+fn shared_state_database_exists(data_dir: &str) -> Result<bool, DriveError> {
+    Ok(std::path::Path::new(&shared_state_layout(data_dir.to_owned())?.database_file).is_file())
 }
 
 /// The coordinator-side in-process write handle over the shared durable
@@ -1050,11 +1306,10 @@ pub(crate) fn shared_state_store(data_dir: &str) -> Result<StateStore, DriveErro
 /// Upserts the account row and its root item — the same coordinator-side
 /// in-process write path the engine host uses (`shared_state.rs` § Writes).
 fn write_account_row(
-    data_dir: &str,
+    txn: &WriteTxn<'_>,
     account: AccountId,
     display_name: &str,
 ) -> Result<(), DriveError> {
-    let mut store = shared_state_store(data_dir)?;
     let scope = AccountScope {
         account: AccountKey {
             account_id: account,
@@ -1063,7 +1318,6 @@ fn write_account_row(
     };
     let root_id: ItemId = ItemKey::Canonical(CanonicalKey::Account(scope.account)).id();
     let now = now_ms();
-    let txn = store.write_txn().map_err(storage_error)?;
     txn.upsert_account(&AccountRecord {
         account: scope.account,
         source_kind: SourceKind::LocalTdlib,
@@ -1094,9 +1348,21 @@ fn write_account_row(
         deleted_at_ms: None,
     })
     .map_err(storage_error)?;
-    upsert_fixed_root_structure(&txn, scope, root_id, now)?;
-    txn.commit().map_err(storage_error)?;
+    upsert_fixed_root_structure(txn, scope, root_id, now)?;
     Ok(())
+}
+
+fn commit_account_finalization(
+    data_dir: &str,
+    account: AccountId,
+    display_name: &str,
+) -> Result<(), DriveError> {
+    let mut store = shared_state_store(data_dir)?;
+    let txn = store.write_txn().map_err(storage_error)?;
+    write_account_row(&txn, account, display_name)?;
+    txn.commit_auth_finalization(account)
+        .map_err(storage_error)?;
+    txn.commit().map_err(storage_error)
 }
 
 fn storage_error(error: impl std::fmt::Display) -> DriveError {
@@ -1139,6 +1405,7 @@ pub(crate) fn probe_over(
     }
     let account = AccountId(account_id);
     let _guard = ScopeGuard::acquire(&config.data_dir, account)?;
+    recover_auth_finalization_locked(config, vault, account)?;
 
     let secrets = VaultSecrets {
         vault: Arc::clone(vault),
@@ -1547,6 +1814,256 @@ mod tests {
             handle,
             client_id,
         }
+    }
+
+    const TEST_ACCOUNT: AccountId = AccountId(777000123);
+    const INCUMBENT_KEY: &[u8] = &[9u8; 32];
+
+    fn seed_incumbent(fixture: &SessionFixture) {
+        let config = config(&fixture.root);
+        let layout = config.storage_layout();
+        let target = layout
+            .account_paths(TEST_ACCOUNT)
+            .database_directory()
+            .to_owned();
+        std::fs::create_dir_all(&target).expect("incumbent tdlib directory");
+        std::fs::write(target.join("incumbent"), b"incumbent").expect("incumbent marker");
+        let staged = layout
+            .account_paths(SIGN_IN_SLOT)
+            .database_directory()
+            .to_owned();
+        std::fs::write(staged.join("successor"), b"successor").expect("successor marker");
+        fixture
+            .vault
+            .store_database_key(TEST_ACCOUNT.0, INCUMBENT_KEY.to_vec())
+            .expect("incumbent key");
+
+        let mut store = shared_state_store(&config.data_dir).expect("state store");
+        let txn = store.write_txn().expect("state write");
+        write_account_row(&txn, TEST_ACCOUNT, "Incumbent").expect("incumbent row");
+        txn.commit().expect("commit incumbent row");
+    }
+
+    fn account_display_name(root: &TempRoot) -> String {
+        let store = SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider)
+            .expect("provider state");
+        store
+            .accounts()
+            .expect("accounts")
+            .into_iter()
+            .find(|account| account.account_id == TEST_ACCOUNT.0)
+            .expect("test account")
+            .display_name
+    }
+
+    fn assert_authorized_probe(root: &TempRoot, vault: &Arc<FakeVault>) {
+        let (runtime, handle) = start_runtime();
+        handle.set_responder(|sent: &SentRequest| {
+            let extra = sent.extra().expect("extra");
+            let cid = sent.client_id;
+            match sent.request_type().as_deref() {
+                Some("setTdlibParameters") => {
+                    vec![ok_response(extra, cid), auth_update(cid, READY)]
+                }
+                Some("getMe") => vec![me_response(extra, cid)],
+                Some("close") => vec![
+                    ok_response(extra, cid),
+                    auth_update(cid, CLOSING),
+                    auth_update(cid, CLOSED),
+                ],
+                _ => vec![ok_response(extra, cid)],
+            }
+        });
+        let kick_handle = handle;
+        let kick_thread = std::thread::spawn(move || {
+            let client_id = client_id_of(&kick_handle);
+            kick(&kick_handle, client_id);
+        });
+        let outcome = probe_over(
+            &runtime,
+            &config(root),
+            TEST_ACCOUNT.0,
+            &(Arc::clone(vault) as Arc<dyn SecretVault>),
+        )
+        .expect("incumbent remains probeable");
+        kick_thread.join().expect("kick thread");
+        assert!(matches!(outcome, AuthProbeOutcome::Authorized { .. }));
+    }
+
+    fn assert_incumbent_preserved(fixture: &SessionFixture) {
+        let config = config(&fixture.root);
+        let layout = config.storage_layout();
+        let target = layout
+            .account_paths(TEST_ACCOUNT)
+            .database_directory()
+            .to_owned();
+        assert!(target.join("incumbent").is_file());
+        assert!(!target.join("successor").exists());
+        assert_eq!(
+            fixture.vault.key(TEST_ACCOUNT.0),
+            Some(INCUMBENT_KEY.to_vec())
+        );
+        assert!(
+            fixture
+                .vault
+                .key(rollback_key_account(TEST_ACCOUNT).0)
+                .is_none()
+        );
+        assert!(!auth_backup_dir(&layout, TEST_ACCOUNT).exists());
+        assert_eq!(account_display_name(&fixture.root), "Incumbent");
+        assert!(
+            auth_finalization(&config.data_dir, TEST_ACCOUNT)
+                .expect("journal read")
+                .is_none()
+        );
+        assert_authorized_probe(&fixture.root, &fixture.vault);
+    }
+
+    #[test]
+    fn every_precommit_failure_restores_an_openable_incumbent() {
+        let steps = [
+            FinalizationStep::JournalPrepared,
+            FinalizationStep::KeyBackedUp,
+            FinalizationStep::StorageBackedUp,
+            FinalizationStep::StorageInstalled,
+            FinalizationStep::KeyInstalled,
+            FinalizationStep::SuccessorProven,
+        ];
+        for failed_step in steps {
+            let fixture = start_session();
+            fixture
+                .listener
+                .wait_for(|phase| *phase == AuthPhase::WaitPhoneNumber);
+            seed_incumbent(&fixture);
+            let result = persist_account_with_hook(
+                &fixture.session.shared,
+                &SignedInIdentity {
+                    account_id: TEST_ACCOUNT.0,
+                    display_name: "Successor".to_owned(),
+                },
+                |step| {
+                    if step == failed_step {
+                        Err("injected-finalization-failure")
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(
+                result,
+                Err("injected-finalization-failure"),
+                "{failed_step:?}"
+            );
+            assert_incumbent_preserved(&fixture);
+        }
+    }
+
+    #[test]
+    fn restart_recovery_rolls_back_precommit_and_is_idempotent() {
+        let fixture = start_session();
+        fixture
+            .listener
+            .wait_for(|phase| *phase == AuthPhase::WaitPhoneNumber);
+        seed_incumbent(&fixture);
+        let config = config(&fixture.root);
+        let layout = config.storage_layout();
+        let backup = auth_backup_dir(&layout, TEST_ACCOUNT);
+        let target = layout.account_dir(TEST_ACCOUNT);
+        prepare_auth_finalization(
+            &config.data_dir,
+            AuthFinalizationRecord {
+                account: TEST_ACCOUNT,
+                phase: AuthFinalizationPhase::Prepared,
+                had_account_row: true,
+                had_database_key: true,
+                had_tdlib_state: true,
+            },
+        )
+        .expect("prepare journal");
+        fixture
+            .vault
+            .store_database_key(rollback_key_account(TEST_ACCOUNT).0, INCUMBENT_KEY.to_vec())
+            .expect("backup key");
+        std::fs::rename(&target, &backup).expect("backup incumbent state");
+        std::fs::rename(layout.account_dir(SIGN_IN_SLOT), &target).expect("install staged state");
+        fixture
+            .vault
+            .store_database_key(TEST_ACCOUNT.0, vec![7u8; 32])
+            .expect("install staged key");
+
+        recover_auth_finalization_locked(
+            &config,
+            &(Arc::clone(&fixture.vault) as Arc<dyn SecretVault>),
+            TEST_ACCOUNT,
+        )
+        .expect("restart rollback");
+        recover_auth_finalization_locked(
+            &config,
+            &(Arc::clone(&fixture.vault) as Arc<dyn SecretVault>),
+            TEST_ACCOUNT,
+        )
+        .expect("idempotent restart rollback");
+        assert_incumbent_preserved(&fixture);
+    }
+
+    #[test]
+    fn restart_recovery_keeps_the_committed_successor_and_cleans_backups() {
+        let fixture = start_session();
+        fixture
+            .listener
+            .wait_for(|phase| *phase == AuthPhase::WaitPhoneNumber);
+        seed_incumbent(&fixture);
+        let result = persist_account_with_hook(
+            &fixture.session.shared,
+            &SignedInIdentity {
+                account_id: TEST_ACCOUNT.0,
+                display_name: "Successor".to_owned(),
+            },
+            |step| {
+                if step == FinalizationStep::StateCommitted {
+                    Err("injected-postcommit-crash")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Err("injected-postcommit-crash"));
+
+        let config = config(&fixture.root);
+        let journal = auth_finalization(&config.data_dir, TEST_ACCOUNT)
+            .expect("journal read")
+            .expect("committed journal retained");
+        assert_eq!(journal.phase, AuthFinalizationPhase::Committed);
+        recover_auth_finalization_locked(
+            &config,
+            &(Arc::clone(&fixture.vault) as Arc<dyn SecretVault>),
+            TEST_ACCOUNT,
+        )
+        .expect("postcommit cleanup");
+        recover_auth_finalization_locked(
+            &config,
+            &(Arc::clone(&fixture.vault) as Arc<dyn SecretVault>),
+            TEST_ACCOUNT,
+        )
+        .expect("idempotent postcommit cleanup");
+
+        let layout = config.storage_layout();
+        let target = layout
+            .account_paths(TEST_ACCOUNT)
+            .database_directory()
+            .to_owned();
+        assert!(target.join("successor").is_file());
+        assert!(!target.join("incumbent").exists());
+        assert_eq!(fixture.vault.key(TEST_ACCOUNT.0), Some(vec![7u8; 32]));
+        assert!(fixture.vault.key(SIGN_IN_SLOT.0).is_none());
+        assert!(!auth_backup_dir(&layout, TEST_ACCOUNT).exists());
+        assert_eq!(account_display_name(&fixture.root), "Successor");
+        assert!(
+            auth_finalization(&config.data_dir, TEST_ACCOUNT)
+                .expect("journal read")
+                .is_none()
+        );
+        assert_authorized_probe(&fixture.root, &fixture.vault);
     }
 
     #[tokio::test]
