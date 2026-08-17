@@ -93,6 +93,8 @@ public enum ControlChannelUnavailable: Equatable, Sendable {
   case notWired
   /// The agent is not running, so there is nothing to command.
   case agentNotRunning
+  /// The agent is already handling another sign-in request.
+  case busy
   /// The channel existed but dropped mid-operation.
   case dropped
   /// The agent did not make progress before the operation's deadline.
@@ -105,9 +107,11 @@ public enum ControlChannelUnavailable: Equatable, Sendable {
       return
         "This action needs the agent control channel, which is not available in this build yet."
     case .agentNotRunning:
-      return "The GramDrive agent is not running."
+      return "The GramDrive agent is not running. Open GramDrive and try again."
+    case .busy:
+      return "A sign-in is already in progress — try again in a moment."
     case .dropped:
-      return "Lost the connection to the GramDrive agent."
+      return "Lost the connection to the GramDrive agent. Try signing in again."
     case .timedOut:
       return "The GramDrive agent did not respond in time. Try signing in again."
     }
@@ -117,6 +121,7 @@ public enum ControlChannelUnavailable: Equatable, Sendable {
 /// The stable category of a failed command, mirroring the FFI `DriveError`
 /// categories so a UI can pick an actionable state without parsing detail.
 public enum CommandFailure: Equatable, Sendable {
+  case busy
   case invalidArgument
   case notFound
   case authRequired
@@ -130,6 +135,7 @@ public enum CommandFailure: Equatable, Sendable {
   /// A short, user-facing explanation.
   public var message: String {
     switch self {
+    case .busy: return "The agent is busy — try again in a moment."
     case .invalidArgument: return "The request was invalid."
     case .notFound: return "Nothing to act on was found."
     case .authRequired: return "Sign in first — this action needs an authorized account."

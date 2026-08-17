@@ -351,6 +351,9 @@ public struct ControlRemovalRequest: Codable, Equatable, Sendable {
 /// The stable category of a failed control command — the wire form of the
 /// FFI `DriveError` categories, so the shell can branch without parsing.
 public enum ControlFailureCategory: String, Codable, Equatable, Sendable {
+  /// The requested operation conflicts with work the agent is already
+  /// performing. In particular, the agent hosts only one sign-in at a time.
+  case busy
   case invalidArgument
   case notFound
   case authRequired

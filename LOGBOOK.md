@@ -5,6 +5,13 @@
 
 ## 2026-08-11
 
+### 2245 — typed auth-start refusals preserve sign-in contention (BUG-260729-2a6h8c)
+
+- FINDING: a second FFI `AuthSession.start` reports `DriveError.InvalidArgument` for the process-wide sign-in slot; the prior auth client discarded that first `commandFailed` event as `.dropped`.
+- DECISION: the control contract now sends `busy` for an auth-start `InvalidArgument`; the new client retains a narrow `invalidArgument → busy` fallback for compatible older agents. EOF and other transport failures remain `.dropped`.
+- UX: agent-not-running, busy, and dropped transport each have distinct actionable Sign In copy.
+- VALIDATION: `swift test --filter ControlChannelTests`, `LiveControlTests`, and `AuthorizationInputTests`; `make check-apple`; `make check-security`; and `git diff --check` all exited 0. The touched two-space contract/server/client files lint clean under `swift format lint --strict`; the package has no formatter configuration, and a whole-package strict run exits 1 on existing mixed-indentation/line-length debt, so it was not expanded into a formatting rewrite.
+
 ### 2158 — Sign-in control paths fail closed across startup, submit, and cancellation (BUG-260729-31bfuj)
 
 - FIX: `AuthorizationViewModel` renders `.starting` before any namespace teardown, coalesces repeated cancellation, maintains submission state across concurrent exits, and reports typed teardown failures. `LiveAuthorizationSession` now bounds channel open, first-event, submit, and the full cancellation path; a deadline closes the channel and returns `.timedOut`, while first-event EOF remains `.dropped`. Hosted auth submits receive the same bounded fail-closed behavior in `ControlServer`, retaining the current-main `Task.detached` Sendable boundary.
