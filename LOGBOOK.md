@@ -5,6 +5,12 @@
 
 ## 2026-08-18
 
+### 0331 — Onboarding re-entry consumes one fresh sign-in attempt (BUG-260729-1dxhno)
+
+- ROOT CAUSE: onboarding auto-started only from `.idle` with no control-channel error, so closed, unsupported, failed, busy, dropped, timed-out, and otherwise unavailable outcomes permanently suppressed the Sign In step's `.task` on a later visit.
+- FIX: `OnboardingViewModel` owns one private auto-start opportunity per intentional Sign In entry. Re-entry consumes that opportunity exactly once and may replace terminal/unavailable state; active phone, code, QR, password, configuring, logout/close streams, cancellation, and health-observed authorization remain authoritative and are not restarted.
+- REGRESSION: deterministic transition matrices cover three streamed terminal states, all five typed unavailable reasons, eight live/transitional states, duplicate calls, cancellation, stale-copy clearing, and late authorized health. The focused Sign In suite (6 tests), all onboarding tests (41), authorization-health reconciliation (5), targeted companion test build, `make check-apple`, `make check-security`, and `git diff --check` exited 0 from the isolated exact-`origin/main` worktree. No new Swift files were added, so new-file SwiftFormat was not applicable.
+
 ### 0130 — Retryable startup refusals and repair restarts publish definitive auth health (BUG-260729-2fla1z)
 
 - FIX: every namespace failure categorized `auth-required` is definitive for live authorization even when its namespace recovery metadata remains retryable. Transitional `preparing`/`unavailable` observations still cannot overwrite a stored-session probe's definitive refusal; a later definitive namespace `authorized` or `authorizationRequired` result can replace it. The durable write-once `accounts.auth_state` row is never mutated.
