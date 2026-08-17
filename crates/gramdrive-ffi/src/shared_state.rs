@@ -1439,6 +1439,10 @@ mod tests {
             .change_journal_state()
             .expect("journal before")
             .latest_sequence;
+        assert_eq!(
+            before, 3,
+            "the fixture journals its account root, chat, and attachment exactly once"
+        );
 
         let readiness = store.ensure_root_structure().expect("ensure structure");
         assert_eq!(readiness.authorized_account_count, 1);
@@ -1462,6 +1466,49 @@ mod tests {
             .expect("journal after first")
             .latest_sequence;
         assert_eq!(after_first, before + 4);
+        let fixed_root_changes = store
+            .item_changes_since(7, before, 100)
+            .expect("fixed root changes");
+        assert_eq!(
+            fixed_root_changes
+                .iter()
+                .map(|change| change.sequence)
+                .collect::<Vec<_>>(),
+            vec![before + 1, before + 2, before + 3, before + 4],
+            "each fixed root owns one durable journal sequence"
+        );
+        assert_eq!(
+            fixed_root_changes
+                .iter()
+                .map(|change| change.metadata.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                    scope: scope(),
+                    kind: ChatListKind::Main,
+                }))
+                .id()
+                .text(),
+                ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                    scope: scope(),
+                    kind: ChatListKind::Archive,
+                }))
+                .id()
+                .text(),
+                ItemKey::Canonical(CanonicalKey::ChatList(ChatListKey {
+                    scope: scope(),
+                    kind: ChatListKind::Stories,
+                }))
+                .id()
+                .text(),
+                ItemKey::Canonical(CanonicalKey::FolderCatalog(FolderCatalogKey {
+                    scope: scope(),
+                }))
+                .id()
+                .text(),
+            ],
+            "sequence 7 is the real Stories-or-Folders event, not relaunch drift"
+        );
 
         drop(store);
         let relaunched = SharedStateStore::open(root.as_str().to_owned(), StateRole::Coordinator)
@@ -1477,6 +1524,13 @@ mod tests {
                 .latest_sequence,
             after_first,
             "an identical repair is journal-quiet"
+        );
+        assert!(
+            relaunched
+                .item_changes_since(7, after_first, 100)
+                .expect("changes after relaunch")
+                .is_empty(),
+            "relaunch emits no hidden durable event"
         );
         assert_eq!(
             relaunched
