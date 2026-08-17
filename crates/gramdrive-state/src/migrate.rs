@@ -218,6 +218,15 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "story_list_provider_view",
         step: MigrationStep::AtomicRebuild(migrate_story_list_provider_view),
     },
+    // v22 — authorization finalization spans SQLite, the OS keychain, and
+    // TDLib's directory tree. This journal supplies the durable decision
+    // record that makes the cross-resource swap recoverable without ever
+    // storing secret key bytes in ordinary state.
+    Migration {
+        version: 22,
+        name: "auth_finalization_journal",
+        step: MigrationStep::Sql(include_str!("schema/v22.sql")),
+    },
 ];
 
 /// [`SCHEMA_VERSION`] and [`MIGRATIONS`] are one fact stated twice, so the
@@ -1225,6 +1234,45 @@ mod tests {
                 seed.display()
             );
         }
+    }
+
+    #[test]
+    fn v22_installs_the_auth_finalization_decision_journal_atomically() {
+        let mut conn = memory_v1();
+        run(&mut conn, MIGRATIONS, 21).expect("migrate installed database to v21");
+        let before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'auth_finalization_journal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table probe");
+        assert_eq!(before, 0);
+
+        run(&mut conn, MIGRATIONS, 22).expect("migrate installed database to v22");
+        conn.execute(
+            "INSERT INTO auth_finalization_journal (
+                 account_id, phase, had_account_row, had_database_key, had_tdlib_state
+             ) VALUES (777000123, 'prepared', 1, 1, 1)",
+            [],
+        )
+        .expect("prepared decision");
+        conn.execute(
+            "UPDATE auth_finalization_journal SET phase = 'committed'
+             WHERE account_id = 777000123",
+            [],
+        )
+        .expect("commit decision");
+        let phase: String = conn
+            .query_row(
+                "SELECT phase FROM auth_finalization_journal WHERE account_id = 777000123",
+                [],
+                |row| row.get(0),
+            )
+            .expect("decision read");
+        assert_eq!(phase, "committed");
+        assert_eq!(version_of(&conn), 22);
     }
 
     #[test]

@@ -46,6 +46,7 @@ use gramdrive_model::identity::AccountScope;
 
 mod accounts;
 mod attachments;
+mod auth_finalization;
 mod backfill;
 mod cache;
 mod changes;
@@ -72,6 +73,7 @@ pub use attachments::{
     AttachmentProjection, AttachmentState, BlobRecord, RetainedAttachmentVersion,
     TelegramRepresentation,
 };
+pub use auth_finalization::{AuthFinalizationPhase, AuthFinalizationRecord};
 pub use backfill::BackfillControlRecord;
 pub use cache::{
     ArchiveBackfillProgressRecord, CacheEntryRecord, CacheKind, CacheTotals, CacheUsage,
