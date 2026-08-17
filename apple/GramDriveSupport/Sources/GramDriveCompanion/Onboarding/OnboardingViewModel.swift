@@ -108,6 +108,7 @@ public final class OnboardingViewModel {
     private let domainSetup: any FileProviderDomainSettingUp
     private let completionStore: any OnboardingCompletionStore
     private var registeredDriveURL: URL?
+    private var hasHandledCurrentSignInEntry = false
 
     public init(
         authorization: AuthorizationViewModel,
@@ -160,6 +161,7 @@ public final class OnboardingViewModel {
         guard canAdvance else { return }
         switch step {
         case .welcome:
+            hasHandledCurrentSignInEntry = false
             step = .signIn
         case .signIn:
             settings.load()
@@ -176,6 +178,9 @@ public final class OnboardingViewModel {
     /// Steps back one screen. A no-op on the first step.
     public func back() {
         guard let previous = Step(rawValue: step.rawValue - 1) else { return }
+        if previous == .signIn {
+            hasHandledCurrentSignInEntry = false
+        }
         step = previous
     }
 
@@ -205,12 +210,29 @@ public final class OnboardingViewModel {
 
     // MARK: - Sign In
 
-    /// Starts the sign-in flow if it has not begun. Idempotent for a step the
-    /// user may revisit: it only (re)begins from a fresh `idle` state, so it
-    /// never interrupts a flow already in progress or already authorized.
+    /// Starts at most one sign-in attempt for each intentional entry into the
+    /// Sign In step. A new entry may recover from a terminal or unavailable
+    /// attempt, while an active stream, cancellation, or observed authorized
+    /// state remains authoritative and is never interrupted.
     public func beginSignInIfNeeded() async {
-        guard authorization.state == .idle, authorization.unavailable == nil else { return }
+        guard step == .signIn, !hasHandledCurrentSignInEntry else { return }
+        hasHandledCurrentSignInEntry = true
+        guard shouldBeginSignIn else { return }
         await authorization.begin()
+    }
+
+    private var shouldBeginSignIn: Bool {
+        guard authorization.healthState != .authorized,
+              !authorization.isCancelling
+        else { return false }
+
+        switch authorization.state {
+        case .idle, .closed, .unsupported, .failed:
+            return true
+        case .starting, .configuring, .waitPhoneNumber, .waitCode,
+             .waitQrConfirmation, .waitPassword, .ready, .loggingOut, .closing:
+            return false
+        }
     }
 
     // MARK: - Success

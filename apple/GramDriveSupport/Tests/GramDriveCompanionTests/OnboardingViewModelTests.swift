@@ -57,6 +57,70 @@ private actor DomainSetupOperationProbe {
     }
 }
 
+private final class OnboardingAuthorizationSessionSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessions: [any AuthorizationSession]
+    private var creationCountStorage = 0
+
+    init(_ sessions: [any AuthorizationSession]) {
+        self.sessions = sessions
+    }
+
+    func next() -> any AuthorizationSession {
+        lock.lock()
+        defer { lock.unlock() }
+        creationCountStorage += 1
+        return sessions.removeFirst()
+    }
+
+    var creationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return creationCountStorage
+    }
+}
+
+private final class OnboardingDelayedCancellationSession: AuthorizationSession, @unchecked Sendable {
+    let states: AsyncStream<CompanionAuthState>
+    let cancellationStarted: AsyncStream<Void>
+
+    private let stateContinuation: AsyncStream<CompanionAuthState>.Continuation
+    private let cancellationContinuation: AsyncStream<Void>.Continuation
+    private let lock = NSLock()
+    private var cancellationWaiter: CheckedContinuation<Void, Never>?
+
+    init() {
+        (states, stateContinuation) = AsyncStream.makeStream(of: CompanionAuthState.self)
+        (cancellationStarted, cancellationContinuation) = AsyncStream.makeStream(of: Void.self)
+        stateContinuation.yield(.waitPhoneNumber)
+    }
+
+    func start() async -> AuthStartResult { .started }
+
+    func submit(_ input: CompanionAuthInput) async -> AuthSubmitResult { .accepted }
+
+    func cancel() async -> ControlChannelUnavailable? {
+        cancellationContinuation.yield(())
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            cancellationWaiter = continuation
+            lock.unlock()
+        }
+        return nil
+    }
+
+    func releaseCancellation() {
+        stateContinuation.yield(.closed)
+        stateContinuation.finish()
+        cancellationContinuation.finish()
+        lock.lock()
+        let waiter = cancellationWaiter
+        cancellationWaiter = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+}
+
 /// Drives the shared sign-in flow to `.ready` so gated steps unblock.
 @MainActor
 private func authorize(
@@ -201,6 +265,7 @@ private func authorize(
         let session = ScriptedAuthorizationSession()
         let backend = InMemoryCompanionBackend(session: { session })
         let model = makeOnboarding(backend: backend)
+        model.advance()
         session.emit(.waitPhoneNumber)
         await model.beginSignInIfNeeded()
         session.finish()
@@ -208,15 +273,189 @@ private func authorize(
         #expect(model.authorization.state == .waitPhoneNumber)
     }
 
-    @Test func beginSignInDoesNotRestartAnUnavailableChannel() async {
-        let backend = InMemoryCompanionBackend(
-            session: { UnavailableAuthorizationSession(reason: .notWired) })
-        let model = makeOnboarding(backend: backend)
-        await model.authorization.begin()
-        #expect(model.authorization.unavailable == .notWired)
-        // A second call must not re-begin over the honest unavailable state.
+    @Test func terminalStateTransitionMatrixStartsOneFreshAttemptOnReentry() async {
+        let terminalStates: [CompanionAuthState] = [
+            .closed,
+            .unsupported(kind: "authorizationStateWaitRegistration"),
+            .failed(detail: "auth-finalization-failed"),
+        ]
+
+        for terminalState in terminalStates {
+            let first = ScriptedAuthorizationSession()
+            let second = ScriptedAuthorizationSession()
+            let unexpectedThird = ScriptedAuthorizationSession()
+            let sessions = OnboardingAuthorizationSessionSequence([
+                first, second, unexpectedThird,
+            ])
+            let model = makeOnboarding(
+                backend: InMemoryCompanionBackend(session: { sessions.next() }))
+
+            model.advance()
+            await model.beginSignInIfNeeded()
+            first.emit(terminalState)
+            first.finish()
+            await model.authorization.waitForCompletion()
+            #expect(model.authorization.state == terminalState)
+
+            await model.beginSignInIfNeeded()
+            #expect(sessions.creationCount == 1)
+
+            model.back()
+            model.advance()
+            second.emit(.waitPhoneNumber)
+            second.finish()
+            await model.beginSignInIfNeeded()
+            await model.beginSignInIfNeeded()
+            await model.authorization.waitForCompletion()
+
+            #expect(model.authorization.state == .waitPhoneNumber)
+            #expect(model.authorization.unavailable == nil)
+            #expect(sessions.creationCount == 2)
+        }
+    }
+
+    @Test func unavailableOutcomeTransitionMatrixClearsCopyOnOneFreshReentry() async {
+        let unavailableReasons: [ControlChannelUnavailable] = [
+            .notWired, .agentNotRunning, .busy, .dropped, .timedOut,
+        ]
+
+        for reason in unavailableReasons {
+            let second = ScriptedAuthorizationSession()
+            let unexpectedThird = ScriptedAuthorizationSession()
+            let sessions = OnboardingAuthorizationSessionSequence([
+                UnavailableAuthorizationSession(reason: reason), second, unexpectedThird,
+            ])
+            let model = makeOnboarding(
+                backend: InMemoryCompanionBackend(session: { sessions.next() }))
+
+            model.advance()
+            await model.beginSignInIfNeeded()
+            #expect(model.authorization.state == .idle)
+            #expect(model.authorization.unavailable == reason)
+
+            await model.beginSignInIfNeeded()
+            #expect(sessions.creationCount == 1)
+
+            model.back()
+            model.advance()
+            second.emit(.waitPhoneNumber)
+            second.finish()
+            await model.beginSignInIfNeeded()
+            await model.beginSignInIfNeeded()
+            await model.authorization.waitForCompletion()
+
+            #expect(model.authorization.state == .waitPhoneNumber)
+            #expect(model.authorization.unavailable == nil)
+            #expect(sessions.creationCount == 2)
+        }
+    }
+
+    @Test func activeStateTransitionMatrixSurvivesSignInReentryAndLateHealth() async {
+        let activeStates: [CompanionAuthState] = [
+            .starting,
+            .configuring,
+            .waitPhoneNumber,
+            .waitCode(CompanionCodeInfo(phoneNumber: "+1 555 0100")),
+            .waitQrConfirmation(link: "tg://login?token=synthetic"),
+            .waitPassword(CompanionPasswordInfo(hint: "", hasRecoveryEmail: false)),
+            .loggingOut,
+            .closing,
+        ]
+
+        for activeState in activeStates {
+            let first = ScriptedAuthorizationSession()
+            let unexpectedSecond = ScriptedAuthorizationSession()
+            let sessions = OnboardingAuthorizationSessionSequence([first, unexpectedSecond])
+            let model = makeOnboarding(
+                backend: InMemoryCompanionBackend(session: { sessions.next() }))
+
+            model.advance()
+            await model.beginSignInIfNeeded()
+            first.emit(activeState)
+            for _ in 0 ..< 100 where model.authorization.state != activeState {
+                await Task.yield()
+            }
+
+            model.back()
+            model.advance()
+            await model.beginSignInIfNeeded()
+            model.authorization.reconcile(
+                with: .running(
+                    previewSnapshot(
+                        accounts: [
+                            AccountHealthSummary(
+                                accountId: 42,
+                                displayName: "Private",
+                                authState: "authorized",
+                                observedAuthorization: .authorized),
+                        ])))
+
+            #expect(model.authorization.state == activeState)
+            #expect(model.authorization.healthState == .unknown)
+            #expect(sessions.creationCount == 1)
+            first.finish()
+            await model.authorization.waitForCompletion()
+        }
+    }
+
+    @Test func observedAuthorizedStateNeverAutoStarts() async {
+        let sessions = OnboardingAuthorizationSessionSequence([
+            ScriptedAuthorizationSession(),
+        ])
+        let model = makeOnboarding(
+            backend: InMemoryCompanionBackend(session: { sessions.next() }))
+        model.authorization.reconcile(
+            with: .running(
+                previewSnapshot(
+                    accounts: [
+                        AccountHealthSummary(
+                            accountId: 42,
+                            displayName: "Private",
+                            authState: "authorized",
+                            observedAuthorization: .authorized),
+                    ])))
+
+        model.advance()
         await model.beginSignInIfNeeded()
-        #expect(model.authorization.unavailable == .notWired)
+        await model.beginSignInIfNeeded()
+
+        #expect(model.authorization.state == .ready)
+        #expect(model.authorization.healthState == .authorized)
+        #expect(sessions.creationCount == 0)
+    }
+
+    @Test func cancellationIsNotInterruptedAndSettledReentryCanStartFresh() async {
+        let first = OnboardingDelayedCancellationSession()
+        let second = ScriptedAuthorizationSession()
+        let sessions = OnboardingAuthorizationSessionSequence([first, second])
+        let model = makeOnboarding(
+            backend: InMemoryCompanionBackend(session: { sessions.next() }))
+        model.advance()
+        await model.beginSignInIfNeeded()
+        var cancellationStarted = first.cancellationStarted.makeAsyncIterator()
+
+        let cancellation = Task { @MainActor in await model.authorization.cancel() }
+        _ = await cancellationStarted.next()
+        model.back()
+        model.advance()
+        await model.beginSignInIfNeeded()
+
+        #expect(model.authorization.isCancelling)
+        #expect(sessions.creationCount == 1)
+
+        first.releaseCancellation()
+        await cancellation.value
+        await model.beginSignInIfNeeded()
+        #expect(sessions.creationCount == 1)
+
+        model.back()
+        model.advance()
+        second.emit(.waitPhoneNumber)
+        second.finish()
+        await model.beginSignInIfNeeded()
+        await model.authorization.waitForCompletion()
+        #expect(model.authorization.state == .waitPhoneNumber)
+        #expect(sessions.creationCount == 2)
     }
 }
 
