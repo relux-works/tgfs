@@ -299,6 +299,22 @@ private final class RecordingAuthorizationSession: AuthorizationSession, @unchec
         #expect(model.state == .idle)
     }
 
+    @Test func signInUnavailableReasonsRemainDistinctAndActionable() async {
+        let cases: [(ControlChannelUnavailable, String)] = [
+            (.agentNotRunning, "The GramDrive agent is not running. Open GramDrive and try again."),
+            (.busy, "A sign-in is already in progress — try again in a moment."),
+            (.dropped, "Lost the connection to the GramDrive agent. Try signing in again."),
+        ]
+        for (reason, message) in cases {
+            let backend = InMemoryCompanionBackend(
+                session: { UnavailableAuthorizationSession(reason: reason) })
+            let model = AuthorizationViewModel(backend: backend)
+            await model.begin()
+            #expect(model.unavailable == reason)
+            #expect(model.unavailable?.message == message)
+        }
+    }
+
     @Test func aRejectionIsClassifiedWithAdvice() async {
         let session = ScriptedAuthorizationSession(onSubmit: { input in
             if case .submitCode = input { return .rejected(.expiredCode) }

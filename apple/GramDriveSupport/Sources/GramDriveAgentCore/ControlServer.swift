@@ -775,7 +775,7 @@ public final class ControlServer: @unchecked Sendable {
     do {
       session = try authorizer.makeSession()
     } catch {
-      connection.refuse(Self.failure(from: error))
+      connection.refuse(Self.authStartFailure(from: error))
       remove(connection)
       return
     }
@@ -816,10 +816,11 @@ public final class ControlServer: @unchecked Sendable {
           return
         }
         Task.detached { [weak self, session, frame, connection] in
-          guard let answer = await Self.answerAuthInput(
-            session: session,
-            input: frame.input,
-            timeout: self?.configuration.authSubmissionTimeout ?? .seconds(90))
+          guard
+            let answer = await Self.answerAuthInput(
+              session: session,
+              input: frame.input,
+              timeout: self?.configuration.authSubmissionTimeout ?? .seconds(90))
           else {
             connection.teardown()
             self?.remove(connection)
@@ -908,6 +909,19 @@ public final class ControlServer: @unchecked Sendable {
     case .Internal:
       return ControlCommandFailure(category: .internalError, detail: "internal failure")
     }
+  }
+
+  /// The FFI reserves `InvalidArgument` from `AuthSession.start` for the
+  /// process-wide sign-in slot already being held. Keep that operation-specific
+  /// fact on the wire instead of describing a duplicate Sign In tap as a
+  /// broken connection. Other control operations retain the general mapping.
+  private static func authStartFailure(from error: Error) -> ControlCommandFailure {
+    if case .InvalidArgument = error as? DriveError {
+      return ControlCommandFailure(
+        category: .busy,
+        detail: "a sign-in is already in progress")
+    }
+    return failure(from: error)
   }
 }
 

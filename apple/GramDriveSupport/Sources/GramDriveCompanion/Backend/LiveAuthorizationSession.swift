@@ -61,7 +61,7 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
       timeout: firstEventTimeout,
       operation: openChannel,
       onLateValue: { result in
-        if case let .opened(channel) = result { channel.close() }
+        if case .opened(let channel) = result { channel.close() }
       }
     ) {
     case .timedOut:
@@ -109,10 +109,10 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
         self?.finish()
       }
       return .started
-    case .value(.some(.commandFailed)):
+    case .value(.some(.commandFailed(let failure))):
       channel.close()
       finish()
-      return .unavailable(.dropped)
+      return .unavailable(Self.authUpgradeUnavailable(for: failure))
     default:
       channel.close()
       finish()
@@ -164,6 +164,21 @@ public final class LiveAuthorizationSession: AuthorizationSession, @unchecked Se
   }
 
   // MARK: - Event routing
+
+  /// Maps an auth-upgrade refusal onto the user-visible channel state. The
+  /// v1 agent used `invalid-argument` for the process-wide sign-in slot, so
+  /// retain that narrow fallback while newer agents send `busy` explicitly.
+  static func authUpgradeUnavailable(
+    for failure: ControlCommandFailure
+  ) -> ControlChannelUnavailable {
+    switch failure.category {
+    case .busy, .invalidArgument:
+      return .busy
+    case .authRequired, .rateLimited, .sourceUnavailable, .storage, .integrity,
+      .cancelled, .internalError, .notFound:
+      return .dropped
+    }
+  }
 
   // NSLock is not async-safe to hold across suspension, so every locked
   // section lives in one of these synchronous helpers.

@@ -664,6 +664,7 @@ public struct LiveCompanionBackend: CompanionBackend {
 
     static func commandFailure(_ failure: ControlCommandFailure) -> CommandFailure {
         switch failure.category {
+        case .busy: return .busy
         case .invalidArgument: return .invalidArgument
         case .notFound: return .notFound
         case .authRequired: return .authRequired

@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import GramDriveAgentCore
+import GramDriveCore
 @testable import GramDriveCompanion
 import GramDriveSupport
 import Testing
@@ -630,6 +631,41 @@ struct LiveControlTests {
         #expect(await session.submit(.cancel) == .unavailable(.dropped))
     }
 
+    @Test func authUpgradePreservesBusyAndSupportsTheLegacyBusyRefusal() {
+        #expect(
+            LiveAuthorizationSession.authUpgradeUnavailable(
+                for: ControlCommandFailure(
+                    category: .busy,
+                    detail: "a sign-in is already in progress")) == .busy)
+        // Older compatible agents reported the same single-flight refusal as
+        // `invalid-argument`; only this auth-start fallback treats it as busy.
+        #expect(
+            LiveAuthorizationSession.authUpgradeUnavailable(
+                for: ControlCommandFailure(category: .invalidArgument, detail: "invalid argument"))
+                == .busy)
+        #expect(
+            LiveAuthorizationSession.authUpgradeUnavailable(
+                for: ControlCommandFailure(category: .sourceUnavailable, detail: "source unavailable"))
+                == .dropped)
+    }
+
+    @Test func liveSessionReportsTheServerBusyRefusal() async throws {
+        let layout = try Self.tempLayout()
+        let server = try ControlServer.start(
+            socketURL: layout.controlSocket,
+            handlers: ControlServerHandlers(
+                status: { Self.snapshot() },
+                reloadSettings: { AgentSettings() },
+                authorizer: BusyCompanionAuthorizer()))
+        defer { server.stop() }
+
+        let controlSocket = layout.controlSocket
+        let session = LiveAuthorizationSession(openChannel: {
+            .opened(try! ControlAuthChannel.open(socketURL: controlSocket))
+        })
+        #expect(await session.start() == .unavailable(.busy))
+    }
+
     @Test func liveSessionTimesOutWaitingForItsFirstAuthEventAndClosesTheChannel() async throws {
         let layout = try Self.tempLayout()
         let hosted = ScriptedCompanionHostedSession()
@@ -1022,6 +1058,12 @@ private struct ScriptedCompanionAuthorizer: AgentAuthorizing {
     let session: any AgentAuthSessionHosting
     func makeSession() throws -> any AgentAuthSessionHosting {
         session
+    }
+}
+
+private struct BusyCompanionAuthorizer: AgentAuthorizing {
+    func makeSession() throws -> any AgentAuthSessionHosting {
+        throw DriveError.InvalidArgument(detail: "another sign-in is already running")
     }
 }
 

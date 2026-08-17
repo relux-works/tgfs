@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import GramDriveCore
 import GramDriveSupport
 import Testing
 
@@ -1127,6 +1128,40 @@ private final class LockedCount: @unchecked Sendable {
     #expect(failure.category == .sourceUnavailable)
   }
 
+  @Test func aDuplicateSignInUpgradeIsRefusedAsBusy() async throws {
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let server = try ControlServer.start(
+      socketURL: socket,
+      handlers: Self.handlers(authorizer: BusyAuthorizer()))
+    defer { server.stop() }
+
+    let channel = try ControlAuthChannel.open(socketURL: socket)
+    defer { channel.close() }
+    let events = EventCollector(channel.events)
+    #expect(
+      await events.next()
+        == .commandFailed(
+          ControlCommandFailure(
+            category: .busy,
+            detail: "a sign-in is already in progress")))
+  }
+
+  @Test func newerControlFailureCategoriesDecodeWithoutBreakingOlderPeers() throws {
+    let busyEvent = ControlEvent.commandFailed(
+      ControlCommandFailure(category: .busy, detail: "a sign-in is already in progress"))
+    let encoded = try JSONEncoder().encode(busyEvent)
+    #expect(try JSONDecoder().decode(ControlEvent.self, from: encoded) == busyEvent)
+
+    // A peer that predates `busy` has the documented lenient decode posture:
+    // it can still read the event and falls back to its safe internal bucket.
+    #expect(
+      try JSONDecoder().decode(LegacyFailureCategory.self, from: Data("\"busy\"".utf8))
+        == .internalError)
+  }
+
   @Test func stopClosesActiveSessions() async throws {
     let root = try Self.tempRoot()
     let socket = ControlContract.socketURL(dataRoot: root)
@@ -1420,6 +1455,29 @@ private struct ScriptedAuthorizer: AgentAuthorizing {
 
   func makeSession() throws -> any AgentAuthSessionHosting {
     session
+  }
+}
+
+private struct BusyAuthorizer: AgentAuthorizing {
+  func makeSession() throws -> any AgentAuthSessionHosting {
+    throw DriveError.InvalidArgument(detail: "another sign-in is already running")
+  }
+}
+
+private enum LegacyFailureCategory: String, Decodable, Equatable {
+  case invalidArgument
+  case notFound
+  case authRequired
+  case rateLimited
+  case sourceUnavailable
+  case storage
+  case integrity
+  case cancelled
+  case internalError = "internal"
+
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = LegacyFailureCategory(rawValue: raw) ?? .internalError
   }
 }
 
