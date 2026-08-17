@@ -446,10 +446,35 @@ public struct AccountHealthSummary: Codable, Equatable, Sendable {
     public var displayName: String
     /// The durable auth-state marker (`authorized`, …).
     public var authState: String
+    /// The agent's current observation of the live namespace authorization.
+    /// This is intentionally independent from ``authState``: the durable
+    /// account row is write-once evidence of a completed sign-in, while this
+    /// value answers whether the actively owned TDLib namespace can serve it
+    /// now. `nil` means an older agent did not publish the additive field.
+    public var observedAuthorization: ObservedAuthorizationState?
 
-    public init(accountId: Int64, displayName: String, authState: String) {
+    public init(
+        accountId: Int64,
+        displayName: String,
+        authState: String,
+        observedAuthorization: ObservedAuthorizationState? = nil
+    ) {
         self.accountId = accountId
         self.displayName = displayName
         self.authState = authState
+        self.observedAuthorization = observedAuthorization
     }
+}
+
+/// The agent-owned authorization observation from a currently live namespace
+/// or a bounded stored-session probe. It never changes the durable account
+/// row, which remains the historical sign-in record.
+public enum ObservedAuthorizationState: String, Codable, Equatable, Sendable {
+    /// The live namespace reached TDLib's `Ready` state, or the stored-session
+    /// probe reached the same terminal state.
+    case authorized
+    /// TDLib reached a terminal sign-in state without becoming ready.
+    case authorizationRequired
+    /// No definitive live authorization result is available yet.
+    case unavailable
 }

@@ -1,8 +1,51 @@
 import Foundation
 import GramDriveAgentCore
+import GramDriveCore
+import GramDriveSupport
+import SQLite3
 import Testing
 
 @testable import GramDriveCompanion
+
+private struct AuthRequiredNamespaceBootstrapper: AgentNamespaceBootstrapping {
+    func start(
+        accountId _: Int64,
+        onProgress _: @escaping @Sendable (AgentNamespaceProgress) -> Void
+    ) throws -> any AgentNamespaceSessionHosting {
+        throw DriveError.AuthRequired(detail: "private diagnostic")
+    }
+}
+
+private func seedAuthorizedCompanionAccount(dataRoot: URL, accountId: Int64) throws {
+    let layout = try sharedStateLayout(dataRoot: dataRoot.path)
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(
+        layout.databaseFile, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+        let database
+    else {
+        throw CocoaError(.fileReadUnknown)
+    }
+    defer { sqlite3_close(database) }
+
+    let sql = """
+        INSERT INTO accounts (
+            account_id, source_kind, display_name, auth_state, namespace_version,
+            retention_mode, archive_mode, created_at_ms, updated_at_ms, display_timezone
+        ) VALUES (?, 'local_tdlib', 'Private', 'authorized', 0, 'mirror', 0, 1, 1, 'UTC')
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+          let statement
+    else {
+        throw CocoaError(.fileReadCorruptFile)
+    }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_bind_int64(statement, 1, accountId) == SQLITE_OK,
+          sqlite3_step(statement) == SQLITE_DONE
+    else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+}
 
 @Suite struct StatusDerivationTests {
     @Test func agentPresenceMapsEveryReadout() {
@@ -23,12 +66,33 @@ import Testing
         #expect(CompanionStatusViewModel.accountStatus(from: .timedOut) == .agentUnavailable)
     }
 
-    @Test func accountStatusProjectsDurableAuthorizationWithoutIdentityData() {
+    @Test func accountStatusProjectsDurableAndLiveAuthorizationWithoutIdentityData() {
         let authorized = AccountHealthSummary(
-            accountId: 7, displayName: "Private", authState: "authorized")
+            accountId: 7,
+            displayName: "Private",
+            authState: "authorized",
+            observedAuthorization: .authorized)
         #expect(
             CompanionStatusViewModel.accountStatus(
                 from: .running(previewSnapshot(accounts: [authorized]))) == .authorized)
+        let terminallySignedOut = AccountHealthSummary(
+            accountId: 7,
+            displayName: "Private",
+            authState: "authorized",
+            observedAuthorization: .authorizationRequired)
+        #expect(
+            CompanionStatusViewModel.accountStatus(
+                from: .running(previewSnapshot(accounts: [terminallySignedOut])))
+                == .authorizationRequired)
+        #expect(AccountStatus.authorizationRequired.label == "Authorization Required")
+        let liveProbeUnavailable = AccountHealthSummary(
+            accountId: 7,
+            displayName: "Private",
+            authState: "authorized",
+            observedAuthorization: .unavailable)
+        #expect(
+            CompanionStatusViewModel.accountStatus(
+                from: .running(previewSnapshot(accounts: [liveProbeUnavailable]))) == .authorized)
         #expect(
             CompanionStatusViewModel.accountStatus(
                 from: .running(previewSnapshot(accounts: []))) == .notConfigured)
@@ -38,6 +102,32 @@ import Testing
             CompanionStatusViewModel.accountStatus(
                 from: .running(previewSnapshot(accounts: [signedOut])))
                 == .authorizationRequired)
+    }
+
+    @Test func retryableSynchronousAuthRequiredOverridesDurableAuthorizedStatus() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gramdrive-companion-auth-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let lifecycle = AgentLifecycle(
+            configuration: AgentConfiguration(
+                dataRoot: root,
+                namespaceBootstrapper: AuthRequiredNamespaceBootstrapper()))
+        try lifecycle.start()
+        try seedAuthorizedCompanionAccount(dataRoot: root, accountId: 9)
+        lifecycle.restartNamespaces()
+
+        let snapshot = try AgentHealthClient.fetch(
+            socketURL: lifecycle.runtimeLayout.healthSocket)
+        let account = try #require(snapshot.accounts?.first)
+        #expect(account.authState == "authorized")
+        #expect(account.observedAuthorization == .authorizationRequired)
+        #expect(
+            CompanionStatusViewModel.accountStatus(from: .running(snapshot))
+                == .authorizationRequired)
+
+        await lifecycle.shutdown(reason: .terminate)
     }
 
     @Test func providerStatusProjectsTheRegistrationField() {

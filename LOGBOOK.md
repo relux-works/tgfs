@@ -3,7 +3,23 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-08-18
+
+### 0130 — Retryable startup refusals and repair restarts publish definitive auth health (BUG-260729-2fla1z)
+
+- FIX: every namespace failure categorized `auth-required` is definitive for live authorization even when its namespace recovery metadata remains retryable. Transitional `preparing`/`unavailable` observations still cannot overwrite a stored-session probe's definitive refusal; a later definitive namespace `authorized` or `authorizationRequired` result can replace it. The durable write-once `accounts.auth_state` row is never mutated.
+- REGRESSION: `CoreRepairRunner` now has a deterministic probe seam. The lifecycle test invokes the runner's real `onAuthorizationObserved` callback, then exercises deferred `afterRepair -> restartNamespaces` against an on-disk durable `authorized` row and reads the health socket. A companion regression drives the synchronous `DriveError.AuthRequired` startup path and proves durable `authorized` plus live `authorizationRequired` renders `Authorization Required`.
+- NATIVE BOUNDARY: `.scripts/smoke/run_agent_auth_health_probe.py` starts the real debug `gramdrive-agent` executable with a DEBUG-only namespace bridge and queries it through the production `gramdrive-agent health` Unix-socket endpoint. Authorized, authorizationRequired, and unavailable were observed in 71 ms, 70 ms, and 76 ms respectively, while both health and SQLite retained durable `authorized`. Release builds exclude the fixture bridge and use `CoreNamespaceBootstrapper`.
+- VALIDATION: the isolated successor remains based on and merge-based at `ced8f57808eed88c073ed4286152a081d17d0632`; the dirty primary checkout was untouched and generated `apple/GramDriveSupport/Package.resolved` remains excluded. Focused lifecycle (29), health IPC (8), and companion derivation (7) tests exited 0. `make check-apple` exited 0 (2/2), `make check-security` exited 0 (1/1), `make package-app-unsigned` exited 0, `swift build -Xswiftc -warnings-as-errors` exited 0, the native authorization probe exited 0, Python bytecode validation exited 0, and `git diff --check` is the final whitespace gate. The ad-hoc unconfigured `swift format lint --strict` diagnostic exited 1 on the repository's existing four-space indentation baseline and is not represented as green.
+
 ## 2026-08-11
+
+### 2334 — Definitive auth-required health survives replacement preparation (BUG-260729-2fla1z)
+
+- REWORK: a stored-session probe can report a terminal `authorizationRequired` immediately before `afterRepair` stops and restarts the durable authorized namespace. The old replacement owner then reports `preparing`, which is only `unavailable` and must not erase the definitive probe result before the companion polls health. Namespace-owned `unavailable` updates now retain a prior `authorizationRequired`; only a replacement namespace's definitive `authorized` or `authorizationRequired` result supersedes it. Direct probe observations still publish `authorized`, `authorizationRequired`, and `unavailable` as received.
+- INVARIANT: the lifecycle keeps this source-priority state strictly in process-owned health data. The deterministic regression inserts a minimum valid durable `authorized` row at the on-disk state boundary, invokes the same `onAuthorizationObserved` callback behavior wired by `AgentMain`, restarts the namespace, and reads the real health socket while it is preparing. It observes durable `authorized` plus live `authorizationRequired`, then observes live `authorized` after the replacement reaches ready; it never writes the durable row.
+- COVERAGE: health IPC round-trips each observed state (`authorized`, `authorizationRequired`, `unavailable`) beside durable `authorized`; companion projection renders the terminal live state as `Authorization Required` and retains durable fallback for `unavailable`.
+- VALIDATION: isolated successor base and `origin/main` are `ced8f57808eed88c073ed4286152a081d17d0632`; stale source merge-base is `dcf5cfba2217b5829bb06096b1a1fc8b68b477f0`. Focused Swift suites passed (43 tests / 3 suites); `make check-apple` passed (build + full Swift package tests); `make check-security` passed; unsigned macOS arm64 app assembly passed and produced the attributable manifest at `.temp/app-packaging/manifest.json`; `git diff --check` passed. Generated `apple/GramDriveSupport/Package.resolved` remains excluded. `swift format lint --strict` returned exit 0 but reported existing whole-file two-space indentation and line-length diagnostics, so it is explicitly not treated as a clean lint gate.
 
 ### 2245 — typed auth-start refusals preserve sign-in contention (BUG-260729-2a6h8c)
 
@@ -17,6 +33,12 @@
 - FIX: `AuthorizationViewModel` renders `.starting` before any namespace teardown, coalesces repeated cancellation, maintains submission state across concurrent exits, and reports typed teardown failures. `LiveAuthorizationSession` now bounds channel open, first-event, submit, and the full cancellation path; a deadline closes the channel and returns `.timedOut`, while first-event EOF remains `.dropped`. Hosted auth submits receive the same bounded fail-closed behavior in `ControlServer`, retaining the current-main `Task.detached` Sendable boundary.
 - REGRESSION: deterministic Swift Testing coverage exercises a stalled model teardown, repeated cancellation, first-event timeout and EOF, stalled client submit, model-plus-live cancellation closure, and stalled hosted submit.
 - VALIDATION: focused authorization-view-model, live-control, and control-channel suites passed; `make check-apple` and `make check-security` passed. `swift format lint --strict` exited 1 because its default two-space rule flags pre-existing whole-file four-space indentation across repository sources/tests; no project formatter configuration or formatter gate exists, so this is retained as a non-green diagnostic rather than a formatting-wide rewrite.
+
+### 0024 — Health distinguishes live authorization from durable sign-in history (BUG-260729-2fla1z)
+
+- DECISION: health now carries an additive per-account live authorization observation beside the durable `auth_state` value. A namespace `AuthMachine` terminal `auth-required` result and a stored-session probe's signed-out result publish `authorizationRequired`; a ready namespace/probe publishes `authorized`; inconclusive or absent live work publishes `unavailable`.
+- INVARIANT: neither path writes the durable account row. Companion account status gives a terminal live `authorizationRequired` precedence over the same account's historical durable `authorized` marker, while an unavailable live observation retains the durable fallback.
+- VALIDATION: focused lifecycle, health-channel, and companion-status coverage passed (45 tests / 4 suites); the isolated current-main Apple acceptance suite passed build and the full Swift package tests; the security gate passed. `swift format lint --strict` exited 1 because its default two-space rule reports pre-existing whole-file four-space indentation and line-length debt in every touched Swift file; no formatter configuration exists, so a broad rewrite is deliberately out of scope.
 
 ### 0023 — Native x86_64 build requires an explicit detached auth submission boundary (BUG-260729-37ffmx)
 

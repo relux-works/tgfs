@@ -187,6 +187,10 @@ public final class AgentLifecycle: @unchecked Sendable {
     private var finderContentFailure: AgentActionableFailure?
     private var namespaceSessions: [Int64: OwnedNamespaceSession] = [:]
     private var namespaceProgress: [Int64: AgentNamespaceProgress] = [:]
+    /// The live namespace/probe observation, deliberately separate from the
+    /// durable `accounts.auth_state` row. A terminal TDLib sign-in state must
+    /// be visible to the companion without rewriting historical sign-in data.
+    private var namespaceAuthorization: [Int64: ObservedAuthorizationState] = [:]
     private var namespaceTokens: [Int64: UUID] = [:]
     private var namespaceReadyAccounts: Set<Int64> = []
     private var namespaceDegradations: [Int64: AgentActionableFailure] = [:]
@@ -689,6 +693,7 @@ public final class AgentLifecycle: @unchecked Sendable {
         let lastWakeMs = self.lastWakeMs
         let configuredFinderFailure = finderContentFailure
         let namespaceProgress = self.namespaceProgress
+        let namespaceAuthorization = self.namespaceAuthorization
         let namespaceReadyAccounts = self.namespaceReadyAccounts
         let namespaceDegradations = self.namespaceDegradations
         let hasNamespaceBootstrapper = configuration.namespaceBootstrapper != nil
@@ -775,7 +780,8 @@ public final class AgentLifecycle: @unchecked Sendable {
                     AccountHealthSummary(
                         accountId: account.accountId,
                         displayName: account.displayName,
-                        authState: account.authState
+                        authState: account.authState,
+                        observedAuthorization: namespaceAuthorization[account.accountId]
                     )
                 }
             },
@@ -794,6 +800,23 @@ public final class AgentLifecycle: @unchecked Sendable {
     public func recordAuthDiagnostic(_ code: AuthDiagnosticCode) {
         authDiagnostics.record(code)
         record(code.rawValue)
+    }
+
+    /// Publishes a privacy-safe live authorization observation without ever
+    /// mutating the durable account row. The namespace bridge calls this for
+    /// TDLib's terminal states; the repair seam calls it for stored-session
+    /// probe outcomes.
+    public func recordObservedAuthorization(
+        _ state: ObservedAuthorizationState,
+        accountId: Int64
+    ) {
+        setLocked { namespaceAuthorization[accountId] = state }
+    }
+
+    /// Testable read of the live observation held by this process. Health
+    /// publishes the same value alongside the durable account summary.
+    func observedAuthorizationState(accountId: Int64) -> ObservedAuthorizationState? {
+        setLockedReturning { namespaceAuthorization[accountId] }
     }
 
     // MARK: - Internals
@@ -1091,6 +1114,7 @@ public final class AgentLifecycle: @unchecked Sendable {
         let token = UUID()
         setLocked {
             namespaceProgress[accountId] = .preparing
+            recordNamespaceAuthorizationLocked(.unavailable, accountId: accountId)
             namespaceTokens[accountId] = token
         }
         do {
@@ -1133,6 +1157,8 @@ public final class AgentLifecycle: @unchecked Sendable {
             // rejects callbacks from an owner that has since been stopped.
             guard namespaceTokens[accountId] == token else { return (false, false) }
             namespaceProgress[accountId] = progress
+            recordNamespaceAuthorizationLocked(
+                Self.observedAuthorization(for: progress), accountId: accountId)
             switch progress {
             case .ready:
                 namespaceReadyAccounts.insert(accountId)
@@ -1186,6 +1212,40 @@ public final class AgentLifecycle: @unchecked Sendable {
         if outcome.recover {
             scheduleNamespaceRecovery(accountId: accountId, token: token)
         }
+    }
+
+    private static func observedAuthorization(
+        for progress: AgentNamespaceProgress
+    ) -> ObservedAuthorizationState {
+        switch progress {
+        case .ready:
+            return .authorized
+        case let .failed(category, _)
+            where category == "auth-required":
+            return .authorizationRequired
+        case .preparing, .degraded, .failed, .stopped:
+            return .unavailable
+        }
+    }
+
+    /// A replacement namespace commonly emits `preparing` before TDLib has
+    /// reached a terminal authorization answer. Do not let that transitional
+    /// `unavailable` result hide a definitive stored-session probe refusal:
+    /// the companion must see it during the next health interval. The new
+    /// owner clears the hold only by reaching its own definitive terminal
+    /// authorization result.
+    ///
+    /// Call only while `lock` is held.
+    private func recordNamespaceAuthorizationLocked(
+        _ state: ObservedAuthorizationState,
+        accountId: Int64
+    ) {
+        if state == .unavailable,
+           namespaceAuthorization[accountId] == .authorizationRequired
+        {
+            return
+        }
+        namespaceAuthorization[accountId] = state
     }
 
     private func scheduleNamespaceRecovery(accountId: Int64, token: UUID) {

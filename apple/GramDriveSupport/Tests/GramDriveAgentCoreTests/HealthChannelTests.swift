@@ -36,6 +36,34 @@ private func sampleSnapshot(state: AgentRunState = .running) -> AgentHealthSnaps
         }
     }
 
+    @Test func healthIpcCarriesEveryLiveAuthorizationStateBesideDurableState() throws {
+        try withTemporaryDirectory { root in
+            for state in [
+                ObservedAuthorizationState.authorized,
+                .authorizationRequired,
+                .unavailable,
+            ] {
+                let socket = root.appendingPathComponent("health-\(state.rawValue).sock")
+                let durableAccount = AccountHealthSummary(
+                    accountId: 7,
+                    displayName: "Private",
+                    authState: "authorized",
+                    observedAuthorization: state)
+                let server = try AgentHealthServer.start(socketURL: socket) {
+                    var snapshot = sampleSnapshot()
+                    snapshot.accounts = [durableAccount]
+                    return snapshot
+                }
+
+                let fetched = try AgentHealthClient.fetch(socketURL: socket)
+                let account = try #require(fetched.accounts?.first)
+                #expect(account.authState == "authorized")
+                #expect(account.observedAuthorization == state)
+                server.stop()
+            }
+        }
+    }
+
     @Test func aSocketPathBeyondSunPathStillWorks() throws {
         try withTemporaryDirectory { root in
             // Group-container data roots routinely exceed sockaddr_un's
