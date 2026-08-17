@@ -500,12 +500,17 @@ public struct CoreAccountRemover: AgentAccountRemoving {
 /// each configured account's stored Telegram session still authorizes. A
 /// signed-out account reports `authRequired` — the actionable answer.
 public struct CoreRepairRunner: AgentRepairing {
+  typealias AuthorizationProbe = @Sendable (
+    AuthSessionConfig, Int64, any SecretVault
+  ) async throws -> AuthProbeOutcome
+
   private let configuration: CoreAuthConfiguration
   private let vault: any SecretVault
   private let accounts: @Sendable () throws -> [AccountHealthSummary]
   private let beforeRepair: @Sendable () -> Void
   private let afterRepair: @Sendable () -> Void
-  private let onSignedOutProbe: @Sendable () -> Void
+  private let onAuthorizationObserved: @Sendable (Int64, ObservedAuthorizationState) -> Void
+  private let authorizationProbe: AuthorizationProbe
 
   public init(
     configuration: CoreAuthConfiguration,
@@ -513,14 +518,40 @@ public struct CoreRepairRunner: AgentRepairing {
     accounts: @escaping @Sendable () throws -> [AccountHealthSummary],
     beforeRepair: @escaping @Sendable () -> Void = {},
     afterRepair: @escaping @Sendable () -> Void = {},
-    onSignedOutProbe: @escaping @Sendable () -> Void = {}
+    onAuthorizationObserved: @escaping @Sendable (Int64, ObservedAuthorizationState) -> Void = {
+      _, _ in
+    }
+  ) {
+    self.init(
+      configuration: configuration,
+      vault: vault,
+      accounts: accounts,
+      beforeRepair: beforeRepair,
+      afterRepair: afterRepair,
+      onAuthorizationObserved: onAuthorizationObserved,
+      authorizationProbe: { config, accountId, vault in
+        try await probeAuthorization(config: config, accountId: accountId, vault: vault)
+      })
+  }
+
+  init(
+    configuration: CoreAuthConfiguration,
+    vault: any SecretVault,
+    accounts: @escaping @Sendable () throws -> [AccountHealthSummary],
+    beforeRepair: @escaping @Sendable () -> Void = {},
+    afterRepair: @escaping @Sendable () -> Void = {},
+    onAuthorizationObserved: @escaping @Sendable (Int64, ObservedAuthorizationState) -> Void = {
+      _, _ in
+    },
+    authorizationProbe: @escaping AuthorizationProbe
   ) {
     self.configuration = configuration
     self.vault = vault
     self.accounts = accounts
     self.beforeRepair = beforeRepair
     self.afterRepair = afterRepair
-    self.onSignedOutProbe = onSignedOutProbe
+    self.onAuthorizationObserved = onAuthorizationObserved
+    self.authorizationProbe = authorizationProbe
   }
 
   public func repair() async -> ControlCommandOutcome {
@@ -536,18 +567,20 @@ public struct CoreRepairRunner: AgentRepairing {
     }
     for account in configured {
       do {
-        let outcome = try await probeAuthorization(
-          config: configuration.sessionConfig(),
-          accountId: account.accountId,
-          vault: vault)
-        if case .signedOut = outcome {
-          onSignedOutProbe()
+        let outcome = try await authorizationProbe(
+          configuration.sessionConfig(), account.accountId, vault)
+        switch outcome {
+        case .authorized(_, _):
+          onAuthorizationObserved(account.accountId, .authorized)
+        case .signedOut(_):
+          onAuthorizationObserved(account.accountId, .authorizationRequired)
           return .failed(
             ControlCommandFailure(
               category: .authRequired,
               detail: "account \(account.accountId) needs a fresh sign-in"))
         }
       } catch {
+        onAuthorizationObserved(account.accountId, .unavailable)
         return .failed(ControlServer.failure(from: error))
       }
     }

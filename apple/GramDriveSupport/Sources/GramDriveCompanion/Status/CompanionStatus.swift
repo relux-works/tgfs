@@ -17,7 +17,7 @@ public enum AgentPresence: Equatable, Sendable {
 }
 
 /// The account's authorization standing from the durable account summaries
-/// carried by agent health.
+/// and the agent's live namespace observations carried by health.
 public enum AccountStatus: Equatable, Sendable {
     /// The agent is not running, so no account can be served.
     case agentUnavailable
@@ -36,7 +36,7 @@ public enum AccountStatus: Equatable, Sendable {
         case .unknown: return "Status not reported yet"
         case .authorized: return "Authorized"
         case .notConfigured: return "No account configured"
-        case .authorizationRequired: return "Authorization required"
+        case .authorizationRequired: return "Authorization Required"
         }
     }
 }
@@ -167,7 +167,10 @@ public final class CompanionStatusViewModel {
         switch readout {
         case .running(let snapshot):
             guard let accounts = snapshot.accounts else { return .unknown }
-            if accounts.contains(where: { $0.authState == "authorized" }) {
+            if accounts.contains(where: {
+                $0.authState == "authorized"
+                    && $0.observedAuthorization != .authorizationRequired
+            }) {
                 return .authorized
             }
             return accounts.isEmpty ? .notConfigured : .authorizationRequired

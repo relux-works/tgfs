@@ -104,6 +104,21 @@ enum AgentMain {
                 ?? (ProcessInfo.processInfo.environment["GRAMDRIVE_TELEGRAM_TEST_DC"] == "1")
         let vault = KeychainSecretVault()
         let authConfiguration = CoreAuthConfiguration(dataRoot: dataRoot, useTestDc: useTestDc)
+        let namespaceBootstrapper: any AgentNamespaceBootstrapping
+        #if DEBUG
+            if let rawState = options["test-observed-authorization"] {
+                guard let state = ObservedAuthorizationState(rawValue: rawState) else {
+                    fail("test-observed-authorization has an invalid state", code: 64)
+                }
+                namespaceBootstrapper = AuthorizationHealthProbeBootstrapper(state: state)
+            } else {
+                namespaceBootstrapper = CoreNamespaceBootstrapper(
+                    configuration: authConfiguration, vault: vault)
+            }
+        #else
+            namespaceBootstrapper = CoreNamespaceBootstrapper(
+                configuration: authConfiguration, vault: vault)
+        #endif
         let lifecycleRef = LifecycleRef()
         let terminationExit = TerminationExitGate(
             watchdog: commitExitWatchdog,
@@ -142,8 +157,12 @@ enum AgentMain {
                 },
                 beforeRepair: { lifecycleRef.lifecycle?.stopAllNamespaces() },
                 afterRepair: { lifecycleRef.lifecycle?.restartNamespaces() },
-                onSignedOutProbe: {
-                    lifecycleRef.lifecycle?.recordAuthDiagnostic(.probeSignedOut)
+                onAuthorizationObserved: { accountId, state in
+                    lifecycleRef.lifecycle?.recordObservedAuthorization(
+                        state, accountId: accountId)
+                    if state == .authorizationRequired {
+                        lifecycleRef.lifecycle?.recordAuthDiagnostic(.probeSignedOut)
+                    }
                 }
             ),
             contentPolicy: contentPolicy
@@ -156,9 +175,7 @@ enum AgentMain {
             ),
             powerEvents: WorkspacePowerEventSource(),
             controlSeams: seams,
-            namespaceBootstrapper: CoreNamespaceBootstrapper(
-                configuration: authConfiguration, vault: vault
-            ),
+            namespaceBootstrapper: namespaceBootstrapper,
             onTerminationAccepted: { request in
                 terminationExit.request(request)
             },
@@ -454,6 +471,44 @@ enum AgentMain {
         }
     }
 }
+
+#if DEBUG
+    /// Process-boundary fixture for the native health smoke. Release builds
+    /// always use `CoreNamespaceBootstrapper`; this bridge drives the same
+    /// lifecycle reducer and health socket without requiring a Telegram
+    /// account on CI.
+    private struct AuthorizationHealthProbeBootstrapper: AgentNamespaceBootstrapping {
+        let state: ObservedAuthorizationState
+
+        func start(
+            accountId _: Int64,
+            onProgress: @escaping @Sendable (AgentNamespaceProgress) -> Void
+        ) throws -> any AgentNamespaceSessionHosting {
+            switch state {
+            case .authorized:
+                onProgress(.ready(canonicalChatCount: 0, appearanceCount: 0))
+            case .authorizationRequired:
+                // Intentionally retryable: auth-required is terminal for the
+                // authorization projection regardless of recovery policy.
+                onProgress(.failed(category: "auth-required", retryable: true))
+            case .unavailable:
+                onProgress(.preparing)
+            }
+            return AuthorizationHealthProbeSession()
+        }
+    }
+
+    private final class AuthorizationHealthProbeSession: AgentNamespaceSessionHosting,
+        @unchecked Sendable
+    {
+        func setChatHistoryPriority(
+            chatId _: Int64,
+            priority _: AgentChatHistoryPriority
+        ) throws {}
+
+        func close() {}
+    }
+#endif
 
 /// Progress sink for the hosted boundary probe; the probe's purpose here
 /// is being drainable, not being watched.

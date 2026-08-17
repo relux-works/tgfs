@@ -1,6 +1,7 @@
 import Foundation
 import GramDriveCore
 import GramDriveSupport
+import SQLite3
 import Testing
 
 @testable import GramDriveAgentCore
@@ -129,6 +130,42 @@ private func startedLifecycle(
             terminationCommitLease: terminationCommitLease))
     try lifecycle.start()
     return lifecycle
+}
+
+/// Seeds one account through the actual on-disk state boundary. Production
+/// writes this row only through the core authorization owner; tests use the
+/// minimum valid durable row to verify health is read-only with respect to it.
+private func seedAuthorizedAccount(dataRoot: URL, accountId: Int64) throws {
+    let layout = try sharedStateLayout(dataRoot: dataRoot.path)
+    var database: OpaquePointer?
+    let openResult = sqlite3_open_v2(
+        layout.databaseFile,
+        &database,
+        SQLITE_OPEN_READWRITE,
+        nil)
+    guard openResult == SQLITE_OK, let database else {
+        throw CocoaError(.fileReadUnknown)
+    }
+    defer { sqlite3_close(database) }
+
+    let statementSQL = """
+        INSERT INTO accounts (
+            account_id, source_kind, display_name, auth_state, namespace_version,
+            retention_mode, archive_mode, created_at_ms, updated_at_ms, display_timezone
+        ) VALUES (?, 'local_tdlib', 'Private', 'authorized', 0, 'mirror', 0, 1, 1, 'UTC')
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, statementSQL, -1, &statement, nil) == SQLITE_OK,
+          let statement
+    else {
+        throw CocoaError(.fileReadCorruptFile)
+    }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_bind_int64(statement, 1, accountId) == SQLITE_OK,
+          sqlite3_step(statement) == SQLITE_DONE
+    else {
+        throw CocoaError(.fileWriteUnknown)
+    }
 }
 
 @Suite struct AgentLifecycleTests {
@@ -495,7 +532,63 @@ private func startedLifecycle(
             #expect(
                 lifecycle.namespaceStatus(accountId: 9)
                     == .failed(category: "auth-required", retryable: true))
+            #expect(
+                lifecycle.observedAuthorizationState(accountId: 9)
+                    == .authorizationRequired)
             #expect(lifecycle.healthSnapshot().recentEvents.contains("namespace-start-failed"))
+
+            await lifecycle.shutdown(reason: .terminate)
+        }
+    }
+
+    @Test func repairAuthRequiredObservationSurvivesRestartAndPreservesDurableHealthRow() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let bootstrapper = FakeNamespaceBootstrapper()
+            let lifecycle = AgentLifecycle(
+                configuration: AgentConfiguration(
+                    dataRoot: root, namespaceBootstrapper: bootstrapper))
+            try lifecycle.start()
+            try seedAuthorizedAccount(dataRoot: root, accountId: 9)
+
+            let repairer = CoreRepairRunner(
+                configuration: CoreAuthConfiguration(dataRoot: root),
+                vault: KeychainSecretVault(),
+                accounts: { lifecycle.healthSnapshot().accounts ?? [] },
+                beforeRepair: { lifecycle.stopAllNamespaces() },
+                afterRepair: { lifecycle.restartNamespaces() },
+                onAuthorizationObserved: { accountId, state in
+                    lifecycle.recordObservedAuthorization(state, accountId: accountId)
+                },
+                authorizationProbe: { _, accountId, _ in
+                    #expect(accountId == 9)
+                    return .signedOut(kind: "waitPhoneNumber")
+                })
+
+            let outcome = await repairer.repair()
+            #expect(
+                outcome
+                    == .failed(
+                        ControlCommandFailure(
+                            category: .authRequired,
+                            detail: "account 9 needs a fresh sign-in")))
+            #expect(bootstrapper.startCount(accountId: 9) == 1)
+            #expect(lifecycle.namespaceStatus(accountId: 9) == .preparing)
+
+            // The replacement owner starts in a transitional state. That must
+            // not erase the repair result before a companion health read.
+            bootstrapper.emit(.preparing, accountId: 9)
+            let afterRestart = try AgentHealthClient.fetch(
+                socketURL: lifecycle.runtimeLayout.healthSocket)
+            let durableButSignedOut = try #require(afterRestart.accounts?.first)
+            #expect(durableButSignedOut.authState == "authorized")
+            #expect(durableButSignedOut.observedAuthorization == .authorizationRequired)
+
+            // A definitive replacement result supersedes the held probe
+            // result, while the durable row stays untouched throughout.
+            bootstrapper.emit(
+                .ready(canonicalChatCount: 1, appearanceCount: 1), accountId: 9)
+            #expect(lifecycle.observedAuthorizationState(accountId: 9) == .authorized)
+            #expect(lifecycle.healthSnapshot().accounts?.first?.authState == "authorized")
 
             await lifecycle.shutdown(reason: .terminate)
         }
