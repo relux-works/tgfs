@@ -5,6 +5,13 @@
 
 ## 2026-08-18
 
+### 0354 — Protected consolidation publication is reconciled without rewriting its historical native failure (TASK-260811-2the0w)
+
+- PUBLICATION: protected PR [#4](https://github.com/relux-works/tgfs/pull/4) merged the accepted consolidation as `655307c889318034105d22ac458283115a3c2aef`. Its tree is byte-identical to the Sol-accepted branch tip `7a27e674ec3c6a8dba111d61ae2fbec1a7afe870`; GitHub recreated the commit during protected integration, so the branch-tip SHA itself is not an ancestor of `main`.
+- PROTECTION DECISION: to remove the self-approval deadlock, the explicitly authorized ruleset change set required approvals from 1 to 0 and disabled CODEOWNERS and last-push approval. PR-only integration, deletion/non-fast-forward protection, resolved-review-thread enforcement, and strict required `rust-core`/`secret-scan` checks remained enabled. PR #4 then merged normally without an administrative bypass or history rewrite; the active `Protect main` ruleset still has that constrained posture.
+- HISTORICAL RESULT: post-merge CI [run 31487623015](https://github.com/relux-works/tgfs/actions/runs/31487623015) passed at `655307c`, but native-ci [run 31487623018](https://github.com/relux-works/tgfs/actions/runs/31487623018) failed `ControlChannelTests.statusAnswersTheLifecycleSnapshot` with a real control-socket timeout. That run remains red. Protected PR [#5](https://github.com/relux-works/tgfs/pull/5) directly repaired the listener-registration race as `165174a6c5ecc65bf1edbc29612be6564ea847ae`; its later native failure was the distinct committed-replacement timing incident recorded below and repaired through protected PR #6.
+- CURRENT PROOF: reconciled public `main` `3f6f17d4a0477ec2434598b4c8d12819896af900` contains `655307c` and every path from the accepted runtime tree, with the Sparkle 2.9.5/helper lifecycle, exact-identity termination, and four fixed roots retained alongside later protected auth, journal, and onboarding fixes. At its immediate predecessor `4f59d2aa0e51cd3c2c6c2a9363afb7c5924ae2fe`, exact-SHA CI [run 32079931251](https://github.com/relux-works/tgfs/actions/runs/32079931251) and native-ci [run 32079931292](https://github.com/relux-works/tgfs/actions/runs/32079931292) both passed; native-ci includes green TDLib, Apple build/test, and unsigned packaging jobs.
+
 ### 0331 — Onboarding re-entry consumes one fresh sign-in attempt (BUG-260729-1dxhno)
 
 - ROOT CAUSE: onboarding auto-started only from `.idle` with no control-channel error, so closed, unsupported, failed, busy, dropped, timed-out, and otherwise unavailable outcomes permanently suppressed the Sign In step's `.task` on a later visit.
