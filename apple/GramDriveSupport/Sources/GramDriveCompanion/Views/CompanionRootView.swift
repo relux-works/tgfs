@@ -57,7 +57,10 @@ public struct CompanionRootView: View {
     case .account:
       AccountStatusView(model: model.status, contentPolicies: model.contentPolicies)
     case .authorization:
-      AuthorizationView(model: model.authorization)
+      AuthorizationView(
+        model: model.authorization,
+        showAccount: { model.selectedSection = .account },
+        removeAccount: { model.selectedSection = .removal })
     case .storage:
       StorageSettingsView(
         model: model.settings,

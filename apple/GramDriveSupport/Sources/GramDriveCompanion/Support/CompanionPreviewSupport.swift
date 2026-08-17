@@ -15,6 +15,7 @@ public final class InMemoryCompanionBackend: CompanionBackend, @unchecked Sendab
   private var loadError: (any Error)?
   private var policyStatuses: [Int64: ControlContentPolicyStatus]
   private var policyCommands: [RecordedPolicyCommand] = []
+  private let healthProvider: (@Sendable () async -> HealthReadout)?
   private let sessionFactory: @Sendable () -> any AuthorizationSession
 
   public init(
@@ -25,6 +26,7 @@ public final class InMemoryCompanionBackend: CompanionBackend, @unchecked Sendab
     policyStatuses: [Int64: ControlContentPolicyStatus] = [:],
     saveError: (any Error)? = nil,
     loadError: (any Error)? = nil,
+    healthProvider: (@Sendable () async -> HealthReadout)? = nil,
     session: @escaping @Sendable () -> any AuthorizationSession = {
       UnavailableAuthorizationSession(reason: .notWired)
     }
@@ -36,6 +38,7 @@ public final class InMemoryCompanionBackend: CompanionBackend, @unchecked Sendab
     self.policyStatuses = policyStatuses
     self.saveError = saveError
     self.loadError = loadError
+    self.healthProvider = healthProvider
     self.sessionFactory = session
   }
 
@@ -53,7 +56,8 @@ public final class InMemoryCompanionBackend: CompanionBackend, @unchecked Sendab
   }
 
   public func fetchHealth() async -> HealthReadout {
-    lock.withLock { health }
+    if let healthProvider { return await healthProvider() }
+    return lock.withLock { health }
   }
 
   public func loadSettings() throws -> AgentSettings {

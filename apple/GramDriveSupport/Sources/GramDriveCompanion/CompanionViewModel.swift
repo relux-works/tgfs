@@ -54,6 +54,7 @@ public final class CompanionViewModel {
   /// The first-launch onboarding flow, over the same live sub-view models so
   /// sign-in and defaults chosen during onboarding are the shell's own.
   public let onboarding: OnboardingViewModel
+  private var healthRefreshGeneration: UInt64 = 0
 
   public init(
     backend: any CompanionBackend,
@@ -87,18 +88,32 @@ public final class CompanionViewModel {
 
   /// Refreshes status and reloads settings — the shell's on-appear pass.
   public func refresh() async {
-    await status.refresh()
+    let readout = await refreshHealthAndAuthorization()
     settings.load()
-    await contentPolicies.refresh(from: status.readout)
+    if let readout { await contentPolicies.refresh(from: readout) }
   }
 
   /// Establishes the companion session's agent readiness before launch UI
   /// is presented. Live status refresh owns the cold-start barrier; scripted
   /// backends remain deterministic in previews and tests.
   public func startAgentSession() async {
-    await status.refresh()
-    guard Self.hasAuthorizedAccount(in: status.readout) else { return }
+    guard let readout = await refreshHealthAndAuthorization(),
+      Self.hasAuthorizedAccount(in: readout)
+    else { return }
     await onboarding.prepareFileProviderDomain()
+  }
+
+  /// Applies only the newest requested health read to authorization. This
+  /// prevents an older delayed refresh from rolling a newer signed-in result
+  /// back to an idle prompt after actor reentrancy.
+  private func refreshHealthAndAuthorization() async -> HealthReadout? {
+    healthRefreshGeneration &+= 1
+    let generation = healthRefreshGeneration
+    await status.refresh()
+    guard generation == healthRefreshGeneration else { return nil }
+    let readout = status.readout
+    authorization.reconcile(with: readout)
+    return readout
   }
 
   /// A privacy-preserving launch gate: only the authorization marker is
