@@ -5,6 +5,8 @@ import base64
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -492,6 +494,49 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertLess(job.index("upload_immutable \".temp/publication/out/$PUBLICATION_PACKAGE\""), job.index("test.xml --clobber"))
         self.assertIn("restore_prior", job)
         self.assertIn("cmp .temp/publication/out/test.xml", job)
+
+    def test_bash_32_optional_prior_file_executes_empty_and_present_branches(self):
+        helper = REPO_ROOT / ".github" / "scripts" / "run-with-optional-file-argument.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = root / "capture"
+            command = root / "capture-command"
+            command.write_text(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            command.chmod(0o755)
+            environment = dict(os.environ, CAPTURE=str(capture))
+
+            for prior, expected in (
+                ("", ["required value", "--output", "feed.xml"]),
+                ("prior feed.xml", ["required value", "--output", "feed.xml", "--prior-feed", "prior feed.xml"]),
+            ):
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-euo",
+                        "pipefail",
+                        "-c",
+                        'source "$1"; run_with_optional_file_argument --prior-feed "$2" "$3" "required value" --output feed.xml',
+                        "bash",
+                        str(helper),
+                        prior,
+                        str(command),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(capture.read_text(encoding="utf-8").splitlines(), expected)
+
+    def test_publication_workflows_use_bash_32_safe_optional_file_helper(self):
+        combined = self.candidate + self.stable
+        self.assertNotIn("prior_args=()", combined)
+        self.assertNotIn('${prior_args[@]}', combined)
+        self.assertEqual(combined.count("run_with_optional_file_argument"), 3)
 
     def test_stable_promotion_never_builds_or_resigns_apple_code(self):
         promote = self.stable[self.stable.index("  promote:"):self.stable.index("  deploy-pages:")]
