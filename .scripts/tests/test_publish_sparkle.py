@@ -90,6 +90,12 @@ def sig(path: Path, length: int, *, notes: bool = False) -> None:
     path.write_text(warning + f'sparkle:edSignature="{SIGNATURE}" {prefix}="{length}"\n', encoding="utf-8")
 
 
+def append_signature(path: Path, signature: bytes) -> None:
+    content = path.read_bytes()
+    encoded = base64.b64encode(signature).decode()
+    path.write_bytes(content + f"<!-- sparkle-signatures:\nedSignature: {encoded}\nlength: {len(content)}\n-->\n".encode())
+
+
 def render(root: Path, output: Path, *, channel: str, generation: int = 1, prior: Path | None = None) -> None:
     manifest = pub.verify_candidate(root)
     notes = output.parent / "notes.md"
@@ -244,6 +250,86 @@ class FeedTests(unittest.TestCase):
             pub.unpack_tree(archive, base / "restored")
             self.assertEqual((base / "restored/updates/stable/v1/stable.xml").read_bytes(), old.read_bytes())
 
+    def _authenticated_site(self, base: Path):
+        site = base / "site"
+        keys = {1: base64.b64encode(b"1" * 32).decode(), 2: base64.b64encode(b"2" * 32).decode()}
+        accepted: dict[tuple[bytes, bytes], bytes] = {}
+        for generation, marker in ((1, b"a"), (2, b"b")):
+            candidate = stage_candidate(base / f"candidate-{generation}", mode="stable-candidate", build=99 + generation)
+            feed = site / f"updates/stable/v{generation}/stable.xml"
+            feed.parent.mkdir(parents=True)
+            render(candidate, feed, channel="stable", generation=generation)
+            notes_name = f"GramDrive-1.2.3-{99 + generation}.md"
+            notes = site / f"updates/stable/v{generation}/notes/{notes_name}"
+            notes.parent.mkdir()
+            notes.write_bytes((feed.parent / "notes.md").read_bytes())
+            (feed.parent / "notes.md").unlink()
+            content = feed.read_bytes()
+            feed_signature = marker * 64
+            append_signature(feed, feed_signature)
+            key = base64.b64decode(keys[generation])
+            accepted[(key, content)] = feed_signature
+            accepted[(key, notes.read_bytes())] = b"s" * 64
+        archive = base / "stable-pages-site.tar.gz"
+        pub.pack_tree(site, archive)
+        manifest = base / "stable-pages-site-manifest.json"
+        pub.write_site_manifest(site, archive, keys, 2, manifest)
+        manifest_signature = base / "stable-pages-site-manifest.signature.txt"
+        sig_bytes = b"m" * 64
+        manifest_signature.write_text(
+            f'sparkle:edSignature="{base64.b64encode(sig_bytes).decode()}" length="{manifest.stat().st_size}"\n'
+        )
+        accepted[(base64.b64decode(keys[2]), manifest.read_bytes())] = sig_bytes
+        return site, archive, manifest, manifest_signature, keys, accepted
+
+    def test_authenticated_site_verifies_every_generation_and_exact_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            site, archive, manifest, signature_path, _keys, accepted = self._authenticated_site(base)
+            verifier = lambda key, data, signature: accepted.get((key, data)) == signature
+            pub.verify_site(site, archive, manifest, signature_path, verifier=verifier)
+
+            (site / "extra.txt").write_text("extra")
+            with self.assertRaisesRegex(pub.PublicationError, "inventory changed"):
+                pub.verify_site(site, archive, manifest, signature_path, verifier=verifier)
+            (site / "extra.txt").unlink()
+
+            notes = site / "updates/stable/v1/notes/GramDrive-1.2.3-100.md"
+            notes.write_text("changed")
+            with self.assertRaisesRegex(pub.PublicationError, "inventory changed"):
+                pub.verify_site(site, archive, manifest, signature_path, verifier=verifier)
+
+    def test_site_rejects_replaced_archive_modified_feed_and_wrong_generation_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            site, archive, manifest, signature_path, keys, accepted = self._authenticated_site(base)
+            verifier = lambda key, data, signature: accepted.get((key, data)) == signature
+
+            archive.write_bytes(archive.read_bytes() + b"changed")
+            with self.assertRaisesRegex(pub.PublicationError, "archive digest changed"):
+                pub.verify_site(site, archive, manifest, signature_path, verifier=verifier)
+
+            pub.pack_tree(site, archive)
+            feed = site / "updates/stable/v1/stable.xml"
+            original_feed = feed.read_bytes()
+            feed.write_bytes(original_feed.replace(b"GramDrive stable", b"GramDrive broken", 1))
+            pub.pack_tree(site, archive)
+            pub.write_site_manifest(site, archive, keys, 2, manifest)
+            sig(signature_path, manifest.stat().st_size)
+            accepted[(base64.b64decode(keys[2]), manifest.read_bytes())] = b"s" * 64
+            with self.assertRaisesRegex(pub.PublicationError, "feed EdDSA signature is invalid"):
+                pub.verify_site(site, archive, manifest, signature_path, verifier=verifier)
+
+            feed.write_bytes(original_feed)
+            pub.pack_tree(site, archive)
+            wrong_key = base64.b64encode(b"3" * 32).decode()
+            keys[1] = wrong_key
+            pub.write_site_manifest(site, archive, keys, 2, manifest)
+            sig(signature_path, manifest.stat().st_size)
+            accepted[(base64.b64decode(keys[2]), manifest.read_bytes())] = b"s" * 64
+            with self.assertRaisesRegex(pub.PublicationError, "feed EdDSA signature is invalid"):
+                pub.verify_site(site, archive, manifest, signature_path, verifier=verifier)
+
     def test_stable_promotion_requires_candidate_in_signed_test_offer(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -266,6 +352,26 @@ class FeedTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(pub.PublicationError, "escapes the test endpoint"):
                 pub.verify_test_offer(candidate, feed, notes, verifier=lambda _key, _data, _signature: True)
+
+    def test_rotation_bridges_same_candidate_then_freezes_old_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bridge_candidate = stage_candidate(base / "bridge", mode="stable-candidate", build=200)
+            old_feed = base / "v1.xml"
+            new_feed = base / "v2.xml"
+            render(bridge_candidate, old_feed, channel="stable", generation=1)
+            render(bridge_candidate, new_feed, channel="stable", generation=2)
+            old_item = ET.parse(old_feed).getroot().find("channel/item")
+            new_item = ET.parse(new_feed).getroot().find("channel/item")
+            self.assertEqual(pub._item_build(old_item), pub._item_build(new_item))
+            self.assertEqual(old_item.find("enclosure").get("url"), new_item.find("enclosure").get("url"))
+            self.assertIn("/stable/v1/notes/", old_item.find(f"{{{pub.SPARKLE_NS}}}releaseNotesLink").text)
+            self.assertIn("/stable/v2/notes/", new_item.find(f"{{{pub.SPARKLE_NS}}}releaseNotesLink").text)
+            frozen_old = old_feed.read_bytes()
+
+            next_candidate = stage_candidate(base / "next", mode="stable-candidate", build=201)
+            render(next_candidate, base / "v2-next.xml", channel="stable", generation=2, prior=new_feed)
+            self.assertEqual(old_feed.read_bytes(), frozen_old)
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -295,6 +401,22 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("verify-test-offer", promote)
         self.assertIn("SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64", promote)
 
+    def test_approved_rotation_signs_old_bridge_and_new_feed_with_distinct_keys(self):
+        promote = self.stable[self.stable.index("  promote:"):self.stable.index("  recover-pages:")]
+        self.assertIn("- rotate-key", self.stable)
+        self.assertIn("SPARKLE_STABLE_PREVIOUS_EDDSA_PRIVATE_KEY_B64", promote)
+        self.assertIn("old generation/public key does not match the authenticated prior site", promote)
+        self.assertIn('"${{ steps.source.outputs.previous_generation }}"', promote)
+        self.assertIn("rotation refuses to create a bridge", promote)
+        self.assertIn('"${{ steps.source.outputs.generation }}"', promote)
+
+    def test_candidate_binds_rotated_stable_clients_but_test_clients_are_v1_disposable(self):
+        self.assertIn("stable_feed_generation", self.candidate)
+        self.assertIn("--update-feed-generation", self.candidate)
+        publisher = self.candidate[self.candidate.index("  publish-test:"):]
+        self.assertIn("updates-test-v1", publisher)
+        self.assertNotIn("SPARKLE_TEST_V2", publisher)
+
     def test_pages_capability_is_isolated_from_stable_key_and_contents_write(self):
         deploy = self.stable[self.stable.index("  deploy-pages:"):]
         self.assertIn("pages: write", deploy)
@@ -310,6 +432,9 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("environment: release", recovery)
         self.assertIn("stable-pages-site.tar.gz", recovery)
         self.assertIn("unpack-tree", recovery)
+        self.assertIn("stable-pages-site.attestation.json", recovery)
+        self.assertIn("gh attestation verify", recovery)
+        self.assertIn("verify-site", recovery)
         self.assertNotIn("contents: write", recovery)
         self.assertNotIn("SPARKLE_STABLE", recovery)
         deploy = self.stable[self.stable.index("  deploy-pages:"):]

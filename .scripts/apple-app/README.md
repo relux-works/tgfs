@@ -53,11 +53,14 @@ commit, and its signature would be stale the moment the toolchain moved.
 
 The packager embeds one trust channel at build time; there is no runtime
 test/stable selector. `--update-channel test` (the default) embeds only the
-reviewed v1 GitHub Release feed and its reviewed public EdDSA key.
-`--update-channel stable` embeds only the reviewed v1 Pages feed and its
-different reviewed public EdDSA key. Both feed/key pairs are checked-in public
-configuration, validated before assembly, and never read from environment or
-CLI input. `Version.json` is the reviewed three-part marketing version source,
+reviewed v1 GitHub Release feed and its reviewed public EdDSA key. Test clients
+are disposable: `updates-test-v1` is frozen, rather than bridged into stable
+trust, if its key is ever retired. `--update-channel stable` defaults to the
+reviewed v1 Pages feed and its different reviewed public EdDSA key. An approved
+rotation candidate uses `--update-feed-generation N --update-public-key KEY`;
+the packager constructs the versioned URL itself, rejects v1 key overrides, and
+records the generation/key in the signed candidate manifest. `Version.json` is
+the reviewed three-part marketing version source,
 while the numeric `CFBundleVersion` remains the commit count.
 
 Publication never rebuilds those bytes. The candidate workflow first uploads
@@ -73,16 +76,20 @@ deploys the complete site.
 If Pages deployment fails—or a previously accepted site must be restored after
 its candidate has aged out of the rolling feed—dispatch `stable-release` with
 `operation=redeploy-site` and the exact stable tag. After the same `release`
-approval, a keyless read-only job safely materializes that Release's immutable
-`stable-pages-site.tar.gz`; the Pages-only job deploys those exact files.
+approval, a keyless read-only job verifies GitHub provenance for the archive,
+inventory manifest, and manifest signature, safely materializes the archive,
+then verifies the exact inventory and every retained feed/notes signature. The
+Pages-only job deploys only those authenticated exact files.
 
 Each stable Release freezes `stable-pages-site.tar.gz`. The next promotion must
 restore it successfully before changing the active versioned feed, so frozen
 old-key feed generations and their bridge items remain byte-identical while a
-new generation is added. Key rotation is a reviewed configuration/workflow
-change: publish the higher-build bridge through the old generation with the old
-key, add the new generation in the same complete site with the new key, and
-only then move new builds to the new embedded URL/key. Never change the signer
+new generation is added. Dispatching `operation=rotate-key` supplies explicit
+old/new generation and public-key bindings; after approval the job verifies the
+old binding against the authenticated prior site, publishes the same tested
+higher-build DMG as the final old-key bridge and first new-key item, verifies
+both signatures, and freezes both in one complete site. Later promotions mutate
+only the active generation. Never change the signer
 behind an existing versioned URL. Rollback uses the same candidate/test/stable
 path with a new protected-main commit and a greater `CFBundleVersion`; a lower
 build is never published as a downgrade.

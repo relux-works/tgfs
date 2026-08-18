@@ -38,6 +38,7 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 TAG_RE = re.compile(r"^v([0-9]+\.[0-9]+\.[0-9]+)$")
 TEST_PUBLIC_ED_KEY_B64 = "T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo="
+STABLE_PUBLIC_ED_KEY_B64 = "FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE="
 ED_P = 2**255 - 19
 ED_L = 2**252 + 27742317777372353535851937790883648493
 ED_D = (-121665 * pow(121666, ED_P - 2, ED_P)) % ED_P
@@ -150,6 +151,10 @@ def _decode_b64(value: str, label: str, expected: int) -> bytes:
     return decoded
 
 
+def public_key(value: str, label: str = "Sparkle public key") -> bytes:
+    return _decode_b64(value, label, 32)
+
+
 def parse_checksums(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     try:
@@ -249,12 +254,18 @@ def verify_candidate(
     require(str(product.get("build", "")).isdigit(), "candidate Sparkle build is invalid")
     sparkle = app.get("sparkle", {})
     require(sparkle.get("channel") == expected_channel, "embedded Sparkle channel does not match candidate")
-    expected_feed = (
-        f"https://github.com/{repository}/releases/download/updates-test-v1/test.xml"
-        if expected_channel == "test"
-        else "https://relux-works.github.io/tgfs/updates/stable/v1/stable.xml"
-    )
+    embedded = app.get("sparkle", {})
+    generation = embedded.get("generation", 1)
+    require(isinstance(generation, int) and generation > 0, "embedded Sparkle feed generation is invalid")
+    embedded_key = str(embedded.get("public_key", ""))
+    if not embedded_key and generation == 1:
+        embedded_key = TEST_PUBLIC_ED_KEY_B64 if expected_channel == "test" else STABLE_PUBLIC_ED_KEY_B64
+    public_key(embedded_key, "embedded Sparkle public key")
+    expected_feed = feed_urls(expected_channel, generation, repository, str(product["short"]), dmg_name, "notes.md")[0]
     require(sparkle.get("feed_url") == expected_feed, "embedded Sparkle feed URL does not match candidate channel")
+    sparkle["generation"] = generation
+    sparkle["public_key"] = embedded_key
+    manifest["sparkle"] = sparkle
     return manifest
 
 
@@ -269,6 +280,8 @@ def github_outputs(manifest: dict) -> dict[str, str]:
         "dmg_sha256": str(manifest["dmg"]["sha256"]),
         "run_id": str(manifest["workflow"]["run_id"]),
         "run_attempt": str(manifest["workflow"]["run_attempt"]),
+        "feed_generation": str(manifest["sparkle"]["generation"]),
+        "feed_public_key": str(manifest["sparkle"]["public_key"]),
     }
 
 
@@ -509,19 +522,23 @@ def validate_feed(path: Path, *, channel: str, generation: int, repository: str)
     validate_items(items, channel=channel, generation=generation, repository=repository)
 
 
-def signed_feed_content(payload: bytes) -> tuple[bytes, bytes]:
+def signed_content(payload: bytes, *, label: str = "file") -> tuple[bytes, bytes]:
     marker = b"<!-- sparkle-signatures:\nedSignature: "
     position = payload.rfind(marker)
-    require(position >= 0, "test feed has no embedded Sparkle signature block")
+    require(position >= 0, f"{label} has no embedded Sparkle signature block")
     content = payload[:position]
     block = payload[position:]
     match = re.fullmatch(
         rb"<!-- sparkle-signatures:\nedSignature: ([A-Za-z0-9+/]{86}==)\nlength: ([1-9][0-9]*)\n-->\n",
         block,
     )
-    require(match is not None, "test feed signature block is malformed or not terminal")
-    require(int(match.group(2)) == len(content), "test feed signed length is wrong")
+    require(match is not None, f"{label} signature block is malformed or not terminal")
+    require(int(match.group(2)) == len(content), f"{label} signed length is wrong")
     return content, _decode_b64(match.group(1).decode("ascii"), "feed signature", 64)
+
+
+def signed_feed_content(payload: bytes) -> tuple[bytes, bytes]:
+    return signed_content(payload, label="test feed")
 
 
 def verify_test_offer(
@@ -530,37 +547,144 @@ def verify_test_offer(
     notes_path: Path,
     *,
     repository: str = REPOSITORY,
+    generation: int = 1,
+    test_public_key_b64: str = TEST_PUBLIC_ED_KEY_B64,
     verifier=verify_ed25519,
 ) -> None:
     manifest = verify_candidate(candidate_dir, repository=repository, mode="stable-candidate")
-    public_key = _decode_b64(TEST_PUBLIC_ED_KEY_B64, "test public key", 32)
+    test_key = public_key(test_public_key_b64, "test public key")
     payload = feed_path.read_bytes()
     content, feed_signature = signed_feed_content(payload)
-    require(verifier(public_key, content, feed_signature), "test feed EdDSA signature is invalid")
+    require(verifier(test_key, content, feed_signature), "test feed EdDSA signature is invalid")
     try:
         root = ET.fromstring(content)
     except ET.ParseError as error:
         raise PublicationError(f"signed test feed XML is invalid: {error}") from error
     channel = root.find("channel")
     require(channel is not None, "signed test feed has no channel")
-    validate_items(channel.findall("item"), channel="test", generation=1, repository=repository)
+    validate_items(channel.findall("item"), channel="test", generation=generation, repository=repository)
     build = int(manifest["version"]["build"])
     matches = [item for item in channel.findall("item") if _item_build(item) == build]
     require(len(matches) == 1, "stable candidate is not uniquely offered by the signed test feed")
     item = matches[0]
     enclosure = item.find("enclosure")
     require(enclosure is not None, "stable candidate test offer has no enclosure")
-    expected_base = f"https://github.com/{repository}/releases/download/updates-test-v1/"
+    expected_base = f"https://github.com/{repository}/releases/download/updates-test-v{generation}/"
     require(enclosure.get("url") == expected_base + manifest["dmg"]["name"], "test offer enclosure URL is not the verified candidate")
     require(int(str(enclosure.get("length", "0"))) == manifest["dmg"]["bytes"], "test offer enclosure length changed")
     enclosure_signature = _decode_b64(str(enclosure.get(f"{{{SPARKLE_NS}}}edSignature", "")), "enclosure signature", 64)
-    require(verifier(public_key, (candidate_dir / manifest["dmg"]["name"]).read_bytes(), enclosure_signature), "test offer enclosure EdDSA signature is invalid")
+    require(verifier(test_key, (candidate_dir / manifest["dmg"]["name"]).read_bytes(), enclosure_signature), "test offer enclosure EdDSA signature is invalid")
     notes = item.find(f"{{{SPARKLE_NS}}}releaseNotesLink")
     require(notes is not None and notes.text, "stable candidate test offer has no release notes")
     require(notes.text.strip() == expected_base + notes_path.name, "test offer release-notes URL is not the downloaded asset")
     require(int(str(notes.get(f"{{{SPARKLE_NS}}}length", "0"))) == notes_path.stat().st_size, "test offer release-notes length changed")
     notes_signature = _decode_b64(str(notes.get(f"{{{SPARKLE_NS}}}edSignature", "")), "release-notes signature", 64)
-    require(verifier(public_key, notes_path.read_bytes(), notes_signature), "test offer release-notes EdDSA signature is invalid")
+    require(verifier(test_key, notes_path.read_bytes(), notes_signature), "test offer release-notes EdDSA signature is invalid")
+
+
+def parse_generation_keys(values: Sequence[str]) -> dict[int, str]:
+    keys: dict[int, str] = {}
+    for value in values:
+        match = re.fullmatch(r"([1-9][0-9]*)=([A-Za-z0-9+/]{43}=)", value)
+        require(match is not None, f"invalid generation/public-key binding: {value!r}")
+        generation = int(match.group(1))
+        key = match.group(2)
+        public_key(key, f"v{generation} public key")
+        require(generation not in keys or keys[generation] == key, f"conflicting public keys for feed generation v{generation}")
+        keys[generation] = key
+    require(keys, "at least one generation/public-key binding is required")
+    return keys
+
+
+def site_inventory(site: Path) -> list[dict[str, object]]:
+    site = site.resolve()
+    require(site.is_dir(), f"stable site directory is missing: {site}")
+    require(all(not path.is_symlink() for path in site.rglob("*")), "stable site contains a symlink")
+    files = sorted(path for path in site.rglob("*") if path.is_file())
+    require(files, "stable site is empty")
+    return [
+        {"path": path.relative_to(site).as_posix(), "sha256": sha256_file(path), "bytes": path.stat().st_size}
+        for path in files
+    ]
+
+
+def write_site_manifest(
+    site: Path,
+    archive: Path,
+    generation_keys: dict[int, str],
+    signer_generation: int,
+    output: Path,
+) -> None:
+    require(signer_generation in generation_keys, "site manifest signer generation has no public key")
+    value = {
+        "schema": SCHEMA,
+        "archive": {"name": archive.name, "sha256": sha256_file(archive), "bytes": archive.stat().st_size},
+        "files": site_inventory(site),
+        "feed_keys": [
+            {"generation": generation, "public_key": generation_keys[generation]}
+            for generation in sorted(generation_keys)
+        ],
+        "signed_by_generation": signer_generation,
+    }
+    output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def verify_site(
+    site: Path,
+    archive: Path,
+    manifest_path: Path,
+    manifest_signature_path: Path,
+    *,
+    repository: str = REPOSITORY,
+    verifier=verify_ed25519,
+) -> None:
+    manifest = read_json(manifest_path)
+    require(manifest.get("schema") == SCHEMA, "unsupported stable site manifest schema")
+    archive_record = manifest.get("archive", {})
+    require(archive_record.get("name") == archive.name, "stable site archive name changed")
+    require(archive_record.get("sha256") == sha256_file(archive), "stable site archive digest changed")
+    require(archive_record.get("bytes") == archive.stat().st_size, "stable site archive length changed")
+    require(manifest.get("files") == site_inventory(site), "stable site extracted inventory changed")
+    key_records = manifest.get("feed_keys")
+    require(isinstance(key_records, list), "stable site feed key inventory is missing")
+    keys = parse_generation_keys(
+        [f"{record.get('generation')}={record.get('public_key')}" for record in key_records if isinstance(record, dict)]
+    )
+    signer_generation = manifest.get("signed_by_generation")
+    require(isinstance(signer_generation, int) and signer_generation in keys, "stable site manifest signer is invalid")
+    manifest_sig, manifest_length = signature(manifest_signature_path)
+    require(manifest_length == manifest_path.stat().st_size, "stable site manifest signed length changed")
+    require(
+        verifier(public_key(keys[signer_generation]), manifest_path.read_bytes(), _decode_b64(manifest_sig, "site manifest signature", 64)),
+        "stable site manifest EdDSA signature is invalid",
+    )
+    expected_feeds = {f"updates/stable/v{generation}/stable.xml" for generation in keys}
+    actual_feeds = {path.relative_to(site).as_posix() for path in site.glob("updates/stable/v*/stable.xml")}
+    require(actual_feeds == expected_feeds, "stable site feed generations do not exactly match key inventory")
+    for generation, key_b64 in keys.items():
+        feed_path = site / f"updates/stable/v{generation}/stable.xml"
+        content, feed_signature = signed_content(feed_path.read_bytes(), label=f"stable v{generation} feed")
+        key = public_key(key_b64, f"stable v{generation} public key")
+        require(verifier(key, content, feed_signature), f"stable v{generation} feed EdDSA signature is invalid")
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError as error:
+            raise PublicationError(f"stable v{generation} feed XML is invalid: {error}") from error
+        channel = root.find("channel")
+        require(channel is not None, f"stable v{generation} feed has no channel")
+        items = channel.findall("item")
+        validate_items(items, channel="stable", generation=generation, repository=repository)
+        for item in items:
+            notes = item.find(f"{{{SPARKLE_NS}}}releaseNotesLink")
+            require(notes is not None and notes.text, "stable feed item has no release notes")
+            prefix = f"https://relux-works.github.io/tgfs/updates/stable/v{generation}/"
+            require(notes.text.startswith(prefix), "stable release-notes URL generation changed")
+            relative = notes.text[len("https://relux-works.github.io/tgfs/"):]
+            notes_path = site / relative
+            require(notes_path.is_file(), f"stable release notes are missing: {relative}")
+            notes_sig = _decode_b64(str(notes.get(f"{{{SPARKLE_NS}}}edSignature", "")), "release-notes signature", 64)
+            require(int(str(notes.get(f"{{{SPARKLE_NS}}}length", "0"))) == notes_path.stat().st_size, "stable release-notes length changed")
+            require(verifier(key, notes_path.read_bytes(), notes_sig), f"stable v{generation} release-notes signature is invalid")
 
 
 def write_notes(manifest: dict, output: Path) -> None:
@@ -623,6 +747,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     offer.add_argument("--feed", type=Path, required=True)
     offer.add_argument("--notes", type=Path, required=True)
     offer.add_argument("--repository", default=REPOSITORY)
+    offer.add_argument("--generation", type=int, default=1)
+    offer.add_argument("--test-public-key", default=TEST_PUBLIC_ED_KEY_B64)
+    site_manifest = commands.add_parser("write-site-manifest")
+    site_manifest.add_argument("--site", type=Path, required=True)
+    site_manifest.add_argument("--archive", type=Path, required=True)
+    site_manifest.add_argument("--key", action="append", required=True)
+    site_manifest.add_argument("--signer-generation", type=int, required=True)
+    site_manifest.add_argument("--output", type=Path, required=True)
+    verify_site_parser = commands.add_parser("verify-site")
+    verify_site_parser.add_argument("--site", type=Path, required=True)
+    verify_site_parser.add_argument("--archive", type=Path, required=True)
+    verify_site_parser.add_argument("--manifest", type=Path, required=True)
+    verify_site_parser.add_argument("--manifest-signature", type=Path, required=True)
+    verify_site_parser.add_argument("--repository", default=REPOSITORY)
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect-candidate":
@@ -639,8 +777,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             render_feed(manifest, channel=args.channel, generation=args.generation, repository=args.repository, dmg_signature_path=args.dmg_signature, notes_signature_path=args.notes_signature, notes_name=args.notes_name, publication_date=args.publication_date, prior_feed=args.prior_feed, output=args.output)
         elif args.command == "validate-feed":
             validate_feed(args.feed, channel=args.channel, generation=args.generation, repository=args.repository)
+        elif args.command == "verify-test-offer":
+            verify_test_offer(args.candidate_dir, args.feed, args.notes, repository=args.repository, generation=args.generation, test_public_key_b64=args.test_public_key)
+        elif args.command == "write-site-manifest":
+            write_site_manifest(args.site, args.archive, parse_generation_keys(args.key), args.signer_generation, args.output)
         else:
-            verify_test_offer(args.candidate_dir, args.feed, args.notes, repository=args.repository)
+            verify_site(args.site, args.archive, args.manifest, args.manifest_signature, repository=args.repository)
     except (OSError, PublicationError, tarfile.TarError) as error:
         print(f"SPARKLE PUBLICATION FAILED: {error}", file=sys.stderr)
         return 1

@@ -21,6 +21,7 @@ and the real pipeline cannot be asked to stage on demand:
 from __future__ import annotations
 
 import contextlib
+import base64
 import importlib.util
 import io
 import json
@@ -149,6 +150,17 @@ class InfoPlistTest(unittest.TestCase):
         self.assertEqual(
             stable["feed_url"], "https://relux-works.github.io/tgfs/updates/stable/v1/stable.xml")
         self.assertEqual(stable["public_key"], "FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE=")
+
+    def test_rotated_update_generation_is_bound_to_key_and_versioned_url(self):
+        key = base64.b64encode(b"k" * 32).decode()
+        stable = app.update_configuration("stable", generation=2, public_key_override=key)
+        self.assertEqual(stable["generation"], 2)
+        self.assertEqual(stable["public_key"], key)
+        self.assertEqual(stable["feed_url"], "https://relux-works.github.io/tgfs/updates/stable/v2/stable.xml")
+        with self.assertRaisesRegex(app.StepFailed, "requires an explicit reviewed public key"):
+            app.update_configuration("stable", generation=2)
+        with self.assertRaisesRegex(app.StepFailed, "disagrees"):
+            app.update_configuration("stable", generation=1, public_key_override=key)
 
     def test_missing_or_invalid_reviewed_public_key_refuses_packaging(self):
         with self.assertRaises(app.StepFailed):
