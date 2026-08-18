@@ -115,6 +115,23 @@ APPEX_BUNDLE_NAME = "GramDriveFileProvider.appex"
 # `lipo -archs` in build_products.
 BUILD_ARCH = "arm64"
 
+# Mach-O and universal binary magic values in either byte order. Reading the
+# bytes directly avoids trusting file extensions or executable bits when we
+# enumerate every shipped code object after framework/runtime embedding.
+MACHO_MAGICS = {
+    bytes.fromhex(value)
+    for value in (
+        "feedface",
+        "cefaedfe",
+        "feedfacf",
+        "cffaedfe",
+        "cafebabe",
+        "bebafeca",
+        "cafebabf",
+        "bfbafeca",
+    )
+}
+
 # macOS deployment floor (POL-5/DEC-017), matching Package.swift's .macOS(.v14).
 MINIMUM_SYSTEM_VERSION = "14.0"
 
@@ -477,6 +494,11 @@ def verify_argv(app: Path) -> tuple[str, ...]:
     return ("codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app))
 
 
+def verify_dmg_argv(dmg: Path) -> tuple[str, ...]:
+    """Strictly verify the detached Developer ID signature on the disk image."""
+    return ("codesign", "--verify", "--strict", "--verbose=2", str(dmg))
+
+
 def entitlements_dump_argv(target: Path) -> tuple[str, ...]:
     """Dump a signed target's entitlements as a plist on stdout."""
     return ("codesign", "-d", "--entitlements", ":-", "--xml", str(target))
@@ -487,6 +509,20 @@ def spctl_exec_argv(app: Path) -> tuple[str, ...]:
     an un-notarized Developer ID app is reported rejected, which is expected
     until the notarize step runs."""
     return ("spctl", "--assess", "--type", "exec", "--verbose=2", str(app))
+
+
+def spctl_open_argv(dmg: Path) -> tuple[str, ...]:
+    """Gatekeeper assessment for a signed, notarized disk image."""
+    return (
+        "spctl",
+        "--assess",
+        "--type",
+        "open",
+        "--context",
+        "context:primary-signature",
+        "--verbose=2",
+        str(dmg),
+    )
 
 
 def cdhash_probe_argv(target: Path) -> tuple[str, ...]:
@@ -532,6 +568,11 @@ def staple_argv(target: Path) -> tuple[str, ...]:
     looked up by the target's cdhash, so the code must have been notarized (its
     cdhash registered with Apple) before this can succeed."""
     return ("xcrun", "stapler", "staple", str(target))
+
+
+def staple_validate_argv(target: Path) -> tuple[str, ...]:
+    """Verify that the target carries a readable notarization ticket."""
+    return ("xcrun", "stapler", "validate", str(target))
 
 
 def hdiutil_argv(app_staging: Path, dmg: Path, volname: str) -> tuple[str, ...]:
@@ -581,6 +622,30 @@ def parse_cdhash(output: str) -> str | None:
         if line.startswith("CDHash="):
             return line.removeprefix("CDHash=").strip()
     return None
+
+
+def parse_codesign_identity(output: str) -> tuple[str | None, list[str]]:
+    """Read actual TeamIdentifier and authority lines from codesign output."""
+    team_id: str | None = None
+    authorities: list[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("TeamIdentifier="):
+            team_id = line.removeprefix("TeamIdentifier=").strip() or None
+        elif line.startswith("Authority="):
+            authorities.append(line.removeprefix("Authority=").strip())
+    return team_id, authorities
+
+
+def is_macho(path: Path) -> bool:
+    """Return whether a regular file begins with a Mach-O/fat magic value."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) in MACHO_MAGICS
+    except OSError:
+        return False
 
 
 def parse_notary_submission(output: str) -> dict:
@@ -1129,6 +1194,99 @@ class AppPackager:
         self.echo(f"    spctl: {verdict} (exit {code})")
         return verdict
 
+    def verify_shipped_code(self, app: Path) -> dict:
+        """Read back architecture, signature, Team ID, and authority per Mach-O.
+
+        This runs only after every framework/helper/runtime library has been
+        embedded and the outer bundle has been sealed. The manifest therefore
+        describes the shipped code set discovered from the app bytes, rather
+        than merely restating the configured signer or the three Swift inputs.
+        """
+        machos = sorted(
+            path for path in app.rglob("*")
+            if is_macho(path)
+        )
+        if not machos:
+            raise StepFailed("no shipped Mach-O code objects were found")
+        objects: list[dict] = []
+        for index, target in enumerate(machos, 1):
+            relative = target.relative_to(app).as_posix()
+            arch_output = self.run(
+                f"shipped-code-{index}-arch",
+                ("lipo", "-archs", str(target)),
+            )
+            architectures = arch_output.split()
+            if BUILD_ARCH not in architectures:
+                raise StepFailed(
+                    f"shipped code {relative} lacks required {BUILD_ARCH} architecture: "
+                    f"{' '.join(architectures) or 'none'}"
+                )
+            self.run(
+                f"shipped-code-{index}-signature",
+                ("codesign", "--verify", "--strict", "--verbose=2", str(target)),
+            )
+            identity_output = self.run(
+                f"shipped-code-{index}-identity",
+                cdhash_probe_argv(target),
+            )
+            team_id, authorities = parse_codesign_identity(identity_output)
+            if team_id != TEAM_ID:
+                raise StepFailed(
+                    f"shipped code {relative} has TeamIdentifier {team_id!r}, expected {TEAM_ID}"
+                )
+            if self.identity not in authorities:
+                raise StepFailed(
+                    f"shipped code {relative} is missing expected leaf authority {self.identity!r}"
+                )
+            objects.append(
+                {
+                    "path": relative,
+                    "architectures": architectures,
+                    "signature": "passed",
+                    "team_id": team_id,
+                    "authority": self.identity,
+                }
+            )
+        return {
+            "complete": True,
+            "discovery": "Mach-O magic under final GramDrive.app, excluding symlinks",
+            "required_architecture": BUILD_ARCH,
+            "expected_team_id": TEAM_ID,
+            "expected_authority": self.identity,
+            "count": len(objects),
+            "objects": objects,
+        }
+
+    def verify_notarized_targets(self, app: Path, dmg: Path) -> dict:
+        """Re-prove both shipped trust surfaces after stapling.
+
+        Notary acceptance alone does not prove that the ticket was attached to
+        the exact bytes being handed downstream.  The candidate boundary needs
+        strict signatures, readable staples, and Gatekeeper acceptance for both
+        the app and its enclosing DMG.
+        """
+        self.run("codesign-verify-post-staple-app", verify_argv(app))
+        self.run("codesign-verify-dmg", verify_dmg_argv(dmg))
+        shipped_code = self.verify_shipped_code(app)
+        self.run("stapler-validate-app", staple_validate_argv(app))
+        self.run("stapler-validate-dmg", staple_validate_argv(dmg))
+
+        dmg_code, dmg_output = self.runner(spctl_open_argv(dmg), self.repo_root, None)
+        (self.log_dir / "spctl-dmg.log").write_text(dmg_output, encoding="utf-8")
+        dmg_verdict = "accepted" if dmg_code == 0 else "rejected"
+        if dmg_code != 0:
+            raise StepFailed(f"Gatekeeper rejected the notarized DMG:\n{dmg_output[-2000:]}")
+
+        app_verdict = self.assess(app)
+        if app_verdict != "accepted":
+            raise StepFailed("Gatekeeper rejected the notarized app after stapling")
+        return {
+            "signatures": {"app": "passed", "dmg": "passed", "nested": "passed"},
+            "staples": {"app": "validated", "dmg": "validated"},
+            "gatekeeper": {"app": app_verdict, "dmg": dmg_verdict},
+            "shipped_code": shipped_code,
+        }
+
     def build_dmg(self, app: Path, version: str, *, timestamp: bool) -> Path:
         """Stage the .app alone into a folder and build a signed dmg from it."""
         staging = self.out_dir / "dmg-staging"
@@ -1360,6 +1518,19 @@ def package(
     entitlement_files = packager.write_entitlement_files()
 
     notarization: dict = {"submitted": False}
+    post_staple_verification: dict = {
+        "signatures": {"app": "not-run", "dmg": "not-run", "nested": "not-run"},
+        "staples": {"app": "not-run", "dmg": "not-run"},
+        "gatekeeper": {"app": "not-run", "dmg": "not-run"},
+        "shipped_code": {
+            "complete": False,
+            "required_architecture": BUILD_ARCH,
+            "expected_team_id": TEAM_ID,
+            "expected_authority": identity,
+            "count": 0,
+            "objects": [],
+        },
+    }
     if unsigned:
         # Assembly-only: the bundle and its plists exist, but nothing is signed.
         signed = packager.record_unsigned()
@@ -1386,8 +1557,8 @@ def package(
                 "app": app_note,
                 "dmg": dmg_note,
             }
-            # Re-assess the stapled app: now it must be accepted.
-            spctl_verdict = packager.assess(app)
+            post_staple_verification = packager.verify_notarized_targets(app, dmg)
+            spctl_verdict = post_staple_verification["gatekeeper"]["app"]
 
     manifest = build_manifest(
         product_version={"short": short_version, "build": build_version},
@@ -1401,7 +1572,15 @@ def package(
         update=update,
         is_signed=not unsigned,
     )
-    manifest["gatekeeper"] = {"spctl": spctl_verdict, "notarized": notarization.get("submitted", False)}
+    manifest["gatekeeper"] = {
+        "spctl": spctl_verdict,
+        "app": post_staple_verification["gatekeeper"]["app"],
+        "dmg": post_staple_verification["gatekeeper"]["dmg"],
+        "notarized": notarization.get("submitted", False),
+    }
+    manifest["signature_verification"] = post_staple_verification["signatures"]
+    manifest["staple_verification"] = post_staple_verification["staples"]
+    manifest["shipped_code_verification"] = post_staple_verification["shipped_code"]
     manifest["tdjson"] = {
         "linked": packager.core_tdjson_linked(),
         "embedded_libraries": embedded_libraries,

@@ -316,7 +316,13 @@ class ResolveIdentityTest(unittest.TestCase):
 class PipelineTest(unittest.TestCase):
     """The whole pipeline's control flow, with every subprocess faked."""
 
-    def scripted(self, extra=None, leak_get_task_allow=False):
+    def scripted(
+        self,
+        extra=None,
+        leak_get_task_allow=False,
+        nested_arch="arm64",
+        nested_team=app.TEAM_ID,
+    ):
         """A runner that fakes swift/codesign/spctl/hdiutil/git/notarytool.
 
         Build side effects are real files (the pipeline copies them), so a fake
@@ -358,18 +364,35 @@ class PipelineTest(unittest.TestCase):
                 sparkle = bin_dir / "Sparkle.framework" / "Versions" / "A"
                 (sparkle / "XPCServices" / "Downloader.xpc").mkdir(parents=True)
                 (sparkle / "XPCServices" / "Installer.xpc").mkdir(parents=True)
-                (sparkle / "Autoupdate").write_bytes(b"helper")
+                (sparkle / "Sparkle").write_bytes(b"\xcf\xfa\xed\xfe framework")
+                (sparkle / "Autoupdate").write_bytes(b"\xcf\xfa\xed\xfe helper")
                 (sparkle / "Updater.app").mkdir()
+                nested_executables = (
+                    sparkle / "Updater.app" / "Contents" / "MacOS" / "Updater",
+                    sparkle / "XPCServices" / "Downloader.xpc" / "Contents" / "MacOS" / "Downloader",
+                    sparkle / "XPCServices" / "Installer.xpc" / "Contents" / "MacOS" / "Installer",
+                )
+                for binary in nested_executables:
+                    binary.parent.mkdir(parents=True)
+                    binary.write_bytes(b"\xcf\xfa\xed\xfe nested")
                 (sparkle.parent / "Current").symlink_to("A")
                 return 0, str(bin_dir) + "\n"
             if joined.startswith("swift build"):
                 return 0, ""
             if joined.startswith("lipo -archs"):
+                if "Sparkle.framework" in joined:
+                    return 0, nested_arch + "\n"
                 return 0, "arm64\n"
             if "-d --entitlements" in joined:
                 return 0, entitlements_xml_for(argv[-1])
             if "-d --verbose=4" in joined:
-                return 0, f"Executable={argv[-1]}\nCDHash=deadbeef\n"
+                team = nested_team if "Sparkle.framework" in joined else app.TEAM_ID
+                return 0, (
+                    f"Executable={argv[-1]}\n"
+                    "CDHash=deadbeef\n"
+                    f"Authority=Developer ID Application: Test ({app.TEAM_ID})\n"
+                    + (f"TeamIdentifier={team}\n" if team is not None else "")
+                )
             if joined.startswith("codesign"):
                 return 0, ""
             if joined.startswith("spctl"):
@@ -428,13 +451,20 @@ class PipelineTest(unittest.TestCase):
         *,
         extra=None,
         leak_get_task_allow=False,
+        nested_arch="arm64",
+        nested_team=app.TEAM_ID,
         linked=True,
         **kwargs,
     ):
         repo, core = self.stage(tmp, linked=linked)
         out = tmp / "out"
         out.mkdir()
-        run, calls = self.scripted(extra, leak_get_task_allow=leak_get_task_allow)
+        run, calls = self.scripted(
+            extra,
+            leak_get_task_allow=leak_get_task_allow,
+            nested_arch=nested_arch,
+            nested_team=nested_team,
+        )
         manifest = app.package(
             repo,
             out_dir=out,
@@ -723,6 +753,47 @@ class PipelineTest(unittest.TestCase):
             # Both the app and the dmg are notarized+stapled, recorded per target.
             self.assertEqual(manifest["notarization"]["app"]["target"], "app")
             self.assertEqual(manifest["notarization"]["dmg"]["target"], "dmg")
+            self.assertEqual(
+                manifest["signature_verification"],
+                {"app": "passed", "dmg": "passed", "nested": "passed"},
+            )
+            self.assertEqual(
+                manifest["staple_verification"],
+                {"app": "validated", "dmg": "validated"},
+            )
+            self.assertEqual(manifest["gatekeeper"]["app"], "accepted")
+            self.assertEqual(manifest["gatekeeper"]["dmg"], "accepted")
+            shipped = manifest["shipped_code_verification"]
+            self.assertTrue(shipped["complete"])
+            self.assertEqual(shipped["count"], len(shipped["objects"]))
+            self.assertGreaterEqual(shipped["count"], 9)
+            self.assertTrue(all("arm64" in item["architectures"] for item in shipped["objects"]))
+            self.assertTrue(all(item["team_id"] == app.TEAM_ID for item in shipped["objects"]))
+            joined = [" ".join(c) for c in calls]
+            self.assertTrue(any(j.startswith("codesign --verify --strict") and j.endswith(".dmg") for j in joined))
+            self.assertTrue(any("stapler validate" in j and j.endswith("GramDrive.app") for j in joined))
+            self.assertTrue(any("stapler validate" in j and j.endswith(".dmg") for j in joined))
+            self.assertTrue(any("spctl --assess --type open" in j and j.endswith(".dmg") for j in joined))
+
+    def test_wrong_nested_architecture_fails_post_embedding_readback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(app.StepFailed, "lacks required arm64 architecture"):
+                self.run_pipeline(Path(tmp), notarize=True, nested_arch="x86_64")
+
+    def test_wrong_or_missing_nested_team_id_fails_post_embedding_readback(self):
+        for team in ("BADTEAM123", None):
+            with self.subTest(team=team), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(app.StepFailed, "TeamIdentifier"):
+                    self.run_pipeline(Path(tmp), notarize=True, nested_team=team)
+
+    def test_post_staple_dmg_gatekeeper_rejection_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(app.StepFailed, "Gatekeeper rejected the notarized DMG"):
+                self.run_pipeline(
+                    Path(tmp),
+                    notarize=True,
+                    extra={"spctl --assess --type open": (3, "rejected")},
+                )
 
     def test_the_app_is_stapled_before_the_dmg_is_built(self):
         # The offline-ticket fix (packaging review 2115): the app must be zipped,

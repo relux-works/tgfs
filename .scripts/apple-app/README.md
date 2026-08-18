@@ -75,6 +75,19 @@ assumed:
   notarized+stapled artifact turns it to *accepted*, which the notarize run
   re-checks.
 
+The notarized path also re-runs strict verification on the final stapled app
+and DMG, runs `stapler validate` on both, and requires Gatekeeper acceptance for
+both the executable app and the disk image's primary signature. These final
+results are recorded in `signature_verification`, `staple_verification`, and the
+per-target `gatekeeper` fields of `manifest.json`.
+
+After all frameworks and runtime libraries are embedded, the same path discovers
+every non-symlink Mach-O from its magic bytes and reads back its architectures,
+strict signature, `TeamIdentifier`, and Developer ID leaf authority. The
+privacy-safe relative-path inventory is recorded in
+`shipped_code_verification`; candidate production refuses an incomplete or
+mismatched inventory.
+
 Measured on the current build: `codesign --verify --deep --strict` passes,
 `flags=0x10000(runtime)` on all three binaries, `TeamIdentifier=262RZ595FP`.
 
