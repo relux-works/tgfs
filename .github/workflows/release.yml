@@ -219,14 +219,15 @@ jobs:
         id: transition
         run: |
           set -euo pipefail
-          prior_args=()
+          previous_manifest=
           if [ -f .temp/stable/previous/stable-pages-site-manifest.json ]; then
-            prior_args=(--previous-manifest .temp/stable/previous/stable-pages-site-manifest.json)
+            previous_manifest=.temp/stable/previous/stable-pages-site-manifest.json
           fi
-          python3 .scripts/release/publish_sparkle.py plan-transition \
+          source .github/scripts/run-with-optional-file-argument.sh
+          run_with_optional_file_argument --previous-manifest "$previous_manifest" \
+            python3 .scripts/release/publish_sparkle.py plan-transition \
             --config .github/sparkle-stable.json \
-            --requested-operation "${{ steps.source.outputs.requested_operation }}" \
-            "${prior_args[@]}"
+            --requested-operation "${{ steps.source.outputs.requested_operation }}"
 
       - name: Match the tested candidate to the enforced transition
         run: |
@@ -271,13 +272,12 @@ jobs:
             test -n "$key_value"
             feed_dir=".temp/stable/site/updates/stable/v$generation"
             feed="$feed_dir/stable.xml"
-            prior_args=()
+            prior=
             if [ -f "$feed" ]; then
               prior=".temp/stable/prior-stable-v$generation.xml"
               cp "$feed" "$prior"
               printf '%s' "$key_value" | base64 --decode | \
                 "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - "$prior"
-              prior_args=(--prior-feed "$prior")
             elif [ "$require_prior" = yes ]; then
               echo "rotation refuses to create a bridge without the authenticated old feed" >&2
               exit 1
@@ -289,7 +289,9 @@ jobs:
             printf '%s' "$key_value" | base64 --decode | \
               "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
               "$feed_dir/notes/$STABLE_NOTES" > ".temp/stable/notes-signature-v$generation.txt"
-            python3 .scripts/release/publish_sparkle.py render-feed \
+            source .github/scripts/run-with-optional-file-argument.sh
+            run_with_optional_file_argument --prior-feed "$prior" \
+              python3 .scripts/release/publish_sparkle.py render-feed \
               --candidate-dir .temp/stable/candidate \
               --channel stable --generation "$generation" \
               --repository "$GITHUB_REPOSITORY" \
@@ -297,7 +299,7 @@ jobs:
               --notes-signature ".temp/stable/notes-signature-v$generation.txt" \
               --notes-name "$STABLE_NOTES" \
               --publication-date "$(git show -s --format=%cD '${{ steps.source.outputs.commit }}')" \
-              "${prior_args[@]}" --output "$feed"
+              --output "$feed"
             printf '%s' "$key_value" | base64 --decode | "$SPARKLE_SIGN_UPDATE" --ed-key-file - "$feed"
             printf '%s' "$key_value" | base64 --decode | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - "$feed"
             python3 .scripts/release/publish_sparkle.py validate-feed \

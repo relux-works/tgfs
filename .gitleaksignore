@@ -24,3 +24,9 @@ bfd67bf794bfd07e1c83eb3e6f7606d85d793d93:.scripts/release/publish_sparkle.py:gen
 # verification keys, not the release-environment private seeds.
 1cd1ceb909cd5b45f005237f16a478aae90cc613:.scripts/release/publish_sparkle.py:generic-api-key:41
 1cd1ceb909cd5b45f005237f16a478aae90cc613:.github/workflows/release.yml:generic-api-key:83
+# Protected main contains byte-equivalent cherry-picks of the publication
+# commits, so gitleaks assigns distinct commit-bound fingerprints to the same
+# reviewed public test/stable Ed25519 verification keys.
+f3dfecb6977cda3ce3aefdbfa6bfac6104956a8f:.scripts/release/publish_sparkle.py:generic-api-key:40
+926543f2529ae8eb7f2778b636e7210eafc32e3b:.scripts/release/publish_sparkle.py:generic-api-key:41
+926543f2529ae8eb7f2778b636e7210eafc32e3b:.github/workflows/release.yml:generic-api-key:83
