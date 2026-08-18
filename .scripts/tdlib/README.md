@@ -92,8 +92,11 @@ The dedicated x86_64 CI/signing runner consumes an artifact built on that
 arm64 host through `restore_pinned_artifact.py`. The runner-local cache key is
 derived from `build_tdlib.py`; a miss fails actionably instead of rebuilding or
 relabeling. Restoration validates the exact file/checksum/manifest inventory,
-the pinned TDLib source and target, and arm64-only `file(1)` output before an
-atomic workspace replacement. CI then cross-links the shipped target with
+the pinned TDLib source and target, and arm64-only `file(1)` output. It rejects
+symlinks at the cache root, recipe-key directory, artifact source, or anywhere
+inside the artifact. A verified scratch tree is published with one same-volume
+rename only when the workspace destination is absent; an existing destination
+is preserved and fails closed. CI then cross-links the shipped target with
 `make tdlib-smoke-link`; it never attempts to execute arm64 code on Intel.
 
 ## The three properties this pipeline guarantees

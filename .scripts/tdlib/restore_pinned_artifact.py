@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -73,6 +74,46 @@ def default_file_runner(argv: Sequence[str]) -> tuple[int, str]:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ArtifactError(message)
+
+
+def absolute_without_symlink_resolution(path: Path) -> Path:
+    """Normalize a path without erasing a symlink from its trust ancestry."""
+
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def first_symlink_in_ancestry(path: Path) -> Path | None:
+    """Return the first symlink from the filesystem root through ``path``."""
+
+    absolute = absolute_without_symlink_resolution(path)
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def require_cache_trust_ancestry(cache_root: Path, key: str) -> Path:
+    """Reject redirectable cache-root, recipe-key, and artifact directories."""
+
+    cache_root = absolute_without_symlink_resolution(cache_root)
+    recipe_root = cache_root / key
+    source = recipe_root / "out"
+    redirect = first_symlink_in_ancestry(cache_root)
+    require(
+        redirect is None,
+        f"runner-local TDLib cache root ancestry contains a symlink: {redirect}",
+    )
+    for label, path in (
+        ("recipe-key directory", recipe_root),
+        ("artifact source", source),
+    ):
+        require(
+            not path.is_symlink(),
+            f"runner-local TDLib {label} is a symlink: {path}",
+        )
+    return source
 
 
 def artifact_files(root: Path) -> dict[str, Path]:
@@ -250,28 +291,34 @@ def restore(
     file_runner: FileRunner = default_file_runner,
 ) -> dict:
     key = cache_key()
-    source = cache_root / key / "out"
-    if not source.is_dir() or source.is_symlink():
+    source = require_cache_trust_ancestry(cache_root, key)
+    if not source.is_dir():
         raise ColdCacheError(
             f"runner-local TDLib cache miss for key {key}; seed it from an arm64 "
             f"host with 'make tdlib', then copy .temp/tdlib/out to {source}"
         )
+    out_dir = absolute_without_symlink_resolution(out_dir)
     out_dir.parent.mkdir(parents=True, exist_ok=True)
-    scratch = out_dir.parent / f".{out_dir.name}.restore-{os.getpid()}"
-    if scratch.exists():
-        shutil.rmtree(scratch)
+    scratch_root = Path(
+        tempfile.mkdtemp(prefix=f".{out_dir.name}.restore-", dir=out_dir.parent)
+    )
+    scratch = scratch_root / "out"
     try:
         shutil.copytree(source, scratch, symlinks=True)
         manifest = validate_artifact(scratch, file_runner=file_runner)
         if out_dir.exists() or out_dir.is_symlink():
-            if out_dir.is_dir() and not out_dir.is_symlink():
-                shutil.rmtree(out_dir)
-            else:
-                out_dir.unlink()
-        scratch.rename(out_dir)
+            raise ArtifactError(
+                "TDLib restore destination already exists; refusing replacement: "
+                f"{out_dir}"
+            )
+        try:
+            scratch.rename(out_dir)
+        except OSError as error:
+            raise ArtifactError(
+                f"cannot atomically publish verified TDLib destination: {error}"
+            ) from error
     finally:
-        if scratch.exists():
-            shutil.rmtree(scratch)
+        shutil.rmtree(scratch_root, ignore_errors=True)
     print(
         "RESTORED PINNED TDLIB: "
         f"{key} sha256 {manifest['artifacts']['library']['sha256']}"
@@ -289,7 +336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, default=Path(".temp/tdlib/out"))
     args = parser.parse_args(argv)
     try:
-        restore(args.cache_root.resolve(), args.out_dir.resolve())
+        restore(args.cache_root, args.out_dir)
     except ColdCacheError as error:
         print(f"COLD CACHE: {error}", file=sys.stderr)
         return EXIT_COLD_CACHE

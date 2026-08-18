@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / ".scripts/tdlib/restore_pinned_artifact.py"
@@ -89,7 +90,7 @@ def stage_cache(root: Path) -> Path:
 class RestorePinnedArtifactTests(unittest.TestCase):
     def test_x86_signing_host_can_restore_verified_arm64_artifact(self):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             cache = root / "cache"
             source = stage_cache(cache)
             destination = root / "workspace/.temp/tdlib/out"
@@ -103,7 +104,7 @@ class RestorePinnedArtifactTests(unittest.TestCase):
 
     def test_cold_cache_refuses_without_replacing_existing_destination(self):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             destination = root / "out"
             destination.mkdir()
             marker = destination / "marker"
@@ -114,9 +115,72 @@ class RestorePinnedArtifactTests(unittest.TestCase):
                 )
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserved")
 
+    def test_symlinked_cache_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            real_cache = root / "real-cache"
+            stage_cache(real_cache)
+            cache_link = root / "cache-link"
+            cache_link.symlink_to(real_cache, target_is_directory=True)
+            destination = root / "out"
+            with self.assertRaisesRegex(
+                restore.ArtifactError, "cache root ancestry contains a symlink"
+            ):
+                restore.restore(cache_link, destination, file_runner=arm64_file)
+            self.assertFalse(destination.exists())
+
+    def test_symlinked_cache_root_parent_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            real_parent = root / "real-parent"
+            real_cache = real_parent / "cache"
+            stage_cache(real_cache)
+            parent_link = root / "parent-link"
+            parent_link.symlink_to(real_parent, target_is_directory=True)
+            destination = root / "out"
+            with self.assertRaisesRegex(
+                restore.ArtifactError, "cache root ancestry contains a symlink"
+            ):
+                restore.restore(
+                    parent_link / "cache", destination, file_runner=arm64_file
+                )
+            self.assertFalse(destination.exists())
+
+    def test_symlinked_recipe_key_ancestor_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            real_cache = root / "real-cache"
+            stage_cache(real_cache)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / restore.cache_key()).symlink_to(
+                real_cache / restore.cache_key(), target_is_directory=True
+            )
+            destination = root / "out"
+            with self.assertRaisesRegex(
+                restore.ArtifactError, "recipe-key directory is a symlink"
+            ):
+                restore.restore(cache, destination, file_runner=arm64_file)
+            self.assertFalse(destination.exists())
+
+    def test_symlinked_artifact_source_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            real_cache = root / "real-cache"
+            real_source = stage_cache(real_cache)
+            recipe_root = root / "cache" / restore.cache_key()
+            recipe_root.mkdir(parents=True)
+            (recipe_root / "out").symlink_to(real_source, target_is_directory=True)
+            destination = root / "out"
+            with self.assertRaisesRegex(
+                restore.ArtifactError, "artifact source is a symlink"
+            ):
+                restore.restore(root / "cache", destination, file_runner=arm64_file)
+            self.assertFalse(destination.exists())
+
     def test_checksum_tamper_is_rejected_before_destination_replacement(self):
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             cache = root / "cache"
             source = stage_cache(cache)
             (source / "lib/libtdjson.dylib").write_bytes(b"tampered")
@@ -126,6 +190,38 @@ class RestorePinnedArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(restore.ArtifactError, "checksum mismatch"):
                 restore.restore(cache, destination, file_runner=arm64_file)
             self.assertTrue((destination / "marker").is_file())
+
+    def test_existing_destination_is_rejected_and_preserved(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            cache = root / "cache"
+            stage_cache(cache)
+            destination = root / "out"
+            destination.mkdir()
+            marker = destination / "marker"
+            marker.write_text("authoritative", encoding="utf-8")
+            with self.assertRaisesRegex(
+                restore.ArtifactError, "destination already exists"
+            ):
+                restore.restore(cache, destination, file_runner=arm64_file)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "authoritative")
+            self.assertEqual(list(root.glob(".out.restore-*")), [])
+
+    def test_commit_rename_failure_leaves_no_partial_destination_or_residue(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            cache = root / "cache"
+            stage_cache(cache)
+            destination = root / "out"
+            with mock.patch.object(
+                Path, "rename", side_effect=OSError("injected commit failure")
+            ):
+                with self.assertRaisesRegex(
+                    restore.ArtifactError, "cannot atomically publish"
+                ):
+                    restore.restore(cache, destination, file_runner=arm64_file)
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.glob(".out.restore-*")), [])
 
     def test_wrong_architecture_and_universal_artifact_are_rejected(self):
         with tempfile.TemporaryDirectory() as raw:

@@ -76,7 +76,8 @@ jobs:
       - name: Restore and verify the pinned arm64 artifact (runner-local cache)
         # The helper keys the cache by build_tdlib.py, refuses a cold cache,
         # checks the complete digest/manifest inventory, and proves with file(1)
-        # that libtdjson is arm64-only before replacing the workspace artifact.
+        # that libtdjson is arm64-only before atomically publishing into an
+        # absent workspace destination (a pre-existing destination fails closed).
         run: |
           set -euo pipefail
           python3 .scripts/tdlib/restore_pinned_artifact.py \
