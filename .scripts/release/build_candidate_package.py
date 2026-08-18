@@ -34,6 +34,20 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 TEXT_SUFFIXES = {".json", ".md", ".txt", ".sha256"}
 PINNED_TDLIB_REPO = "https://github.com/tdlib/td.git"
 PINNED_TDLIB_COMMIT = "022d60202e446ad1287b9fb68e687c8a0760788b"
+OPENSSL_LICENSE_PATH = "ThirdPartyLicenses/OpenSSL.txt"
+APP_OPENSSL_LICENSE_PATH = f"GramDrive.app/Contents/Resources/{OPENSSL_LICENSE_PATH}"
+PINNED_OPENSSL_VERSION = "3.6.3"
+PINNED_OPENSSL_SOURCE_SHA256 = "243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1"
+OPENSSL_CERT_FILE = "/etc/ssl/cert.pem"
+FORBIDDEN_RUNTIME_PATH_MARKERS = (
+    b"/opt/homebrew/",
+    b"/usr/local/opt/",
+    b"/usr/local/Cellar/",
+    b"/Users/",
+    b"/home/",
+    b"/private/tmp/",
+    b"/var/folders/",
+)
 FORBIDDEN_TEXT = (
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN ENCRYPTED PRIVATE KEY-----",
@@ -159,6 +173,23 @@ def scrub_text_files(root: Path) -> None:
             require("/Users/" not in text and "/home/" not in text, f"privacy scrub rejected local path in {path.name}")
 
 
+def require_portable_tdlib_bytes(path: Path, label: str) -> None:
+    """Reject compiled builder defaults even when Mach-O load commands are clean."""
+
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise CandidateError(f"cannot inspect {label} TDLib bytes: {error}") from error
+    offenders = [
+        marker.decode("ascii") for marker in FORBIDDEN_RUNTIME_PATH_MARKERS if marker in payload
+    ]
+    require(
+        not offenders,
+        f"{label} TDLib contains builder-local OpenSSL/runtime paths despite clean "
+        "Mach-O linkage: " + ", ".join(offenders),
+    )
+
+
 def _accepted_notarization(app: dict) -> bool:
     note = app.get("notarization", {})
     return (
@@ -226,7 +257,26 @@ def validate_inputs(
         "a shipped code object failed architecture, signature, Team ID, or authority readback",
     )
     require(app.get("tdjson", {}).get("linked") is True, "app does not carry a live TDJSON-linked core")
-    require("libtdjson.dylib" in app.get("tdjson", {}).get("embedded_libraries", []), "app does not embed libtdjson.dylib")
+    require(app.get("tdjson", {}).get("embedded_libraries") == ["libtdjson.dylib"], "app runtime payload is not the hermetic libtdjson-only contract")
+    app_runtime = app.get("tdjson", {}).get("runtime", {})
+    app_trust_store = app_runtime.get("trust_store", {})
+    require(
+        app_runtime.get("verified") is True
+        and app_runtime.get("dependency_policy")
+        == "system-or-bundle-relative-static-openssl"
+        and app_runtime.get("openssl_linkage") == "static",
+        "app runtime dependency closure was not verified as portable static-OpenSSL",
+    )
+    require(
+        app_runtime.get("forbidden_builder_paths_verified") is True
+        and app_trust_store.get("policy") == "macos-system-pem"
+        and app_trust_store.get("cert_file") == OPENSSL_CERT_FILE
+        and app_trust_store.get("environment_overrides_scrubbed") is True
+        and app_trust_store.get("verified") is True
+        and isinstance(app_trust_store.get("certificate_objects"), int)
+        and app_trust_store.get("certificate_objects", 0) > 0,
+        "app portable macOS trust-store proof is missing or malformed",
+    )
 
     version = app.get("product_version", {})
     build_text = str(version.get("build", ""))
@@ -236,6 +286,7 @@ def validate_inputs(
     require(core.get("git", {}).get("commit") == commit, "core commit does not match requested source")
     require(core.get("git", {}).get("worktree_clean") is True, "core was built from a dirty worktree")
     require(core.get("tdjson", {}).get("linked") is True, "core manifest is not live TDJSON-linked")
+    core_runtime = core.get("tdjson", {}).get("runtime", {})
     require(core.get("host_test_slice") is None, "candidate core contains a host-test-only slice")
     tdlib_builder_commit = str(tdlib.get("gramdrive", {}).get("commit", ""))
     require(COMMIT_RE.fullmatch(tdlib_builder_commit) is not None, "TDLib builder commit is missing")
@@ -247,6 +298,65 @@ def validate_inputs(
     )
     require(tdlib.get("target", {}).get("label") == "macos-arm64" and tdlib.get("target", {}).get("arch") == "arm64", "TDLib target is not macos-arm64")
     require(tdlib.get("reproducibility", {}).get("clean_build_tree") is True, "TDLib did not use a clean build tree")
+    tdlib_runtime = tdlib.get("runtime", {})
+    tdlib_trust_store = tdlib_runtime.get("trust_store", {})
+    require(
+        tdlib_runtime.get("dependency_policy") == "system-only-static-openssl"
+        and tdlib_runtime.get("openssl_linkage") == "static"
+        and tdlib.get("linkage") == tdlib_runtime.get("dependencies"),
+        "TDLib runtime dependency provenance is not hermetic static-OpenSSL",
+    )
+    require(
+        tdlib_runtime.get("forbidden_builder_paths_verified") is True
+        and tdlib_trust_store.get("policy") == "macos-system-pem"
+        and tdlib_trust_store.get("cert_file") == OPENSSL_CERT_FILE
+        and tdlib_trust_store.get("environment_overrides_scrubbed") is True
+        and tdlib_trust_store.get("verified") is True
+        and isinstance(tdlib_trust_store.get("certificate_objects"), int)
+        and tdlib_trust_store.get("certificate_objects", 0) > 0
+        and core_runtime == tdlib_runtime
+        and app_trust_store == tdlib_trust_store,
+        "TDLib portable trust-store proof is missing or was not preserved through core/app",
+    )
+    tdlib_openssl = tdlib.get("third_party", {}).get("openssl", {})
+    tdlib_openssl_license = tdlib_openssl.get("license", {})
+    require(
+        tdlib_openssl.get("name") == "OpenSSL"
+        and re.fullmatch(
+            r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?",
+            str(tdlib_openssl.get("version", "")),
+        )
+        is not None
+        and tdlib_openssl.get("linkage") == "static"
+        and tdlib_openssl.get("embedded_in") == "lib/libtdjson.dylib"
+        and tdlib_openssl.get("version") == PINNED_OPENSSL_VERSION
+        and tdlib_openssl.get("source", {}).get("sha256")
+        == PINNED_OPENSSL_SOURCE_SHA256
+        and tdlib_openssl_license.get("id") == "Apache-2.0"
+        and tdlib_openssl_license.get("file") == OPENSSL_LICENSE_PATH
+        and SHA256_RE.fullmatch(str(tdlib_openssl_license.get("sha256", "")))
+        is not None,
+        "TDLib static OpenSSL attribution is missing or malformed",
+    )
+    core_openssl = core.get("third_party", {}).get("openssl", {})
+    app_openssl = app.get("third_party", {}).get("openssl", {})
+    for label, record, license_path in (
+        ("core", core_openssl, OPENSSL_LICENSE_PATH),
+        ("app", app_openssl, f"Contents/Resources/{OPENSSL_LICENSE_PATH}"),
+    ):
+        require(
+            record.get("name") == tdlib_openssl.get("name")
+            and record.get("version") == tdlib_openssl.get("version")
+            and record.get("linkage") == "static"
+            and record.get("embedded_in") == tdlib_openssl.get("embedded_in")
+            and record.get("source") == tdlib_openssl.get("source")
+            and record.get("build_options") == tdlib_openssl.get("build_options")
+            and record.get("license", {}).get("id") == "Apache-2.0"
+            and record.get("license", {}).get("file") == license_path
+            and record.get("license", {}).get("sha256")
+            == tdlib_openssl_license.get("sha256"),
+            f"{label} OpenSSL attribution does not match the TDLib artifact",
+        )
     tdlib_digest = tdlib.get("artifacts", {}).get("library", {}).get("sha256")
     require(SHA256_RE.fullmatch(str(tdlib_digest or "")) is not None, "TDLib library digest is missing")
     require(core.get("tdjson", {}).get("library_sha256") == tdlib_digest, "core is not linked to the staged TDLib bytes")
@@ -287,6 +397,10 @@ def validate_inputs(
         app_checksums.get("GramDrive.app/Contents/Frameworks/libtdjson.dylib") == tdlib_digest,
         "embedded live TDLib bytes do not match the pinned TDLib artifact",
     )
+    require(
+        core_checksums.get("lib/libtdjson.dylib") == tdlib_digest,
+        "staged core TDLib bytes do not match the pinned TDLib artifact",
+    )
     require(app.get("checksums") == app_checksums, "app manifest checksum inventory does not match CHECKSUMS.sha256")
     require(core.get("checksums") == core_checksums, "core manifest checksum inventory does not match CHECKSUMS.sha256")
     tdlib_manifest_checksums = {
@@ -295,8 +409,21 @@ def validate_inputs(
         if isinstance(record, dict)
     }
     require(tdlib_manifest_checksums == tdlib_checksums, "TDLib manifest checksum inventory does not match CHECKSUMS.sha256")
+    openssl_license_digest = str(tdlib_openssl_license["sha256"])
+    require(
+        tdlib_checksums.get(OPENSSL_LICENSE_PATH) == openssl_license_digest
+        and core_checksums.get(OPENSSL_LICENSE_PATH) == openssl_license_digest
+        and app_checksums.get(APP_OPENSSL_LICENSE_PATH) == openssl_license_digest,
+        "OpenSSL license bytes are not identical across TDLib, core, and signed app inventories",
+    )
     require(app.get("checksums", {}).get(dmg.name) == dmg_digest, "DMG checksum does not match app manifest")
     require(app.get("sizes", {}).get("dmg_bytes") == dmg.stat().st_size, "DMG size does not match app manifest")
+    for label, library in (
+        ("authoritative", tdlib_dir / "lib" / "libtdjson.dylib"),
+        ("core", core_artifact / "lib" / "libtdjson.dylib"),
+        ("signed app", app_bundle / "Contents" / "Frameworks" / "libtdjson.dylib"),
+    ):
+        require_portable_tdlib_bytes(library, label)
     return app, core, tdlib, dmg, dmg_digest
 
 
@@ -358,7 +485,11 @@ def build_candidate(args: argparse.Namespace) -> dict:
             "version": tdlib.get("tdlib", {}).get("runtime_version"),
             "library_sha256": tdlib.get("artifacts", {}).get("library", {}).get("sha256"),
             "builder_source_commit": tdlib.get("gramdrive", {}).get("commit"),
+            "runtime": tdlib.get("runtime"),
+            "third_party": tdlib.get("third_party"),
         },
+        "app_runtime": app.get("tdjson", {}).get("runtime"),
+        "app_third_party": app.get("third_party"),
     }
     write_json(out_dir / "verification.json", verification)
     write_json(out_dir / "candidate-provenance.json", provenance)

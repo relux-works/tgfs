@@ -70,6 +70,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,19 @@ EXIT_CANNOT_START = 2
 
 OUT_ROOT = Path(".temp") / "packaging"
 TDLIB_ARTIFACT_ENV = "GRAMDRIVE_TDLIB_ARTIFACT_DIR"
+OPENSSL_LICENSE_PATH = Path("ThirdPartyLicenses") / "OpenSSL.txt"
+OPENSSL_LICENSE_ID = "Apache-2.0"
+OPENSSL_SOURCE_SHA256 = "243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1"
+OPENSSL_CERT_FILE = "/etc/ssl/cert.pem"
+FORBIDDEN_RUNTIME_PATH_MARKERS = (
+    b"/opt/homebrew/",
+    b"/usr/local/opt/",
+    b"/usr/local/Cellar/",
+    b"/Users/",
+    b"/home/",
+    b"/private/tmp/",
+    b"/var/folders/",
+)
 
 # The crate that is packaged, and the names its build and its bindings use.
 FFI_CRATE = "gramdrive-ffi"
@@ -364,6 +378,62 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def tdlib_openssl_attribution(root: Path) -> tuple[dict, Path, dict]:
+    """Validate the staged static-OpenSSL attribution before propagating it."""
+
+    manifest_path = root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise StepFailed(f"cannot read TDLib attribution manifest: {error}") from error
+    openssl = manifest.get("third_party", {}).get("openssl", {})
+    runtime = manifest.get("runtime", {})
+    trust_store = runtime.get("trust_store", {})
+    license_record = openssl.get("license", {})
+    version = str(openssl.get("version", ""))
+    if not (
+        openssl.get("name") == "OpenSSL"
+        and re.fullmatch(
+            r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version
+        )
+        and openssl.get("linkage") == "static"
+        and openssl.get("embedded_in") == "lib/libtdjson.dylib"
+        and openssl.get("source", {}).get("sha256") == OPENSSL_SOURCE_SHA256
+        and license_record.get("id") == OPENSSL_LICENSE_ID
+        and license_record.get("file") == OPENSSL_LICENSE_PATH.as_posix()
+    ):
+        raise StepFailed("TDLib static OpenSSL attribution is missing or malformed")
+    if not (
+        runtime.get("forbidden_builder_paths_verified") is True
+        and trust_store.get("policy") == "macos-system-pem"
+        and trust_store.get("cert_file") == OPENSSL_CERT_FILE
+        and trust_store.get("environment_overrides_scrubbed") is True
+        and trust_store.get("verified") is True
+        and isinstance(trust_store.get("certificate_objects"), int)
+        and trust_store.get("certificate_objects", 0) > 0
+    ):
+        raise StepFailed("TDLib portable macOS trust-store proof is missing or malformed")
+    library = root / "lib" / "libtdjson.dylib"
+    payload = library.read_bytes()
+    offenders = [
+        marker.decode("ascii") for marker in FORBIDDEN_RUNTIME_PATH_MARKERS if marker in payload
+    ]
+    if offenders:
+        raise StepFailed(
+            "TDLib contains builder-local OpenSSL/runtime paths despite clean linkage: "
+            + ", ".join(offenders)
+        )
+    license_path = root / OPENSSL_LICENSE_PATH
+    expected_digest = license_record.get("sha256")
+    if (
+        not license_path.is_file()
+        or license_path.is_symlink()
+        or expected_digest != sha256_file(license_path)
+    ):
+        raise StepFailed("TDLib OpenSSL license bytes do not match their manifest digest")
+    return openssl, license_path, runtime
 
 
 def checksum_tree(root: Path) -> dict[str, str]:
@@ -943,7 +1013,11 @@ class Packager:
         return output
 
     def stage_artifact(
-        self, bindings_dir: Path, artifact_dir: Path, tdjson_lib: Path | None = None
+        self,
+        bindings_dir: Path,
+        artifact_dir: Path,
+        tdjson_lib: Path | None = None,
+        openssl_license: Path | None = None,
     ) -> None:
         sources = artifact_dir / "Sources" / SWIFT_MODULE
         sources.mkdir(parents=True, exist_ok=True)
@@ -953,19 +1027,20 @@ class Packager:
         )
         if tdjson_lib is not None:
             # Stage the runtime library beside the staticlib that references
-            # it, with an absolute install name: local consumers (the
-            # verifier, smokes, the apple test suite) load it with no rpath
-            # story of their own; the app bundle rewrites to @rpath when it
-            # embeds a copy.
+            # it without mutating the authoritative @rpath install name. Local
+            # verification resolves that unchanged ID through a process-scoped
+            # DYLD_LIBRARY_PATH; no workspace path is ever written into the
+            # candidate-bound bytes.
             lib_dir = artifact_dir / "lib"
             lib_dir.mkdir(parents=True, exist_ok=True)
             staged = lib_dir / tdjson_lib.name
             shutil.copy2(tdjson_lib, staged)
             staged.chmod(0o644)
-            self.run(
-                "tdjson-install-name",
-                ("install_name_tool", "-id", str(staged), str(staged)),
-            )
+            if openssl_license is None:
+                raise StepFailed("tdjson staging requires the attributed OpenSSL license")
+            license_dest = artifact_dir / OPENSSL_LICENSE_PATH
+            license_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(openssl_license, license_dest)
 
     def verify_with_swift(
         self, consumer_dir: Path, library_path: Path | None = None
@@ -976,7 +1051,8 @@ class Packager:
         real package dependency rather than a hand-built compiler command: the
         thing being proven is that a native host can consume what we ship.
         `library_path` (the tdjson staging) reaches ld64 through LIBRARY_PATH;
-        at run time the dylib resolves by its absolute staged install name.
+        at run time the unchanged @rpath ID resolves through the scoped
+        DYLD_LIBRARY_PATH.
         """
         env = self.consumer_env(library_path)
         self.run(
@@ -984,6 +1060,31 @@ class Packager:
             ("swift", "build", "--package-path", str(consumer_dir), "-c", "release"),
             env=env,
         )
+        if library_path is not None:
+            bin_output = self.run(
+                "swift-bin-path",
+                (
+                    "swift",
+                    "build",
+                    "--show-bin-path",
+                    "--package-path",
+                    str(consumer_dir),
+                    "-c",
+                    "release",
+                ),
+                env=env,
+            )
+            lines = [line.strip() for line in bin_output.splitlines() if line.strip()]
+            if not lines:
+                raise StepFailed("swift --show-bin-path returned no verifier directory")
+            bin_dir = Path(lines[-1])
+            if not bin_dir.is_dir():
+                raise StepFailed(f"swift verifier bin directory is missing: {bin_dir}")
+            source = library_path / "libtdjson.dylib"
+            destination = bin_dir / source.name
+            shutil.copy2(source, destination)
+            if sha256_file(destination) != sha256_file(source):
+                raise StepFailed("temporary verifier TDLib copy changed bytes")
         output = self.run(
             "swift-verify",
             ("swift", "run", "--package-path", str(consumer_dir), "-c", "release", "GramDriveVerify"),
@@ -1125,20 +1226,32 @@ def package(
         TDLIB_ARTIFACT_ENV
     )
     tdjson_lib: Path | None = None
+    openssl_attribution: dict | None = None
+    openssl_license: Path | None = None
+    tdjson_runtime: dict | None = None
     if tdlib_env:
-        tdjson_lib = Path(tdlib_env) / "lib" / "libtdjson.dylib"
+        tdlib_root = Path(tdlib_env)
+        tdjson_lib = tdlib_root / "lib" / "libtdjson.dylib"
         if not tdjson_lib.is_file():
             raise StepFailed(
                 f"GRAMDRIVE_TDLIB_ARTIFACT_DIR is set but {tdjson_lib} does not "
                 "exist; run `make tdlib` first"
             )
+        openssl_attribution, openssl_license, tdjson_runtime = tdlib_openssl_attribution(
+            tdlib_root
+        )
 
     libraries = packager.build_slices(extra_triples)
     # Bindings come from the release staticlib of the first slice: every slice
     # is the same source and the same contract, and UniFFI's checksums are over
     # the API, not the architecture.
     packager.generate_bindings(libraries[SLICES[0].triple], bindings_dir)
-    packager.stage_artifact(bindings_dir, artifact_dir, tdjson_lib=tdjson_lib)
+    packager.stage_artifact(
+        bindings_dir,
+        artifact_dir,
+        tdjson_lib=tdjson_lib,
+        openssl_license=openssl_license,
+    )
     host_test_lib = libraries[extra_triples[0]] if extra_triples else None
     packager.create_xcframework(
         libraries, bindings_dir, artifact_dir, host_test_lib=host_test_lib
@@ -1206,7 +1319,10 @@ def package(
             if tdjson_lib is not None
             else {}
         ),
+        **({"runtime": tdjson_runtime} if tdjson_runtime is not None else {}),
     }
+    if openssl_attribution is not None:
+        manifest["third_party"] = {"openssl": openssl_attribution}
 
     # README and manifest go inside the artifact before it is checksummed, so
     # the checksums cover everything that ships.

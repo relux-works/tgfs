@@ -5,6 +5,18 @@
 
 ## 2026-08-18
 
+### 0615 — Static OpenSSL attribution follows the exact shipped bytes (TASK-260810-fwgmr4)
+
+- ATTRIBUTION AUDIT: The repository Apache-2.0 `LICENSE`/`NOTICE` identifies GramDrive, and the Rust/Swift SBOM covers their package graphs, but neither identifies OpenSSL bytes statically incorporated into `libtdjson.dylib`. The authoritative TDLib artifact therefore now carries the exact `LICENSE.txt` from its selected OpenSSL prefix plus a normalized version, Apache-2.0 identifier, static embedding relationship, and license SHA-256.
+- FAIL-CLOSED PROPAGATION: The recipe schema/key advances with the new attribution bytes. Restore cross-checks OpenSSL version against toolchain provenance and binds the license to the exact manifest/checksum inventory. Core staging, app assembly, and candidate validation preserve identical license bytes and require matching privacy-safe identity/digest records; the signed app ships the license under `Contents/Resources/ThirdPartyLicenses`.
+- TRANSPLANT: The focused hermetic-OpenSSL delta was rebased onto exact protected `origin/main` `1ee74c976d28560b0491c52acabbe9cf45381184`; that commit is now the task branch's direct parent, so the already-integrated bindgen history is not duplicated. Existing main and task logbook entries are both retained.
+
+### 0550 — Arm64 TDLib artifacts carry no builder-local OpenSSL runtime (TASK-260810-fwgmr4)
+
+- Exact-main candidate run `32094552609` restored and cross-linked the clean arm64 TDLib artifact and initialized Developer ID/notary access, then correctly refused packaging because `libtdjson.dylib` retained `/opt/homebrew/opt/openssl@3` load commands unavailable on the Intel signer. The failure was independent of signing credentials and uploaded no candidate.
+- TDLib now requests static OpenSSL at CMake configure time and fails its build unless `otool -L` reports only Apple system dependencies. The recipe-key changes with this contract; restore independently re-reads the exact Mach-O bytes and requires its static-OpenSSL policy and dependency inventory to match before atomic workspace publication.
+- App packaging no longer attempts to discover or copy a signing-host Homebrew closure. It embeds only `libtdjson.dylib`, rejects libssl/libcrypto and every non-system/non-bundle-relative runtime reference, and binds the verified privacy-safe dependency policy into app and candidate provenance.
+
 ### 0415 — Candidate signing consumes verified arm64 TDLib on Intel (TASK-260810-fwgmr4)
 
 - Exact-main candidate run `32087816420` established that the dedicated signing runner is x86_64 and cannot run the arm64-only from-source TDLib build. Candidate CI now shares native-ci's recipe-keyed runner-local artifact path, refuses cold cache or digest/manifest/architecture tampering, and cross-links the arm64 artifact before credential import.
@@ -2392,3 +2404,10 @@
 - FIX: The coordinator now installs one request-scoped cancellation `Task` before either caller yields. The AppKit cancellation path and drain reconciliation join that same task; bounded idempotent retries begin only after the first command returns. The task is cleared with the active request, so no cancellation state crosses termination cycles, and prepare/cancel retain the same request UUID.
 - REGRESSION: A delayed-cancellation probe holds first delivery beyond the retry interval. It reproduced two cancellation invocations and `prepare,cancel,cancel` before the fix, then passed with exactly one invocation and `prepare,cancel` after the fix.
 - VALIDATION: The focused coordinator suite passed 20/20; the exact live-composition regression passed 50 consecutive isolated runs; three full Swift runs passed 513/513 in 69 suites; `make package-host-test`, `swift build`, scoped SwiftFormat 0.60.1 lint, and `git diff --check` exited 0 in the isolated exact-`origin/main` worktree.
+
+### 0818 — Candidate TDLib uses a source-pinned macOS trust store (TASK-260810-fwgmr4)
+
+- ROOT CAUSE: Static linkage alone retained Homebrew OpenSSL 3.6.3's compiled certificate, config, engine, and provider defaults. TDLib calls OpenSSL's default certificate APIs, so clean Macs could not use those builder-local paths even though `otool -L` showed only Apple system libraries.
+- FIX: The TDLib recipe now checksum-pins and builds official OpenSSL 3.6.3 source with static built-in providers/engines, stable `/usr` metadata, and `/etc/ssl` trust/config defaults. An offline binary probe linked to the exact archives scrubs environment overrides and requires a non-empty `/etc/ssl/cert.pem` store. Raw-byte gates reject Homebrew, user-home, and temporary builder paths at producer, restore, core, app, and candidate boundaries.
+- BYTE CONTRACT: Core verification temporarily copies the unchanged `@rpath` dylib beside its verifier executable instead of writing an absolute staging install name. The authoritative, core-staged, and app-embedded dylibs remain byte-identical; OpenSSL source digest, build options, trust proof, license, and exact dylib digest propagate through their manifests and checksum inventories.
+- REAL BUILD EVIDENCE: Clean arm64 schema-4 build loaded 128 certificate objects and produced `libtdjson.dylib` SHA-256 `321cb95e3a995f2bad546258c454f70220a64dc0fdeba6933034f97799f6bfeb`; real live core packaging and unsigned app assembly passed with exact source-built OpenSSL bytes. The first trust-probe source generation, the absolute core install-name approach, and the wall-clock-bearing OpenSSL build each failed closed before correction; no rejected artifact was accepted or seeded.

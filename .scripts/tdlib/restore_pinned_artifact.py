@@ -40,7 +40,7 @@ def _load_build_contract():
 
 
 build_contract = _load_build_contract()
-FileRunner = Callable[[Sequence[str]], tuple[int, str]]
+ToolRunner = Callable[[Sequence[str]], tuple[int, str]]
 
 
 class ArtifactError(RuntimeError):
@@ -63,7 +63,7 @@ def cache_key() -> str:
     return f"tdlib-{sha256_file(BUILD_SCRIPT)[:16]}"
 
 
-def default_file_runner(argv: Sequence[str]) -> tuple[int, str]:
+def default_tool_runner(argv: Sequence[str]) -> tuple[int, str]:
     try:
         result = subprocess.run(list(argv), capture_output=True, text=True)
     except FileNotFoundError:
@@ -149,8 +149,18 @@ def parse_checksums(path: Path) -> dict[str, str]:
     return checksums
 
 
+def parse_otool_dependencies(output: str) -> list[str]:
+    entries = [
+        line.split(" (", 1)[0].strip()
+        for line in output.splitlines()
+        if line.startswith("\t")
+    ]
+    require(bool(entries), "otool returned no cached TDLib install name")
+    return entries[1:]
+
+
 def validate_artifact(
-    root: Path, *, file_runner: FileRunner = default_file_runner
+    root: Path, *, file_runner: ToolRunner = default_tool_runner
 ) -> dict:
     require(
         root.is_dir() and not root.is_symlink(),
@@ -221,6 +231,37 @@ def validate_artifact(
         "cached TDLib license identity is missing",
     )
 
+    openssl = manifest.get("third_party", {}).get("openssl", {})
+    openssl_license = openssl.get("license", {})
+    openssl_version = str(openssl.get("version", ""))
+    openssl_license_name = build_contract.OPENSSL_LICENSE_PATH.as_posix()
+    require(
+        openssl.get("name") == build_contract.OPENSSL_NAME
+        and re.fullmatch(
+            r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?",
+            openssl_version,
+        )
+        is not None
+        and openssl.get("linkage") == "static"
+        and openssl.get("embedded_in") == f"lib/{build_contract.DYLIB_NAME}",
+        "cached TDLib OpenSSL attribution identity is missing or malformed",
+    )
+    require(
+        openssl_version == build_contract.OPENSSL_VERSION
+        and openssl.get("source")
+        == {
+            "url": build_contract.OPENSSL_SOURCE_URL,
+            "sha256": build_contract.OPENSSL_SOURCE_SHA256,
+        }
+        and openssl.get("build_options") == list(build_contract.OPENSSL_BUILD_OPTIONS),
+        "cached TDLib OpenSSL source/build recipe is not pinned",
+    )
+    require(
+        openssl_license.get("id") == build_contract.OPENSSL_LICENSE_ID
+        and openssl_license.get("file") == openssl_license_name,
+        "cached TDLib OpenSSL license attribution is missing",
+    )
+
     records = manifest.get("artifacts", {}).get("files", {})
     require(isinstance(records, dict), "cached TDLib manifest file inventory is malformed")
     require(
@@ -236,6 +277,16 @@ def validate_artifact(
     require(
         manifest_checksums == checksums,
         "cached TDLib manifest digest inventory does not match CHECKSUMS.sha256",
+    )
+    require(
+        openssl_license_name in files
+        and openssl_license.get("sha256") == checksums.get(openssl_license_name),
+        "cached TDLib OpenSSL license digest is not bound to the artifact inventory",
+    )
+    toolchain_openssl = str(manifest.get("toolchain", {}).get("openssl", ""))
+    require(
+        toolchain_openssl.startswith(f"OpenSSL {openssl_version}"),
+        "cached TDLib OpenSSL attribution disagrees with builder toolchain provenance",
     )
     require(
         manifest.get("artifacts", {}).get("total_bytes")
@@ -267,6 +318,63 @@ def validate_artifact(
         "cached TDLib library digest is malformed",
     )
 
+    runtime = manifest.get("runtime", {})
+    trust_store = runtime.get("trust_store", {})
+    require(
+        runtime.get("dependency_policy")
+        == build_contract.RUNTIME_DEPENDENCY_POLICY
+        and runtime.get("openssl_linkage") == "static",
+        "cached TDLib runtime dependency policy is not hermetic static-OpenSSL",
+    )
+    require(
+        runtime.get("forbidden_builder_paths_verified") is True
+        and trust_store.get("policy") == build_contract.TRUST_STORE_POLICY
+        and trust_store.get("cert_file") == build_contract.OPENSSL_CERT_FILE
+        and trust_store.get("cert_dir") == build_contract.OPENSSL_CERT_DIR
+        and trust_store.get("config_file") == build_contract.OPENSSL_CONFIG_FILE
+        and trust_store.get("environment_overrides_scrubbed") is True
+        and isinstance(trust_store.get("certificate_objects"), int)
+        and trust_store.get("certificate_objects", 0) > 0
+        and trust_store.get("verified") is True,
+        "cached TDLib macOS trust-store proof is missing or malformed",
+    )
+    try:
+        library_payload = library.read_bytes()
+    except OSError as error:
+        raise ArtifactError(f"cannot inspect cached TDLib bytes: {error}") from error
+    embedded_path_offenders = [
+        marker.decode("ascii")
+        for marker in build_contract.FORBIDDEN_RUNTIME_PATH_MARKERS
+        if marker in library_payload
+    ]
+    require(
+        not embedded_path_offenders,
+        "cached TDLib contains builder-local OpenSSL/runtime paths despite clean "
+        "Mach-O linkage: " + ", ".join(embedded_path_offenders),
+    )
+    code, otool_output = file_runner(("otool", "-L", str(library)))
+    require(
+        code == 0,
+        f"otool could not inspect cached TDLib library: {otool_output.strip()}",
+    )
+    dependencies = parse_otool_dependencies(otool_output)
+    offenders = [
+        dependency
+        for dependency in dependencies
+        if not dependency.startswith(build_contract.SYSTEM_RUNTIME_PREFIXES)
+        or Path(dependency).name.startswith(build_contract.OPENSSL_RUNTIME_NAMES)
+    ]
+    require(
+        not offenders,
+        "cached TDLib has non-hermetic runtime dependencies: "
+        + ", ".join(offenders),
+    )
+    require(
+        runtime.get("dependencies") == dependencies
+        and manifest.get("linkage") == dependencies,
+        "cached TDLib runtime dependency inventory disagrees with its Mach-O bytes",
+    )
+
     code, file_output = file_runner(("file", str(library)))
     require(
         code == 0,
@@ -288,7 +396,7 @@ def restore(
     cache_root: Path,
     out_dir: Path,
     *,
-    file_runner: FileRunner = default_file_runner,
+    file_runner: ToolRunner = default_tool_runner,
 ) -> dict:
     key = cache_key()
     source = require_cache_trust_ancestry(cache_root, key)

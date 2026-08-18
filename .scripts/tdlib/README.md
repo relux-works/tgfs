@@ -44,6 +44,8 @@ Bumping TDLib is editing that one constant and re-running `make tdlib`.
     lib/libtdjson.dylib         the shared C JSON client library (@rpath install name)
     include/td/telegram/        td_json_client.h, td_log.h, tdjson_export.h
     LICENSE_1_0.txt             TDLib's Boost Software License 1.0 (POL-6)
+    ThirdPartyLicenses/OpenSSL.txt
+                                exact Apache-2.0 text for statically linked OpenSSL
     manifest.json               pin, version, toolchain, sizes, checksums, linkage
     CHECKSUMS.sha256            sha256 of every shipped file (`shasum -c` format)
 ```
@@ -60,15 +62,27 @@ macOS arm64 host with:
 | Tool | Provides | Install |
 |---|---|---|
 | Xcode / command line tools | `clang`, `install_name_tool`, `otool`, `xcrun`, the macOS SDK (**zlib** lives here) | Xcode from the App Store, or `xcode-select --install` |
+| curl, tar, perl, make | fetch, verify, extract, and build the pinned OpenSSL source | macOS system tools |
 | cmake | configure/build | `brew install cmake` |
 | gperf | TDLib's build-time perfect-hash generator | `brew install gperf` |
-| OpenSSL 3 | libcrypto/libssl TDLib links | `brew install openssl@3` |
 
-`build_tdlib.py` resolves OpenSSL with `brew --prefix openssl@3` (Homebrew keeps
-it keg-only, off the default search path) and passes it to cmake as
-`OPENSSL_ROOT_DIR`. Override with `OPENSSL_ROOT_DIR=…` for a vendored or non-brew
-OpenSSL. The exact cmake invocation is in `configure_and_build`; the resolved
-tool versions are recorded in `manifest.json` under `toolchain`.
+`build_tdlib.py` pins the official OpenSSL 3.6.3 source URL and SHA-256, then
+builds its own arm64 `no-shared`, `no-module`, `no-engine` archives. The target
+configuration uses stable `/usr` and `/etc/ssl` defaults while `DESTDIR` keeps
+all installed build inputs inside `.temp`; Homebrew OpenSSL bytes and paths are
+never inputs. `GRAMDRIVE_OPENSSL_SOURCE_ARCHIVE` may identify a pre-downloaded
+archive, but the same pinned digest is mandatory.
+
+The builder links a dedicated offline probe against those exact static archives,
+scrubs OpenSSL/Homebrew environment overrides, and proves that
+`/etc/ssl/cert.pem` loads a non-empty macOS certificate store. After TDLib
+linking, both `otool -L` and raw-byte path gates run: only Apple system dylibs
+may remain, and compiled Homebrew, user-home, or temporary builder paths fail
+even when load commands look clean. The source URL/digest, build options,
+trust-store proof, dependency inventory, and static linkage are recorded in the
+schema-4 manifest and revalidated by restore, core staging, app assembly, and
+candidate packaging. The exact OpenSSL license remains checksum-bound through
+all four inventories.
 
 ## Per-platform consumption
 
@@ -109,8 +123,9 @@ The guarantee is that the bytes tie back to their inputs. `manifest.json`
 records the pinned TDLib commit, the TDLib version (both the source-declared
 number and the **runtime** version the smoke test reads out of the built
 library), the full toolchain (cmake, clang, OpenSSL, zlib, gperf), the target
-and deployment floor, the license, the dylib's dynamic dependencies (`otool
--L`), and a sha256 for every shipped file. `CHECKSUMS.sha256` is the same in
+and deployment floor, the TDLib and OpenSSL licenses, the normalized OpenSSL
+version and license digest, the dylib's system-only dynamic dependencies
+(`otool -L`), the static-OpenSSL policy, and a sha256 for every shipped file. `CHECKSUMS.sha256` is the same in
 `shasum -c` form. The manifest and checksum file exclude themselves — a file
 cannot list its own hash.
 

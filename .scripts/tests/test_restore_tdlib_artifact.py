@@ -26,11 +26,33 @@ def load_module():
 restore = load_module()
 
 
-def arm64_file(_argv):
-    return (
-        0,
-        "libtdjson.dylib: Mach-O 64-bit dynamically linked shared library arm64\n",
-    )
+SYSTEM_DEPENDENCIES = [
+    "/usr/lib/libz.1.dylib",
+    "/usr/lib/libc++.1.dylib",
+    "/usr/lib/libSystem.B.dylib",
+]
+
+
+def tool_runner(*, file_output="Mach-O 64-bit dynamically linked shared library arm64", dependencies=None):
+    dependencies = SYSTEM_DEPENDENCIES if dependencies is None else dependencies
+
+    def run(argv):
+        if argv[:2] == ("otool", "-L"):
+            lines = [
+                f"{argv[2]}:",
+                f"\t{restore.build_contract.DYLIB_INSTALL_NAME} (compatibility version 1.0.0, current version 1.8.0)",
+            ]
+            lines.extend(
+                f"\t{dependency} (compatibility version 1.0.0, current version 1.0.0)"
+                for dependency in dependencies
+            )
+            return 0, "\n".join(lines) + "\n"
+        return 0, f"libtdjson.dylib: {file_output}\n"
+
+    return run
+
+
+arm64_file = tool_runner()
 
 
 def stage_cache(root: Path) -> Path:
@@ -43,6 +65,11 @@ def stage_cache(root: Path) -> Path:
     library.write_bytes(b"arm64 tdjson bytes")
     (out / "LICENSE_1_0.txt").write_text(
         "Boost Software License\n", encoding="utf-8"
+    )
+    openssl_license = out / restore.build_contract.OPENSSL_LICENSE_PATH
+    openssl_license.parent.mkdir(parents=True)
+    openssl_license.write_text(
+        "Apache License\nVersion 2.0, January 2004\n", encoding="utf-8"
     )
     files = restore.artifact_files(out)
     checksums = {name: restore.sha256_file(path) for name, path in files.items()}
@@ -63,7 +90,44 @@ def stage_cache(root: Path) -> Path:
             ),
         },
         "license": {"id": restore.build_contract.LICENSE_ID},
+        "third_party": {
+            "openssl": {
+                "name": restore.build_contract.OPENSSL_NAME,
+                "version": restore.build_contract.OPENSSL_VERSION,
+                "source": {
+                    "url": restore.build_contract.OPENSSL_SOURCE_URL,
+                    "sha256": restore.build_contract.OPENSSL_SOURCE_SHA256,
+                },
+                "build_options": list(restore.build_contract.OPENSSL_BUILD_OPTIONS),
+                "license": {
+                    "id": restore.build_contract.OPENSSL_LICENSE_ID,
+                    "file": restore.build_contract.OPENSSL_LICENSE_PATH.as_posix(),
+                    "sha256": checksums[
+                        restore.build_contract.OPENSSL_LICENSE_PATH.as_posix()
+                    ],
+                },
+                "linkage": "static",
+                "embedded_in": "lib/libtdjson.dylib",
+            }
+        },
+        "toolchain": {"openssl": "OpenSSL 3.6.3 9 Jun 2026"},
         "reproducibility": {"clean_build_tree": True},
+        "linkage": SYSTEM_DEPENDENCIES,
+        "runtime": {
+            "dependency_policy": restore.build_contract.RUNTIME_DEPENDENCY_POLICY,
+            "openssl_linkage": "static",
+            "dependencies": SYSTEM_DEPENDENCIES,
+            "forbidden_builder_paths_verified": True,
+            "trust_store": {
+                "policy": restore.build_contract.TRUST_STORE_POLICY,
+                "cert_file": restore.build_contract.OPENSSL_CERT_FILE,
+                "cert_dir": restore.build_contract.OPENSSL_CERT_DIR,
+                "config_file": restore.build_contract.OPENSSL_CONFIG_FILE,
+                "environment_overrides_scrubbed": True,
+                "certificate_objects": 158,
+                "verified": True,
+            },
+        },
         "artifacts": {
             "total_bytes": sum(path.stat().st_size for path in files.values()),
             "files": {
@@ -87,6 +151,26 @@ def stage_cache(root: Path) -> Path:
     return out
 
 
+def rewrite_library(out: Path, payload: bytes) -> None:
+    library = out / "lib/libtdjson.dylib"
+    library.write_bytes(payload)
+    digest = restore.sha256_file(library)
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["files"]["lib/libtdjson.dylib"]["sha256"] = digest
+    manifest["artifacts"]["library"]["sha256"] = digest
+    manifest["artifacts"]["library"]["bytes"] = library.stat().st_size
+    files = restore.artifact_files(out)
+    manifest["artifacts"]["total_bytes"] = sum(path.stat().st_size for path in files.values())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    checksums = restore.parse_checksums(out / "CHECKSUMS.sha256")
+    checksums["lib/libtdjson.dylib"] = digest
+    (out / "CHECKSUMS.sha256").write_text(
+        "".join(f"{value}  {name}\n" for name, value in sorted(checksums.items())),
+        encoding="utf-8",
+    )
+
+
 class RestorePinnedArtifactTests(unittest.TestCase):
     def test_x86_signing_host_can_restore_verified_arm64_artifact(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -101,6 +185,28 @@ class RestorePinnedArtifactTests(unittest.TestCase):
             )
             self.assertEqual(manifest["target"]["arch"], "arm64")
             self.assertNotEqual(manifest["gramdrive"]["commit"], "b" * 40)
+
+    def test_openssl_identity_must_match_toolchain_and_license_inventory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            source = stage_cache(root / "cache")
+            manifest_path = source / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["third_party"]["openssl"]["version"] = "3.6.4"
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(restore.ArtifactError, "source/build recipe"):
+                restore.restore(
+                    root / "cache", root / "out", file_runner=arm64_file
+                )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            source = stage_cache(root / "cache")
+            (source / restore.build_contract.OPENSSL_LICENSE_PATH).unlink()
+            with self.assertRaisesRegex(restore.ArtifactError, "inventory"):
+                restore.restore(
+                    root / "cache", root / "out", file_runner=arm64_file
+                )
 
     def test_cold_cache_refuses_without_replacing_existing_destination(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -228,12 +334,50 @@ class RestorePinnedArtifactTests(unittest.TestCase):
             out = stage_cache(Path(raw) / "cache")
             with self.assertRaisesRegex(restore.ArtifactError, "not Mach-O arm64"):
                 restore.validate_artifact(
-                    out, file_runner=lambda _: (0, "Mach-O 64-bit x86_64")
+                    out, file_runner=tool_runner(file_output="Mach-O 64-bit x86_64")
                 )
             with self.assertRaisesRegex(restore.ArtifactError, "not arm64-only"):
                 restore.validate_artifact(
-                    out, file_runner=lambda _: (0, "Mach-O universal arm64 x86_64")
+                    out, file_runner=tool_runner(file_output="Mach-O universal arm64 x86_64")
                 )
+
+    def test_dynamic_homebrew_openssl_is_rejected_even_when_checksummed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out = stage_cache(Path(raw) / "cache")
+            dependencies = [
+                "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+                "/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib",
+                "/usr/lib/libSystem.B.dylib",
+            ]
+            manifest_path = out / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["linkage"] = dependencies
+            manifest["runtime"]["dependencies"] = dependencies
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(restore.ArtifactError, "non-hermetic"):
+                restore.validate_artifact(
+                    out, file_runner=tool_runner(dependencies=dependencies)
+                )
+
+    def test_compiled_homebrew_defaults_are_rejected_with_clean_load_commands(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out = stage_cache(Path(raw) / "cache")
+            rewrite_library(
+                out,
+                b"arm64 Mach-O\0/opt/homebrew/etc/openssl@3/cert.pem\0",
+            )
+            with self.assertRaisesRegex(restore.ArtifactError, "builder-local"):
+                restore.validate_artifact(out, file_runner=arm64_file)
+
+    def test_runtime_inventory_tamper_is_rejected_against_macho_bytes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out = stage_cache(Path(raw) / "cache")
+            manifest_path = out / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["runtime"]["dependencies"] = ["/usr/lib/libSystem.B.dylib"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(restore.ArtifactError, "inventory disagrees"):
+                restore.validate_artifact(out, file_runner=arm64_file)
 
     def test_manifest_pin_tamper_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
