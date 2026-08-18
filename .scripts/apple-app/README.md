@@ -121,6 +121,11 @@ and every file in the bundle. For a live TDLib build it also records the
 privacy-safe OpenSSL version and exact license digest propagated from the
 authoritative TDLib artifact; the license ships inside the signed app and the
 candidate gate requires identical bytes across TDLib, core, and app inventories.
+The TDLib signing transition separately binds the authoritative/core digest to
+the embedded dylib immediately before `codesign`, then binds the final changed
+Mach-O digest to `CHECKSUMS.sha256` and the strict nested Developer ID identity
+readback. It deliberately does not require pre-sign and post-sign bytes to be
+equal.
 
 The signed bytes are **deliberately not byte-reproducible**: Developer ID signing
 embeds a trusted timestamp that varies per signature *by design* — that is the
@@ -190,9 +195,11 @@ artifact.
   `libtdjson.dylib`, which is embedded at `Contents/Frameworks` and loaded via
   `@rpath`. OpenSSL is statically linked into that authoritative TDLib artifact;
   the packager rejects libssl/libcrypto load commands and compiled Homebrew,
-  user-home, or temporary builder paths. It preserves the exact dylib bytes and
-  the source-built OpenSSL `/etc/ssl/cert.pem` trust-store proof from the
-  authoritative TDLib artifact through core staging into the app manifest.
+  user-home, or temporary builder paths. It preserves the exact dylib bytes
+  through core staging and pre-sign app assembly, then records the final
+  Developer ID-signed bytes separately. The source-built OpenSSL
+  `/etc/ssl/cert.pem` trust-store proof remains identical from the authoritative
+  TDLib artifact through the app manifest.
 - **The release workflow** now exists (`.github/workflows/release.yml`,
   TASK-260715-3bhbkv): tag-triggering, importing the cert from `MACOS_CERT_P12`
   into a throwaway keychain, GitHub artifact attestation, and — via

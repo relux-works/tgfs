@@ -29,6 +29,7 @@ COMMIT = "a" * 40
 DMG = b"exact candidate dmg bytes"
 DMG_SHA = sha256(DMG).hexdigest()
 TDLIB_SHA = sha256(b"tdlib").hexdigest()
+SIGNED_TDLIB_SHA = sha256(b"signed tdlib").hexdigest()
 CORE_SHA = sha256(b"core").hexdigest()
 CORE_ZIP_SHA = sha256(b"core zip").hexdigest()
 OPENSSL_LICENSE = b"Apache License 2.0\n"
@@ -93,7 +94,7 @@ def stage(root: Path, mode: str = "test") -> None:
     (app_dir / "GramDrive-0.5.0.dmg").write_bytes(DMG)
     embedded_tdlib = app_dir / "GramDrive.app" / "Contents" / "Frameworks" / "libtdjson.dylib"
     embedded_tdlib.parent.mkdir(parents=True)
-    embedded_tdlib.write_bytes(b"tdlib")
+    embedded_tdlib.write_bytes(b"signed tdlib")
     app_openssl_license = (
         app_dir / "GramDrive.app" / "Contents" / "Resources" / candidate.OPENSSL_LICENSE_PATH
     )
@@ -101,7 +102,7 @@ def stage(root: Path, mode: str = "test") -> None:
     app_openssl_license.write_bytes(OPENSSL_LICENSE)
     app_checksums = {
         "GramDrive-0.5.0.dmg": DMG_SHA,
-        "GramDrive.app/Contents/Frameworks/libtdjson.dylib": TDLIB_SHA,
+        "GramDrive.app/Contents/Frameworks/libtdjson.dylib": SIGNED_TDLIB_SHA,
         candidate.APP_OPENSSL_LICENSE_PATH: OPENSSL_LICENSE_SHA,
     }
     (app_dir / "CHECKSUMS.sha256").write_text(
@@ -134,6 +135,26 @@ def stage(root: Path, mode: str = "test") -> None:
         "tdjson": {
             "linked": True,
             "embedded_libraries": ["libtdjson.dylib"],
+            "signing_transition": {
+                "required": True,
+                "operation": "developer-id-codesign",
+                "source": {"artifact": "staged-core", "sha256": TDLIB_SHA},
+                "pre_sign": {
+                    "bundle_path": "Contents/Frameworks/libtdjson.dylib",
+                    "sha256": TDLIB_SHA,
+                    "matches_source": True,
+                },
+                "post_sign": {
+                    "bundle_path": "Contents/Frameworks/libtdjson.dylib",
+                    "sha256": SIGNED_TDLIB_SHA,
+                },
+                "signature": {
+                    "verified": True,
+                    "team_id": candidate.TEAM_ID,
+                    "authority": candidate.IDENTITY,
+                    "architecture": "arm64",
+                },
+            },
             "runtime": {
                 "verified": True,
                 "dependency_policy": "system-or-bundle-relative-static-openssl",
@@ -257,6 +278,10 @@ class CandidatePackageTests(unittest.TestCase):
                 OPENSSL_LICENSE_SHA,
             )
             self.assertTrue(provenance["app_runtime"]["verified"])
+            self.assertEqual(
+                provenance["app_tdlib_signing_transition"]["post_sign"]["sha256"],
+                SIGNED_TDLIB_SHA,
+            )
 
             verification = candidate.read_json(out / "verification.json")
             verification["result"] = "forged"
@@ -293,8 +318,37 @@ class CandidatePackageTests(unittest.TestCase):
             app_manifest = candidate.read_json(second / "app" / "manifest.json")
             app_manifest["checksums"]["GramDrive.app/Contents/Frameworks/libtdjson.dylib"] = embedded_sha
             write_json(second / "app" / "manifest.json", app_manifest)
-            with self.assertRaisesRegex(candidate.CandidateError, "embedded live TDLib bytes"):
+            with self.assertRaisesRegex(candidate.CandidateError, "checksum mismatch"):
                 candidate.build_candidate(args(second))
+
+    def test_rejects_forged_pre_sign_tdlib_provenance(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); stage(root)
+            app_manifest = candidate.read_json(root / "app" / "manifest.json")
+            app_manifest["tdjson"]["signing_transition"]["pre_sign"]["sha256"] = "0" * 64
+            write_json(root / "app" / "manifest.json", app_manifest)
+            with self.assertRaisesRegex(candidate.CandidateError, "pre-sign provenance"):
+                candidate.build_candidate(args(root))
+
+    def test_rejects_post_sign_bytes_not_bound_to_final_app_checksum(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); stage(root)
+            app_manifest = candidate.read_json(root / "app" / "manifest.json")
+            app_manifest["tdjson"]["signing_transition"]["post_sign"]["sha256"] = "0" * 64
+            write_json(root / "app" / "manifest.json", app_manifest)
+            with self.assertRaisesRegex(candidate.CandidateError, "post-sign provenance"):
+                candidate.build_candidate(args(root))
+
+    def test_rejects_signed_transition_without_tdlib_code_readback(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); stage(root)
+            app_manifest = candidate.read_json(root / "app" / "manifest.json")
+            app_manifest["shipped_code_verification"]["objects"][0]["path"] = (
+                "Contents/MacOS/other"
+            )
+            write_json(root / "app" / "manifest.json", app_manifest)
+            with self.assertRaisesRegex(candidate.CandidateError, "exactly one shipped-code"):
+                candidate.build_candidate(args(root))
 
     def test_rejects_unverified_or_dynamic_openssl_runtime_provenance(self):
         with tempfile.TemporaryDirectory() as raw:

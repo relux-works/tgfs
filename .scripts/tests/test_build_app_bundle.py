@@ -476,9 +476,14 @@ class PipelineTest(unittest.TestCase):
         (core / "Package.swift").write_text("// core")
         manifest = {"contract_version": "0.5.0"}
         if linked:
-            manifest["tdjson"] = {"linked": True}
             (core / "lib").mkdir()
             (core / "lib" / "libtdjson.dylib").write_bytes(b"\xcf\xfa\xed\xfe dylib")
+            manifest["tdjson"] = {
+                "linked": True,
+                "library_sha256": app.sha256_file(
+                    core / "lib" / "libtdjson.dylib"
+                ),
+            }
             stage_openssl_attribution(core, manifest)
         (core / "gramdrive-core-manifest.json").write_text(json.dumps(manifest))
         return repo, core
@@ -926,6 +931,62 @@ class PipelineTest(unittest.TestCase):
             rendered = (out / "CHECKSUMS.sha256").read_text()
             self.assertIn("GramDrive-0.5.0.dmg", rendered)
             self.assertTrue(any(name.startswith("GramDrive.app/") for name in manifest["checksums"]))
+
+    def test_manifest_binds_pre_sign_tdlib_to_final_signed_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _, _ = self.run_pipeline(Path(tmp), notarize=True)
+            transition = manifest["tdjson"]["signing_transition"]
+            self.assertTrue(transition["required"])
+            self.assertEqual(
+                transition["source"]["sha256"],
+                transition["pre_sign"]["sha256"],
+            )
+            self.assertEqual(
+                transition["post_sign"]["sha256"],
+                manifest["checksums"][
+                    "GramDrive.app/Contents/Frameworks/libtdjson.dylib"
+                ],
+            )
+            self.assertEqual(
+                transition["signature"],
+                {
+                    "verified": True,
+                    "team_id": app.TEAM_ID,
+                    "authority": "Developer ID Application: Test (262RZ595FP)",
+                    "architecture": "arm64",
+                },
+            )
+
+    def test_pre_sign_tdlib_tamper_is_rejected_before_codesign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, core = self.stage(Path(tmp))
+            out = Path(tmp) / "out"
+            out.mkdir()
+            run, calls = self.scripted()
+            packager = app.AppPackager(
+                repo,
+                out,
+                identity="Developer ID Application: Test (262RZ595FP)",
+                core_package=core,
+                runner=run,
+                echo=lambda _: None,
+                environ={},
+            )
+            app_bundle = self._assembled_runtime_app_for_transition(Path(tmp), core)
+            embedded = app_bundle / "Contents" / "Frameworks" / "libtdjson.dylib"
+            embedded.write_bytes(b"tampered before signing")
+            with self.assertRaisesRegex(app.StepFailed, "immediately before signing"):
+                packager.begin_tdjson_signing_transition(
+                    app_bundle, ["libtdjson.dylib"]
+                )
+            self.assertFalse(any(call and call[0] == "codesign" for call in calls))
+
+    def _assembled_runtime_app_for_transition(self, tmp: Path, core: Path) -> Path:
+        app_bundle = tmp / "transition.app"
+        embedded = app_bundle / "Contents" / "Frameworks" / "libtdjson.dylib"
+        embedded.parent.mkdir(parents=True)
+        embedded.write_bytes((core / "lib" / "libtdjson.dylib").read_bytes())
+        return app_bundle
 
     def test_reproducibility_claim_is_honest(self):
         with tempfile.TemporaryDirectory() as tmp:

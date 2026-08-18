@@ -394,12 +394,60 @@ def validate_inputs(
     )
     require(app_checksums.get(dmg.name) == dmg_digest, "DMG checksum does not match app packaging record")
     require(
-        app_checksums.get("GramDrive.app/Contents/Frameworks/libtdjson.dylib") == tdlib_digest,
-        "embedded live TDLib bytes do not match the pinned TDLib artifact",
-    )
-    require(
         core_checksums.get("lib/libtdjson.dylib") == tdlib_digest,
         "staged core TDLib bytes do not match the pinned TDLib artifact",
+    )
+    transition = app.get("tdjson", {}).get("signing_transition", {})
+    shipped_tdlib_digest = app_checksums.get(
+        "GramDrive.app/Contents/Frameworks/libtdjson.dylib"
+    )
+    require(
+        transition.get("required") is True
+        and transition.get("operation") == "developer-id-codesign"
+        and transition.get("source")
+        == {"artifact": "staged-core", "sha256": tdlib_digest}
+        and transition.get("pre_sign")
+        == {
+            "bundle_path": "Contents/Frameworks/libtdjson.dylib",
+            "sha256": tdlib_digest,
+            "matches_source": True,
+        },
+        "TDLib pre-sign provenance does not match the authoritative staged bytes",
+    )
+    require(
+        SHA256_RE.fullmatch(str(shipped_tdlib_digest or "")) is not None
+        and transition.get("post_sign")
+        == {
+            "bundle_path": "Contents/Frameworks/libtdjson.dylib",
+            "sha256": shipped_tdlib_digest,
+        },
+        "TDLib post-sign provenance does not match the final shipped bytes",
+    )
+    require(
+        transition.get("signature")
+        == {
+            "verified": True,
+            "team_id": TEAM_ID,
+            "authority": IDENTITY,
+            "architecture": "arm64",
+        },
+        "TDLib signed transition lacks strict Developer ID signature readback",
+    )
+    tdlib_shipped_objects = [
+        item
+        for item in shipped_objects
+        if item.get("path") == "Contents/Frameworks/libtdjson.dylib"
+    ]
+    require(
+        len(tdlib_shipped_objects) == 1
+        and tdlib_shipped_objects[0].get("signature") == "passed"
+        and tdlib_shipped_objects[0].get("team_id")
+        == transition["signature"]["team_id"]
+        and tdlib_shipped_objects[0].get("authority")
+        == transition["signature"]["authority"]
+        and transition["signature"]["architecture"]
+        in tdlib_shipped_objects[0].get("architectures", []),
+        "TDLib signed transition is not backed by exactly one shipped-code readback",
     )
     require(app.get("checksums") == app_checksums, "app manifest checksum inventory does not match CHECKSUMS.sha256")
     require(core.get("checksums") == core_checksums, "core manifest checksum inventory does not match CHECKSUMS.sha256")
@@ -466,6 +514,7 @@ def build_candidate(args: argparse.Namespace) -> dict:
             "checksums": "passed",
             "gatekeeper_app_and_dmg": "passed",
             "live_tdlib": "passed",
+            "live_tdlib_signed_transition": "passed",
             "manifest": "passed",
             "nested_and_dmg_signatures": "passed",
             "notarization_app_and_dmg": "passed",
@@ -489,6 +538,9 @@ def build_candidate(args: argparse.Namespace) -> dict:
             "third_party": tdlib.get("third_party"),
         },
         "app_runtime": app.get("tdjson", {}).get("runtime"),
+        "app_tdlib_signing_transition": app.get("tdjson", {}).get(
+            "signing_transition"
+        ),
         "app_third_party": app.get("third_party"),
     }
     write_json(out_dir / "verification.json", verification)

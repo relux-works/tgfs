@@ -808,6 +808,97 @@ class AppPackager:
             raise StepFailed("core TDLib runtime contract is malformed")
         return runtime
 
+    def begin_tdjson_signing_transition(
+        self, app: Path, embedded_libraries: list[str]
+    ) -> dict:
+        """Bind the staged TDLib bytes to the exact pre-sign bundle bytes.
+
+        Developer ID signing necessarily changes a Mach-O.  The source-byte
+        invariant therefore ends immediately before ``codesign``; the final
+        shipped digest and signature readback are attached separately after
+        signing, notarization, and stapling.
+        """
+        if not self.core_tdjson_linked():
+            return {"required": False}
+        if embedded_libraries != ["libtdjson.dylib"]:
+            raise StepFailed("TDLib signing transition requires exactly libtdjson.dylib")
+        try:
+            core_manifest = json.loads(
+                (self.core_package / "gramdrive-core-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise StepFailed(f"cannot read core TDLib signing input: {error}") from error
+        declared = core_manifest.get("tdjson", {}).get("library_sha256")
+        source = self.core_package / "lib" / "libtdjson.dylib"
+        embedded = app / "Contents" / "Frameworks" / "libtdjson.dylib"
+        if not source.is_file() or source.is_symlink() or not embedded.is_file():
+            raise StepFailed("TDLib signing transition input is missing or unsafe")
+        source_digest = sha256_file(source)
+        embedded_digest = sha256_file(embedded)
+        if not (
+            isinstance(declared, str)
+            and re.fullmatch(r"[0-9a-f]{64}", declared)
+            and declared == source_digest == embedded_digest
+        ):
+            raise StepFailed(
+                "embedded TDLib bytes do not match the staged core immediately before signing"
+            )
+        return {
+            "required": True,
+            "operation": "developer-id-codesign",
+            "source": {"artifact": "staged-core", "sha256": source_digest},
+            "pre_sign": {
+                "bundle_path": "Contents/Frameworks/libtdjson.dylib",
+                "sha256": embedded_digest,
+                "matches_source": True,
+            },
+        }
+
+    def finish_tdjson_signing_transition(
+        self, app: Path, transition: dict, shipped_code: dict, *, signed: bool
+    ) -> dict:
+        """Bind the final embedded bytes to their strict signature readback."""
+        if transition.get("required") is not True:
+            return transition
+        embedded = app / "Contents" / "Frameworks" / "libtdjson.dylib"
+        post_digest = sha256_file(embedded)
+        if not signed:
+            return {
+                **transition,
+                "post_sign": {"sha256": post_digest},
+                "signature": {"verified": False, "reason": "unsigned-assembly"},
+            }
+        matches = [
+            item
+            for item in shipped_code.get("objects", [])
+            if item.get("path") == "Contents/Frameworks/libtdjson.dylib"
+        ]
+        if len(matches) != 1:
+            raise StepFailed("final TDLib signature readback is missing or ambiguous")
+        record = matches[0]
+        if not (
+            record.get("signature") == "passed"
+            and record.get("team_id") == TEAM_ID
+            and record.get("authority") == self.identity
+            and BUILD_ARCH in record.get("architectures", [])
+        ):
+            raise StepFailed("final TDLib signature identity or architecture is invalid")
+        return {
+            **transition,
+            "post_sign": {
+                "bundle_path": "Contents/Frameworks/libtdjson.dylib",
+                "sha256": post_digest,
+            },
+            "signature": {
+                "verified": True,
+                "team_id": TEAM_ID,
+                "authority": self.identity,
+                "architecture": BUILD_ARCH,
+            },
+        }
+
     def git_info(self) -> dict:
         code, describe = self.runner(
             ("git", "describe", "--tags", "--always", "--dirty"), self.repo_root, None
@@ -1654,6 +1745,9 @@ def package(
     app = packager.assemble_bundle(bin_dir, (short_version, build_version), update)
     packager.embed_sparkle_framework(app, bin_dir)
     embedded_libraries = packager.embed_runtime_libraries(app)
+    tdjson_signing_transition = packager.begin_tdjson_signing_transition(
+        app, embedded_libraries
+    )
     third_party = packager.embed_third_party_attribution(app)
     packager.add_companion_frameworks_rpath(app)
     entitlement_files = packager.write_entitlement_files()
@@ -1680,6 +1774,10 @@ def package(
     else:
         signed = packager.sign(app, entitlement_files, timestamp=timestamp)
         packager.verify(app, signed)
+        # Record the final embedded TDLib identity even for local signed
+        # packaging.  The notarized candidate path repeats this readback after
+        # stapling and replaces the record with that later proof.
+        post_staple_verification["shipped_code"] = packager.verify_shipped_code(app)
         spctl_verdict = packager.assess(app)
         if notarize:
             # Staple the app FIRST, before the dmg is built, so the copy inside
@@ -1726,6 +1824,12 @@ def package(
         "linked": packager.core_tdjson_linked(),
         "embedded_libraries": embedded_libraries,
         "runtime": packager.assert_no_absolute_runtime_refs(app, embedded_libraries),
+        "signing_transition": packager.finish_tdjson_signing_transition(
+            app,
+            tdjson_signing_transition,
+            post_staple_verification["shipped_code"],
+            signed=not unsigned,
+        ),
     }
     manifest["third_party"] = third_party
 
