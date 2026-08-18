@@ -653,6 +653,7 @@ class PipelineTest(unittest.TestCase):
 
         report = kwargs.pop("report", '{"contract_version": "0.1.0"}')
         kwargs.setdefault("host_machine", "arm64")
+        environ = kwargs.pop("environ", {"HOME": "/home/u", "PATH": "/bin"})
 
         def scripted(argv, cwd, env=None):
             argv = tuple(str(a) for a in argv)
@@ -703,7 +704,7 @@ class PipelineTest(unittest.TestCase):
             out_dir=out_dir,
             runner=scripted,
             echo=lambda _: None,
-            environ={"HOME": "/home/u", "PATH": "/bin"},
+            environ=environ,
             **kwargs,
         )
         return manifest, runner, out_dir
@@ -779,7 +780,7 @@ class PipelineTest(unittest.TestCase):
             self.assertNotIn(tmp, shipped)
             self.assertNotIn("/home/u", shipped)
 
-    def test_bindgen_stays_out_of_the_packaging_target_dir(self):
+    def test_bindgen_uses_host_environment_outside_packaging_target_dir(self):
         # It is a host tool built with --features bindgen; letting it into the
         # packaging target dir is exactly the pollution the wipe exists to stop.
         with tempfile.TemporaryDirectory() as tmp:
@@ -787,7 +788,39 @@ class PipelineTest(unittest.TestCase):
             index = next(
                 i for i, argv in enumerate(runner.calls) if "uniffi-bindgen" in " ".join(argv)
             )
-            self.assertIsNone(runner.envs[index])
+            self.assertNotIn("CARGO_TARGET_DIR", runner.envs[index])
+            self.assertEqual(runner.envs[index]["PATH"], "/bin")
+
+    def test_x86_host_bindgen_does_not_link_the_arm64_tdlib_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tdlib = root / "tdlib"
+            library = tdlib / "lib/libtdjson.dylib"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"arm64 tdjson")
+            _, runner, _ = self.run_pipeline(
+                root,
+                host_machine="x86_64",
+                environ={
+                    "HOME": "/home/u",
+                    "PATH": "/bin",
+                    packaging.TDLIB_ARTIFACT_ENV: str(tdlib),
+                },
+            )
+            build_index = next(
+                i for i, argv in enumerate(runner.calls) if "rustc" in " ".join(argv)
+            )
+            bindgen_index = next(
+                i
+                for i, argv in enumerate(runner.calls)
+                if "uniffi-bindgen" in " ".join(argv)
+            )
+            self.assertEqual(
+                runner.envs[build_index][packaging.TDLIB_ARTIFACT_ENV], str(tdlib)
+            )
+            self.assertNotIn(
+                packaging.TDLIB_ARTIFACT_ENV, runner.envs[bindgen_index]
+            )
 
     def test_checksums_cover_the_artifact_and_the_zip(self):
         with tempfile.TemporaryDirectory() as tmp:

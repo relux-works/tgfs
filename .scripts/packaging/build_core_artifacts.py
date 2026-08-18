@@ -84,6 +84,7 @@ EXIT_FAILED = 1
 EXIT_CANNOT_START = 2
 
 OUT_ROOT = Path(".temp") / "packaging"
+TDLIB_ARTIFACT_ENV = "GRAMDRIVE_TDLIB_ARTIFACT_DIR"
 
 # The crate that is packaged, and the names its build and its bindings use.
 FFI_CRATE = "gramdrive-ffi"
@@ -859,12 +860,18 @@ class Packager:
         derived from `library`, nothing of it ships, and keeping its
         `--features bindgen` build (which pulls in uniffi's CLI machinery) out
         of packaging's target directory is what keeps that directory
-        single-purpose and its contents predictable.
+        single-purpose and its contents predictable. The real-TDLib artifact
+        variable is removed only for this host tool: on an Intel packaging host
+        it would otherwise make the generator binary try to link the shipped
+        arm64-only dylib. The target staticlib build retains the variable and
+        therefore remains live-TDLib-linked.
         """
         if out_dir.exists():
             shutil.rmtree(out_dir)
         out_dir.mkdir(parents=True)
-        self.run("uniffi-bindgen", bindgen_argv(library, out_dir))
+        host_env = dict(self.environ if self.environ is not None else os.environ)
+        host_env.pop(TDLIB_ARTIFACT_ENV, None)
+        self.run("uniffi-bindgen", bindgen_argv(library, out_dir), env=host_env)
         expected = [f"{SWIFT_MODULE}.swift", f"{FFI_MODULE}.h", f"{FFI_MODULE}.modulemap"]
         missing = [name for name in expected if not (out_dir / name).is_file()]
         if missing:
@@ -1114,7 +1121,7 @@ def package(
     # `make tdjson-smoke` uses) and the runtime library is staged into the
     # artifact. Unset -- every hermetic gate run -- nothing here changes.
     tdlib_env = (environ if environ is not None else os.environ).get(
-        "GRAMDRIVE_TDLIB_ARTIFACT_DIR"
+        TDLIB_ARTIFACT_ENV
     )
     tdjson_lib: Path | None = None
     if tdlib_env:
