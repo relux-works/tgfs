@@ -1,398 +1,330 @@
-# Tag-triggered release — the signed, notarized, attested GramDrive.app + dmg and
-# its provenance (TASK-260715-3bhbkv). Mirrors the relux-works/barycenter
-# release.yml pattern: a `v*` tag, the self-hosted mac runner (see the job
-# comment), a Developer ID identity imported from a secret into a THROWAWAY
-# keychain, hardened-runtime signing, dmg, notarize + staple, and GitHub
-# artifact attestation (id-token + attestations).
-#
-# WHY A SEPARATE WORKFLOW FROM ci.yml / native-ci.yml. Those gate every PR and
-# main; they read only the checkout, mint no token, and hold no secret. Release
-# is the one workflow with elevated permissions and the signing identity, so it
-# is isolated to a single tag trigger with its own least-privilege grant. It
-# never re-implements a signing or codesign command: it INVOKES the reusable
-# scripts native-ci already proves unsigned (`build_app_bundle.py`,
-# `build_release_provenance.py`) — the one-entrypoint contract, one step deeper.
-#
-# THE HUMAN GATE. POL-8 / DEC-020: public release is the single mandatory human
-# approval gate. That is the `environment: release` below — its required-reviewer
-# protection rule (owner sign-off) is a repo-admin setting a workflow file cannot
-# grant itself, the same transparent limitation the required-status-check rule
-# has in ci.yml. Until it is set, the job runs unguarded; setting it makes the
-# tag wait for owner approval before any credential is touched.
-#
-# SECRETS (never in the repo or logs — SEC-001/NFR-053; the gitleaks gate + the
-# release provenance scrub both enforce it):
-#   MACOS_CERT_P12        base64 of the Developer ID Application .p12
-#   MACOS_CERT_PASSWORD   the .p12 export password
-#   APPSTORE_KEY_ID       App Store Connect API key id (notarization)
-#   APPSTORE_ISSUER_ID    App Store Connect issuer id
-#   APPSTORE_PRIVATE_KEY  the ASC API .p8 private key contents
-# No Telegram api_id/api_hash here: `make package` builds the core mock-only and
-# the bundle links no TDLib, so the signed artifact needs no runtime secret.
-name: release
+name: stable-release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Promote a tested candidate or redeploy an immutable stable site
+        required: true
+        type: choice
+        options:
+          - promote
+          - redeploy-site
+      tag:
+        description: Existing v* tag to recover or redeploy
+        required: true
+        type: string
 
-# Least privilege, but wider than the gate workflows because a release publishes:
-#   contents: write      create the GitHub Release and upload its assets
-#   id-token: write      mint the OIDC token the attestation is bound to
-#   attestations: write  record the build-provenance attestation
 permissions:
   contents: read
 
 concurrency:
-  # One release per tag; never cancel one in flight — a cancelled run mid-notarize
-  # or mid-publish leaves a half-made release. (Unlike PR gates, which cancel.)
-  group: release-${{ github.ref }}
+  group: gramdrive-stable-publication
   cancel-in-progress: false
 
+env:
+  STABLE_FEED_GENERATION: "1"
+  TEST_FEED_GENERATION: "1"
+
 jobs:
-  release:
-    name: release-macos
-    # SELF-HOSTED (TASK-260719-1dwaj8): the persistent x86_64 mac runner —
-    # hosted macOS minutes are blocked by org billing. The signed artifacts
-    # stay arm64 (POL-5 / DEC-017): the core is cross-compiled per the SLICES
-    # list and the app executables are built --arch arm64 and arch-verified
-    # with lipo inside build_app_bundle.py. Xcode comes from the runner's .env
-    # (DEVELOPER_DIR), not from a hosted image.
-    #
-    # PERSISTENT-RUNNER SECRET DISCIPLINE — this machine outlives the run, so
-    # the ephemeral-VM assumptions are replaced with explicit cleanup:
-    #   * the throwaway keychain lives in RUNNER_TEMP and is deleted in the
-    #     always() step, which ALSO restores the original default keychain and
-    #     search list (making the throwaway default would otherwise dangle);
-    #   * decoded secret files exist only inside the import step and are
-    #     removed there, with a belt-and-suspenders rm in the cleanup;
-    #   * the always() cleanup wipes .temp, so the workspace keeps no signed
-    #     bundle, dmg or provenance beyond the uploaded artifacts.
+  # Approval is before either stable private-key access or Release mutation.
+  # This job has contents:write but intentionally has no Pages capability.
+  promote:
+    name: approve-sign-and-promote-exact-candidate
+    if: github.event_name == 'push' || inputs.operation == 'promote'
     runs-on: [self-hosted, gramdrive-mac]
-    # POL-8 / DEC-020 single human approval gate (see header).
     environment: release
     permissions:
       contents: write
-      id-token: write
-      attestations: write
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      build: ${{ steps.candidate.outputs.build }}
     steps:
-      - name: Name the throwaway signing keychain
-        # The one keychain that holds BOTH the signing identity and the notary
-        # profile for this run; deleted in the always() cleanup step. Kept in
-        # RUNNER_TEMP so it never lands in the workspace or a cache. Exported here
-        # because the `runner` context is not available in a job-level `env:`.
-        # The original default keychain AND search list are recorded now so the
-        # cleanup can restore them verbatim — on a persistent runner "whatever
-        # they were" still matters after the run. Verbatim restore, not
-        # filter-out-the-throwaway: `security delete-keychain` leaves a
-        # dangling search-list entry behind (measured on the runner,
-        # TASK-260719-1dwaj8), and `list-keychains -s` with zero paths is a
-        # silent no-op, so a grep-based cleanup can quietly keep the residue.
-        run: |
-          echo "KEYCHAIN_PATH=$RUNNER_TEMP/gramdrive-signing.keychain-db" >> "$GITHUB_ENV"
-          original="$(security default-keychain -d user | sed 's/^[[:space:]]*//;s/"//g')"
-          echo "ORIGINAL_DEFAULT_KEYCHAIN=$original" >> "$GITHUB_ENV"
-          {
-            echo "ORIGINAL_KEYCHAIN_SEARCH_LIST<<GRAMDRIVE_KEYCHAIN_EOF"
-            security list-keychains -d user | sed 's/^[[:space:]]*//;s/"//g'
-            echo "GRAMDRIVE_KEYCHAIN_EOF"
-          } >> "$GITHUB_ENV"
-
-      - name: Checkout full history and tags
-        # Version stamping reads `git describe --tags` (marketing version) and
-        # `git rev-list --count HEAD` (CFBundleVersion, Sparkle ordering), and
-        # the changelog spans from the previous tag — all need full history+tags.
+      - name: Checkout full protected-main history
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          clean: true
 
-      - name: Install the pinned Rust toolchain
-        run: |
-          rustup show
-          rustc --version
-          cargo --version
-
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-
-      - name: Install cargo-deny (pinned)
-        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
-        with:
-          tool: cargo-deny@0.20.2
-
-      - name: Supply-chain gate before signing (POL-6)
-        # Fail CLOSED before any credential is imported: a tag that pulls in a
-        # disallowed license or an open advisory must never reach the signing
-        # identity. Run through the ONE acceptance entrypoint (single step name),
-        # not an ad-hoc cargo-deny line, so it is the exact gate CI and devs run.
-        run: python3 .scripts/acceptance/run_automated.py --suite supply-chain --run-id release-supply-chain
-
-      - name: Import the Developer ID identity and notary profile (throwaway keychain)
-        # Every secret arrives via env and is written only to RUNNER_TEMP files
-        # that are deleted in the same step. No secret is ever echoed (no set -x),
-        # and the keychain password is generated here — it never leaves the run.
+      - name: Validate the immutable release tag and protected-main source
+        id: source
         env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
-          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
-          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          cert_path="$RUNNER_TEMP/cert.p12"
-          asc_key="$RUNNER_TEMP/asc_key.p8"
-          keychain_pw="$(openssl rand -base64 24)"
-
-          # A dedicated keychain, unlocked, set as default and added to the search
-          # list so codesign finds the identity. Auto-lock long enough for the run.
-          security create-keychain -p "$keychain_pw" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$keychain_pw" "$KEYCHAIN_PATH"
-          security default-keychain -s "$KEYCHAIN_PATH"
-          # Keep the existing keychains in the search list; strip only the quotes
-          # security prints around each path and let word-splitting separate them
-          # (each remains its own argument). Word-splitting is intentional here.
-          # shellcheck disable=SC2046
-          security list-keychains -d user -s "$KEYCHAIN_PATH" \
-            $(security list-keychains -d user | sed 's/"//g')
-
-          # Import the Developer ID Application identity, then authorise codesign
-          # to use its private key without an interactive prompt.
-          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$cert_path"
-          security import "$cert_path" -k "$KEYCHAIN_PATH" -P "$MACOS_CERT_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_pw" "$KEYCHAIN_PATH" >/dev/null
-          rm -f "$cert_path"
-
-          # Import the Apple "Developer ID Certification Authority" (G2)
-          # intermediate that the leaf chains through up to the (system-trusted)
-          # Apple Root CA. Hosted GitHub runners preinstall this intermediate;
-          # this persistent runner does not (BUG-260720-29dn2v), so without it
-          # the imported leaf never builds a valid chain and `find-identity -v`
-          # lists 0 codesigning identities even though "1 identity imported".
-          # Fetch the public CA from Apple pinned by sha256 — fail CLOSED on any
-          # mismatch so a swapped or MITM'd cert never reaches the keychain — and
-          # add it to the SAME throwaway keychain. It carries no private key (no
-          # -T) and no trust override (the anchor stays the OS-trusted Apple Root
-          # CA, never this run); it is a public cert, not a secret, and it is
-          # gone with the keychain in the always() cleanup. Verify the pinned
-          # sha256 against https://www.apple.com/certificateauthority/ before
-          # bumping it.
-          devid_ca="$RUNNER_TEMP/DeveloperIDG2CA.cer"
-          devid_ca_sha256="f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a"
-          curl --fail --location --silent --show-error \
-            --output "$devid_ca" \
-            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
-          echo "$devid_ca_sha256  $devid_ca" | shasum -a 256 --check --status
-          security import "$devid_ca" -k "$KEYCHAIN_PATH"
-          rm -f "$devid_ca"
-
-          # Store the notary profile in the SAME throwaway keychain (not the login
-          # keychain), so notarization needs no key on disk and cleanup is one
-          # delete-keychain. build_app_bundle.py is told which keychain via
-          # --notary-keychain.
-          printf '%s' "$APPSTORE_PRIVATE_KEY" > "$asc_key"
-          xcrun notarytool store-credentials gramdrive-notary \
-            --key "$asc_key" \
-            --key-id "$APPSTORE_KEY_ID" \
-            --issuer "$APPSTORE_ISSUER_ID" \
-            --keychain "$KEYCHAIN_PATH"
-          rm -f "$asc_key"
-
-          # Confirm the identity is present (name only — never the key).
-          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -c "Developer ID Application"
-
-      - name: Stage the GramDriveCore artifact
-        # The Swift package resolves GramDriveCore by path; `make package` builds
-        # the XCFramework + bindings (core mock-only, no TDLib) into .temp.
-        run: make package
-
-      - name: Build the signed, notarized bundle and dmg
-        # The reusable pipeline: build the three executables, assemble GramDrive.app
-        # with the nested appex, sign inside-out with the hardened runtime and a
-        # trusted timestamp, notarize + staple the .app AND the dmg, and write
-        # manifest.json + CHECKSUMS.sha256. Version stamping is automatic here:
-        # marketing version from the tag's `git describe`, CFBundleVersion from
-        # the rev-count. The identity default is the Relux Works Developer ID.
-        run: |
-          python3 .scripts/apple-app/build_app_bundle.py \
-            --notarize \
-            --notary-profile gramdrive-notary \
-            --notary-keychain "$KEYCHAIN_PATH"
-
-      - name: Preflight the GitHub attestation entitlement for this repo
-        # Artifact attestation is entitled per org plan: a public repo gets it
-        # free, a PRIVATE repo needs a paid plan. On this private repo without
-        # that entitlement the create-attestation API rejects with "Feature not
-        # available … upgrade the billing plan, or make this repository public"
-        # (BUG-260720-116eli) — which, unguarded, fails the whole release AFTER
-        # signing and notarizing, before `gh release create` ever runs.
-        #
-        # A `uses:` action's error text can't be captured, so the entitlement is
-        # PREFLIGHTED here with one controlled call: POST an intentionally
-        # invalid bundle to the create endpoint. The org-plan check fires BEFORE
-        # body validation (verified against this repo), so nothing is ever
-        # created (the body is not a valid sigstore bundle) and the response
-        # distinguishes the two cases:
-        #   * feature UNAVAILABLE → the exact plan message;
-        #   * feature AVAILABLE   → a bundle-validation error (any other message).
-        # Degrade ONLY on the narrow feature-unavailable signature — BOTH the
-        # "Feature not available" phrase AND the "upgrade the billing plan" hint.
-        # Every other outcome (a validation error, a transport failure, an
-        # unexpected 5xx) leaves attestation ENABLED, so the real attest step
-        # below still HARD-FAILS on real errors (task AC). When the plan is later
-        # upgraded — or the repo made public — the probe passes and attestation
-        # resumes with zero config.
-        id: attest_preflight
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          resp="$(gh api --method POST \
-            "repos/${GITHUB_REPOSITORY}/attestations" \
-            -f 'bundle=preflight-entitlement-probe' 2>&1 || true)"
-          if printf '%s' "$resp" | grep -q 'Feature not available' \
-             && printf '%s' "$resp" | grep -q 'upgrade the billing plan'; then
-            echo "attestation_available=false" >> "$GITHUB_OUTPUT"
-            echo "attestation: unavailable (private-repo plan) — recording the gap and continuing the release."
-            echo "::notice title=Attestation unavailable::GitHub artifact attestation is not entitled for this private repo under the current org plan; recording the provenance gap and continuing."
-          else
-            echo "attestation_available=true" >> "$GITHUB_OUTPUT"
-            echo "attestation: entitled — the attest step will run and hard-fail on real errors."
+          if [ "$GITHUB_EVENT_NAME" = push ]; then tag="$GITHUB_REF_NAME"; else tag="$DISPATCH_TAG"; fi
+          if ! [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "stable promotion requires an exact vMAJOR.MINOR.PATCH tag" >&2
+            exit 1
           fi
-
-      - name: Build the release provenance (SBOM, changelog, rollback, manifest)
-        # Derived from the signed artifact's manifest + git history + cargo
-        # metadata: CycloneDX SBOM (POL-6 inventory), changelog since the last
-        # tag, rollback metadata, a release manifest tying every artifact to a
-        # sha256, and a credential scrub that FAILS the release if any produced
-        # file looks like it carries a secret. The attestation entitlement the
-        # preflight found is recorded in the manifest so the provenance gap (or
-        # its absence) is explicit and independently readable.
-        env:
-          ATTESTATION_AVAILABLE: ${{ steps.attest_preflight.outputs.attestation_available }}
-        run: |
-          set -euo pipefail
-          if [ "$ATTESTATION_AVAILABLE" = "true" ]; then
-            attestation_status=available
-          else
-            attestation_status=unavailable
-          fi
-          python3 .scripts/release/build_release_provenance.py \
-            --package-dir .temp/app-packaging \
-            --out-dir .temp/release \
-            --tag "${GITHUB_REF_NAME}" \
-            --attestation-status "$attestation_status"
-
-      - name: Attest build provenance for the dmg
-        # GitHub artifact attestation: a signed, OIDC-bound statement that this
-        # dmg was built by this workflow at this commit — independently verifiable
-        # with `gh attestation verify`. This is what makes the release traceable
-        # to a reviewed commit (the task AC) without embedding anything.
-        #
-        # Gated on the entitlement preflight: it runs ONLY when attestation is
-        # available, and when it runs it HARD-FAILS on any error (task AC). When
-        # the feature is unavailable this step is skipped, the manifest and job
-        # summary record the gap, and the release continues on the notarization +
-        # checksums + SBOM integrity story.
-        id: attest
-        if: steps.attest_preflight.outputs.attestation_available == 'true'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-path: |
-            .temp/app-packaging/GramDrive-*.dmg
-            .temp/release/release-manifest.json
-
-      - name: Record the attestation status in the job summary
-        # Make the provenance decision visible on the run itself, both ways: the
-        # produced attestation when entitled, or the explicit gap when it is not.
-        # Runs on the normal path — the attest step above is SKIPPED (not failed)
-        # when unavailable, so success() still holds here; a REAL attest failure
-        # fails the job before this step and nothing ships.
-        env:
-          ATTESTATION_AVAILABLE: ${{ steps.attest_preflight.outputs.attestation_available }}
-          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
-        run: |
-          set -uo pipefail
+          git fetch --force origin main "refs/tags/$tag:refs/tags/$tag"
+          commit="$(git rev-list -n 1 "$tag")"
+          test -n "$commit"
+          git merge-base --is-ancestor "$commit" origin/main
+          git checkout --detach "$commit"
+          test -z "$(git status --porcelain)"
+          test "$(python3 -c 'import json; print(json.load(open("apple/GramDriveSupport/Version.json"))["marketing_version"])')" = "${BASH_REMATCH[1]}"
           {
-            echo "### Build provenance attestation"
-            echo ""
-            if [ "$ATTESTATION_AVAILABLE" = "true" ]; then
-              echo "**attestation: attested** — a GitHub build-provenance attestation was produced for the dmg and the release manifest. Verify with \`gh attestation verify\`."
-              if [ -n "${ATTESTATION_URL:-}" ]; then
-                echo ""
-                echo "Attestation: ${ATTESTATION_URL}"
-              fi
-            else
-              echo "**attestation: unavailable (private-repo plan)** — GitHub artifact attestation is not entitled for this private repo under the current org plan, so this release ships without a build-provenance attestation. Integrity is carried by the notarization ticket, CHECKSUMS/RELEASE-CHECKSUMS and the SBOM. Attestation resumes with zero config once the plan enables it or the repo is made public."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "tag=$tag"
+            echo "version=${BASH_REMATCH[1]}"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Publish the GitHub Release
-        # The `gh` CLI (preinstalled, not a third-party action — no extra supply
-        # chain) creates the release from the tag with the changelog as its notes
-        # and every artifact + its provenance attached. --verify-tag ensures the
-        # tag being released is the one that triggered the run.
+      - name: Download immutable candidates from the rolling test prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "GramDrive ${GITHUB_REF_NAME}" \
-            --notes-file .temp/release/CHANGELOG.md \
-            --verify-tag \
-            .temp/app-packaging/GramDrive-*.dmg \
-            .temp/app-packaging/CHECKSUMS.sha256 \
-            .temp/app-packaging/manifest.json#app-manifest.json \
-            .temp/release/sbom.json \
-            .temp/release/CHANGELOG.md \
-            .temp/release/rollback.json \
-            .temp/release/release-manifest.json \
-            .temp/release/RELEASE-CHECKSUMS.sha256
+          mkdir -p .temp/stable/downloads
+          gh release download "updates-test-v$TEST_FEED_GENERATION" \
+            --pattern 'GramDrive-*.candidate.tar.gz' \
+            --dir .temp/stable/downloads
 
-      - name: Upload release provenance artifact
-        # The full provenance set, retained on the run itself (not only the
-        # Release) so a red or interrupted run still leaves an attributable record
-        # (NFR-052) — same posture as the gate workflows.
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Select and revalidate the exact tested stable candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          matches=0
+          for archive in .temp/stable/downloads/GramDrive-*.candidate.tar.gz; do
+            scratch=".temp/stable/try-$(basename "$archive" .tar.gz)"
+            rm -rf "$scratch"
+            python3 .scripts/release/publish_sparkle.py unpack-tree \
+              --archive "$archive" --output "$scratch" --flat
+            if python3 .scripts/release/publish_sparkle.py inspect-candidate \
+              --candidate-dir "$scratch" --repository "$GITHUB_REPOSITORY" \
+              --commit "${{ steps.source.outputs.commit }}" \
+              --mode stable-candidate --version "${{ steps.source.outputs.version }}" \
+              > .temp/stable/selected-output.txt 2>/dev/null; then
+              matches=$((matches + 1))
+              rm -rf .temp/stable/candidate
+              mv "$scratch" .temp/stable/candidate
+              cp "$archive" .temp/stable/selected-candidate.tar.gz
+            else
+              rm -rf "$scratch"
+            fi
+          done
+          test "$matches" -eq 1
+          python3 .scripts/release/build_candidate_package.py verify \
+            --out-dir .temp/stable/candidate
+          python3 .scripts/release/publish_sparkle.py inspect-candidate \
+            --candidate-dir .temp/stable/candidate --repository "$GITHUB_REPOSITORY" \
+            --commit "${{ steps.source.outputs.commit }}" \
+            --mode stable-candidate --version "${{ steps.source.outputs.version }}"
+          dmg=".temp/stable/candidate/$(python3 -c 'import json; print(json.load(open(".temp/stable/candidate/candidate-manifest.json"))["dmg"]["name"])')"
+          gh attestation verify "$dmg" \
+            --repo "$GITHUB_REPOSITORY" \
+            --bundle .temp/stable/candidate/candidate-attestation.json \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate-build.yml" \
+            --source-digest "${{ steps.source.outputs.commit }}"
+
+      - name: Prove the tested prerelease DMG is byte-identical
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .temp/stable/test-release
+          dmg_name="${{ steps.candidate.outputs.dmg_name }}"
+          notes_name="${dmg_name%.dmg}.md"
+          gh release download "updates-test-v$TEST_FEED_GENERATION" \
+            --pattern "$dmg_name" \
+            --pattern "$notes_name" \
+            --pattern test.xml \
+            --dir .temp/stable/test-release
+          cmp \
+            ".temp/stable/candidate/$dmg_name" \
+            ".temp/stable/test-release/$dmg_name"
+          echo "${{ steps.candidate.outputs.dmg_sha256 }}  .temp/stable/test-release/$dmg_name" | shasum -a 256 --check --status
+          python3 .scripts/release/publish_sparkle.py verify-test-offer \
+            --candidate-dir .temp/stable/candidate \
+            --feed .temp/stable/test-release/test.xml \
+            --notes ".temp/stable/test-release/$notes_name" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Fetch the exact pinned Sparkle 2.9.5 signing tool
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/gramdrive-stable-sparkle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$tools"
+          curl --fail --location --silent --show-error \
+            --output "$tools/Sparkle.zip" \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.5/Sparkle-for-Swift-Package-Manager.zip
+          echo "34b9b2071f3de0012eca3faa3a9290bb94e62131e9a74f6dc91514a000097a6c  $tools/Sparkle.zip" | shasum -a 256 --check --status
+          unzip -q "$tools/Sparkle.zip" bin/sign_update -d "$tools"
+          chmod 700 "$tools/bin/sign_update"
+          echo "SPARKLE_SIGN_UPDATE=$tools/bin/sign_update" >> "$GITHUB_ENV"
+          echo "SPARKLE_TOOLS_DIR=$tools" >> "$GITHUB_ENV"
+
+      - name: Restore the last complete stable site without mutating it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .temp/stable/site
+          previous="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | select(.tag_name != "${{ steps.source.outputs.tag }}" and any(.assets[]?; .name == "stable-pages-site.tar.gz"))] | sort_by(.published_at) | last | .tag_name // empty')"
+          if [ -n "$previous" ]; then
+            gh release download "$previous" \
+              --pattern stable-pages-site.tar.gz --dir .temp/stable/previous
+            rm -rf .temp/stable/site
+            python3 .scripts/release/publish_sparkle.py unpack-tree \
+              --archive .temp/stable/previous/stable-pages-site.tar.gz \
+              --output .temp/stable/site
+          fi
+          test -d .temp/stable/site
+
+      - name: Prepare stable notes and the unsigned active versioned feed
+        run: |
+          set -euo pipefail
+          notes_dir=".temp/stable/site/updates/stable/v$STABLE_FEED_GENERATION/notes"
+          mkdir -p "$notes_dir"
+          notes="GramDrive-${{ steps.candidate.outputs.version }}-${{ steps.candidate.outputs.build }}.md"
+          python3 .scripts/release/publish_sparkle.py write-notes \
+            --candidate-dir .temp/stable/candidate --output "$notes_dir/$notes"
+          echo "STABLE_NOTES=$notes" >> "$GITHUB_ENV"
+
+      - name: Sign exact enclosure notes and feed with only the stable key
+        env:
+          SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64: ${{ secrets.SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          key() { printf '%s' "$SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64" | base64 --decode; }
+          feed_dir=".temp/stable/site/updates/stable/v$STABLE_FEED_GENERATION"
+          feed="$feed_dir/stable.xml"
+          prior_args=()
+          if [ -f "$feed" ]; then
+            cp "$feed" .temp/stable/prior-stable.xml
+            key | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - .temp/stable/prior-stable.xml
+            prior_args=(--prior-feed .temp/stable/prior-stable.xml)
+          fi
+          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
+            ".temp/stable/candidate/${{ steps.candidate.outputs.dmg_name }}" \
+            > .temp/stable/dmg-signature.txt
+          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
+            "$feed_dir/notes/$STABLE_NOTES" > .temp/stable/notes-signature.txt
+          python3 .scripts/release/publish_sparkle.py render-feed \
+            --candidate-dir .temp/stable/candidate \
+            --channel stable --generation "$STABLE_FEED_GENERATION" \
+            --repository "$GITHUB_REPOSITORY" \
+            --dmg-signature .temp/stable/dmg-signature.txt \
+            --notes-signature .temp/stable/notes-signature.txt \
+            --notes-name "$STABLE_NOTES" \
+            --publication-date "$(git show -s --format=%cD '${{ steps.source.outputs.commit }}')" \
+            "${prior_args[@]}" --output "$feed"
+          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - "$feed"
+          key | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - "$feed"
+          python3 .scripts/release/publish_sparkle.py validate-feed \
+            --feed "$feed" --channel stable --generation "$STABLE_FEED_GENERATION" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Freeze the complete Pages site before any stable mutation
+        run: |
+          set -euo pipefail
+          find .temp/stable/site -type l -print -quit | grep -q . && exit 1 || true
+          python3 .scripts/release/publish_sparkle.py pack-tree \
+            --root .temp/stable/site --output .temp/stable/stable-pages-site.tar.gz
+
+      - name: Publish exact immutable stable Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.source.outputs.tag }}"
+          dmg=".temp/stable/candidate/${{ steps.candidate.outputs.dmg_name }}"
+          package=".temp/stable/${{ steps.candidate.outputs.dmg_name }}.candidate.tar.gz"
+          cp .temp/stable/selected-candidate.tar.gz "$package"
+          notes=".temp/stable/site/updates/stable/v$STABLE_FEED_GENERATION/notes/$STABLE_NOTES"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --verify-tag --latest \
+              --title "GramDrive ${{ steps.source.outputs.version }}" \
+              --notes-file "$notes"
+          fi
+          upload_immutable() {
+            asset="$1"; name="$2"
+            if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              mkdir -p .temp/stable/existing
+              gh release download "$tag" --pattern "$name" --dir .temp/stable/existing --clobber
+              cmp "$asset" ".temp/stable/existing/$name"
+            else
+              gh release upload "$tag" "$asset#$name"
+            fi
+          }
+          upload_immutable "$dmg" "${{ steps.candidate.outputs.dmg_name }}"
+          upload_immutable "$package" "${{ steps.candidate.outputs.dmg_name }}.candidate.tar.gz"
+          upload_immutable "$notes" "$STABLE_NOTES"
+          upload_immutable .temp/stable/stable-pages-site.tar.gz stable-pages-site.tar.gz
+
+      - name: Upload the complete site for isolated Pages deployment
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
-          name: release-provenance
-          path: |
-            .temp/release
-            .temp/app-packaging/manifest.json
-            .temp/app-packaging/CHECKSUMS.sha256
-            .temp/acceptance/release-supply-chain
-          if-no-files-found: warn
-          retention-days: 14
+          path: .temp/stable/site
 
-      - name: Delete the signing keychain and restore the runner's keychain state
-        # Always, even on failure: the throwaway keychain and any decoded secret
-        # file must never outlive the run. On this PERSISTENT runner that
-        # contract carries further than the ephemeral-VM original
-        # (TASK-260719-1dwaj8): the throwaway was made the default keychain and
-        # put on the search list, so both are restored, and the workspace's
-        # .temp — the signed bundle, dmg and provenance, all already uploaded
-        # as artifacts above — is wiped so nothing release-related stays on the
-        # machine outside the run.
+      - name: Remove stable signing and candidate state
         if: always()
         run: |
-          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" \
-            "$RUNNER_TEMP/DeveloperIDG2CA.cer" 2>/dev/null || true
-          # Restore the recorded search list VERBATIM (delete-keychain leaves a
-          # dangling entry and an empty -s is a no-op — see the naming step),
-          # then the recorded default. IFS=newline so a path with spaces stays
-          # one argument; the fallback pins the login keychain rather than
-          # leaving a throwaway entry live if the recording ever comes up empty.
-          if [ -n "${ORIGINAL_KEYCHAIN_SEARCH_LIST:-}" ]; then
-            old_ifs="$IFS"; IFS=$'\n'
-            # shellcheck disable=SC2086
-            security list-keychains -d user -s $ORIGINAL_KEYCHAIN_SEARCH_LIST || true
-            IFS="$old_ifs"
-          else
-            security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db" || true
+          case "${SPARKLE_TOOLS_DIR:-}" in "$RUNNER_TEMP"/gramdrive-stable-sparkle-*) rm -rf "$SPARKLE_TOOLS_DIR" ;; esac
+          rm -rf .temp/stable
+
+  # Recovery never regenerates or re-signs a feed. After release approval it
+  # materializes the exact complete-site archive frozen on the selected stable
+  # Release, so an old valid Pages deployment remains recoverable even after
+  # its candidate has aged out of the eleven-item rolling test feed.
+  recover-pages:
+    name: approve-exact-stable-site-redeployment
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'redeploy-site'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout publication verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 1
+          clean: true
+
+      - name: Download and safely materialize the immutable complete site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVERY_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RECOVERY_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "site recovery requires an exact vMAJOR.MINOR.PATCH tag" >&2
+            exit 1
           fi
-          if [ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
-            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" 2>/dev/null || true
-          fi
-          rm -rf .temp
+          mkdir -p .temp/stable-recovery
+          gh release download "$RECOVERY_TAG" \
+            --pattern stable-pages-site.tar.gz \
+            --dir .temp/stable-recovery
+          python3 .scripts/release/publish_sparkle.py unpack-tree \
+            --archive .temp/stable-recovery/stable-pages-site.tar.gz \
+            --output .temp/stable-recovery/site
+
+      - name: Upload the exact recovered site for isolated Pages deployment
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: .temp/stable-recovery/site
+
+  # This is the only job in the repository with Pages/OIDC capability. It has
+  # neither contents:write nor any private key and can deploy only the complete
+  # artifact prepared after release-environment approval.
+  deploy-pages:
+    name: deploy-complete-stable-site
+    needs: [promote, recover-pages]
+    if: always() && (needs.promote.result == 'success' || needs.recover-pages.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy the complete approved site
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
