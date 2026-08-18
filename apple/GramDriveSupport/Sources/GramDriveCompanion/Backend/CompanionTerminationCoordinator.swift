@@ -65,7 +65,7 @@ public final class CompanionTerminationCoordinator {
     private let cancellationTimeout: Duration
     private var drainTask: Task<DrainResult, Never>?
     private var activeRequest: ControlTerminationRequest?
-    private var explicitCancellationRequested = false
+    private var explicitCancellationTask: Task<CommandOutcome, Never>?
     /// Shown by the AppKit delegate after it replies `false`. It explicitly
     /// names the safe retry/Force Quit boundary rather than silently leaving an
     /// update pending after an unsuccessful drain.
@@ -192,7 +192,7 @@ public final class CompanionTerminationCoordinator {
             let deadline = ContinuousClock.now + timeout
             let acceptanceDeadline = ContinuousClock.now + .seconds(1)
             while ContinuousClock.now < deadline {
-                if takeExplicitCancellationRequest() {
+                if let explicitCancellationTask {
                     return await Self.cancelAndReconcile(
                         request: request,
                         cancel: cancel,
@@ -201,7 +201,7 @@ public final class CompanionTerminationCoordinator {
                         timeout: cancellationTimeout,
                         identity: identity,
                         recoverCurrentBuild: recoverCurrentBuild,
-                        cancellationAlreadySent: true
+                        initialCancellation: explicitCancellationTask
                     )
                 }
                 switch await health() {
@@ -303,7 +303,7 @@ public final class CompanionTerminationCoordinator {
         let result = await task.value
         drainTask = nil
         activeRequest = nil
-        explicitCancellationRequested = false
+        explicitCancellationTask = nil
         lastFailureMessage = result.failureMessage
         return result.isAllowed
     }
@@ -313,10 +313,18 @@ public final class CompanionTerminationCoordinator {
     /// decision or starts a second agent shutdown.
     public func cancelTermination() async -> Bool {
         guard let activeRequest, let drainTask else { return false }
-        var request = activeRequest
-        request.action = .cancel
-        explicitCancellationRequested = true
-        _ = await cancel(request)
+        let cancellationTask: Task<CommandOutcome, Never>
+        if let explicitCancellationTask {
+            cancellationTask = explicitCancellationTask
+        } else {
+            var request = activeRequest
+            request.action = .cancel
+            let cancel = self.cancel
+            let task = Task { await cancel(request) }
+            explicitCancellationTask = task
+            cancellationTask = task
+        }
+        _ = await cancellationTask.value
         let result = await drainTask.value
         lastFailureMessage = result.failureMessage
         return result.isAllowed
@@ -335,11 +343,16 @@ public final class CompanionTerminationCoordinator {
         timeout: Duration,
         identity: AgentProcessIdentity,
         recoverCurrentBuild: @escaping @Sendable () async -> Bool,
-        cancellationAlreadySent: Bool = false
+        initialCancellation: Task<CommandOutcome, Never>? = nil
     ) async -> DrainResult {
         var cancellation = request
         cancellation.action = .cancel
-        if !cancellationAlreadySent {
+        if let initialCancellation {
+            // The explicit AppKit path installs this task before awaiting the
+            // command. Joining it here prevents the reconciliation loop from
+            // retrying while the first cancellation is merely still in flight.
+            _ = await initialCancellation.value
+        } else {
             _ = await cancel(cancellation)
         }
 
@@ -569,10 +582,5 @@ public final class CompanionTerminationCoordinator {
             defer { lock.unlock() }
             return exited
         }
-    }
-
-    private func takeExplicitCancellationRequest() -> Bool {
-        defer { explicitCancellationRequested = false }
-        return explicitCancellationRequested
     }
 }

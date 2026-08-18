@@ -89,6 +89,52 @@ private final class TerminationProbe: @unchecked Sendable {
     }
 }
 
+private final class DelayedCancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let cancellationDelay: Duration
+    private var recorded: [ControlTerminationRequest] = []
+    private var cancellationInvocations = 0
+    private var currentSnapshot = CompanionTerminationCoordinatorTests.drainingSnapshot(
+        state: .running
+    )
+
+    init(cancellationDelay: Duration) {
+        self.cancellationDelay = cancellationDelay
+    }
+
+    var requests: [ControlTerminationRequest] {
+        lock.withLock { recorded }
+    }
+
+    var cancellationInvocationCount: Int {
+        lock.withLock { cancellationInvocations }
+    }
+
+    func prepare(_ request: ControlTerminationRequest) async -> CommandOutcome {
+        lock.withLock {
+            recorded.append(request)
+            currentSnapshot.terminationRequestID = request.requestID
+            currentSnapshot.state = .draining
+        }
+        return .completed
+    }
+
+    func cancel(_ request: ControlTerminationRequest) async -> CommandOutcome {
+        lock.withLock { cancellationInvocations += 1 }
+        try? await Task.sleep(for: cancellationDelay)
+        lock.withLock {
+            recorded.append(request)
+            currentSnapshot.terminationRequestID = request.requestID
+            currentSnapshot.state = .terminationCancelled
+        }
+        return .completed
+    }
+
+    func health() async -> HealthReadout {
+        lock.withLock { .running(currentSnapshot) }
+    }
+}
+
 @MainActor struct CompanionTerminationCoordinatorTests {
     private nonisolated static let fixtureIdentity = AgentProcessIdentity(
         instanceID: UUID(), pid: Int32.max, kernelStartSeconds: 1, kernelStartMicroseconds: 1
@@ -561,6 +607,29 @@ private final class TerminationProbe: @unchecked Sendable {
         #expect(!(await coordinator.cancelTermination()))
         #expect(!(await request))
         #expect(probe.requests.count == 1)
+    }
+
+    @Test func explicitCancellationSharesOneInFlightCommandWithDrainReconciliation() async throws {
+        let probe = DelayedCancellationProbe(cancellationDelay: .milliseconds(50))
+        let coordinator = CompanionTerminationCoordinator(
+            prepare: { await probe.prepare($0) },
+            cancel: { await probe.cancel($0) },
+            health: { await probe.health() },
+            pollInterval: .milliseconds(1),
+            timeout: .seconds(1),
+            cancellationTimeout: .seconds(1)
+        )
+
+        async let terminationAllowed = coordinator.requestTermination(.userQuit)
+        try await Self.waitUntil { probe.requests.count == 1 }
+        async let cancellationAllowed = coordinator.cancelTermination()
+
+        #expect(!(await cancellationAllowed))
+        #expect(!(await terminationAllowed))
+        #expect(probe.cancellationInvocationCount == 1)
+        #expect(probe.requests.map(\.action) == [.prepare, .cancel])
+        guard probe.requests.count == 2 else { return }
+        #expect(probe.requests[0].requestID == probe.requests[1].requestID)
     }
 
     @Test func aLiveStoppedSnapshotWaitsForEndpointDisappearance() async {
