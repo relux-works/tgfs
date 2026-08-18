@@ -5,6 +5,13 @@
 
 ## 2026-08-18
 
+### 0930 — Sparkle publication is exact-byte, channel-isolated, and recoverable (TASK-260810-y3zcg8)
+
+- OWNERSHIP: The verified candidate workflow now hands its immutable artifact to a separate rolling-test job. That job alone has `contents: write` plus the test Sparkle key; the Apple candidate job remains read-only and keyless for feeds, and the test publisher has neither stable key nor Pages capability.
+- PROMOTION: The tag workflow no longer rebuilds or re-codesigns Apple code. After `release` approval it selects the unique tested stable-candidate matching the tag commit/version, revalidates package checksums and Sigstore identity, compares the prerelease DMG exact bytes, signs Sparkle metadata with only the stable key, and publishes immutable tag assets. A separate keyless job alone holds `pages: write`/OIDC and deploys the complete site.
+- RECOVERY/ROTATION: Rolling `test.xml` is replaced only after immutable assets validate and is restored on replacement/readback failure. Every stable Release freezes the complete Pages site; later promotion fails closed if that predecessor artifact cannot be restored, carries frozen old generations byte-for-byte, and updates only the active versioned feed. An approval-gated, keyless/read-only recovery operation can redeploy an older exact site after its candidate ages out of the rolling feed. Forward rollback is the ordinary higher-build candidate/test/promotion path; released DMGs are never overwritten.
+- REGRESSION: Publication tests cover exact candidate intake/tamper refusal, deterministic safe archives, test/stable endpoint isolation, stable-candidate enrollment, monotonic ordering, eleven-item test retention, old-generation byte retention, key/permission separation, recovery ordering, and exact-byte promotion.
+
 ### 0615 — Static OpenSSL attribution follows the exact shipped bytes (TASK-260810-fwgmr4)
 
 - ATTRIBUTION AUDIT: The repository Apache-2.0 `LICENSE`/`NOTICE` identifies GramDrive, and the Rust/Swift SBOM covers their package graphs, but neither identifies OpenSSL bytes statically incorporated into `libtdjson.dylib`. The authoritative TDLib artifact therefore now carries the exact `LICENSE.txt` from its selected OpenSSL prefix plus a normalized version, Apache-2.0 identifier, static embedding relationship, and license SHA-256.

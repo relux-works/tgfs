@@ -37,6 +37,10 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    outputs:
+      artifact_name: ${{ steps.handoff.outputs.artifact_name }}
+      commit: ${{ steps.source.outputs.commit }}
+      mode: ${{ steps.source.outputs.mode }}
     steps:
       - name: Record the runner keychain state
         shell: bash
@@ -225,10 +229,15 @@ jobs:
           python3 .scripts/release/build_candidate_package.py verify \
             --out-dir .temp/candidate
 
+      - name: Name the immutable handoff
+        id: handoff
+        run: |
+          echo "artifact_name=gramdrive-candidate-${{ steps.candidate.outputs.build }}-${{ steps.source.outputs.commit }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
       - name: Upload one immutable verified candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: gramdrive-candidate-${{ steps.candidate.outputs.build }}-${{ steps.source.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.handoff.outputs.artifact_name }}
           path: .temp/candidate
           if-no-files-found: error
           compression-level: 0
@@ -256,3 +265,176 @@ jobs:
             "$RUNNER_TEMP"/gramdrive-candidate-*) rm -rf "$cleanup_temp" ;;
           esac
           rm -rf .temp
+
+  # Sole rolling-test publication boundary (TASK-260810-y3zcg8). This job can
+  # mutate Releases and use the test Sparkle key, but it cannot deploy Pages,
+  # read the stable key, or access any Apple signing/notarization credential.
+  publish-test:
+    name: publish-rolling-test-feed
+    needs: candidate
+    runs-on: [self-hosted, gramdrive-mac]
+    environment: updates-test
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the exact verified candidate source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.candidate.outputs.commit }}
+          fetch-depth: 1
+          clean: true
+
+      - name: Download only this run's immutable candidate handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.candidate.outputs.artifact_name }}
+          path: .temp/publication/candidate
+
+      - name: Revalidate candidate provenance exact bytes and attestation
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 .scripts/release/build_candidate_package.py verify \
+            --out-dir .temp/publication/candidate
+          python3 .scripts/release/publish_sparkle.py inspect-candidate \
+            --candidate-dir .temp/publication/candidate \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --commit "${{ needs.candidate.outputs.commit }}" \
+            --mode "${{ needs.candidate.outputs.mode }}"
+          dmg=".temp/publication/candidate/$(python3 -c 'import json; print(json.load(open(".temp/publication/candidate/candidate-manifest.json"))["dmg"]["name"])')"
+          gh attestation verify "$dmg" \
+            --repo "$GITHUB_REPOSITORY" \
+            --bundle .temp/publication/candidate/candidate-attestation.json \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate-build.yml" \
+            --source-digest "${{ needs.candidate.outputs.commit }}"
+
+      - name: Fetch the exact pinned Sparkle 2.9.5 signing tool
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/gramdrive-sparkle-tools-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$tools"
+          curl --fail --location --silent --show-error \
+            --output "$tools/Sparkle.zip" \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.5/Sparkle-for-Swift-Package-Manager.zip
+          echo "34b9b2071f3de0012eca3faa3a9290bb94e62131e9a74f6dc91514a000097a6c  $tools/Sparkle.zip" | shasum -a 256 --check --status
+          unzip -q "$tools/Sparkle.zip" bin/sign_update -d "$tools"
+          chmod 700 "$tools/bin/sign_update"
+          echo "SPARKLE_SIGN_UPDATE=$tools/bin/sign_update" >> "$GITHUB_ENV"
+          echo "SPARKLE_TOOLS_DIR=$tools" >> "$GITHUB_ENV"
+
+      - name: Prepare unsigned test feed and immutable publication assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .temp/publication/out
+          dmg="${{ steps.candidate.outputs.dmg_name }}"
+          stem="${dmg%.dmg}"
+          notes="$stem.md"
+          package="$stem.candidate.tar.gz"
+          python3 .scripts/release/publish_sparkle.py write-notes \
+            --candidate-dir .temp/publication/candidate \
+            --output ".temp/publication/out/$notes"
+          python3 .scripts/release/publish_sparkle.py pack-tree \
+            --root .temp/publication/candidate \
+            --output ".temp/publication/out/$package"
+          cp ".temp/publication/candidate/$dmg" ".temp/publication/out/$dmg"
+          if ! gh release view updates-test-v1 >/dev/null 2>&1; then
+            gh release create updates-test-v1 \
+              --target "${{ needs.candidate.outputs.commit }}" \
+              --title "GramDrive rolling test updates v1" \
+              --notes "Rolling Sparkle test channel. Build-named assets are immutable." \
+              --prerelease --latest=false
+          fi
+          prior_url="https://github.com/$GITHUB_REPOSITORY/releases/download/updates-test-v1/test.xml"
+          status="$(curl --location --silent --show-error \
+            --output .temp/publication/prior-test.xml --write-out '%{http_code}' "$prior_url")"
+          case "$status" in
+            200) prior_feed=.temp/publication/prior-test.xml ;;
+            404) rm -f .temp/publication/prior-test.xml; prior_feed= ;;
+            *) echo "cannot read prior test feed: HTTP $status" >&2; exit 1 ;;
+          esac
+          {
+            echo "PRIOR_TEST_FEED=$prior_feed"
+            echo "PUBLICATION_DMG=$dmg"
+            echo "PUBLICATION_NOTES=$notes"
+            echo "PUBLICATION_PACKAGE=$package"
+          } >> "$GITHUB_ENV"
+
+      - name: Sign enclosure notes and complete test feed with only the test key
+        env:
+          SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64: ${{ secrets.SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          key() { printf '%s' "$SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64" | base64 --decode; }
+          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
+            ".temp/publication/out/$PUBLICATION_DMG" > .temp/publication/dmg-signature.txt
+          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
+            ".temp/publication/out/$PUBLICATION_NOTES" > .temp/publication/notes-signature.txt
+          prior_args=()
+          if [ -n "$PRIOR_TEST_FEED" ]; then
+            key | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - "$PRIOR_TEST_FEED"
+            prior_args=(--prior-feed "$PRIOR_TEST_FEED")
+          fi
+          python3 .scripts/release/publish_sparkle.py render-feed \
+            --candidate-dir .temp/publication/candidate \
+            --channel test --generation 1 --repository "$GITHUB_REPOSITORY" \
+            --dmg-signature .temp/publication/dmg-signature.txt \
+            --notes-signature .temp/publication/notes-signature.txt \
+            --notes-name "$PUBLICATION_NOTES" \
+            --publication-date "$(git show -s --format=%cD '${{ needs.candidate.outputs.commit }}')" \
+            "${prior_args[@]}" \
+            --output .temp/publication/out/test.xml
+          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - .temp/publication/out/test.xml
+          key | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - .temp/publication/out/test.xml
+          python3 .scripts/release/publish_sparkle.py validate-feed \
+            --feed .temp/publication/out/test.xml --channel test --generation 1 \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Publish immutable assets then atomically recover the rolling feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upload_immutable() {
+            asset="$1"
+            name="$(basename "$asset")"
+            if gh release view updates-test-v1 --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              mkdir -p .temp/publication/existing
+              gh release download updates-test-v1 --pattern "$name" --dir .temp/publication/existing --clobber
+              cmp "$asset" ".temp/publication/existing/$name"
+            else
+              gh release upload updates-test-v1 "$asset"
+            fi
+          }
+          upload_immutable ".temp/publication/out/$PUBLICATION_DMG"
+          upload_immutable ".temp/publication/out/$PUBLICATION_NOTES"
+          upload_immutable ".temp/publication/out/$PUBLICATION_PACKAGE"
+
+          restore_prior() {
+            if [ -n "$PRIOR_TEST_FEED" ]; then
+              gh release upload updates-test-v1 "$PRIOR_TEST_FEED#test.xml" --clobber
+            else
+              gh release delete-asset updates-test-v1 test.xml --yes >/dev/null 2>&1 || true
+            fi
+          }
+          if ! gh release upload updates-test-v1 .temp/publication/out/test.xml --clobber; then
+            restore_prior
+            exit 1
+          fi
+          if ! curl --fail --location --silent --show-error \
+            --output .temp/publication/published-test.xml \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/updates-test-v1/test.xml?run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            || ! cmp .temp/publication/out/test.xml .temp/publication/published-test.xml; then
+            restore_prior
+            exit 1
+          fi
+
+      - name: Remove publication and key-tool state
+        if: always()
+        run: |
+          case "${SPARKLE_TOOLS_DIR:-}" in "$RUNNER_TEMP"/gramdrive-sparkle-tools-*) rm -rf "$SPARKLE_TOOLS_DIR" ;; esac
+          rm -rf .temp/publication

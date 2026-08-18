@@ -60,6 +60,33 @@ configuration, validated before assembly, and never read from environment or
 CLI input. `Version.json` is the reviewed three-part marketing version source,
 while the numeric `CFBundleVersion` remains the commit count.
 
+Publication never rebuilds those bytes. The candidate workflow first uploads
+one attested exact-byte package. Its downstream `publish-test` job revalidates
+that package, signs with only the test EdDSA key, uploads immutable build-named
+assets to `updates-test-v1`, and replaces `test.xml` last with restoration of
+the prior feed on failure. The tag workflow accepts only a tested
+`stable-candidate` package for the exact tag commit/version, compares the
+prerelease DMG byte-for-byte, and—after `release` environment approval—signs
+with only the stable key. A separate keyless job alone has `pages: write` and
+deploys the complete site.
+
+If Pages deployment fails—or a previously accepted site must be restored after
+its candidate has aged out of the rolling feed—dispatch `stable-release` with
+`operation=redeploy-site` and the exact stable tag. After the same `release`
+approval, a keyless read-only job safely materializes that Release's immutable
+`stable-pages-site.tar.gz`; the Pages-only job deploys those exact files.
+
+Each stable Release freezes `stable-pages-site.tar.gz`. The next promotion must
+restore it successfully before changing the active versioned feed, so frozen
+old-key feed generations and their bridge items remain byte-identical while a
+new generation is added. Key rotation is a reviewed configuration/workflow
+change: publish the higher-build bridge through the old generation with the old
+key, add the new generation in the same complete site with the new key, and
+only then move new builds to the new embedded URL/key. Never change the signer
+behind an existing versioned URL. Rollback uses the same candidate/test/stable
+path with a new protected-main commit and a greater `CFBundleVersion`; a lower
+build is never published as a downgrade.
+
 ### Signed and verifiable
 
 Every Mach-O is Developer ID signed with the hardened runtime (`--options

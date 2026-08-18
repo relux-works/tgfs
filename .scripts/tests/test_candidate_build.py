@@ -472,6 +472,9 @@ class WorkflowContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = (REPO / ".github/workflows/candidate-build.yml").read_text()
+        cls.candidate_job = cls.text[
+            cls.text.index("  candidate:"):cls.text.index("  publish-test:")
+        ]
 
     def test_trigger_environment_permissions_and_dedicated_concurrency(self):
         self.assertIn("branches: [main]", self.text)
@@ -485,14 +488,14 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("contents: read", self.text)
         self.assertIn("id-token: write", self.text)
         self.assertIn("attestations: write", self.text)
-        self.assertNotIn("contents: write", self.text)
-        self.assertNotIn("pages: write", self.text)
+        self.assertNotIn("contents: write", self.candidate_job)
+        self.assertNotIn("pages: write", self.candidate_job)
 
     def test_job_has_only_apple_secrets_and_no_publication_capability(self):
         for name in ("MACOS_CERT_P12", "MACOS_CERT_PASSWORD", "APPSTORE_KEY_ID", "APPSTORE_ISSUER_ID", "APPSTORE_PRIVATE_KEY"):
-            self.assertIn(f"secrets.{name}", self.text)
+            self.assertIn(f"secrets.{name}", self.candidate_job)
         for forbidden in ("SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64", "SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64", "gh release", "test.xml#", "deploy-pages", "upload-pages-artifact"):
-            self.assertNotIn(forbidden, self.text)
+            self.assertNotIn(forbidden, self.candidate_job)
 
     def test_live_candidate_uses_the_locked_sparkle_dependency(self):
         resolved = json.loads((REPO / "apple/GramDriveSupport/Package.resolved").read_text())
