@@ -15,3 +15,7 @@ fd9bbd8ff1f2210dd5894cbe6056c821fd094942:.task-board/EPIC-260715-2ptb18_local-td
 # False positive: reviewer verdict prose in the logbook about the release workflow
 # holding no hardcoded secrets — generic-api-key matched the sentence itself.
 c6a309fbbaf14d1cc0a3b4efcbc53cfa3962619e:LOGBOOK.md:generic-api-key:20
+# False positive: Sparkle's checked-in v1 Ed25519 public verification key. It
+# is the client trust anchor and intentionally public; private seeds remain
+# release-environment secrets.
+bfd67bf794bfd07e1c83eb3e6f7606d85d793d93:.scripts/release/publish_sparkle.py:generic-api-key:40

@@ -11,10 +11,28 @@ on:
         type: choice
         options:
           - promote
+          - rotate-key
           - redeploy-site
       tag:
         description: Existing v* tag to recover or redeploy
         required: true
+        type: string
+      stable_feed_generation:
+        description: Active stable feed generation
+        required: false
+        default: "1"
+        type: string
+      stable_public_key:
+        description: Reviewed active stable EdDSA public key (required after v1)
+        required: false
+        type: string
+      previous_feed_generation:
+        description: Frozen old generation to receive the one-time bridge item
+        required: false
+        type: string
+      previous_public_key:
+        description: Reviewed old stable EdDSA public key for bridge verification
+        required: false
         type: string
 
 permissions:
@@ -25,22 +43,25 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  STABLE_FEED_GENERATION: "1"
   TEST_FEED_GENERATION: "1"
+  TEST_PUBLIC_KEY: "T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo="
 
 jobs:
   # Approval is before either stable private-key access or Release mutation.
   # This job has contents:write but intentionally has no Pages capability.
   promote:
     name: approve-sign-and-promote-exact-candidate
-    if: github.event_name == 'push' || inputs.operation == 'promote'
+    if: github.event_name == 'push' || inputs.operation == 'promote' || inputs.operation == 'rotate-key'
     runs-on: [self-hosted, gramdrive-mac]
     environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     outputs:
       version: ${{ steps.source.outputs.version }}
       build: ${{ steps.candidate.outputs.build }}
+      tag: ${{ steps.source.outputs.tag }}
     steps:
       - name: Checkout full protected-main history
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -52,9 +73,41 @@ jobs:
         id: source
         env:
           DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_OPERATION: ${{ inputs.operation }}
+          DISPATCH_GENERATION: ${{ inputs.stable_feed_generation }}
+          DISPATCH_PUBLIC_KEY: ${{ inputs.stable_public_key }}
+          DISPATCH_PREVIOUS_GENERATION: ${{ inputs.previous_feed_generation }}
+          DISPATCH_PREVIOUS_PUBLIC_KEY: ${{ inputs.previous_public_key }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = push ]; then tag="$GITHUB_REF_NAME"; else tag="$DISPATCH_TAG"; fi
+          v1_key="FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE="
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag="$GITHUB_REF_NAME"; operation=promote; generation=1; public_key="$v1_key"
+          else
+            tag="$DISPATCH_TAG"; operation="$DISPATCH_OPERATION"
+            generation="${DISPATCH_GENERATION:-1}"
+            public_key="$DISPATCH_PUBLIC_KEY"
+            if [ "$generation" = 1 ]; then
+              test -z "$public_key" || [ "$public_key" = "$v1_key" ]
+              public_key="$v1_key"
+            fi
+          fi
+          [[ "$generation" =~ ^[1-9][0-9]*$ ]]
+          python3 - "$public_key" <<'PY'
+          import base64, sys
+          assert len(base64.b64decode(sys.argv[1], validate=True)) == 32
+          PY
+          previous_generation=""; previous_public_key=""
+          if [ "$operation" = rotate-key ]; then
+            previous_generation="$DISPATCH_PREVIOUS_GENERATION"
+            previous_public_key="$DISPATCH_PREVIOUS_PUBLIC_KEY"
+            [[ "$previous_generation" =~ ^[1-9][0-9]*$ ]]
+            [ "$previous_generation" -lt "$generation" ]
+            python3 - "$previous_public_key" <<'PY'
+          import base64, sys
+          assert len(base64.b64decode(sys.argv[1], validate=True)) == 32
+          PY
+          fi
           if ! [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             echo "stable promotion requires an exact vMAJOR.MINOR.PATCH tag" >&2
             exit 1
@@ -70,6 +123,11 @@ jobs:
             echo "tag=$tag"
             echo "version=${BASH_REMATCH[1]}"
             echo "commit=$commit"
+            echo "operation=$operation"
+            echo "generation=$generation"
+            echo "public_key=$public_key"
+            echo "previous_generation=$previous_generation"
+            echo "previous_public_key=$previous_public_key"
           } >> "$GITHUB_OUTPUT"
 
       - name: Download immutable candidates from the rolling test prerelease
@@ -114,6 +172,8 @@ jobs:
             --candidate-dir .temp/stable/candidate --repository "$GITHUB_REPOSITORY" \
             --commit "${{ steps.source.outputs.commit }}" \
             --mode stable-candidate --version "${{ steps.source.outputs.version }}"
+          [ "$(python3 -c 'import json; print(json.load(open(".temp/stable/candidate/app-manifest.json"))["sparkle"].get("generation", 1))')" = "${{ steps.source.outputs.generation }}" ]
+          [ "$(python3 -c 'import json; print(json.load(open(".temp/stable/candidate/app-manifest.json"))["sparkle"]["public_key"])')" = "${{ steps.source.outputs.public_key }}" ]
           dmg=".temp/stable/candidate/$(python3 -c 'import json; print(json.load(open(".temp/stable/candidate/candidate-manifest.json"))["dmg"]["name"])')"
           gh attestation verify "$dmg" \
             --repo "$GITHUB_REPOSITORY" \
@@ -142,6 +202,8 @@ jobs:
             --candidate-dir .temp/stable/candidate \
             --feed .temp/stable/test-release/test.xml \
             --notes ".temp/stable/test-release/$notes_name" \
+            --generation "$TEST_FEED_GENERATION" \
+            --test-public-key "$TEST_PUBLIC_KEY" \
             --repository "$GITHUB_REPOSITORY"
 
       - name: Fetch the exact pinned Sparkle 2.9.5 signing tool
@@ -165,67 +227,171 @@ jobs:
           set -euo pipefail
           mkdir -p .temp/stable/site
           previous="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '[.[] | select(.tag_name != "${{ steps.source.outputs.tag }}" and any(.assets[]?; .name == "stable-pages-site.tar.gz"))] | sort_by(.published_at) | last | .tag_name // empty')"
+            --jq '[.[] | select(.tag_name != "${{ steps.source.outputs.tag }}" and any(.assets[]?; .name == "stable-pages-site.attestation.json"))] | sort_by(.published_at) | last | .tag_name // empty')"
           if [ -n "$previous" ]; then
             gh release download "$previous" \
-              --pattern stable-pages-site.tar.gz --dir .temp/stable/previous
+              --pattern stable-pages-site.tar.gz \
+              --pattern stable-pages-site-manifest.json \
+              --pattern stable-pages-site-manifest.signature.txt \
+              --pattern stable-pages-site.attestation.json \
+              --dir .temp/stable/previous
+            git fetch --force origin "refs/tags/$previous:refs/tags/$previous"
+            previous_commit="$(git rev-list -n 1 "$previous")"
+            for subject in stable-pages-site.tar.gz stable-pages-site-manifest.json stable-pages-site-manifest.signature.txt; do
+              gh attestation verify ".temp/stable/previous/$subject" \
+                --repo "$GITHUB_REPOSITORY" \
+                --bundle .temp/stable/previous/stable-pages-site.attestation.json \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-digest "$previous_commit"
+            done
             rm -rf .temp/stable/site
             python3 .scripts/release/publish_sparkle.py unpack-tree \
               --archive .temp/stable/previous/stable-pages-site.tar.gz \
               --output .temp/stable/site
+            python3 .scripts/release/publish_sparkle.py verify-site \
+              --site .temp/stable/site \
+              --archive .temp/stable/previous/stable-pages-site.tar.gz \
+              --manifest .temp/stable/previous/stable-pages-site-manifest.json \
+              --manifest-signature .temp/stable/previous/stable-pages-site-manifest.signature.txt \
+              --repository "$GITHUB_REPOSITORY"
           fi
           test -d .temp/stable/site
 
-      - name: Prepare stable notes and the unsigned active versioned feed
+      - name: Prepare active notes and optional one-time old-generation bridge notes
         run: |
           set -euo pipefail
-          notes_dir=".temp/stable/site/updates/stable/v$STABLE_FEED_GENERATION/notes"
-          mkdir -p "$notes_dir"
+          generation="${{ steps.source.outputs.generation }}"
           notes="GramDrive-${{ steps.candidate.outputs.version }}-${{ steps.candidate.outputs.build }}.md"
+          notes_dir=".temp/stable/site/updates/stable/v$generation/notes"
+          mkdir -p "$notes_dir"
           python3 .scripts/release/publish_sparkle.py write-notes \
             --candidate-dir .temp/stable/candidate --output "$notes_dir/$notes"
+          if [ "${{ steps.source.outputs.operation }}" = rotate-key ]; then
+            old_generation="${{ steps.source.outputs.previous_generation }}"
+            old_feed=".temp/stable/site/updates/stable/v$old_generation/stable.xml"
+            test -f "$old_feed"
+            test -f .temp/stable/previous/stable-pages-site-manifest.json
+            python3 - "$old_generation" "${{ steps.source.outputs.previous_public_key }}" <<'PY'
+          import json, sys
+          manifest = json.load(open(".temp/stable/previous/stable-pages-site-manifest.json"))
+          keys = {str(item["generation"]): item["public_key"] for item in manifest["feed_keys"]}
+          assert keys.get(sys.argv[1]) == sys.argv[2], "old generation/public key does not match the authenticated prior site"
+          PY
+            old_notes_dir=".temp/stable/site/updates/stable/v$old_generation/notes"
+            mkdir -p "$old_notes_dir"
+            cp "$notes_dir/$notes" "$old_notes_dir/$notes"
+          fi
           echo "STABLE_NOTES=$notes" >> "$GITHUB_ENV"
 
-      - name: Sign exact enclosure notes and feed with only the stable key
+      - name: Sign active feed and optional old-key bridge under release approval
         env:
-          SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64: ${{ secrets.SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64 }}
+          SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64: ${{ secrets.SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64 || secrets.SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64 }}
+          SPARKLE_STABLE_PREVIOUS_EDDSA_PRIVATE_KEY_B64: ${{ secrets.SPARKLE_STABLE_PREVIOUS_EDDSA_PRIVATE_KEY_B64 }}
         run: |
           set -euo pipefail
-          key() { printf '%s' "$SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64" | base64 --decode; }
-          feed_dir=".temp/stable/site/updates/stable/v$STABLE_FEED_GENERATION"
-          feed="$feed_dir/stable.xml"
-          prior_args=()
-          if [ -f "$feed" ]; then
-            cp "$feed" .temp/stable/prior-stable.xml
-            key | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - .temp/stable/prior-stable.xml
-            prior_args=(--prior-feed .temp/stable/prior-stable.xml)
+          sign_generation() {
+            generation="$1"; key_value="$2"; require_prior="$3"
+            test -n "$key_value"
+            feed_dir=".temp/stable/site/updates/stable/v$generation"
+            feed="$feed_dir/stable.xml"
+            prior_args=()
+            if [ -f "$feed" ]; then
+              prior=".temp/stable/prior-stable-v$generation.xml"
+              cp "$feed" "$prior"
+              printf '%s' "$key_value" | base64 --decode | \
+                "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - "$prior"
+              prior_args=(--prior-feed "$prior")
+            elif [ "$require_prior" = yes ]; then
+              echo "rotation refuses to create a bridge without the authenticated old feed" >&2
+              exit 1
+            fi
+            printf '%s' "$key_value" | base64 --decode | \
+              "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
+              ".temp/stable/candidate/${{ steps.candidate.outputs.dmg_name }}" \
+              > ".temp/stable/dmg-signature-v$generation.txt"
+            printf '%s' "$key_value" | base64 --decode | \
+              "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
+              "$feed_dir/notes/$STABLE_NOTES" > ".temp/stable/notes-signature-v$generation.txt"
+            python3 .scripts/release/publish_sparkle.py render-feed \
+              --candidate-dir .temp/stable/candidate \
+              --channel stable --generation "$generation" \
+              --repository "$GITHUB_REPOSITORY" \
+              --dmg-signature ".temp/stable/dmg-signature-v$generation.txt" \
+              --notes-signature ".temp/stable/notes-signature-v$generation.txt" \
+              --notes-name "$STABLE_NOTES" \
+              --publication-date "$(git show -s --format=%cD '${{ steps.source.outputs.commit }}')" \
+              "${prior_args[@]}" --output "$feed"
+            printf '%s' "$key_value" | base64 --decode | "$SPARKLE_SIGN_UPDATE" --ed-key-file - "$feed"
+            printf '%s' "$key_value" | base64 --decode | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - "$feed"
+            python3 .scripts/release/publish_sparkle.py validate-feed \
+              --feed "$feed" --channel stable --generation "$generation" \
+              --repository "$GITHUB_REPOSITORY"
+          }
+          if [ "${{ steps.source.outputs.operation }}" = rotate-key ]; then
+            sign_generation \
+              "${{ steps.source.outputs.previous_generation }}" \
+              "$SPARKLE_STABLE_PREVIOUS_EDDSA_PRIVATE_KEY_B64" yes
           fi
-          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
-            ".temp/stable/candidate/${{ steps.candidate.outputs.dmg_name }}" \
-            > .temp/stable/dmg-signature.txt
-          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
-            "$feed_dir/notes/$STABLE_NOTES" > .temp/stable/notes-signature.txt
-          python3 .scripts/release/publish_sparkle.py render-feed \
-            --candidate-dir .temp/stable/candidate \
-            --channel stable --generation "$STABLE_FEED_GENERATION" \
-            --repository "$GITHUB_REPOSITORY" \
-            --dmg-signature .temp/stable/dmg-signature.txt \
-            --notes-signature .temp/stable/notes-signature.txt \
-            --notes-name "$STABLE_NOTES" \
-            --publication-date "$(git show -s --format=%cD '${{ steps.source.outputs.commit }}')" \
-            "${prior_args[@]}" --output "$feed"
-          key | "$SPARKLE_SIGN_UPDATE" --ed-key-file - "$feed"
-          key | "$SPARKLE_SIGN_UPDATE" --verify --ed-key-file - "$feed"
-          python3 .scripts/release/publish_sparkle.py validate-feed \
-            --feed "$feed" --channel stable --generation "$STABLE_FEED_GENERATION" \
-            --repository "$GITHUB_REPOSITORY"
+          sign_generation \
+            "${{ steps.source.outputs.generation }}" \
+            "$SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64" no
 
-      - name: Freeze the complete Pages site before any stable mutation
+      - name: Freeze authenticate and verify the complete Pages site before mutation
+        env:
+          SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64: ${{ secrets.SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64 || secrets.SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64 }}
         run: |
           set -euo pipefail
           find .temp/stable/site -type l -print -quit | grep -q . && exit 1 || true
           python3 .scripts/release/publish_sparkle.py pack-tree \
             --root .temp/stable/site --output .temp/stable/stable-pages-site.tar.gz
+          key_args=()
+          if [ -f .temp/stable/previous/stable-pages-site-manifest.json ]; then
+            while IFS= read -r binding; do key_args+=(--key "$binding"); done < <(
+              python3 - <<'PY'
+          import json
+          manifest = json.load(open(".temp/stable/previous/stable-pages-site-manifest.json"))
+          for item in manifest["feed_keys"]:
+              print(f'{item["generation"]}={item["public_key"]}')
+          PY
+            )
+          fi
+          key_args+=(--key "${{ steps.source.outputs.generation }}=${{ steps.source.outputs.public_key }}")
+          if [ "${{ steps.source.outputs.operation }}" = rotate-key ]; then
+            key_args+=(--key "${{ steps.source.outputs.previous_generation }}=${{ steps.source.outputs.previous_public_key }}")
+          fi
+          python3 .scripts/release/publish_sparkle.py write-site-manifest \
+            --site .temp/stable/site \
+            --archive .temp/stable/stable-pages-site.tar.gz \
+            "${key_args[@]}" \
+            --signer-generation "${{ steps.source.outputs.generation }}" \
+            --output .temp/stable/stable-pages-site-manifest.json
+          printf '%s' "$SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode | \
+            "$SPARKLE_SIGN_UPDATE" --ed-key-file - \
+            .temp/stable/stable-pages-site-manifest.json \
+            > .temp/stable/stable-pages-site-manifest.signature.txt
+          python3 .scripts/release/publish_sparkle.py verify-site \
+            --site .temp/stable/site \
+            --archive .temp/stable/stable-pages-site.tar.gz \
+            --manifest .temp/stable/stable-pages-site-manifest.json \
+            --manifest-signature .temp/stable/stable-pages-site-manifest.signature.txt \
+            --repository "$GITHUB_REPOSITORY"
+          (
+            cd .temp/stable
+            shasum -a 256 \
+              stable-pages-site.tar.gz \
+              stable-pages-site-manifest.json \
+              stable-pages-site-manifest.signature.txt \
+              > STABLE-SITE-SUBJECTS.sha256
+          )
+
+      - name: Attest the exact authenticated site recovery subjects
+        id: attest_site
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-checksums: .temp/stable/STABLE-SITE-SUBJECTS.sha256
+
+      - name: Freeze the site attestation bundle
+        run: cp "${{ steps.attest_site.outputs.bundle-path }}" .temp/stable/stable-pages-site.attestation.json
 
       - name: Publish exact immutable stable Release assets
         env:
@@ -236,7 +402,7 @@ jobs:
           dmg=".temp/stable/candidate/${{ steps.candidate.outputs.dmg_name }}"
           package=".temp/stable/${{ steps.candidate.outputs.dmg_name }}.candidate.tar.gz"
           cp .temp/stable/selected-candidate.tar.gz "$package"
-          notes=".temp/stable/site/updates/stable/v$STABLE_FEED_GENERATION/notes/$STABLE_NOTES"
+          notes=".temp/stable/site/updates/stable/v${{ steps.source.outputs.generation }}/notes/$STABLE_NOTES"
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --verify-tag --latest \
               --title "GramDrive ${{ steps.source.outputs.version }}" \
@@ -256,6 +422,22 @@ jobs:
           upload_immutable "$package" "${{ steps.candidate.outputs.dmg_name }}.candidate.tar.gz"
           upload_immutable "$notes" "$STABLE_NOTES"
           upload_immutable .temp/stable/stable-pages-site.tar.gz stable-pages-site.tar.gz
+          upload_immutable .temp/stable/stable-pages-site-manifest.json stable-pages-site-manifest.json
+          upload_immutable .temp/stable/stable-pages-site-manifest.signature.txt stable-pages-site-manifest.signature.txt
+          if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq stable-pages-site.attestation.json; then
+            gh release download "$tag" --pattern stable-pages-site.attestation.json \
+              --dir .temp/stable/existing --clobber
+            for subject in stable-pages-site.tar.gz stable-pages-site-manifest.json stable-pages-site-manifest.signature.txt; do
+              gh attestation verify ".temp/stable/$subject" \
+                --repo "$GITHUB_REPOSITORY" \
+                --bundle .temp/stable/existing/stable-pages-site.attestation.json \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-digest "${{ steps.source.outputs.commit }}"
+            done
+            cp .temp/stable/existing/stable-pages-site.attestation.json \
+              .temp/stable/stable-pages-site.attestation.json
+          fi
+          upload_immutable .temp/stable/stable-pages-site.attestation.json stable-pages-site.attestation.json
 
       - name: Upload the complete site for isolated Pages deployment
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
@@ -300,10 +482,28 @@ jobs:
           mkdir -p .temp/stable-recovery
           gh release download "$RECOVERY_TAG" \
             --pattern stable-pages-site.tar.gz \
+            --pattern stable-pages-site-manifest.json \
+            --pattern stable-pages-site-manifest.signature.txt \
+            --pattern stable-pages-site.attestation.json \
             --dir .temp/stable-recovery
+          git fetch --force origin "refs/tags/$RECOVERY_TAG:refs/tags/$RECOVERY_TAG"
+          recovery_commit="$(git rev-list -n 1 "$RECOVERY_TAG")"
+          for subject in stable-pages-site.tar.gz stable-pages-site-manifest.json stable-pages-site-manifest.signature.txt; do
+            gh attestation verify ".temp/stable-recovery/$subject" \
+              --repo "$GITHUB_REPOSITORY" \
+              --bundle .temp/stable-recovery/stable-pages-site.attestation.json \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$recovery_commit"
+          done
           python3 .scripts/release/publish_sparkle.py unpack-tree \
             --archive .temp/stable-recovery/stable-pages-site.tar.gz \
             --output .temp/stable-recovery/site
+          python3 .scripts/release/publish_sparkle.py verify-site \
+            --site .temp/stable-recovery/site \
+            --archive .temp/stable-recovery/stable-pages-site.tar.gz \
+            --manifest .temp/stable-recovery/stable-pages-site-manifest.json \
+            --manifest-signature .temp/stable-recovery/stable-pages-site-manifest.signature.txt \
+            --repository "$GITHUB_REPOSITORY"
 
       - name: Upload the exact recovered site for isolated Pages deployment
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4

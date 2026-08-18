@@ -494,7 +494,16 @@ class WorkflowContractTests(unittest.TestCase):
     def test_job_has_only_apple_secrets_and_no_publication_capability(self):
         for name in ("MACOS_CERT_P12", "MACOS_CERT_PASSWORD", "APPSTORE_KEY_ID", "APPSTORE_ISSUER_ID", "APPSTORE_PRIVATE_KEY"):
             self.assertIn(f"secrets.{name}", self.candidate_job)
-        for forbidden in ("SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64", "SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64", "gh release", "test.xml#", "deploy-pages", "upload-pages-artifact"):
+        for forbidden in (
+            "SPARKLE_TEST_V1_EDDSA_PRIVATE_KEY_B64",
+            "SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64",
+            "SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64",
+            "SPARKLE_STABLE_PREVIOUS_EDDSA_PRIVATE_KEY_B64",
+            "gh release",
+            "test.xml#",
+            "deploy-pages",
+            "upload-pages-artifact",
+        ):
             self.assertNotIn(forbidden, self.candidate_job)
 
     def test_live_candidate_uses_the_locked_sparkle_dependency(self):

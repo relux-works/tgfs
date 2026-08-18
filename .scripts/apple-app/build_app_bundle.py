@@ -174,7 +174,13 @@ UPDATE_CHANNELS = {
 }
 
 
-def update_configuration(channel: str, channels: dict | None = None) -> dict:
+def update_configuration(
+    channel: str,
+    channels: dict | None = None,
+    *,
+    generation: int = 1,
+    public_key_override: str | None = None,
+) -> dict:
     """Return one validated, checked-in Sparkle trust configuration.
 
     A candidate can contain exactly one feed/key pair. Validation is retained
@@ -189,6 +195,19 @@ def update_configuration(channel: str, channels: dict | None = None) -> dict:
         public_key = configuration["public_key"]
     except (KeyError, TypeError) as error:
         raise StepFailed(f"missing reviewed Sparkle configuration for channel {channel!r}") from error
+    if not isinstance(generation, int) or generation < 1:
+        raise StepFailed(f"invalid Sparkle feed generation for channel {channel!r}")
+    if generation != 1:
+        if not public_key_override:
+            raise StepFailed(f"Sparkle feed generation {generation} requires an explicit reviewed public key")
+        public_key = public_key_override
+        feed_url = (
+            f"https://github.com/relux-works/tgfs/releases/download/updates-test-v{generation}/test.xml"
+            if channel == "test"
+            else f"https://relux-works.github.io/tgfs/updates/stable/v{generation}/stable.xml"
+        )
+    elif public_key_override is not None and public_key_override != public_key:
+        raise StepFailed(f"Sparkle v1 public key override disagrees with the checked-in trust anchor for {channel!r}")
     if not isinstance(feed_url, str) or not feed_url.startswith("https://"):
         raise StepFailed(f"invalid Sparkle feed URL for channel {channel!r}")
     if not isinstance(public_key, str):
@@ -199,7 +218,7 @@ def update_configuration(channel: str, channels: dict | None = None) -> dict:
         raise StepFailed(f"invalid Sparkle public key for channel {channel!r}") from error
     if len(decoded) != 32:
         raise StepFailed(f"invalid Sparkle public key for channel {channel!r}")
-    return {"channel": channel, "feed_url": feed_url, "public_key": public_key}
+    return {"channel": channel, "generation": generation, "feed_url": feed_url, "public_key": public_key}
 
 
 @dataclass(frozen=True)
@@ -1656,7 +1675,12 @@ def build_manifest(
             "verified_by": "lipo -archs on every built product (build_products)",
         },
         "minimum_system_version": MINIMUM_SYSTEM_VERSION,
-        "sparkle": {"channel": update["channel"], "feed_url": update["feed_url"]},
+        "sparkle": {
+            "channel": update["channel"],
+            "generation": update["generation"],
+            "feed_url": update["feed_url"],
+            "public_key": update["public_key"],
+        },
         "app_group": APP_GROUP,
         "signed": is_signed,
         "signing_identity": identity,
@@ -1707,6 +1731,8 @@ def package(
     echo: Callable[[str], None] = print,
     environ: dict[str, str] | None = None,
     update_channel: str = "test",
+    update_feed_generation: int = 1,
+    update_public_key: str | None = None,
 ) -> dict:
     """Run the whole pipeline and return the manifest.
 
@@ -1725,7 +1751,11 @@ def package(
         environ=environ,
     )
     environ = environ if environ is not None else os.environ
-    update = update_configuration(update_channel)
+    update = update_configuration(
+        update_channel,
+        generation=update_feed_generation,
+        public_key_override=update_public_key,
+    )
     if not (core_package / "Package.swift").is_file():
         raise StepFailed(
             f"staged core package not found at {core_package}; run "
@@ -1887,6 +1917,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="embedded Sparkle trust channel (default: test)",
     )
     parser.add_argument(
+        "--update-feed-generation",
+        type=int,
+        default=int(os.environ.get("GRAMDRIVE_UPDATE_FEED_GENERATION", "1")),
+        help="embedded versioned Sparkle feed generation (default: 1)",
+    )
+    parser.add_argument(
+        "--update-public-key",
+        default=os.environ.get("GRAMDRIVE_UPDATE_PUBLIC_KEY"),
+        help="reviewed EdDSA public key required for generations after v1",
+    )
+    parser.add_argument(
         "--notarize",
         action="store_true",
         help="submit the dmg for notarization and staple it (network; Apple)",
@@ -1941,6 +1982,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             notary_keychain=args.notary_keychain.resolve() if args.notary_keychain else None,
             unsigned=args.unsigned,
             update_channel=args.update_channel,
+            update_feed_generation=args.update_feed_generation,
+            update_public_key=args.update_public_key,
         )
     except StepFailed as failure:
         print(f"\nAPP PACKAGING FAILED\n{failure}", file=sys.stderr)

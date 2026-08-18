@@ -16,6 +16,15 @@ on:
         description: Full commit SHA reachable from protected origin/main
         required: true
         type: string
+      stable_feed_generation:
+        description: Versioned stable feed embedded in a stable-candidate (v1 by default)
+        required: false
+        default: "1"
+        type: string
+      stable_public_key:
+        description: Reviewed stable EdDSA public key; required when stable_feed_generation is after v1
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -41,6 +50,8 @@ jobs:
       artifact_name: ${{ steps.handoff.outputs.artifact_name }}
       commit: ${{ steps.source.outputs.commit }}
       mode: ${{ steps.source.outputs.mode }}
+      feed_generation: ${{ steps.source.outputs.feed_generation }}
+      feed_public_key: ${{ steps.source.outputs.feed_public_key }}
     steps:
       - name: Record the runner keychain state
         shell: bash
@@ -70,6 +81,8 @@ jobs:
         env:
           DISPATCH_MODE: ${{ inputs.mode }}
           DISPATCH_COMMIT: ${{ inputs.commit }}
+          DISPATCH_STABLE_GENERATION: ${{ inputs.stable_feed_generation }}
+          DISPATCH_STABLE_PUBLIC_KEY: ${{ inputs.stable_public_key }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -77,6 +90,8 @@ jobs:
             [ "$GITHUB_REF" = "refs/heads/main" ]
             mode="test"
             commit="$GITHUB_SHA"
+            generation="1"
+            public_key="T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo="
           elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             if [ "$GITHUB_REF" != "refs/heads/main" ]; then
               echo "workflow_dispatch must run from protected main" >&2
@@ -84,11 +99,27 @@ jobs:
             fi
             mode="$DISPATCH_MODE"
             commit="$DISPATCH_COMMIT"
+            generation="1"
+            public_key="T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo="
+            if [ "$mode" = stable-candidate ]; then
+              generation="${DISPATCH_STABLE_GENERATION:-1}"
+              if [ "$generation" = 1 ]; then
+                public_key="FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE="
+                test -z "$DISPATCH_STABLE_PUBLIC_KEY" || [ "$DISPATCH_STABLE_PUBLIC_KEY" = "$public_key" ]
+              else
+                public_key="$DISPATCH_STABLE_PUBLIC_KEY"
+              fi
+            fi
           else
             echo "unsupported event: $GITHUB_EVENT_NAME" >&2
             exit 1
           fi
           case "$mode" in test|stable-candidate) ;; *) echo "invalid mode" >&2; exit 1;; esac
+          [[ "$generation" =~ ^[1-9][0-9]*$ ]]
+          python3 - "$public_key" <<'PY'
+          import base64, sys
+          assert len(base64.b64decode(sys.argv[1], validate=True)) == 32
+          PY
           if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
             echo "commit must be a full lowercase SHA-1" >&2
             exit 1
@@ -104,6 +135,8 @@ jobs:
             echo "mode=$mode"
             echo "channel=$channel"
             echo "commit=$commit"
+            echo "feed_generation=$generation"
+            echo "feed_public_key=$public_key"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check monotonic Sparkle build ordering
@@ -188,6 +221,8 @@ jobs:
           set -euo pipefail
           python3 .scripts/apple-app/build_app_bundle.py \
             --update-channel "${{ steps.source.outputs.channel }}" \
+            --update-feed-generation "${{ steps.source.outputs.feed_generation }}" \
+            --update-public-key "${{ steps.source.outputs.feed_public_key }}" \
             --notarize \
             --notary-profile gramdrive-candidate-notary \
             --notary-keychain "$KEYCHAIN_PATH"
@@ -269,6 +304,9 @@ jobs:
   # Sole rolling-test publication boundary (TASK-260810-y3zcg8). This job can
   # mutate Releases and use the test Sparkle key, but it cannot deploy Pages,
   # read the stable key, or access any Apple signing/notarization credential.
+  # Test clients are deliberately disposable: v1 is the sole test trust root.
+  # A future test-key discontinuity freezes this prerelease and requires a new
+  # reviewed workflow/client generation; it never bridges through stable trust.
   publish-test:
     name: publish-rolling-test-feed
     needs: candidate
