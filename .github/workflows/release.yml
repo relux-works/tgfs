@@ -17,23 +17,6 @@ on:
         description: Existing v* tag to recover or redeploy
         required: true
         type: string
-      stable_feed_generation:
-        description: Active stable feed generation
-        required: false
-        default: "1"
-        type: string
-      stable_public_key:
-        description: Reviewed active stable EdDSA public key (required after v1)
-        required: false
-        type: string
-      previous_feed_generation:
-        description: Frozen old generation to receive the one-time bridge item
-        required: false
-        type: string
-      previous_public_key:
-        description: Reviewed old stable EdDSA public key for bridge verification
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -74,39 +57,12 @@ jobs:
         env:
           DISPATCH_TAG: ${{ inputs.tag }}
           DISPATCH_OPERATION: ${{ inputs.operation }}
-          DISPATCH_GENERATION: ${{ inputs.stable_feed_generation }}
-          DISPATCH_PUBLIC_KEY: ${{ inputs.stable_public_key }}
-          DISPATCH_PREVIOUS_GENERATION: ${{ inputs.previous_feed_generation }}
-          DISPATCH_PREVIOUS_PUBLIC_KEY: ${{ inputs.previous_public_key }}
         run: |
           set -euo pipefail
-          v1_key="FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE="
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            tag="$GITHUB_REF_NAME"; operation=promote; generation=1; public_key="$v1_key"
+            tag="$GITHUB_REF_NAME"; requested_operation=auto
           else
-            tag="$DISPATCH_TAG"; operation="$DISPATCH_OPERATION"
-            generation="${DISPATCH_GENERATION:-1}"
-            public_key="$DISPATCH_PUBLIC_KEY"
-            if [ "$generation" = 1 ]; then
-              test -z "$public_key" || [ "$public_key" = "$v1_key" ]
-              public_key="$v1_key"
-            fi
-          fi
-          [[ "$generation" =~ ^[1-9][0-9]*$ ]]
-          python3 - "$public_key" <<'PY'
-          import base64, sys
-          assert len(base64.b64decode(sys.argv[1], validate=True)) == 32
-          PY
-          previous_generation=""; previous_public_key=""
-          if [ "$operation" = rotate-key ]; then
-            previous_generation="$DISPATCH_PREVIOUS_GENERATION"
-            previous_public_key="$DISPATCH_PREVIOUS_PUBLIC_KEY"
-            [[ "$previous_generation" =~ ^[1-9][0-9]*$ ]]
-            [ "$previous_generation" -lt "$generation" ]
-            python3 - "$previous_public_key" <<'PY'
-          import base64, sys
-          assert len(base64.b64decode(sys.argv[1], validate=True)) == 32
-          PY
+            tag="$DISPATCH_TAG"; requested_operation="$DISPATCH_OPERATION"
           fi
           if ! [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             echo "stable promotion requires an exact vMAJOR.MINOR.PATCH tag" >&2
@@ -119,15 +75,17 @@ jobs:
           git checkout --detach "$commit"
           test -z "$(git status --porcelain)"
           test "$(python3 -c 'import json; print(json.load(open("apple/GramDriveSupport/Version.json"))["marketing_version"])')" = "${BASH_REMATCH[1]}"
+          generation="$(python3 -c 'import json; print(json.load(open(".github/sparkle-stable.json"))["active_generation"])')"
+          public_key="$(python3 -c 'import json; print(json.load(open(".github/sparkle-stable.json"))["active_public_key"])')"
+          python3 .scripts/release/publish_sparkle.py read-stable-config \
+            --config .github/sparkle-stable.json >/dev/null
           {
             echo "tag=$tag"
             echo "version=${BASH_REMATCH[1]}"
             echo "commit=$commit"
-            echo "operation=$operation"
+            echo "requested_operation=$requested_operation"
             echo "generation=$generation"
             echo "public_key=$public_key"
-            echo "previous_generation=$previous_generation"
-            echo "previous_public_key=$previous_public_key"
           } >> "$GITHUB_OUTPUT"
 
       - name: Download immutable candidates from the rolling test prerelease
@@ -257,6 +215,25 @@ jobs:
           fi
           test -d .temp/stable/site
 
+      - name: Enforce the authenticated stable generation transition
+        id: transition
+        run: |
+          set -euo pipefail
+          prior_args=()
+          if [ -f .temp/stable/previous/stable-pages-site-manifest.json ]; then
+            prior_args=(--previous-manifest .temp/stable/previous/stable-pages-site-manifest.json)
+          fi
+          python3 .scripts/release/publish_sparkle.py plan-transition \
+            --config .github/sparkle-stable.json \
+            --requested-operation "${{ steps.source.outputs.requested_operation }}" \
+            "${prior_args[@]}"
+
+      - name: Match the tested candidate to the enforced transition
+        run: |
+          set -euo pipefail
+          [ "${{ steps.source.outputs.generation }}" = "${{ steps.transition.outputs.generation }}" ]
+          [ "${{ steps.source.outputs.public_key }}" = "${{ steps.transition.outputs.public_key }}" ]
+
       - name: Prepare active notes and optional one-time old-generation bridge notes
         run: |
           set -euo pipefail
@@ -266,12 +243,12 @@ jobs:
           mkdir -p "$notes_dir"
           python3 .scripts/release/publish_sparkle.py write-notes \
             --candidate-dir .temp/stable/candidate --output "$notes_dir/$notes"
-          if [ "${{ steps.source.outputs.operation }}" = rotate-key ]; then
-            old_generation="${{ steps.source.outputs.previous_generation }}"
+          if [ "${{ steps.transition.outputs.operation }}" = rotate-key ]; then
+            old_generation="${{ steps.transition.outputs.previous_generation }}"
             old_feed=".temp/stable/site/updates/stable/v$old_generation/stable.xml"
             test -f "$old_feed"
             test -f .temp/stable/previous/stable-pages-site-manifest.json
-            python3 - "$old_generation" "${{ steps.source.outputs.previous_public_key }}" <<'PY'
+            python3 - "$old_generation" "${{ steps.transition.outputs.previous_public_key }}" <<'PY'
           import json, sys
           manifest = json.load(open(".temp/stable/previous/stable-pages-site-manifest.json"))
           keys = {str(item["generation"]): item["public_key"] for item in manifest["feed_keys"]}
@@ -327,9 +304,9 @@ jobs:
               --feed "$feed" --channel stable --generation "$generation" \
               --repository "$GITHUB_REPOSITORY"
           }
-          if [ "${{ steps.source.outputs.operation }}" = rotate-key ]; then
+          if [ "${{ steps.transition.outputs.operation }}" = rotate-key ]; then
             sign_generation \
-              "${{ steps.source.outputs.previous_generation }}" \
+              "${{ steps.transition.outputs.previous_generation }}" \
               "$SPARKLE_STABLE_PREVIOUS_EDDSA_PRIVATE_KEY_B64" yes
           fi
           sign_generation \
@@ -356,8 +333,8 @@ jobs:
             )
           fi
           key_args+=(--key "${{ steps.source.outputs.generation }}=${{ steps.source.outputs.public_key }}")
-          if [ "${{ steps.source.outputs.operation }}" = rotate-key ]; then
-            key_args+=(--key "${{ steps.source.outputs.previous_generation }}=${{ steps.source.outputs.previous_public_key }}")
+          if [ "${{ steps.transition.outputs.operation }}" = rotate-key ]; then
+            key_args+=(--key "${{ steps.transition.outputs.previous_generation }}=${{ steps.transition.outputs.previous_public_key }}")
           fi
           python3 .scripts/release/publish_sparkle.py write-site-manifest \
             --site .temp/stable/site \

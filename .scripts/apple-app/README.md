@@ -57,10 +57,12 @@ reviewed v1 GitHub Release feed and its reviewed public EdDSA key. Test clients
 are disposable: `updates-test-v1` is frozen, rather than bridged into stable
 trust, if its key is ever retired. `--update-channel stable` defaults to the
 reviewed v1 Pages feed and its different reviewed public EdDSA key. An approved
-rotation candidate uses `--update-feed-generation N --update-public-key KEY`;
-the packager constructs the versioned URL itself, rejects v1 key overrides, and
-records the generation/key in the signed candidate manifest. `Version.json` is
-the reviewed three-part marketing version source,
+rotation candidate uses the generation and public key from the reviewed
+`.github/sparkle-stable.json`; the candidate workflow passes that binding to
+`--update-feed-generation N --update-public-key KEY`. The packager constructs
+the versioned URL itself, rejects v1 key overrides, and records the
+generation/key in the signed candidate manifest. `Version.json` is the reviewed
+three-part marketing version source,
 while the numeric `CFBundleVersion` remains the commit count.
 
 Publication never rebuilds those bytes. The candidate workflow first uploads
@@ -84,12 +86,16 @@ Pages-only job deploys only those authenticated exact files.
 Each stable Release freezes `stable-pages-site.tar.gz`. The next promotion must
 restore it successfully before changing the active versioned feed, so frozen
 old-key feed generations and their bridge items remain byte-identical while a
-new generation is added. Dispatching `operation=rotate-key` supplies explicit
-old/new generation and public-key bindings; after approval the job verifies the
-old binding against the authenticated prior site, publishes the same tested
-higher-build DMG as the final old-key bridge and first new-key item, verifies
-both signatures, and freezes both in one complete site. Later promotions mutate
-only the active generation. Never change the signer
+new generation is added. Rotation first lands a reviewed higher generation/key
+in `.github/sparkle-stable.json` and builds the tested candidate from that exact
+binding. A tag publication then derives the sole prior generation/key from the
+authenticated site manifest and automatically performs the one-time bridge;
+an explicit `operation=rotate-key` enforces the same transition. Promotion
+cannot advance a generation, and repeated rotation cannot rewrite a frozen
+feed. After approval the job publishes the same tested higher-build DMG as the
+final old-key bridge and first new-key item, verifies both signatures, and
+freezes both in one complete site. Later tags read the checked-in active binding
+and mutate only that generation. Never change the signer
 behind an existing versioned URL. Rollback uses the same candidate/test/stable
 path with a new protected-main commit and a greater `CFBundleVersion`; a lower
 build is never published as a downgrade.

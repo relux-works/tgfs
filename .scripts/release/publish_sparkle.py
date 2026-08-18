@@ -596,6 +596,80 @@ def parse_generation_keys(values: Sequence[str]) -> dict[int, str]:
     return keys
 
 
+def load_stable_config(path: Path) -> tuple[int, str]:
+    config = read_json(path)
+    require(config.get("schema") == SCHEMA, "unsupported stable configuration schema")
+    require(
+        set(config) == {"schema", "active_generation", "active_public_key"},
+        "stable configuration has unknown or missing fields",
+    )
+    generation = config.get("active_generation")
+    key = config.get("active_public_key")
+    require(isinstance(generation, int) and generation > 0, "stable active generation must be positive")
+    require(isinstance(key, str), "stable active public key is missing")
+    public_key(key, f"stable v{generation} public key")
+    return generation, key
+
+
+def plan_stable_transition(
+    config_path: Path,
+    previous_manifest_path: Path | None,
+    requested_operation: str,
+) -> dict[str, str]:
+    """Plan one publication from reviewed config and authenticated prior state."""
+    require(requested_operation in ("auto", "promote", "rotate-key"), "invalid stable operation")
+    generation, key = load_stable_config(config_path)
+    if previous_manifest_path is None:
+        require(generation == 1, "the first stable publication must start at generation 1")
+        require(requested_operation != "rotate-key", "rotation requires an authenticated prior site")
+        return {
+            "operation": "promote",
+            "generation": str(generation),
+            "public_key": key,
+            "previous_generation": "",
+            "previous_public_key": "",
+        }
+
+    manifest = read_json(previous_manifest_path)
+    require(manifest.get("schema") == SCHEMA, "unsupported prior stable site manifest schema")
+    records = manifest.get("feed_keys")
+    require(isinstance(records, list) and records, "prior stable site key inventory is missing")
+    bindings: list[str] = []
+    for record in records:
+        require(isinstance(record, dict), "prior stable site key inventory is malformed")
+        bindings.append(f"{record.get('generation')}={record.get('public_key')}")
+    keys = parse_generation_keys(bindings)
+    active = manifest.get("signed_by_generation")
+    require(isinstance(active, int) and active in keys, "prior stable active generation is invalid")
+    require(active == max(keys), "prior stable active generation is not the newest generation")
+
+    operation = requested_operation
+    if operation == "auto":
+        operation = "promote" if generation == active else "rotate-key"
+
+    if operation == "promote":
+        require(
+            generation == active,
+            "normal promotion cannot advance or replace the authenticated active generation",
+        )
+        require(key == keys[active], "reviewed stable key does not match the authenticated active generation")
+        previous_generation = ""
+        previous_key = ""
+    else:
+        require(generation > active, "rotation must advance beyond the authenticated active generation")
+        require(generation not in keys, "rotation target generation already exists and is frozen")
+        previous_generation = str(active)
+        previous_key = keys[active]
+
+    return {
+        "operation": operation,
+        "generation": str(generation),
+        "public_key": key,
+        "previous_generation": previous_generation,
+        "previous_public_key": previous_key,
+    }
+
+
 def site_inventory(site: Path) -> list[dict[str, object]]:
     site = site.resolve()
     require(site.is_dir(), f"stable site directory is missing: {site}")
@@ -761,6 +835,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify_site_parser.add_argument("--manifest", type=Path, required=True)
     verify_site_parser.add_argument("--manifest-signature", type=Path, required=True)
     verify_site_parser.add_argument("--repository", default=REPOSITORY)
+    stable_config = commands.add_parser("read-stable-config")
+    stable_config.add_argument("--config", type=Path, required=True)
+    transition = commands.add_parser("plan-transition")
+    transition.add_argument("--config", type=Path, required=True)
+    transition.add_argument("--previous-manifest", type=Path)
+    transition.add_argument("--requested-operation", choices=("auto", "promote", "rotate-key"), required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect-candidate":
@@ -781,8 +861,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             verify_test_offer(args.candidate_dir, args.feed, args.notes, repository=args.repository, generation=args.generation, test_public_key_b64=args.test_public_key)
         elif args.command == "write-site-manifest":
             write_site_manifest(args.site, args.archive, parse_generation_keys(args.key), args.signer_generation, args.output)
-        else:
+        elif args.command == "verify-site":
             verify_site(args.site, args.archive, args.manifest, args.manifest_signature, repository=args.repository)
+        elif args.command == "read-stable-config":
+            generation, key = load_stable_config(args.config)
+            emit_outputs({"generation": str(generation), "public_key": key})
+        else:
+            emit_outputs(plan_stable_transition(args.config, args.previous_manifest, args.requested_operation))
     except (OSError, PublicationError, tarfile.TarError) as error:
         print(f"SPARKLE PUBLICATION FAILED: {error}", file=sys.stderr)
         return 1
