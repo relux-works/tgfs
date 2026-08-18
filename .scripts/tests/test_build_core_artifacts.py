@@ -795,15 +795,17 @@ class PipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             tdlib = root / "tdlib"
+            host_target = root / "runner-global-cargo-target"
             library = tdlib / "lib/libtdjson.dylib"
             library.parent.mkdir(parents=True)
             library.write_bytes(b"arm64 tdjson")
-            _, runner, _ = self.run_pipeline(
+            _, runner, out_dir = self.run_pipeline(
                 root,
                 host_machine="x86_64",
                 environ={
-                    "HOME": "/home/u",
-                    "PATH": "/bin",
+                    "HOME": "/runner/home",
+                    "PATH": "/runner/bin:/usr/bin:/bin",
+                    "CARGO_TARGET_DIR": str(host_target),
                     packaging.TDLIB_ARTIFACT_ENV: str(tdlib),
                 },
             )
@@ -818,8 +820,18 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(
                 runner.envs[build_index][packaging.TDLIB_ARTIFACT_ENV], str(tdlib)
             )
+            self.assertEqual(
+                runner.envs[build_index]["CARGO_TARGET_DIR"], str(out_dir / "target")
+            )
             self.assertNotIn(
                 packaging.TDLIB_ARTIFACT_ENV, runner.envs[bindgen_index]
+            )
+            self.assertEqual(runner.envs[bindgen_index]["HOME"], "/runner/home")
+            self.assertEqual(
+                runner.envs[bindgen_index]["PATH"], "/runner/bin:/usr/bin:/bin"
+            )
+            self.assertEqual(
+                runner.envs[bindgen_index]["CARGO_TARGET_DIR"], str(host_target)
             )
 
     def test_checksums_cover_the_artifact_and_the_zip(self):

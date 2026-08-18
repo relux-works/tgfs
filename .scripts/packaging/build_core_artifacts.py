@@ -855,16 +855,17 @@ class Packager:
     def generate_bindings(self, library: Path, out_dir: Path) -> None:
         """Generate the Swift bindings from the shipped library.
 
-        Deliberately runs without build_env, so the generator builds in the
-        repo's own target directory: it is a host tool whose output is text
-        derived from `library`, nothing of it ships, and keeping its
-        `--features bindgen` build (which pulls in uniffi's CLI machinery) out
-        of packaging's target directory is what keeps that directory
-        single-purpose and its contents predictable. The real-TDLib artifact
-        variable is removed only for this host tool: on an Intel packaging host
-        it would otherwise make the generator binary try to link the shipped
-        arm64-only dylib. The target staticlib build retains the variable and
-        therefore remains live-TDLib-linked.
+        Deliberately runs without build_env, so the generator preserves the
+        caller's host environment, including a runner-global CARGO_TARGET_DIR
+        when configured (otherwise Cargo uses its normal repo-local default).
+        It is a host tool whose output is text derived from `library`; nothing
+        of it ships. Keeping its `--features bindgen` build (which pulls in
+        uniffi's CLI machinery) out of packaging's target directory keeps that
+        directory single-purpose and its contents predictable. The real-TDLib
+        artifact variable is removed only for this host tool: on an Intel
+        packaging host it would otherwise make the generator binary try to link
+        the shipped arm64-only dylib. The target staticlib build retains the
+        variable and therefore remains live-TDLib-linked.
         """
         if out_dir.exists():
             shutil.rmtree(out_dir)
