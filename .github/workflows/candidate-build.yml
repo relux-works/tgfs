@@ -124,11 +124,14 @@ jobs:
       - name: Run supply-chain gates before credentials exist
         run: python3 .scripts/acceptance/run_automated.py --suite supply-chain --run-id candidate-supply-chain
 
-      - name: Build and prove the pinned live TDLib core
+      - name: Restore and prove the pinned arm64 live TDLib core
         run: |
           set -euo pipefail
-          make tdlib
-          make tdjson-smoke
+          test "$(uname -m)" = "x86_64"
+          python3 .scripts/tdlib/restore_pinned_artifact.py \
+            --cache-root "$HOME/gramdrive-ci/cache" \
+            --out-dir .temp/tdlib/out
+          make tdlib-smoke-link
           GRAMDRIVE_TDLIB_ARTIFACT_DIR=.temp/tdlib/out make package
 
       - name: Import Developer ID and create the non-interactive notary profile

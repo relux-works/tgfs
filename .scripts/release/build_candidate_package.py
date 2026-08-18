@@ -32,6 +32,8 @@ MODE_TO_CHANNEL = {"test": "test", "stable-candidate": "stable"}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 TEXT_SUFFIXES = {".json", ".md", ".txt", ".sha256"}
+PINNED_TDLIB_REPO = "https://github.com/tdlib/td.git"
+PINNED_TDLIB_COMMIT = "022d60202e446ad1287b9fb68e687c8a0760788b"
 FORBIDDEN_TEXT = (
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN ENCRYPTED PRIVATE KEY-----",
@@ -235,8 +237,14 @@ def validate_inputs(
     require(core.get("git", {}).get("worktree_clean") is True, "core was built from a dirty worktree")
     require(core.get("tdjson", {}).get("linked") is True, "core manifest is not live TDJSON-linked")
     require(core.get("host_test_slice") is None, "candidate core contains a host-test-only slice")
-    require(tdlib.get("gramdrive", {}).get("commit") == commit, "TDLib artifact was staged for a different GramDrive commit")
+    tdlib_builder_commit = str(tdlib.get("gramdrive", {}).get("commit", ""))
+    require(COMMIT_RE.fullmatch(tdlib_builder_commit) is not None, "TDLib builder commit is missing")
     require(tdlib.get("gramdrive", {}).get("worktree_clean") is True, "TDLib artifact came from a dirty GramDrive worktree")
+    require(
+        tdlib.get("tdlib", {}).get("repo") == PINNED_TDLIB_REPO
+        and tdlib.get("tdlib", {}).get("commit") == PINNED_TDLIB_COMMIT,
+        "TDLib source identity is not pinned",
+    )
     require(tdlib.get("target", {}).get("label") == "macos-arm64" and tdlib.get("target", {}).get("arch") == "arm64", "TDLib target is not macos-arm64")
     require(tdlib.get("reproducibility", {}).get("clean_build_tree") is True, "TDLib did not use a clean build tree")
     tdlib_digest = tdlib.get("artifacts", {}).get("library", {}).get("sha256")
@@ -344,7 +352,13 @@ def build_candidate(args: argparse.Namespace) -> dict:
         "workflow": {"ref": args.workflow_ref, "run_id": args.run_id, "run_attempt": args.run_attempt},
         "candidate": {"mode": args.mode, "channel": MODE_TO_CHANNEL[args.mode]},
         "toolchains": {"app": app.get("toolchain", {}), "core": core.get("toolchain", {}), "tdlib": tdlib.get("toolchain", {})},
-        "tdlib": {"repo": tdlib.get("tdlib", {}).get("repo"), "commit": tdlib.get("tdlib", {}).get("commit"), "version": tdlib.get("tdlib", {}).get("runtime_version")},
+        "tdlib": {
+            "repo": tdlib.get("tdlib", {}).get("repo"),
+            "commit": tdlib.get("tdlib", {}).get("commit"),
+            "version": tdlib.get("tdlib", {}).get("runtime_version"),
+            "library_sha256": tdlib.get("artifacts", {}).get("library", {}).get("sha256"),
+            "builder_source_commit": tdlib.get("gramdrive", {}).get("commit"),
+        },
     }
     write_json(out_dir / "verification.json", verification)
     write_json(out_dir / "candidate-provenance.json", provenance)

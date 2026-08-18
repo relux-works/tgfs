@@ -88,6 +88,14 @@ nothing runs and nothing checks — the same reasoning `.scripts/packaging/`
 records for Android/iOS. Adding a platform is adding a target here, not a
 rewrite.
 
+The dedicated x86_64 CI/signing runner consumes an artifact built on that
+arm64 host through `restore_pinned_artifact.py`. The runner-local cache key is
+derived from `build_tdlib.py`; a miss fails actionably instead of rebuilding or
+relabeling. Restoration validates the exact file/checksum/manifest inventory,
+the pinned TDLib source and target, and arm64-only `file(1)` output before an
+atomic workspace replacement. CI then cross-links the shipped target with
+`make tdlib-smoke-link`; it never attempts to execute arm64 code on Intel.
+
 ## The three properties this pipeline guarantees
 
 Each fails loudly rather than degrading quietly, matching `.scripts/packaging/`.

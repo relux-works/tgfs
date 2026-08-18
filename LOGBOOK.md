@@ -5,6 +5,12 @@
 
 ## 2026-08-18
 
+### 0415 — Candidate signing consumes verified arm64 TDLib on Intel (TASK-260810-fwgmr4)
+
+- Exact-main candidate run `32087816420` established that the dedicated signing runner is x86_64 and cannot run the arm64-only from-source TDLib build. Candidate CI now shares native-ci's recipe-keyed runner-local artifact path, refuses cold cache or digest/manifest/architecture tampering, and cross-links the arm64 artifact before credential import.
+- The reusable TDLib artifact records the clean GramDrive commit on which it was built, which need not equal the candidate source commit. The candidate's live core and app remain bound to the exact library SHA-256, and the builder commit plus digest are carried in the attested privacy-safe provenance.
+- Native-ci run `32087816461` has an independent `CompanionTerminationCoordinator` test-ordering failure; no candidate-build workaround or suppression was added for it.
+
 ### 0354 — Protected consolidation publication is reconciled without rewriting its historical native failure (TASK-260811-2the0w)
 
 - PUBLICATION: protected PR [#4](https://github.com/relux-works/tgfs/pull/4) merged the accepted consolidation as `655307c889318034105d22ac458283115a3c2aef`. Its tree is byte-identical to the Sol-accepted branch tip `7a27e674ec3c6a8dba111d61ae2fbec1a7afe870`; GitHub recreated the commit during protected integration, so the branch-tip SHA itself is not an ancestor of `main`.
