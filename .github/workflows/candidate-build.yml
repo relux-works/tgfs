@@ -16,15 +16,6 @@ on:
         description: Full commit SHA reachable from protected origin/main
         required: true
         type: string
-      stable_feed_generation:
-        description: Versioned stable feed embedded in a stable-candidate (v1 by default)
-        required: false
-        default: "1"
-        type: string
-      stable_public_key:
-        description: Reviewed stable EdDSA public key; required when stable_feed_generation is after v1
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -81,8 +72,6 @@ jobs:
         env:
           DISPATCH_MODE: ${{ inputs.mode }}
           DISPATCH_COMMIT: ${{ inputs.commit }}
-          DISPATCH_STABLE_GENERATION: ${{ inputs.stable_feed_generation }}
-          DISPATCH_STABLE_PUBLIC_KEY: ${{ inputs.stable_public_key }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -90,8 +79,6 @@ jobs:
             [ "$GITHUB_REF" = "refs/heads/main" ]
             mode="test"
             commit="$GITHUB_SHA"
-            generation="1"
-            public_key="T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo="
           elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             if [ "$GITHUB_REF" != "refs/heads/main" ]; then
               echo "workflow_dispatch must run from protected main" >&2
@@ -99,27 +86,11 @@ jobs:
             fi
             mode="$DISPATCH_MODE"
             commit="$DISPATCH_COMMIT"
-            generation="1"
-            public_key="T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo="
-            if [ "$mode" = stable-candidate ]; then
-              generation="${DISPATCH_STABLE_GENERATION:-1}"
-              if [ "$generation" = 1 ]; then
-                public_key="FWkWDnXjzJFkgtipafAAtUJ42qcIuGBZ14Qvd0WpuDE="
-                test -z "$DISPATCH_STABLE_PUBLIC_KEY" || [ "$DISPATCH_STABLE_PUBLIC_KEY" = "$public_key" ]
-              else
-                public_key="$DISPATCH_STABLE_PUBLIC_KEY"
-              fi
-            fi
           else
             echo "unsupported event: $GITHUB_EVENT_NAME" >&2
             exit 1
           fi
           case "$mode" in test|stable-candidate) ;; *) echo "invalid mode" >&2; exit 1;; esac
-          [[ "$generation" =~ ^[1-9][0-9]*$ ]]
-          python3 - "$public_key" <<'PY'
-          import base64, sys
-          assert len(base64.b64decode(sys.argv[1], validate=True)) == 32
-          PY
           if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
             echo "commit must be a full lowercase SHA-1" >&2
             exit 1
@@ -130,7 +101,15 @@ jobs:
           [ "$(git rev-parse HEAD)" = "$commit" ]
           [ -z "$(git status --porcelain)" ]
           channel="test"
-          [ "$mode" = "test" ] || channel="stable"
+          generation="1"
+          public_key="T8IBLvve21ObUHz78CLXdF0eWN7QgJPHd1eKlcFhqmo="
+          if [ "$mode" = "stable-candidate" ]; then
+            channel="stable"
+            generation="$(python3 -c 'import json; print(json.load(open(".github/sparkle-stable.json"))["active_generation"])')"
+            public_key="$(python3 -c 'import json; print(json.load(open(".github/sparkle-stable.json"))["active_public_key"])')"
+            python3 .scripts/release/publish_sparkle.py read-stable-config \
+              --config .github/sparkle-stable.json >/dev/null
+          fi
           {
             echo "mode=$mode"
             echo "channel=$channel"

@@ -374,11 +374,111 @@ class FeedTests(unittest.TestCase):
             self.assertEqual(old_feed.read_bytes(), frozen_old)
 
 
+class StableTransitionTests(unittest.TestCase):
+    def _config(self, base: Path, generation: int, key: str) -> Path:
+        path = base / "sparkle-stable.json"
+        write_json(path, {"schema": 1, "active_generation": generation, "active_public_key": key})
+        return path
+
+    def _prior(self, base: Path, keys: dict[int, str], active: int) -> Path:
+        path = base / "stable-pages-site-manifest.json"
+        write_json(
+            path,
+            {
+                "schema": 1,
+                "feed_keys": [
+                    {"generation": generation, "public_key": key}
+                    for generation, key in sorted(keys.items())
+                ],
+                "signed_by_generation": active,
+            },
+        )
+        return path
+
+    def test_auto_rotation_derives_the_only_old_key_from_authenticated_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            old_key = base64.b64encode(b"1" * 32).decode()
+            new_key = base64.b64encode(b"2" * 32).decode()
+            plan = pub.plan_stable_transition(
+                self._config(base, 2, new_key),
+                self._prior(base, {1: old_key}, 1),
+                "auto",
+            )
+            self.assertEqual(
+                plan,
+                {
+                    "operation": "rotate-key",
+                    "generation": "2",
+                    "public_key": new_key,
+                    "previous_generation": "1",
+                    "previous_public_key": old_key,
+                },
+            )
+
+    def test_promote_cannot_bypass_the_required_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            old_key = base64.b64encode(b"1" * 32).decode()
+            new_key = base64.b64encode(b"2" * 32).decode()
+            with self.assertRaisesRegex(pub.PublicationError, "normal promotion cannot advance"):
+                pub.plan_stable_transition(
+                    self._config(base, 2, new_key),
+                    self._prior(base, {1: old_key}, 1),
+                    "promote",
+                )
+
+    def test_repeated_rotation_cannot_rewrite_a_frozen_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            keys = {
+                1: base64.b64encode(b"1" * 32).decode(),
+                2: base64.b64encode(b"2" * 32).decode(),
+            }
+            with self.assertRaisesRegex(pub.PublicationError, "rotation must advance"):
+                pub.plan_stable_transition(
+                    self._config(base, 2, keys[2]),
+                    self._prior(base, keys, 2),
+                    "rotate-key",
+                )
+
+    def test_prior_manifest_cannot_claim_an_old_generation_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            keys = {
+                1: base64.b64encode(b"1" * 32).decode(),
+                2: base64.b64encode(b"2" * 32).decode(),
+            }
+            with self.assertRaisesRegex(pub.PublicationError, "active generation is not the newest"):
+                pub.plan_stable_transition(
+                    self._config(base, 3, base64.b64encode(b"3" * 32).decode()),
+                    self._prior(base, keys, 1),
+                    "rotate-key",
+                )
+
+    def test_tag_promotion_continues_on_the_post_rotation_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            keys = {
+                1: base64.b64encode(b"1" * 32).decode(),
+                2: base64.b64encode(b"2" * 32).decode(),
+            }
+            plan = pub.plan_stable_transition(
+                self._config(base, 2, keys[2]),
+                self._prior(base, keys, 2),
+                "auto",
+            )
+            self.assertEqual(plan["operation"], "promote")
+            self.assertEqual(plan["generation"], "2")
+            self.assertEqual(plan["previous_generation"], "")
+
+
 class WorkflowContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.candidate = (REPO_ROOT / ".github/workflows/candidate-build.yml").read_text()
         cls.stable = (REPO_ROOT / ".github/workflows/release.yml").read_text()
+        cls.stable_config = json.loads((REPO_ROOT / ".github/sparkle-stable.json").read_text())
 
     def test_test_publisher_has_only_contents_write_test_key_and_no_pages(self):
         job = self.candidate[self.candidate.index("  publish-test:"):]
@@ -406,16 +506,29 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("- rotate-key", self.stable)
         self.assertIn("SPARKLE_STABLE_PREVIOUS_EDDSA_PRIVATE_KEY_B64", promote)
         self.assertIn("old generation/public key does not match the authenticated prior site", promote)
-        self.assertIn('"${{ steps.source.outputs.previous_generation }}"', promote)
+        self.assertIn('"${{ steps.transition.outputs.previous_generation }}"', promote)
         self.assertIn("rotation refuses to create a bridge", promote)
         self.assertIn('"${{ steps.source.outputs.generation }}"', promote)
+        self.assertIn("plan-transition", promote)
+        self.assertIn("steps.transition.outputs.previous_generation", promote)
 
     def test_candidate_binds_rotated_stable_clients_but_test_clients_are_v1_disposable(self):
-        self.assertIn("stable_feed_generation", self.candidate)
+        self.assertIn(".github/sparkle-stable.json", self.candidate)
+        self.assertNotIn("stable_feed_generation:", self.candidate)
+        self.assertNotIn("stable_public_key:", self.candidate)
         self.assertIn("--update-feed-generation", self.candidate)
+        self.assertEqual(self.stable_config["active_generation"], 1)
+        self.assertEqual(self.stable_config["active_public_key"], pub.STABLE_PUBLIC_ED_KEY_B64)
         publisher = self.candidate[self.candidate.index("  publish-test:"):]
         self.assertIn("updates-test-v1", publisher)
         self.assertNotIn("SPARKLE_TEST_V2", publisher)
+
+    def test_tag_and_dispatch_use_reviewed_config_not_mutable_generation_inputs(self):
+        self.assertIn("requested_operation=auto", self.stable)
+        self.assertIn(".github/sparkle-stable.json", self.stable)
+        self.assertNotIn("stable_feed_generation:", self.stable)
+        self.assertNotIn("previous_feed_generation:", self.stable)
+        self.assertNotIn("previous_public_key:", self.stable)
 
     def test_pages_capability_is_isolated_from_stable_key_and_contents_write(self):
         deploy = self.stable[self.stable.index("  deploy-pages:"):]
