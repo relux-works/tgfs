@@ -60,6 +60,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -78,6 +79,19 @@ OUT_ROOT = Path(".temp") / "app-packaging"
 # links (make package). Relative to the repo root.
 SUPPORT_PACKAGE = Path("apple") / "GramDriveSupport"
 DEFAULT_CORE_PACKAGE = Path(".temp") / "packaging" / "GramDriveCore"
+OPENSSL_LICENSE_PATH = Path("ThirdPartyLicenses") / "OpenSSL.txt"
+APP_OPENSSL_LICENSE_PATH = Path("Contents") / "Resources" / OPENSSL_LICENSE_PATH
+OPENSSL_SOURCE_SHA256 = "243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1"
+OPENSSL_CERT_FILE = "/etc/ssl/cert.pem"
+FORBIDDEN_RUNTIME_PATH_MARKERS = (
+    b"/opt/homebrew/",
+    b"/usr/local/opt/",
+    b"/usr/local/Cellar/",
+    b"/Users/",
+    b"/home/",
+    b"/private/tmp/",
+    b"/var/folders/",
+)
 
 # Identity and naming, all sourced from .spec/platform-requirements.md and
 # TASK-260716-1jswke, never invented here.
@@ -740,6 +754,60 @@ class AppPackager:
             return False
         return bool(data.get("tdjson", {}).get("linked", False))
 
+    def core_openssl_attribution(self) -> tuple[dict, Path]:
+        """Validate static OpenSSL identity and license bytes from the core stage."""
+
+        manifest_path = self.core_package / "gramdrive-core-manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise StepFailed(f"cannot read core OpenSSL attribution: {error}") from error
+        openssl = manifest.get("third_party", {}).get("openssl", {})
+        runtime = manifest.get("tdjson", {}).get("runtime", {})
+        trust_store = runtime.get("trust_store", {})
+        license_record = openssl.get("license", {})
+        license_path = self.core_package / OPENSSL_LICENSE_PATH
+        if not (
+            openssl.get("name") == "OpenSSL"
+            and re.fullmatch(
+                r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?",
+                str(openssl.get("version", "")),
+            )
+            and openssl.get("linkage") == "static"
+            and openssl.get("embedded_in") == "lib/libtdjson.dylib"
+            and openssl.get("source", {}).get("sha256") == OPENSSL_SOURCE_SHA256
+            and license_record.get("id") == "Apache-2.0"
+            and license_record.get("file") == OPENSSL_LICENSE_PATH.as_posix()
+            and license_path.is_file()
+            and not license_path.is_symlink()
+            and license_record.get("sha256") == sha256_file(license_path)
+            and runtime.get("forbidden_builder_paths_verified") is True
+            and trust_store.get("policy") == "macos-system-pem"
+            and trust_store.get("cert_file") == OPENSSL_CERT_FILE
+            and trust_store.get("environment_overrides_scrubbed") is True
+            and trust_store.get("verified") is True
+            and isinstance(trust_store.get("certificate_objects"), int)
+            and trust_store.get("certificate_objects", 0) > 0
+        ):
+            raise StepFailed("core static OpenSSL attribution is missing or malformed")
+        return openssl, license_path
+
+    def core_tdjson_runtime_contract(self) -> dict:
+        """Return the verified source runtime/trust contract propagated by core."""
+
+        try:
+            manifest = json.loads(
+                (self.core_package / "gramdrive-core-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise StepFailed(f"cannot read core TDLib runtime contract: {error}") from error
+        runtime = manifest.get("tdjson", {}).get("runtime", {})
+        if not isinstance(runtime, dict):
+            raise StepFailed("core TDLib runtime contract is malformed")
+        return runtime
+
     def git_info(self) -> dict:
         code, describe = self.runner(
             ("git", "describe", "--tags", "--always", "--dirty"), self.repo_root, None
@@ -947,10 +1015,13 @@ class AppPackager:
 
     # -- runtime libraries (tdjson) --------------------------------------
 
-    #: Where Homebrew-built dependencies live; anything a bundled library
-    #: references under these prefixes must itself be bundled, or the app
-    #: only runs on machines with that Homebrew tree.
+    #: Builder-local runtime roots are never valid in a candidate. OpenSSL is
+    #: statically linked into the authoritative TDLib artifact.
     BREW_PREFIXES = ("/opt/homebrew/", "/usr/local/opt/", "/usr/local/Cellar/")
+    SYSTEM_RUNTIME_PREFIXES = ("/usr/lib/", "/System/Library/")
+    RELOCATABLE_RUNTIME_PREFIXES = ("@rpath/", "@loader_path/", "@executable_path/")
+    OPENSSL_RUNTIME_NAMES = ("libssl", "libcrypto")
+    RUNTIME_DEPENDENCY_POLICY = "system-or-bundle-relative-static-openssl"
 
     def dylib_dependencies(self, path: Path) -> list[str]:
         """The install names `path` links against, as recorded (otool -L)."""
@@ -966,8 +1037,7 @@ class AppPackager:
         return deps
 
     def embed_runtime_libraries(self, app: Path) -> list[str]:
-        """Embed libtdjson (and its Homebrew dependency closure) into
-        `Contents/Frameworks`, rewriting every reference to `@rpath`.
+        """Embed the hermetic libtdjson into `Contents/Frameworks`.
 
         No-op for a hermetic (non-tdjson) core. The staged library carries an
         absolute install name (its own staged path — what local consumers
@@ -987,33 +1057,24 @@ class AppPackager:
         frameworks = app / "Contents" / "Frameworks"
         frameworks.mkdir(parents=True, exist_ok=True)
 
-        # Copy the dependency closure: the staged library plus everything it
-        # (transitively) pulls from a Homebrew tree.
-        pending: list[Path] = [staged]
-        bundled: dict[str, Path] = {}
-        while pending:
-            source = pending.pop()
-            if source.name in bundled:
-                continue
-            copy = frameworks / source.name
-            shutil.copy2(source, copy)
-            copy.chmod(0o644)
-            bundled[source.name] = copy
-            for dep in self.dylib_dependencies(source):
-                if dep.startswith(self.BREW_PREFIXES):
-                    resolved = Path(dep).resolve()
-                    if not resolved.is_file():
-                        raise StepFailed(f"{source.name} links {dep}, which does not exist")
-                    pending.append(resolved)
+        self.require_portable_runtime_dependencies(staged, allow_relocatable=False)
+        copy = frameworks / staged.name
+        shutil.copy2(staged, copy)
+        copy.chmod(0o644)
+        bundled = {staged.name: copy}
 
         # Rewrite each copy: its own id, and its references to siblings.
         for name, copy in sorted(bundled.items()):
-            argv: list[str] = ["install_name_tool", "-id", f"@rpath/{name}"]
-            for dep in self.dylib_dependencies(copy):
-                if dep.startswith(self.BREW_PREFIXES) or dep == str(staged):
+            dependencies = self.dylib_dependencies(copy)
+            argv: list[str] = ["install_name_tool"]
+            if not dependencies or dependencies[0] != f"@rpath/{name}":
+                argv += ["-id", f"@rpath/{name}"]
+            for dep in dependencies:
+                if dep == str(staged):
                     argv += ["-change", dep, f"@rpath/{Path(dep).name}"]
-            argv.append(str(copy))
-            self.run(f"fixup-{name}", tuple(argv))
+            if len(argv) > 1:
+                argv.append(str(copy))
+                self.run(f"fixup-{name}", tuple(argv))
 
         # Point every executable at the bundle's Frameworks directory.
         executables = (
@@ -1039,7 +1100,74 @@ class AppPackager:
         self.assert_no_absolute_runtime_refs(app, sorted(bundled))
         return sorted(bundled)
 
-    def assert_no_absolute_runtime_refs(self, app: Path, bundled: list[str]) -> None:
+    def embed_third_party_attribution(self, app: Path) -> dict:
+        """Ship the exact license for OpenSSL bytes embedded in libtdjson."""
+
+        if not self.core_tdjson_linked():
+            return {}
+        openssl, source = self.core_openssl_attribution()
+        destination = app / APP_OPENSSL_LICENSE_PATH
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        if sha256_file(destination) != openssl["license"]["sha256"]:
+            raise StepFailed("embedded OpenSSL license bytes changed during app assembly")
+        app_record = json.loads(json.dumps(openssl))
+        app_record["license"]["file"] = APP_OPENSSL_LICENSE_PATH.as_posix()
+        return {"openssl": app_record}
+
+    def require_portable_runtime_dependencies(
+        self, path: Path, *, allow_relocatable: bool
+    ) -> list[str]:
+        if path.name == "libtdjson.dylib":
+            self.require_no_builder_runtime_paths(path)
+        dependencies = self.dylib_dependencies(path)
+        offenders: list[str] = []
+        runtime_dependencies: list[str] = []
+        for dependency in dependencies:
+            # otool reports a dylib's LC_ID_DYLIB in the same tab-indented
+            # section as its load commands. It names these bytes, not another
+            # runtime object, so exclude the staged and normalized self IDs.
+            if path.suffix == ".dylib" and dependency in (
+                str(path),
+                f"@rpath/{path.name}",
+            ):
+                continue
+            runtime_dependencies.append(dependency)
+            name = Path(dependency).name
+            permitted = dependency.startswith(self.SYSTEM_RUNTIME_PREFIXES)
+            if allow_relocatable:
+                permitted = permitted or dependency.startswith(
+                    self.RELOCATABLE_RUNTIME_PREFIXES
+                )
+            if not permitted or name.startswith(self.OPENSSL_RUNTIME_NAMES):
+                offenders.append(dependency)
+        if offenders:
+            raise StepFailed(
+                f"{path.name} has non-portable runtime dependencies; OpenSSL "
+                "must be static and references must be system or bundle-relative:\n  "
+                + "\n  ".join(offenders)
+            )
+        return runtime_dependencies
+
+    def require_no_builder_runtime_paths(self, path: Path) -> None:
+        """Reject compiled Homebrew/user defaults in the exact TDLib bytes."""
+
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise StepFailed(f"cannot inspect {path.name} runtime bytes: {error}") from error
+        offenders = [
+            marker.decode("ascii")
+            for marker in FORBIDDEN_RUNTIME_PATH_MARKERS
+            if marker in payload
+        ]
+        if offenders:
+            raise StepFailed(
+                f"{path.name} contains builder-local OpenSSL/runtime paths despite "
+                "clean Mach-O linkage: " + ", ".join(offenders)
+            )
+
+    def assert_no_absolute_runtime_refs(self, app: Path, bundled: list[str]) -> dict:
         """Read the shipped Mach-Os back and fail if any still loads a runtime
         library by an absolute staged or Homebrew path.
 
@@ -1059,18 +1187,30 @@ class AppPackager:
             / APPEX_EXECUTABLE_NAME,
         ]
         machos += [frameworks / name for name in bundled]
-        staged_root = str(self.core_package)
         offenders: list[str] = []
+        dependency_inventory: set[str] = set()
         for macho in machos:
-            for dep in self.dylib_dependencies(macho):
-                if dep.startswith(self.BREW_PREFIXES) or dep.startswith(staged_root):
-                    offenders.append(f"{macho.name}: {dep}")
+            try:
+                dependencies = self.require_portable_runtime_dependencies(
+                    macho, allow_relocatable=True
+                )
+                dependency_inventory.update(dependencies)
+            except StepFailed as error:
+                offenders.append(str(error))
         if offenders:
             raise StepFailed(
-                "shipped Mach-Os still load runtime libraries by absolute "
-                "staged/Homebrew paths (the bundle would only run on this build "
-                "machine):\n  " + "\n  ".join(offenders)
+                "shipped Mach-Os fail the portable runtime dependency policy:\n  "
+                + "\n  ".join(offenders)
             )
+        source_runtime = self.core_tdjson_runtime_contract()
+        return {
+            "verified": True,
+            "dependency_policy": self.RUNTIME_DEPENDENCY_POLICY,
+            "openssl_linkage": "static",
+            "dependencies": sorted(dependency_inventory),
+            "forbidden_builder_paths_verified": True,
+            "trust_store": source_runtime.get("trust_store"),
+        }
 
     def write_entitlement_files(self) -> dict[str, Path]:
         """Write the generated entitlements to disk for signing and provenance.
@@ -1514,6 +1654,7 @@ def package(
     app = packager.assemble_bundle(bin_dir, (short_version, build_version), update)
     packager.embed_sparkle_framework(app, bin_dir)
     embedded_libraries = packager.embed_runtime_libraries(app)
+    third_party = packager.embed_third_party_attribution(app)
     packager.add_companion_frameworks_rpath(app)
     entitlement_files = packager.write_entitlement_files()
 
@@ -1584,7 +1725,9 @@ def package(
     manifest["tdjson"] = {
         "linked": packager.core_tdjson_linked(),
         "embedded_libraries": embedded_libraries,
+        "runtime": packager.assert_no_absolute_runtime_refs(app, embedded_libraries),
     }
+    manifest["third_party"] = third_party
 
     checksums: dict[str, str] = {}
     if dmg is not None:

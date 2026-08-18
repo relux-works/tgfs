@@ -51,6 +51,43 @@ def read_plist(path: Path) -> dict:
         return plistlib.load(handle)
 
 
+def stage_openssl_attribution(core: Path, manifest: dict) -> None:
+    license_path = core / app.OPENSSL_LICENSE_PATH
+    license_path.parent.mkdir(parents=True, exist_ok=True)
+    license_path.write_text("Apache License 2.0\n")
+    manifest["third_party"] = {
+        "openssl": {
+            "name": "OpenSSL",
+            "version": "3.6.3",
+            "source": {
+                "url": "https://example.invalid/openssl-3.6.3.tar.gz",
+                "sha256": app.OPENSSL_SOURCE_SHA256,
+            },
+            "build_options": ["no-shared", "no-module"],
+            "linkage": "static",
+            "embedded_in": "lib/libtdjson.dylib",
+            "license": {
+                "id": "Apache-2.0",
+                "file": app.OPENSSL_LICENSE_PATH.as_posix(),
+                "sha256": app.sha256_file(license_path),
+            },
+        }
+    }
+    manifest.setdefault("tdjson", {})["runtime"] = {
+        "dependency_policy": "system-only-static-openssl",
+        "openssl_linkage": "static",
+        "dependencies": ["/usr/lib/libSystem.B.dylib"],
+        "forbidden_builder_paths_verified": True,
+        "trust_store": {
+            "policy": "macos-system-pem",
+            "cert_file": app.OPENSSL_CERT_FILE,
+            "environment_overrides_scrubbed": True,
+            "certificate_objects": 158,
+            "verified": True,
+        },
+    }
+
+
 class EntitlementsTest(unittest.TestCase):
     """The load-bearing signing decision: what each binary is entitled to."""
 
@@ -442,6 +479,7 @@ class PipelineTest(unittest.TestCase):
             manifest["tdjson"] = {"linked": True}
             (core / "lib").mkdir()
             (core / "lib" / "libtdjson.dylib").write_bytes(b"\xcf\xfa\xed\xfe dylib")
+            stage_openssl_attribution(core, manifest)
         (core / "gramdrive-core-manifest.json").write_text(json.dumps(manifest))
         return repo, core
 
@@ -667,6 +705,21 @@ class PipelineTest(unittest.TestCase):
             # None of the secret-ish words a leak would carry.
             for forbidden in ("PRIVATE KEY", "BEGIN CERTIFICATE", "p12", "password", "AuthKey"):
                 self.assertNotIn(forbidden, blob)
+
+    def test_signed_app_ships_checksummed_static_openssl_attribution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _, out = self.run_pipeline(Path(tmp))
+            openssl = manifest["third_party"]["openssl"]
+            relative = app.APP_OPENSSL_LICENSE_PATH.as_posix()
+            license_path = out / app.APP_BUNDLE_NAME / app.APP_OPENSSL_LICENSE_PATH
+            self.assertEqual(openssl["version"], "3.6.3")
+            self.assertEqual(openssl["license"]["id"], "Apache-2.0")
+            self.assertEqual(openssl["license"]["file"], relative)
+            self.assertEqual(openssl["license"]["sha256"], app.sha256_file(license_path))
+            self.assertEqual(
+                manifest["checksums"][f"{app.APP_BUNDLE_NAME}/{relative}"],
+                openssl["license"]["sha256"],
+            )
 
     def test_manifest_records_per_binary_entitlements_and_cdhash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -896,6 +949,7 @@ class RuntimeEmbeddingTest(unittest.TestCase):
         manifest = {"contract_version": "0.5.0"}
         if linked:
             manifest["tdjson"] = {"linked": True}
+            stage_openssl_attribution(core, manifest)
         (core / "gramdrive-core-manifest.json").write_text(json.dumps(manifest))
         return core
 
@@ -956,6 +1010,15 @@ class RuntimeEmbeddingTest(unittest.TestCase):
             self.assertEqual(pk.embed_runtime_libraries(appdir), [])
             self.assertFalse((appdir / "Contents" / "Frameworks").exists())
 
+    def test_live_core_rejects_tampered_openssl_license_before_signing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            core = self._core(tmp, linked=True)
+            (core / app.OPENSSL_LICENSE_PATH).write_text("tampered\n")
+            pk = self._packager(tmp, self.otool_runner(lambda _target: []))
+            with self.assertRaisesRegex(app.StepFailed, "OpenSSL attribution"):
+                pk.embed_third_party_attribution(self._app(tmp))
+
     def test_embed_rewrites_to_rpath_and_passes_the_assertion(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -963,7 +1026,7 @@ class RuntimeEmbeddingTest(unittest.TestCase):
 
             def clean_deps(target):
                 if target.endswith("libtdjson.dylib"):
-                    return ["/usr/lib/libSystem.B.dylib"]
+                    return ["@rpath/libtdjson.dylib", "/usr/lib/libSystem.B.dylib"]
                 return ["@rpath/libtdjson.dylib", "/usr/lib/libSystem.B.dylib"]
 
             pk = self._packager(tmp, self.otool_runner(clean_deps))
@@ -1011,6 +1074,48 @@ class RuntimeEmbeddingTest(unittest.TestCase):
             with self.assertRaises(app.StepFailed) as caught:
                 pk.embed_runtime_libraries(appdir)
             self.assertIn("homebrew", str(caught.exception).lower())
+
+    def test_compiled_homebrew_default_fails_with_clean_load_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            core = self._core(tmp, linked=True)
+            (core / "lib" / "libtdjson.dylib").write_bytes(
+                b"Mach-O\0/opt/homebrew/etc/openssl@3/cert.pem\0"
+            )
+            pk = self._packager(
+                tmp,
+                self.otool_runner(lambda _target: ["/usr/lib/libSystem.B.dylib"]),
+            )
+            with self.assertRaisesRegex(app.StepFailed, "builder-local"):
+                pk.embed_runtime_libraries(self._app(tmp))
+
+    def test_staged_tdjson_rejects_dynamic_openssl_before_embedding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._core(tmp, linked=True)
+
+            def openssl_dep(target):
+                if target.endswith("libtdjson.dylib"):
+                    return ["@rpath/libssl.3.dylib", "/usr/lib/libSystem.B.dylib"]
+                return ["@rpath/libtdjson.dylib"]
+
+            pk = self._packager(tmp, self.otool_runner(openssl_dep))
+            with self.assertRaisesRegex(app.StepFailed, "OpenSSL must be static"):
+                pk.embed_runtime_libraries(self._app(tmp))
+
+    def test_staged_tdjson_rejects_any_builder_absolute_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._core(tmp, linked=True)
+
+            def builder_dep(target):
+                if target.endswith("libtdjson.dylib"):
+                    return ["/Users/builder/local/libcustom.dylib"]
+                return ["@rpath/libtdjson.dylib"]
+
+            pk = self._packager(tmp, self.otool_runner(builder_dep))
+            with self.assertRaisesRegex(app.StepFailed, "non-portable"):
+                pk.embed_runtime_libraries(self._app(tmp))
 
     def test_frameworks_dylibs_are_signed_before_the_binaries(self):
         with tempfile.TemporaryDirectory() as tmp:

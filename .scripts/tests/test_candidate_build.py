@@ -31,6 +31,45 @@ DMG_SHA = sha256(DMG).hexdigest()
 TDLIB_SHA = sha256(b"tdlib").hexdigest()
 CORE_SHA = sha256(b"core").hexdigest()
 CORE_ZIP_SHA = sha256(b"core zip").hexdigest()
+OPENSSL_LICENSE = b"Apache License 2.0\n"
+OPENSSL_LICENSE_SHA = sha256(OPENSSL_LICENSE).hexdigest()
+
+
+def openssl_attribution(license_path: str) -> dict:
+    return {
+        "name": "OpenSSL",
+        "version": "3.6.3",
+        "source": {
+            "url": "https://example.invalid/openssl-3.6.3.tar.gz",
+            "sha256": candidate.PINNED_OPENSSL_SOURCE_SHA256,
+        },
+        "build_options": ["no-shared", "no-pinshared", "no-module"],
+        "linkage": "static",
+        "embedded_in": "lib/libtdjson.dylib",
+        "license": {
+            "id": "Apache-2.0",
+            "file": license_path,
+            "sha256": OPENSSL_LICENSE_SHA,
+        },
+    }
+
+
+def tdlib_runtime() -> dict:
+    return {
+        "dependency_policy": "system-only-static-openssl",
+        "openssl_linkage": "static",
+        "dependencies": ["/usr/lib/libSystem.B.dylib"],
+        "forbidden_builder_paths_verified": True,
+        "trust_store": {
+            "policy": "macos-system-pem",
+            "cert_file": candidate.OPENSSL_CERT_FILE,
+            "cert_dir": "/etc/ssl/certs",
+            "config_file": "/etc/ssl/openssl.cnf",
+            "environment_overrides_scrubbed": True,
+            "certificate_objects": 158,
+            "verified": True,
+        },
+    }
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -55,9 +94,15 @@ def stage(root: Path, mode: str = "test") -> None:
     embedded_tdlib = app_dir / "GramDrive.app" / "Contents" / "Frameworks" / "libtdjson.dylib"
     embedded_tdlib.parent.mkdir(parents=True)
     embedded_tdlib.write_bytes(b"tdlib")
+    app_openssl_license = (
+        app_dir / "GramDrive.app" / "Contents" / "Resources" / candidate.OPENSSL_LICENSE_PATH
+    )
+    app_openssl_license.parent.mkdir(parents=True)
+    app_openssl_license.write_bytes(OPENSSL_LICENSE)
     app_checksums = {
         "GramDrive-0.5.0.dmg": DMG_SHA,
         "GramDrive.app/Contents/Frameworks/libtdjson.dylib": TDLIB_SHA,
+        candidate.APP_OPENSSL_LICENSE_PATH: OPENSSL_LICENSE_SHA,
     }
     (app_dir / "CHECKSUMS.sha256").write_text(
         candidate.render_checksums(app_checksums.items())
@@ -86,7 +131,23 @@ def stage(root: Path, mode: str = "test") -> None:
                 "authority": candidate.IDENTITY,
             }],
         },
-        "tdjson": {"linked": True, "embedded_libraries": ["libtdjson.dylib"]},
+        "tdjson": {
+            "linked": True,
+            "embedded_libraries": ["libtdjson.dylib"],
+            "runtime": {
+                "verified": True,
+                "dependency_policy": "system-or-bundle-relative-static-openssl",
+                "openssl_linkage": "static",
+                "dependencies": ["/usr/lib/libSystem.B.dylib"],
+                "forbidden_builder_paths_verified": True,
+                "trust_store": tdlib_runtime()["trust_store"],
+            },
+        },
+        "third_party": {
+            "openssl": openssl_attribution(
+                f"Contents/Resources/{candidate.OPENSSL_LICENSE_PATH}"
+            )
+        },
         "product_version": {"short": "0.5.0", "build": "137"},
         "checksums": app_checksums, "sizes": {"dmg_bytes": len(DMG)},
         "toolchain": {"swift": "Swift test"},
@@ -94,21 +155,50 @@ def stage(root: Path, mode: str = "test") -> None:
     core_artifact = core_dir / "GramDriveCore"
     core_artifact.mkdir()
     (core_artifact / "core.bin").write_bytes(b"core")
+    (core_artifact / "lib").mkdir()
+    (core_artifact / "lib" / "libtdjson.dylib").write_bytes(b"tdlib")
+    core_openssl_license = core_artifact / candidate.OPENSSL_LICENSE_PATH
+    core_openssl_license.parent.mkdir(parents=True)
+    core_openssl_license.write_bytes(OPENSSL_LICENSE)
     core_zip = core_dir / "GramDriveCore-0.5.0.zip"
     core_zip.write_bytes(b"core zip")
-    core_checksums = {"core.bin": CORE_SHA, "../GramDriveCore-0.5.0.zip": CORE_ZIP_SHA}
+    core_checksums = {
+        "core.bin": CORE_SHA,
+        "lib/libtdjson.dylib": TDLIB_SHA,
+        candidate.OPENSSL_LICENSE_PATH: OPENSSL_LICENSE_SHA,
+        "../GramDriveCore-0.5.0.zip": CORE_ZIP_SHA,
+    }
     core = {
-        "git": {"commit": COMMIT, "worktree_clean": True}, "tdjson": {"linked": True, "library_sha256": TDLIB_SHA},
+        "git": {"commit": COMMIT, "worktree_clean": True},
+        "tdjson": {
+            "linked": True,
+            "library_sha256": TDLIB_SHA,
+            "runtime": tdlib_runtime(),
+        },
         "host_test_slice": None, "toolchain": {"rustc": "rustc test"}, "checksums": core_checksums,
+        "third_party": {
+            "openssl": openssl_attribution(candidate.OPENSSL_LICENSE_PATH)
+        },
     }
     (tdlib_dir / "lib").mkdir()
     (tdlib_dir / "lib" / "libtdjson.dylib").write_bytes(b"tdlib")
-    tdlib_checksums = {"lib/libtdjson.dylib": TDLIB_SHA}
+    tdlib_openssl_license = tdlib_dir / candidate.OPENSSL_LICENSE_PATH
+    tdlib_openssl_license.parent.mkdir(parents=True)
+    tdlib_openssl_license.write_bytes(OPENSSL_LICENSE)
+    tdlib_checksums = {
+        "lib/libtdjson.dylib": TDLIB_SHA,
+        candidate.OPENSSL_LICENSE_PATH: OPENSSL_LICENSE_SHA,
+    }
     tdlib = {
         "gramdrive": {"commit": "c" * 40, "worktree_clean": True},
         "tdlib": {"repo": candidate.PINNED_TDLIB_REPO, "commit": candidate.PINNED_TDLIB_COMMIT, "runtime_version": "1.8.51"},
         "target": {"label": "macos-arm64", "arch": "arm64"},
         "reproducibility": {"clean_build_tree": True},
+        "linkage": ["/usr/lib/libSystem.B.dylib"],
+        "runtime": tdlib_runtime(),
+        "third_party": {
+            "openssl": openssl_attribution(candidate.OPENSSL_LICENSE_PATH)
+        },
         "artifacts": {
             "library": {"sha256": TDLIB_SHA},
             "files": {name: {"sha256": digest} for name, digest in tdlib_checksums.items()},
@@ -129,6 +219,15 @@ def attestation_bundle(subjects: dict[str, str]) -> dict:
 
 
 class CandidatePackageTests(unittest.TestCase):
+    def test_compiled_homebrew_defaults_are_rejected_without_load_commands(self):
+        with tempfile.TemporaryDirectory() as raw:
+            library = Path(raw) / "libtdjson.dylib"
+            library.write_bytes(
+                b"clean Mach-O loads\0/opt/homebrew/etc/openssl@3/cert.pem\0"
+            )
+            with self.assertRaisesRegex(candidate.CandidateError, "builder-local"):
+                candidate.require_portable_tdlib_bytes(library, "signed app")
+
     def test_build_finalize_verify_preserves_exact_dmg_and_binds_attestation(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw); stage(root)
@@ -149,6 +248,15 @@ class CandidatePackageTests(unittest.TestCase):
             provenance = candidate.read_json(out / "candidate-provenance.json")
             self.assertEqual(provenance["tdlib"]["library_sha256"], TDLIB_SHA)
             self.assertEqual(provenance["tdlib"]["builder_source_commit"], "c" * 40)
+            self.assertEqual(provenance["tdlib"]["runtime"]["openssl_linkage"], "static")
+            self.assertEqual(
+                provenance["tdlib"]["third_party"]["openssl"]["version"], "3.6.3"
+            )
+            self.assertEqual(
+                provenance["app_third_party"]["openssl"]["license"]["sha256"],
+                OPENSSL_LICENSE_SHA,
+            )
+            self.assertTrue(provenance["app_runtime"]["verified"])
 
             verification = candidate.read_json(out / "verification.json")
             verification["result"] = "forged"
@@ -187,6 +295,43 @@ class CandidatePackageTests(unittest.TestCase):
             write_json(second / "app" / "manifest.json", app_manifest)
             with self.assertRaisesRegex(candidate.CandidateError, "embedded live TDLib bytes"):
                 candidate.build_candidate(args(second))
+
+    def test_rejects_unverified_or_dynamic_openssl_runtime_provenance(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); stage(root)
+            tdlib_manifest = candidate.read_json(root / "tdlib" / "manifest.json")
+            tdlib_manifest["runtime"] = {
+                "dependency_policy": "system-only-static-openssl",
+                "openssl_linkage": "dynamic",
+                "dependencies": ["/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib"],
+            }
+            tdlib_manifest["linkage"] = tdlib_manifest["runtime"]["dependencies"]
+            write_json(root / "tdlib" / "manifest.json", tdlib_manifest)
+            with self.assertRaisesRegex(candidate.CandidateError, "static-OpenSSL"):
+                candidate.build_candidate(args(root))
+
+    def test_rejects_tampered_or_missing_openssl_attribution(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); stage(root)
+            license_path = root / "core" / "GramDriveCore" / candidate.OPENSSL_LICENSE_PATH
+            license_path.write_text("tampered attribution\n")
+            with self.assertRaisesRegex(candidate.CandidateError, "checksum mismatch"):
+                candidate.build_candidate(args(root))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); stage(root)
+            app_manifest = candidate.read_json(root / "app" / "manifest.json")
+            del app_manifest["third_party"]
+            write_json(root / "app" / "manifest.json", app_manifest)
+            with self.assertRaisesRegex(candidate.CandidateError, "app OpenSSL attribution"):
+                candidate.build_candidate(args(root))
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); stage(root)
+            app_manifest = candidate.read_json(root / "app" / "manifest.json")
+            app_manifest["tdjson"]["runtime"]["verified"] = False
+            write_json(root / "app" / "manifest.json", app_manifest)
+            with self.assertRaisesRegex(candidate.CandidateError, "runtime dependency closure"):
+                candidate.build_candidate(args(root))
 
     def test_requires_complete_nested_code_readback(self):
         with tempfile.TemporaryDirectory() as raw:

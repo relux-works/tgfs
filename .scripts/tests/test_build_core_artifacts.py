@@ -683,6 +683,10 @@ class PipelineTest(unittest.TestCase):
                 (output / "Info.plist").write_text("<plist/>")
                 (output / "macos-arm64" / "libgramdrive_ffi.a").write_bytes(b"archive")
                 return 0, ""
+            if "--show-bin-path" in argv:
+                bin_dir = out_dir / "fake-swift-bin"
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                return 0, str(bin_dir) + "\n"
             if "GramDriveVerify" in joined:
                 return 0, f"Build complete!\n{report}\n"
             if "cargo metadata" in joined:
@@ -708,6 +712,36 @@ class PipelineTest(unittest.TestCase):
             **kwargs,
         )
         return manifest, runner, out_dir
+
+    def test_native_verifier_uses_an_exact_temporary_rpath_copy(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            consumer = root / "consumer"
+            library_dir = root / "library"
+            bin_dir = root / "bin"
+            for directory in (consumer, library_dir, bin_dir):
+                directory.mkdir()
+            library = library_dir / "libtdjson.dylib"
+            library.write_bytes(b"exact authoritative tdlib")
+
+            def run(argv, cwd, env=None):
+                argv = tuple(str(value) for value in argv)
+                if "--show-bin-path" in argv:
+                    return 0, str(bin_dir) + "\n"
+                if "GramDriveVerify" in argv:
+                    return 0, '{"contract_version":"0.17.0"}\n'
+                return 0, ""
+
+            packager = packaging.Packager(
+                root,
+                root / "out",
+                runner=run,
+                echo=lambda _line: None,
+                environ={"PATH": "/usr/bin"},
+            )
+            report = packager.verify_with_swift(consumer, library_path=library_dir)
+            self.assertEqual(report["contract_version"], "0.17.0")
+            self.assertEqual((bin_dir / library.name).read_bytes(), library.read_bytes())
 
     def test_produces_a_consumable_artifact_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -799,6 +833,46 @@ class PipelineTest(unittest.TestCase):
             library = tdlib / "lib/libtdjson.dylib"
             library.parent.mkdir(parents=True)
             library.write_bytes(b"arm64 tdjson")
+            openssl_license = tdlib / packaging.OPENSSL_LICENSE_PATH
+            openssl_license.parent.mkdir(parents=True)
+            openssl_license.write_text("Apache License 2.0\n")
+            (tdlib / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "third_party": {
+                            "openssl": {
+                                "name": "OpenSSL",
+                                "version": "3.6.3",
+                                "source": {
+                                    "url": "https://example.invalid/openssl-3.6.3.tar.gz",
+                                    "sha256": packaging.OPENSSL_SOURCE_SHA256,
+                                },
+                                "build_options": ["no-shared", "no-module"],
+                                "linkage": "static",
+                                "embedded_in": "lib/libtdjson.dylib",
+                                "license": {
+                                    "id": packaging.OPENSSL_LICENSE_ID,
+                                    "file": packaging.OPENSSL_LICENSE_PATH.as_posix(),
+                                    "sha256": packaging.sha256_file(openssl_license),
+                                },
+                            }
+                        },
+                        "runtime": {
+                            "dependency_policy": "system-only-static-openssl",
+                            "openssl_linkage": "static",
+                            "dependencies": ["/usr/lib/libSystem.B.dylib"],
+                            "forbidden_builder_paths_verified": True,
+                            "trust_store": {
+                                "policy": "macos-system-pem",
+                                "cert_file": packaging.OPENSSL_CERT_FILE,
+                                "environment_overrides_scrubbed": True,
+                                "certificate_objects": 158,
+                                "verified": True,
+                            },
+                        },
+                    }
+                )
+            )
             _, runner, out_dir = self.run_pipeline(
                 root,
                 host_machine="x86_64",
@@ -833,6 +907,73 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(
                 runner.envs[bindgen_index]["CARGO_TARGET_DIR"], str(host_target)
             )
+            self.assertFalse(
+                any("install_name_tool" in " ".join(argv) for argv in runner.calls),
+                "core staging must preserve the authoritative @rpath TDLib bytes",
+            )
+            self.assertEqual(
+                (out_dir / "GramDriveCore/lib/libtdjson.dylib").read_bytes(),
+                library.read_bytes(),
+            )
+            staged_license = out_dir / "GramDriveCore" / packaging.OPENSSL_LICENSE_PATH
+            self.assertEqual(staged_license.read_bytes(), openssl_license.read_bytes())
+            self.assertEqual(
+                packaging.sha256_file(staged_license),
+                manifest_digest := packaging.sha256_file(openssl_license),
+            )
+            self.assertEqual(
+                json.loads(
+                    (out_dir / "GramDriveCore" / packaging.MANIFEST_NAME).read_text()
+                )["third_party"]["openssl"]["license"]["sha256"],
+                manifest_digest,
+            )
+            staged_manifest = json.loads(
+                (out_dir / "GramDriveCore" / packaging.MANIFEST_NAME).read_text()
+            )
+            self.assertEqual(
+                staged_manifest["tdjson"]["runtime"]["trust_store"]["cert_file"],
+                "/etc/ssl/cert.pem",
+            )
+
+    def test_live_staging_rejects_compiled_homebrew_defaults(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            tdlib = root / "tdlib"
+            library = tdlib / "lib/libtdjson.dylib"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"Mach-O\0/opt/homebrew/etc/openssl@3/cert.pem\0")
+            license_path = tdlib / packaging.OPENSSL_LICENSE_PATH
+            license_path.parent.mkdir(parents=True)
+            license_path.write_text("Apache License 2.0\n")
+            manifest = {
+                "third_party": {
+                    "openssl": {
+                        "name": "OpenSSL",
+                        "version": "3.6.3",
+                        "source": {"sha256": packaging.OPENSSL_SOURCE_SHA256},
+                        "linkage": "static",
+                        "embedded_in": "lib/libtdjson.dylib",
+                        "license": {
+                            "id": packaging.OPENSSL_LICENSE_ID,
+                            "file": packaging.OPENSSL_LICENSE_PATH.as_posix(),
+                            "sha256": packaging.sha256_file(license_path),
+                        },
+                    }
+                },
+                "runtime": {
+                    "forbidden_builder_paths_verified": True,
+                    "trust_store": {
+                        "policy": "macos-system-pem",
+                        "cert_file": packaging.OPENSSL_CERT_FILE,
+                        "environment_overrides_scrubbed": True,
+                        "certificate_objects": 1,
+                        "verified": True,
+                    },
+                },
+            }
+            (tdlib / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(packaging.StepFailed, "builder-local"):
+                packaging.tdlib_openssl_attribution(tdlib)
 
     def test_checksums_cover_the_artifact_and_the_zip(self):
         with tempfile.TemporaryDirectory() as tmp:

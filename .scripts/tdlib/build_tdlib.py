@@ -39,8 +39,10 @@ content-hashed LC_UUID) and checkable with `--verify`, which rebuilds from a
 clean tree and compares the recorded library checksum. Cross-machine identical
 bytes depend on identical clang/OpenSSL and are best-effort, not claimed.
 
-Requires: git, cmake, gperf, a C++ toolchain (Xcode clang) and OpenSSL on a
-macOS arm64 host. POL-5/DEC-017 make macOS 14+ arm64 the entire v1 support
+Requires: git, curl, tar, perl, make, cmake, gperf and a C++ toolchain (Xcode
+clang) on a macOS arm64 host. The exact OpenSSL source archive is downloaded,
+checksum-verified and built as part of this recipe; no Homebrew OpenSSL binary
+is a build or runtime input. POL-5/DEC-017 make macOS 14+ arm64 the entire v1 support
 matrix; on any other host the script exits 2 with that reason rather than
 producing a partial artifact. Python 3.11+, stdlib only.
 
@@ -76,6 +78,10 @@ OUT_ROOT = Path(".temp") / "tdlib"
 # bumping TDLib means editing this one constant and re-running the build.
 TDLIB_REPO = "https://github.com/tdlib/td.git"
 TDLIB_COMMIT = "022d60202e446ad1287b9fb68e687c8a0760788b"
+# Commit timestamp from the pinned Git object. OpenSSL otherwise records the
+# wall clock in OPENSSL_VERSION_TEXT, changing libtdjson bytes between clean
+# builds. Keep this beside the commit so a pin bump must update both inputs.
+TDLIB_SOURCE_DATE_EPOCH = "1784297928"
 
 # The shipped target. POL-5/DEC-017: macOS 14+ arm64 is the whole v1 matrix.
 # Other platforms are documented and deferred in README.md, same posture as
@@ -101,10 +107,47 @@ GENERATED_HEADER = "tdjson_export.h"
 HEADER_INSTALL_SUBDIR = Path("include") / "td" / "telegram"
 LICENSE_SRC_NAME = "LICENSE_1_0.txt"
 LICENSE_ID = "BSL-1.0"
+OPENSSL_LICENSE_SRC_NAME = "LICENSE.txt"
+OPENSSL_LICENSE_PATH = Path("ThirdPartyLicenses") / "OpenSSL.txt"
+OPENSSL_LICENSE_ID = "Apache-2.0"
+OPENSSL_NAME = "OpenSSL"
+OPENSSL_VERSION = "3.6.3"
+OPENSSL_SOURCE_URL = (
+    "https://github.com/openssl/openssl/releases/download/"
+    f"openssl-{OPENSSL_VERSION}/openssl-{OPENSSL_VERSION}.tar.gz"
+)
+OPENSSL_SOURCE_SHA256 = "243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1"
+OPENSSL_ARCHIVE_ENV = "GRAMDRIVE_OPENSSL_SOURCE_ARCHIVE"
+OPENSSL_PREFIX = "/usr"
+OPENSSL_DIR = "/etc/ssl"
+OPENSSL_CERT_FILE = "/etc/ssl/cert.pem"
+OPENSSL_CERT_DIR = "/etc/ssl/certs"
+OPENSSL_CONFIG_FILE = "/etc/ssl/openssl.cnf"
+OPENSSL_BUILD_OPTIONS = (
+    "no-shared",
+    "no-pinshared",
+    "no-tests",
+    "no-module",
+    "no-engine",
+    "no-zlib",
+)
 
 MANIFEST_NAME = "manifest.json"
 CHECKSUMS_NAME = "CHECKSUMS.sha256"
-SCHEMA_VERSION = "tdlib-artifact/1"
+SCHEMA_VERSION = "tdlib-artifact/4"
+RUNTIME_DEPENDENCY_POLICY = "system-only-static-openssl"
+TRUST_STORE_POLICY = "macos-system-pem"
+SYSTEM_RUNTIME_PREFIXES = ("/usr/lib/", "/System/Library/")
+OPENSSL_RUNTIME_NAMES = ("libssl", "libcrypto")
+FORBIDDEN_RUNTIME_PATH_MARKERS = (
+    b"/opt/homebrew/",
+    b"/usr/local/opt/",
+    b"/usr/local/Cellar/",
+    b"/Users/",
+    b"/home/",
+    b"/private/tmp/",
+    b"/var/folders/",
+)
 
 # The dylib's install name. `@rpath` hands load-path control to the consumer
 # (an rpath at its link step) rather than baking this machine's absolute path
@@ -237,6 +280,26 @@ class TdlibBuilder:
     def lib_out(self) -> Path:
         return self.stage_dir / "lib" / DYLIB_NAME
 
+    @property
+    def openssl_root_dir(self) -> Path:
+        return self.out_dir / "openssl"
+
+    @property
+    def openssl_archive(self) -> Path:
+        return self.openssl_root_dir / f"openssl-{OPENSSL_VERSION}.tar.gz"
+
+    @property
+    def openssl_source_dir(self) -> Path:
+        return self.openssl_root_dir / f"openssl-{OPENSSL_VERSION}"
+
+    @property
+    def openssl_install_root(self) -> Path:
+        return self.openssl_root_dir / "install"
+
+    @property
+    def openssl_prefix(self) -> Path:
+        return self.openssl_install_root / OPENSSL_PREFIX.lstrip("/")
+
     # -- small helpers ---------------------------------------------------
 
     def run(
@@ -261,31 +324,214 @@ class TdlibBuilder:
 
     # -- dependency discovery -------------------------------------------
 
-    def openssl_root(self) -> Path:
-        """Where OpenSSL lives, so cmake finds it without guessing.
+    def fetch_openssl_archive(self) -> Path:
+        """Materialize the exact OpenSSL source archive and verify its pin."""
 
-        Homebrew keeps OpenSSL keg-only (off the default search path), so a
-        cmake that does not get OPENSSL_ROOT_DIR either fails to find it or, on
-        an Intel-era layout, finds the wrong one. `brew --prefix` is the
-        supported way to resolve it; an explicit env override wins for a
-        vendored or non-brew OpenSSL.
-        """
-        override = self.environ.get("OPENSSL_ROOT_DIR")
-        if override:
-            return Path(override)
-        code, output = self.runner(("brew", "--prefix", "openssl@3"), self.repo_root, None)
-        prefix = output.strip()
-        if code != 0 or not prefix:
+        configured = self.environ.get(OPENSSL_ARCHIVE_ENV)
+        if configured:
+            source = Path(configured)
+            if not source.is_file() or source.is_symlink():
+                raise StepFailed(f"pinned OpenSSL source archive is missing: {source}")
+            archive = source
+        else:
+            self.openssl_root_dir.mkdir(parents=True, exist_ok=True)
+            archive = self.openssl_archive
+            if not archive.exists():
+                scratch = archive.with_suffix(".download")
+                scratch.unlink(missing_ok=True)
+                self.run(
+                    "OpenSSL source download",
+                    ("curl", "-fL", "--retry", "3", "-o", str(scratch), OPENSSL_SOURCE_URL),
+                )
+                scratch.replace(archive)
+        actual = sha256_file(archive)
+        if actual != OPENSSL_SOURCE_SHA256:
             raise StepFailed(
-                "cannot locate OpenSSL: set OPENSSL_ROOT_DIR, or `brew install "
-                "openssl@3`. TDLib links libcrypto/libssl and cmake needs the root."
+                "pinned OpenSSL source checksum mismatch: "
+                f"expected {OPENSSL_SOURCE_SHA256}, got {actual}"
             )
-        return Path(prefix)
+        return archive
+
+    def prepare_openssl_source(self, *, clean: bool) -> Path:
+        """Extract only the checksum-pinned source tree into the owned temp root."""
+
+        archive = self.fetch_openssl_archive()
+        marker = self.openssl_source_dir / ".gramdrive-source.sha256"
+        if clean and self.openssl_source_dir.exists():
+            shutil.rmtree(self.openssl_source_dir)
+        if not self.openssl_source_dir.exists():
+            self.openssl_root_dir.mkdir(parents=True, exist_ok=True)
+            self.run(
+                "OpenSSL source extract",
+                ("tar", "-xzf", str(archive), "-C", str(self.openssl_root_dir)),
+            )
+            if not self.openssl_source_dir.is_dir():
+                raise StepFailed("pinned OpenSSL archive did not contain its expected root")
+            marker.write_text(OPENSSL_SOURCE_SHA256 + "\n", encoding="utf-8")
+        try:
+            recorded = marker.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            raise StepFailed(f"OpenSSL source marker is missing: {error}") from error
+        if recorded != OPENSSL_SOURCE_SHA256:
+            raise StepFailed("OpenSSL source tree does not match the pinned archive")
+        return self.openssl_source_dir
+
+    def build_openssl(self, *, clean: bool) -> Path:
+        """Build static OpenSSL with portable macOS trust/config defaults.
+
+        ``DESTDIR`` redirects installation without changing compiled paths.
+        OpenSSL therefore records only stable target paths (/etc/ssl and /usr),
+        while cmake consumes headers and archives from this recipe-owned tree.
+        Providers and engines are built in; dynamic module/engine lookup is
+        disabled so absent /usr module directories are not runtime inputs.
+        """
+
+        source = self.prepare_openssl_source(clean=clean)
+        if clean and self.openssl_install_root.exists():
+            shutil.rmtree(self.openssl_install_root)
+        # OpenSSL records its compiler command in the library. An absolute
+        # ``-ffile-prefix-map=/Users/...`` would therefore reintroduce the path
+        # it exists to remove. The build runs from ``source``, so a relative
+        # mapping both remaps compiler inputs and keeps the recorded command
+        # privacy-safe.
+        prefix_map = "-ffile-prefix-map=.=/openssl"
+        configure = (
+            "perl",
+            "./Configure",
+            f"--prefix={OPENSSL_PREFIX}",
+            f"--openssldir={OPENSSL_DIR}",
+            "--libdir=lib",
+            *OPENSSL_BUILD_OPTIONS,
+            "darwin64-arm64-cc",
+            "enable-ec_nistp_64_gcc_128",
+            f"-mmacosx-version-min={MACOSX_DEPLOYMENT_TARGET}",
+            prefix_map,
+        )
+        build_env = {
+            **self.environ,
+            "ZERO_AR_DATE": "1",
+            "SOURCE_DATE_EPOCH": TDLIB_SOURCE_DATE_EPOCH,
+        }
+        build_env.pop("OPENSSL_LOCAL_CONFIG_DIR", None)
+        self.run("OpenSSL configure", configure, cwd=source, env=build_env)
+        self.run(
+            "OpenSSL build",
+            ("make", "-j", str(self.jobs), "build_libs"),
+            cwd=source,
+            env=build_env,
+        )
+        self.run(
+            "OpenSSL install",
+            ("make", "install_dev", f"DESTDIR={self.openssl_install_root}"),
+            cwd=source,
+            env=build_env,
+        )
+        required = (
+            self.openssl_prefix / "include" / "openssl" / "ssl.h",
+            self.openssl_prefix / "lib" / "libssl.a",
+            self.openssl_prefix / "lib" / "libcrypto.a",
+        )
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise StepFailed("static OpenSSL build is incomplete: " + ", ".join(missing))
+        self.verify_system_trust_store()
+        return self.openssl_prefix
+
+    def verify_system_trust_store(self) -> dict:
+        """Link the exact static archives and prove macOS's PEM store loads.
+
+        The probe scrubs every OpenSSL/Homebrew override and checks both the
+        compiled default and actual certificate objects. This is deliberately
+        offline: candidate production cannot depend on a mutable network host.
+        """
+
+        probe_dir = self.openssl_root_dir / "trust-probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        source = probe_dir / "trust_probe.c"
+        binary = probe_dir / "trust-probe"
+        source.write_text(
+            f"""#include <openssl/crypto.h>
+#include <openssl/x509_vfy.h>
+#include <stdio.h>
+#include <string.h>
+int main(void) {{
+  const char *expected = "{OPENSSL_CERT_FILE}";
+  const char *actual = X509_get_default_cert_file();
+  if (actual == NULL || strcmp(actual, expected) != 0) return 10;
+  X509_STORE *store = X509_STORE_new();
+  if (store == NULL) return 11;
+  if (X509_STORE_load_file(store, actual) != 1) return 12;
+  const STACK_OF(X509_OBJECT) *objects = X509_STORE_get0_objects(store);
+  int count = objects == NULL ? 0 : sk_X509_OBJECT_num(objects);
+  printf("openssl=%s cert_file=%s cert_objects=%d\\n",
+         OpenSSL_version(OPENSSL_VERSION), actual, count);
+  X509_STORE_free(store);
+  return count > 0 ? 0 : 13;
+}}
+""",
+            encoding="utf-8",
+        )
+        self.run(
+            "OpenSSL trust probe compile",
+            (
+                "cc",
+                "-arch",
+                TARGET_ARCH,
+                f"-mmacosx-version-min={MACOSX_DEPLOYMENT_TARGET}",
+                str(source),
+                "-I",
+                str(self.openssl_prefix / "include"),
+                str(self.openssl_prefix / "lib" / "libssl.a"),
+                str(self.openssl_prefix / "lib" / "libcrypto.a"),
+                "-framework",
+                "Security",
+                "-framework",
+                "CoreFoundation",
+                "-o",
+                str(binary),
+            ),
+        )
+        scrubbed = {
+            key: value
+            for key, value in self.environ.items()
+            if key
+            not in {
+                "OPENSSL_CONF",
+                "OPENSSL_CONF_INCLUDE",
+                "OPENSSL_MODULES",
+                "SSL_CERT_DIR",
+                "SSL_CERT_FILE",
+                "DYLD_LIBRARY_PATH",
+                "DYLD_FALLBACK_LIBRARY_PATH",
+            }
+            and not key.startswith("HOMEBREW_")
+        }
+        output = self.run("OpenSSL trust probe", (str(binary),), env=scrubbed)
+        match = re.search(
+            rf"openssl=OpenSSL\s+{re.escape(OPENSSL_VERSION)}\b.*"
+            rf"cert_file={re.escape(OPENSSL_CERT_FILE)}\s+cert_objects=([1-9][0-9]*)\b",
+            output,
+        )
+        if match is None:
+            raise StepFailed("OpenSSL trust probe returned malformed evidence: " + output)
+        return {
+            "policy": TRUST_STORE_POLICY,
+            "cert_file": OPENSSL_CERT_FILE,
+            "cert_dir": OPENSSL_CERT_DIR,
+            "config_file": OPENSSL_CONFIG_FILE,
+            "environment_overrides_scrubbed": True,
+            "certificate_objects": int(match.group(1)),
+            "verified": True,
+        }
 
     def require_tools(self) -> None:
         """Fail early and specifically if a required build tool is missing."""
         needed = {
             "git": ("git", "--version"),
+            "curl": ("curl", "--version"),
+            "tar": ("tar", "--version"),
+            "perl": ("perl", "-v"),
+            "make": ("make", "--version"),
             "cmake": ("cmake", "--version"),
             "gperf": ("gperf", "--version"),
             "cc": ("cc", "--version"),
@@ -371,7 +617,7 @@ class TdlibBuilder:
         self.build_dir.mkdir(parents=True, exist_ok=True)
 
         remap_to = "/tdlib"
-        openssl_root = self.openssl_root()
+        openssl_root = self.build_openssl(clean=clean)
         # -ffile-prefix-map rewrites __FILE__, debug paths and NDEBUG-surviving
         # diagnostics from the build tree to a stable prefix; Release already
         # sets -DNDEBUG which drops most of them.
@@ -386,6 +632,10 @@ class TdlibBuilder:
             f"-DCMAKE_OSX_ARCHITECTURES={TARGET_ARCH}",
             f"-DCMAKE_OSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET}",
             f"-DOPENSSL_ROOT_DIR={openssl_root}",
+            # The signing host is intentionally independent from the arm64
+            # builder's Homebrew tree.  Make OpenSSL part of libtdjson's bytes
+            # instead of leaving builder-local libssl/libcrypto load commands.
+            "-DOPENSSL_USE_STATIC_LIBS=TRUE",
             f"-DCMAKE_C_FLAGS={prefix_map}",
             f"-DCMAKE_CXX_FLAGS={prefix_map}",
             # Hand load-path control to the consumer instead of baking an
@@ -442,12 +692,11 @@ class TdlibBuilder:
                 f"target did not produce a dylib"
             )
         shutil.copy2(built, lib_out)
-        # Best-effort install-name normalization; harmless if already @rpath.
-        self.runner(
+        self.run(
+            "normalize tdjson install name",
             ("install_name_tool", "-id", DYLIB_INSTALL_NAME, str(lib_out)),
-            self.repo_root,
-            None,
         )
+        self.library_linkage(lib_out)
 
         for name in PUBLIC_HEADERS:
             src = self.src_dir / "td" / "telegram" / name
@@ -464,6 +713,15 @@ class TdlibBuilder:
                 f"license be recorded with the artifact"
             )
         shutil.copy2(license_src, stage_dir / LICENSE_SRC_NAME)
+        openssl_license = self.openssl_source_dir / OPENSSL_LICENSE_SRC_NAME
+        if not openssl_license.is_file() or openssl_license.is_symlink():
+            raise StepFailed(
+                f"OpenSSL license file missing at {openssl_license}; the static "
+                "OpenSSL bytes require exact attribution in the shipped artifact"
+            )
+        openssl_license_dest = stage_dir / OPENSSL_LICENSE_PATH
+        openssl_license_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(openssl_license, openssl_license_dest)
         return lib_out
 
     def _find_generated_header(self) -> Path:
@@ -476,23 +734,59 @@ class TdlibBuilder:
             )
         return matches[0]
 
-    def library_linkage(self) -> list[str]:
-        """The dylib's dynamic dependencies (`otool -L`), recorded in the manifest.
+    def library_linkage(self, library: Path | None = None) -> list[str]:
+        """Read and enforce libtdjson's hermetic runtime dependency closure.
 
-        A consumer needs to know the artifact expects OpenSSL and zlib at load
-        time; recording it is cheaper than a surprise dyld failure in a native
-        host. Each dependency is one tab-indented line; the first such line is
-        the library's own install name, which is not a dependency and is dropped.
+        OpenSSL is a builder input, not a runtime payload.  The staged dylib may
+        load only Apple-provided system libraries; any Homebrew, workspace,
+        absolute third-party, or relocatable libssl/libcrypto reference would
+        make the runner-local artifact non-portable and is rejected here.
         """
-        code, output = self.runner(("otool", "-L", str(self.lib_out)), self.repo_root, None)
+        library = library or self.lib_out
+        self.require_no_builder_runtime_paths(library)
+        code, output = self.runner(("otool", "-L", str(library)), self.repo_root, None)
         if code != 0:
-            return ["unavailable"]
+            raise StepFailed(f"otool -L failed for staged TDLib library:\n{output[-2000:]}")
         entries = [
             line.split(" (", 1)[0].strip()
             for line in output.splitlines()
             if line.startswith("\t")
         ]
-        return entries[1:] or ["none"]
+        if not entries:
+            raise StepFailed("otool -L returned no install name for staged TDLib library")
+        dependencies = entries[1:]
+        offenders = [
+            dependency
+            for dependency in dependencies
+            if not dependency.startswith(SYSTEM_RUNTIME_PREFIXES)
+            or Path(dependency).name.startswith(OPENSSL_RUNTIME_NAMES)
+        ]
+        if offenders:
+            raise StepFailed(
+                "staged TDLib has non-hermetic runtime dependencies; OpenSSL "
+                "must be linked statically and only Apple system libraries may "
+                "remain:\n  " + "\n  ".join(offenders)
+            )
+        return dependencies
+
+    def require_no_builder_runtime_paths(self, library: Path | None = None) -> None:
+        """Reject compiled Homebrew/user defaults, not only Mach-O load commands."""
+
+        library = library or self.lib_out
+        try:
+            payload = library.read_bytes()
+        except OSError as error:
+            raise StepFailed(f"cannot inspect staged TDLib bytes: {error}") from error
+        offenders = [
+            marker.decode("ascii")
+            for marker in FORBIDDEN_RUNTIME_PATH_MARKERS
+            if marker in payload
+        ]
+        if offenders:
+            raise StepFailed(
+                "staged TDLib contains builder-local OpenSSL/runtime paths despite "
+                "clean Mach-O linkage: " + ", ".join(offenders)
+            )
 
     # -- provenance ------------------------------------------------------
 
@@ -527,29 +821,21 @@ class TdlibBuilder:
         return stamped if code == 0 and stamped else "unknown"
 
     def toolchain_info(self) -> dict:
-        openssl_root = self.environ.get("OPENSSL_ROOT_DIR") or self._safe_openssl_prefix()
         return {
             "cmake": self.tool_version(("cmake", "--version")),
             "cc": self.tool_version(("cc", "--version")),
             "gperf": self.tool_version(("gperf", "--version")),
             "rustc": self.tool_version(("rustc", "--version")),
             "cargo": self.tool_version(("cargo", "--version")),
-            "openssl_root": str(openssl_root) if openssl_root else "unavailable",
-            "openssl": self._openssl_version(openssl_root),
+            "openssl_source_sha256": OPENSSL_SOURCE_SHA256,
+            "openssl": f"OpenSSL {OPENSSL_VERSION} source-built",
             "zlib": self._zlib_version(),
         }
 
-    def _safe_openssl_prefix(self) -> Path | None:
-        try:
-            return self.openssl_root()
-        except StepFailed:
-            return None
+    def openssl_version_identity(self) -> str:
+        """Return the semantic identity bound to the verified source archive."""
 
-    def _openssl_version(self, root: Path | None) -> str:
-        if root is None:
-            return "unavailable"
-        openssl_bin = Path(root) / "bin" / "openssl"
-        return self.tool_version((str(openssl_bin), "version"))
+        return OPENSSL_VERSION
 
     def _zlib_version(self) -> str:
         """The zlib version from the active SDK header (macOS ships zlib).
@@ -618,8 +904,33 @@ class TdlibBuilder:
                 "macosx_deployment_target": MACOSX_DEPLOYMENT_TARGET,
             },
             "license": {"id": LICENSE_ID, "file": LICENSE_SRC_NAME},
+            "third_party": {
+                "openssl": {
+                    "name": OPENSSL_NAME,
+                    "version": self.openssl_version_identity(),
+                    "source": {
+                        "url": OPENSSL_SOURCE_URL,
+                        "sha256": OPENSSL_SOURCE_SHA256,
+                    },
+                    "build_options": list(OPENSSL_BUILD_OPTIONS),
+                    "license": {
+                        "id": OPENSSL_LICENSE_ID,
+                        "file": OPENSSL_LICENSE_PATH.as_posix(),
+                        "sha256": checksums[OPENSSL_LICENSE_PATH.as_posix()],
+                    },
+                    "linkage": "static",
+                    "embedded_in": f"lib/{DYLIB_NAME}",
+                }
+            },
             "toolchain": self.toolchain_info(),
             "linkage": self.library_linkage(),
+            "runtime": {
+                "dependency_policy": RUNTIME_DEPENDENCY_POLICY,
+                "openssl_linkage": "static",
+                "dependencies": self.library_linkage(),
+                "forbidden_builder_paths_verified": True,
+                "trust_store": self.verify_system_trust_store(),
+            },
             "reproducibility": {
                 "build_type": record.build_type,
                 "clean_build_tree": record.clean_build_tree,

@@ -31,6 +31,8 @@ commit, and its signature would be stale the moment the toolchain moved.
       Info.plist                     com.reluxworks.gramdrive
       Frameworks/Sparkle.framework   Sparkle 2.9.5 plus Autoupdate, Updater.app,
                                      Downloader.xpc, and Installer.xpc
+      Resources/ThirdPartyLicenses/OpenSSL.txt
+                                     license for OpenSSL bytes inside libtdjson
       PkgInfo                        APPL????
       MacOS/GramDrive                the menu-bar companion shell
       MacOS/gramdrive-agent          the launchd-run engine-hosting agent
@@ -115,7 +117,10 @@ manifest carries none of the words a leak would (`PRIVATE KEY`, `p12`,
 `manifest.json` records the commit, toolchain (Xcode/Swift/rustc), the staged
 core's contract version, each binary's bundle id + entitlements + cdhash, and —
 when notarized — the submission id and status. `CHECKSUMS.sha256` covers the dmg
-and every file in the bundle.
+and every file in the bundle. For a live TDLib build it also records the
+privacy-safe OpenSSL version and exact license digest propagated from the
+authoritative TDLib artifact; the license ships inside the signed app and the
+candidate gate requires identical bytes across TDLib, core, and app inventories.
 
 The signed bytes are **deliberately not byte-reproducible**: Developer ID signing
 embeds a trusted timestamp that varies per signature *by design* — that is the
@@ -181,12 +186,13 @@ artifact.
 
 ## Not in scope here (recorded so it is not silently forgotten)
 
-- **TDLib in the agent.** The current `gramdrive-agent` links only the Rust core
-  staticlib. When it later links `libtdjson.dylib` (which links brew
-  OpenSSL/zlib via absolute install names), the agent will need the dylib
-  embedded with a fixed rpath and likely
-  `com.apple.security.cs.disable-library-validation`. That belongs to the
-  TDLib-integration/release work (LOGBOOK; TASK-260715-3bhbkv).
+- **TDLib in the agent.** The live core links the staged arm64
+  `libtdjson.dylib`, which is embedded at `Contents/Frameworks` and loaded via
+  `@rpath`. OpenSSL is statically linked into that authoritative TDLib artifact;
+  the packager rejects libssl/libcrypto load commands and compiled Homebrew,
+  user-home, or temporary builder paths. It preserves the exact dylib bytes and
+  the source-built OpenSSL `/etc/ssl/cert.pem` trust-store proof from the
+  authoritative TDLib artifact through core staging into the app manifest.
 - **The release workflow** now exists (`.github/workflows/release.yml`,
   TASK-260715-3bhbkv): tag-triggering, importing the cert from `MACOS_CERT_P12`
   into a throwaway keychain, GitHub artifact attestation, and — via
