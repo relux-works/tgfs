@@ -73,39 +73,15 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: .github/scripts/bootstrap-rust-toolchain.sh
 
-      - name: Restore the pinned TDLib artifact (runner-local cache)
-        id: tdlib-cache
-        # Key discipline is unchanged from the hosted actions/cache version:
-        # the hash of build_tdlib.py pins the exact TDLib commit and recipe,
-        # so a pin bump misses (and needs a fresh seed from the arm64 host).
+      - name: Restore and verify the pinned arm64 artifact (runner-local cache)
+        # The helper keys the cache by build_tdlib.py, refuses a cold cache,
+        # checks the complete digest/manifest inventory, and proves with file(1)
+        # that libtdjson is arm64-only before replacing the workspace artifact.
         run: |
           set -euo pipefail
-          key="tdlib-$(shasum -a 256 .scripts/tdlib/build_tdlib.py | cut -c1-16)"
-          cache_dir="$HOME/gramdrive-ci/cache/$key"
-          echo "key=$key" >> "$GITHUB_OUTPUT"
-          if [ -d "$cache_dir/out" ]; then
-            mkdir -p .temp/tdlib
-            rm -rf .temp/tdlib/out
-            cp -R "$cache_dir/out" .temp/tdlib/out
-            echo "cache-hit=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "cache-hit=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Fail actionably on a cold cache
-        # An honest gate, not a silent skip: this host cannot rebuild the
-        # arm64 artifact, so a cache miss is a seeding task, and the failure
-        # says exactly what to run where.
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
-        run: |
-          echo "::error::runner-local TDLib cache miss for key '${{ steps.tdlib-cache.outputs.key }}'. Cross-building arm64 TDLib on this x86_64 host is blocked (arm64 OpenSSL deps). Seed from an arm64 host: 'make tdlib' there, then rsync .temp/tdlib/out to ~/gramdrive-ci/cache/${{ steps.tdlib-cache.outputs.key }}/out on the runner (TASK-260719-1dwaj8)."
-          exit 1
-
-      - name: Prove the restored artifact is the shipped architecture (file(1))
-        run: |
-          set -euo pipefail
-          file .temp/tdlib/out/lib/libtdjson.dylib
-          file .temp/tdlib/out/lib/libtdjson.dylib | grep -q "arm64"
+          python3 .scripts/tdlib/restore_pinned_artifact.py \
+            --cache-root "$HOME/gramdrive-ci/cache" \
+            --out-dir .temp/tdlib/out
 
       - name: Prove the restored artifact still links (cross-link smoke)
         # cargo build --target aarch64-apple-darwin against the staged dylib:

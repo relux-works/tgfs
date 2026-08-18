@@ -105,8 +105,8 @@ def stage(root: Path, mode: str = "test") -> None:
     (tdlib_dir / "lib" / "libtdjson.dylib").write_bytes(b"tdlib")
     tdlib_checksums = {"lib/libtdjson.dylib": TDLIB_SHA}
     tdlib = {
-        "gramdrive": {"commit": COMMIT, "worktree_clean": True},
-        "tdlib": {"repo": "https://github.com/tdlib/td.git", "commit": "b" * 40, "runtime_version": "1.8.51"},
+        "gramdrive": {"commit": "c" * 40, "worktree_clean": True},
+        "tdlib": {"repo": candidate.PINNED_TDLIB_REPO, "commit": candidate.PINNED_TDLIB_COMMIT, "runtime_version": "1.8.51"},
         "target": {"label": "macos-arm64", "arch": "arm64"},
         "reproducibility": {"clean_build_tree": True},
         "artifacts": {
@@ -146,6 +146,9 @@ class CandidatePackageTests(unittest.TestCase):
             verified = candidate.verify_candidate(argparse.Namespace(out_dir=str(out)))
             self.assertEqual(verified["dmg"]["sha256"], DMG_SHA)
             self.assertEqual(candidate.read_json(out / "finalization.json")["status"], "verified-and-attested")
+            provenance = candidate.read_json(out / "candidate-provenance.json")
+            self.assertEqual(provenance["tdlib"]["library_sha256"], TDLIB_SHA)
+            self.assertEqual(provenance["tdlib"]["builder_source_commit"], "c" * 40)
 
             verification = candidate.read_json(out / "verification.json")
             verification["result"] = "forged"
@@ -309,6 +312,18 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("if: always()", self.text[cleanup:])
         self.assertIn('security import "$cert_path" -k "$KEYCHAIN_PATH" -P "$MACOS_CERT_PASSWORD"', self.text)
         self.assertNotIn("set -x", self.text)
+
+    def test_x86_signing_host_restores_and_cross_links_arm64_tdlib_before_credentials(self):
+        restore_step = self.text.index("name: Restore and prove the pinned arm64 live TDLib core")
+        credentials = self.text.index("name: Import Developer ID")
+        self.assertLess(restore_step, credentials)
+        section = self.text[restore_step:credentials]
+        self.assertIn('test "$(uname -m)" = "x86_64"', section)
+        self.assertIn("restore_pinned_artifact.py", section)
+        self.assertIn("make tdlib-smoke-link", section)
+        self.assertIn("GRAMDRIVE_TDLIB_ARTIFACT_DIR=.temp/tdlib/out make package", section)
+        self.assertNotIn("make tdlib\n", section)
+        self.assertNotIn("make tdjson-smoke", section)
 
 
 if __name__ == "__main__":
