@@ -2440,3 +2440,8 @@
 - FIX: Test and stable workflows now invoke their non-empty command arrays through one sourced helper that appends an optional prior-feed or prior-manifest pair only when a path exists. Initial publication no longer expands an empty array; existing-feed paths preserve exact argument boundaries, including whitespace.
 - REGRESSION: The focused suite executes the production helper under `/bin/bash` 3.2 with both an empty prior path and a prior path containing spaces. It also pins all three publication call sites and rejects reintroduction of the unsafe empty-array pattern.
 - SECURITY GATE: Fetching exact protected main introduced three new commit-bound gitleaks fingerprints for the same checked-in public test/stable Ed25519 verification keys already reviewed on the implementation branch. Exact main-commit/file/line fingerprints were added; no rule or private-key pattern was suppressed.
+
+### 0819 — Sparkle stable-promotion version prepared (TASK-260810-y3zcg8)
+
+- RELEASE INPUT: the reviewed marketing-version source advances from private-era `0.1.0` to unused public version `0.1.2`; the independent crate/protocol versions and monotonic git rev-count build number remain unchanged. Remote tag discovery found no `v0.1.2` tag.
+- VALIDATION: the two-hunk patch was replayed on exact protected-main commit `381184869f47e7fdc78fde878e2658eecf7bb200`; packaging tests passed 77/77, `make check-repo` passed 2/2, JSON validation and `git diff --check` exited 0. No tag, Release, Pages, or feed mutation was performed by the developer run.
