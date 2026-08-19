@@ -316,8 +316,8 @@ class ParseTest(unittest.TestCase):
 
 
 class MarketingVersionTest(unittest.TestCase):
-    def test_repository_source_is_the_next_public_release(self):
-        self.assertEqual(app.marketing_version(REPO_ROOT), "0.1.2")
+    def test_repository_source_is_the_forward_rollback_release(self):
+        self.assertEqual(app.marketing_version(REPO_ROOT), "0.1.3")
 
     def test_reads_the_reviewed_three_component_source(self):
         with tempfile.TemporaryDirectory() as tmp:

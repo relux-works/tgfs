@@ -11,6 +11,11 @@
 - FIX: before detaching, the stable job now accepts workflow dispatch only from `refs/heads/main` and push publication only from the exact pushed tag workflow ref, binds the checkout to `GITHUB_SHA`, and seals the inventory helper's exact git-object bytes in a canonical run-scoped runner-temp directory. Every post-detach invocation revalidates the non-symlink path, runner-temp containment, and both recorded SHA-256 bindings. The candidate, tag, manifests, payloads, and attestations remain sourced from and verified against the requested immutable tag.
 - RECOVERY: old-tag dispatch uses the sealed workflow-source helper; a future push tag uses the same deterministic source contract from its own immutable workflow revision. The run-scoped control directory is removed by the job's unconditional guarded cleanup, with no permission, secret, signing, Release, or Pages capability expansion.
 
+### 1528 — Prepare the forward-only stable rollback release (TASK-260810-y3zcg8 cycle 10)
+
+- RELEASE INPUT: protected main `7058cb4d06059dd9dac1502d4ff54d35a2897ad6` advances the reviewed marketing-version source from live stable `0.1.2` to unused `0.1.3`; read-only GitHub checks found neither a `v0.1.3` tag nor Release. The existing authenticated feed floors still select the strictly higher Sparkle build at candidate time.
+- SCOPE: this patch changes only the marketing-version source, its focused repository regression, and this evidence entry. The orchestrator retains ownership of candidate publication, tag creation, release approval, exact-byte promotion, anonymous endpoint verification, and abort/recovery decisions; no live state was mutated here.
+
 ### 1515 — Stable reruns use deterministic Release asset inventories (TASK-260810-y3zcg8 cycle 8)
 
 - LIVE FIRST-RED: approved rerun `32204896987` regenerated and matched the existing `v0.1.2` publication, but `gh release view ... | grep -Fxq` ran under `set -o pipefail`. The first matching asset closed the pipe early, the probe reported absence, and the workflow attempted a duplicate upload that GitHub rejected. Release and Pages bytes remained unchanged.
