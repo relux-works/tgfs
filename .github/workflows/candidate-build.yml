@@ -467,16 +467,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          asset_inventory=.temp/publication/release-assets.json
+          python3 .scripts/release/release_asset_inventory.py capture \
+            --release updates-test-v1 --output "$asset_inventory"
           upload_immutable() {
             asset="$1"
             name="$(basename "$asset")"
-            if gh release view updates-test-v1 --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
-              mkdir -p .temp/publication/existing
-              gh release download updates-test-v1 --pattern "$name" --dir .temp/publication/existing --clobber
-              cmp "$asset" ".temp/publication/existing/$name"
-            else
-              gh release upload updates-test-v1 "$asset"
-            fi
+            state="$(python3 .scripts/release/release_asset_inventory.py state \
+              --inventory "$asset_inventory" --name "$name")"
+            case "$state" in
+              present)
+                mkdir -p .temp/publication/existing
+                gh release download updates-test-v1 --pattern "$name" --dir .temp/publication/existing --clobber
+                cmp "$asset" ".temp/publication/existing/$name"
+                ;;
+              absent) gh release upload updates-test-v1 "$asset" ;;
+              *) echo "invalid Release asset state: $state" >&2; exit 1 ;;
+            esac
           }
           upload_immutable ".temp/publication/out/$PUBLICATION_DMG"
           upload_immutable ".temp/publication/out/$PUBLICATION_NOTES"

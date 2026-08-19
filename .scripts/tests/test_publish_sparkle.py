@@ -17,6 +17,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / ".scripts" / "release" / "publish_sparkle.py"
+ASSET_INVENTORY_SCRIPT = REPO_ROOT / ".scripts" / "release" / "release_asset_inventory.py"
 
 
 def load_module():
@@ -494,6 +495,184 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertLess(job.index("upload_immutable \".temp/publication/out/$PUBLICATION_PACKAGE\""), job.index("test.xml --clobber"))
         self.assertIn("restore_prior", job)
         self.assertIn("cmp .temp/publication/out/test.xml", job)
+
+    def test_release_asset_inventory_finds_every_position_and_missing_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = Path(tmp) / "assets.json"
+            write_json(
+                inventory,
+                {
+                    "assets": [
+                        {"name": "first.dmg"},
+                        {"name": "middle.tar.gz"},
+                        {"name": "last.json"},
+                    ]
+                },
+            )
+            for name, expected in (
+                ("first.dmg", "present"),
+                ("middle.tar.gz", "present"),
+                ("last.json", "present"),
+                ("missing.txt", "absent"),
+            ):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ASSET_INVENTORY_SCRIPT),
+                        "state",
+                        "--inventory",
+                        str(inventory),
+                        "--name",
+                        name,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_release_asset_inventory_rejects_duplicate_and_invalid_records(self):
+        invalid_payloads = (
+            {"assets": [{"name": "same.dmg"}, {"name": "same.dmg"}]},
+            {"assets": [{"name": "../unsafe.dmg"}]},
+            {"assets": [{"name": ""}]},
+            {"assets": [{"name": 7}]},
+            {"assets": "not-an-array"},
+            [],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = Path(tmp) / "assets.json"
+            for payload in invalid_payloads:
+                inventory.write_text(json.dumps(payload), encoding="utf-8")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ASSET_INVENTORY_SCRIPT),
+                        "state",
+                        "--inventory",
+                        str(inventory),
+                        "--name",
+                        "same.dmg",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0, payload)
+
+    def test_release_asset_capture_fails_closed_on_gh_error_under_pipefail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            gh = fake_bin / "gh"
+            gh.write_text(
+                "#!/bin/bash\nprintf '%s\\n' 'upstream failure' >&2\nexit 42\n",
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            inventory = root / "inventory.json"
+            upload_marker = root / "upload-attempted"
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-euo",
+                    "pipefail",
+                    "-c",
+                    'python3 "$1" capture --release v1.2.3 --output "$2"; touch "$3"',
+                    "bash",
+                    str(ASSET_INVENTORY_SCRIPT),
+                    str(inventory),
+                    str(upload_marker),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(inventory.exists())
+            self.assertFalse(upload_marker.exists())
+
+    def test_release_asset_capture_rejects_malformed_gh_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            gh = fake_bin / "gh"
+            gh.write_text(
+                "#!/bin/bash\nprintf '%s\\n' '{not-json'\n",
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            inventory = root / "inventory.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ASSET_INVENTORY_SCRIPT),
+                    "capture",
+                    "--release",
+                    "v1.2.3",
+                    "--output",
+                    str(inventory),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(inventory.exists())
+
+    def test_existing_release_assets_never_reach_the_upload_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inventory = root / "assets.json"
+            write_json(
+                inventory,
+                {
+                    "assets": [
+                        {"name": "first.dmg"},
+                        {"name": "middle.tar.gz"},
+                        {"name": "last.json"},
+                    ]
+                },
+            )
+            uploads = root / "uploads"
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-euo",
+                    "pipefail",
+                    "-c",
+                    """
+                    for name in first.dmg middle.tar.gz last.json missing.txt; do
+                      state="$(python3 "$1" state --inventory "$2" --name "$name")"
+                      case "$state" in
+                        present) ;;
+                        absent) printf '%s\\n' "$name" >> "$3" ;;
+                        *) exit 1 ;;
+                      esac
+                    done
+                    """,
+                    "bash",
+                    str(ASSET_INVENTORY_SCRIPT),
+                    str(inventory),
+                    str(uploads),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(uploads.read_text(encoding="utf-8"), "missing.txt\n")
+
+    def test_publication_asset_probes_are_structured_and_never_pipe_to_grep(self):
+        combined = self.candidate + self.stable
+        self.assertNotIn("--jq '.assets[].name' | grep", combined)
+        self.assertEqual(combined.count("release_asset_inventory.py capture"), 2)
+        self.assertGreaterEqual(combined.count("release_asset_inventory.py state"), 2)
 
     def test_bash_32_optional_prior_file_executes_empty_and_present_branches(self):
         helper = REPO_ROOT / ".github" / "scripts" / "run-with-optional-file-argument.sh"
