@@ -74,8 +74,12 @@ assets to `updates-test-v1`, and replaces `test.xml` last with restoration of
 the prior feed on failure. The tag workflow accepts only a tested
 `stable-candidate` package for the exact tag commit/version, compares the
 prerelease DMG byte-for-byte, and—after `release` environment approval—signs
-with only the stable key. A separate keyless job alone has `pages: write` and
-deploys the complete site.
+with only the stable key. The macOS promotion job publishes the frozen site
+archive, signed inventory, and GitHub attestation to the immutable stable
+Release, then stops. A keyless GitHub-hosted Ubuntu job downloads and verifies
+those exact Release assets before creating the Pages artifact, so the signing
+runner needs neither Pages permission nor GNU tar. A final keyless job alone
+has `pages: write` and deploys the authenticated complete site.
 
 If Pages deployment fails—or a previously accepted site must be restored after
 its candidate has aged out of the rolling feed—dispatch `stable-release` with
@@ -118,6 +122,38 @@ reviewed next generation to be absent only until that manifest first records it.
 The candidate/stable workflows serialize the final verified handoff against
 publication; a lower or concurrently consumed build is never uploaded or
 published as a downgrade.
+
+#### Forward-only stable rollback
+
+A released DMG cannot be reused byte-for-byte as a rollback item: its embedded
+`CFBundleVersion`, Sparkle metadata, and code signature would still identify the
+old build. The executable rollback contract is therefore a new protected-main
+commit that restores the known-good source/configuration, advances
+`Version.json` to a semver greater than the latest stable tag, and is built and
+signed as new bytes with a Sparkle build greater than every authenticated test
+and stable feed item.
+
+The operator evidence sequence is:
+
+1. Land the reviewed revert/fix and version bump through protected main. Record
+   the exact commit and the prior known-good commit it restores.
+2. Let the ordinary push build publish its higher test item and anonymously
+   verify the Release DMG digest, `test.xml` build/version, notes, and test-key
+   signatures.
+3. Dispatch `candidate-build` from `main` with `mode=stable-candidate` and the
+   exact protected commit. Verify its attestation, embedded stable endpoint/key,
+   immutable DMG name, and strictly higher selected build.
+4. Create the new higher semver tag on that same commit and pass the `release`
+   approval. Stable promotion must select the tested candidate byte-for-byte,
+   publish immutable tag assets, and deploy the authenticated complete site.
+5. Anonymously verify the versioned Pages feed/notes, stable-key signatures,
+   Release DMG digest, retained old-generation bytes, and successful update from
+   the faulty build. Preserve run IDs and hashes as the rollback outcome.
+
+Any failure before the verified Pages artifact leaves the prior site live. If
+Release publication succeeds but Pages deployment fails, `redeploy-site` for
+the new tag reuses only its authenticated frozen site. Tags, Release assets,
+and existing feed items are never overwritten or moved backward.
 
 ### Signed and verifiable
 

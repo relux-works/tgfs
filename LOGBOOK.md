@@ -5,6 +5,12 @@
 
 ## 2026-08-19
 
+### 1345 — Stable first-pass Pages upload leaves the macOS signing runner (TASK-260810-y3zcg8 cycle 7)
+
+- LIVE FIRST-RED: approved stable run `32202230634` selected and promoted exact tested build `0.1.2 (116)` but `actions/upload-pages-artifact` failed on the self-hosted macOS runner because `gtar` was absent. The immutable stable Release was already valid. Approved run `32202344206` then authenticated those frozen Release assets on Ubuntu and deployed Pages without rebuilding or re-signing; anonymous v1 feed/notes and DMG verification succeeded.
+- FIX: the approved macOS job now ends after immutable Release publication and cleanup. A dependent keyless `ubuntu-latest` job checks out the exact promoted tag, binds it to the promoted commit, downloads all four frozen site evidence assets, verifies GitHub provenance for every attested subject, safely unpacks and verifies the signed exact inventory, and only then invokes `actions/upload-pages-artifact`. The Pages/OIDC deployment job remains separate and has neither `contents:write` nor a stable key.
+- FORWARD ROLLBACK: a previous DMG cannot be offered byte-identically under a higher embedded Sparkle build. The supported executable rollback is a protected-main revert/fix plus higher semver, ordinary anonymous test publication, a separately higher attested stable-candidate build, and approval-gated exact-byte promotion. Existing tags/assets/feed items stay immutable; post-Release Pages failure recovers from the new tag's authenticated frozen site.
+
 ### 1230 — Stable state discovery covers every Release page (TASK-260810-y3zcg8 cycle 6)
 
 - REVIEW FIRST-RED: cycle 5 fetched only `per_page=100`, so a higher/incomplete candidate state head, newer incompatible stable state, or incomplete latest predecessor after record 100 could be missed. The offline selector also treated whitespace as a valid `published_at` value.

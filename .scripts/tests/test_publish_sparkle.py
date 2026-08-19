@@ -585,6 +585,41 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("pages: write", promote)
         self.assertIn("environment: release", promote)
 
+    def test_promote_has_no_gnu_tar_pages_upload_dependency(self):
+        promote = self.stable[
+            self.stable.index("  promote:"):self.stable.index("  prepare-pages:")
+        ]
+        self.assertIn("runs-on: [self-hosted, gramdrive-mac]", promote)
+        self.assertNotIn("actions/upload-pages-artifact", promote)
+        self.assertNotIn("gtar", promote)
+
+    def test_ubuntu_pages_preparation_uploads_only_the_authenticated_release_site(self):
+        prepare = self.stable[
+            self.stable.index("  prepare-pages:"):self.stable.index("  recover-pages:")
+        ]
+        self.assertIn("needs: promote", prepare)
+        self.assertIn("runs-on: ubuntu-latest", prepare)
+        self.assertIn("contents: read", prepare)
+        self.assertNotIn("contents: write", prepare)
+        self.assertNotIn("SPARKLE_STABLE", prepare)
+        for asset in (
+            "stable-pages-site.tar.gz",
+            "stable-pages-site-manifest.json",
+            "stable-pages-site-manifest.signature.txt",
+            "stable-pages-site.attestation.json",
+        ):
+            self.assertIn(asset, prepare)
+        attest = prepare.index("gh attestation verify")
+        unpack = prepare.index("unpack-tree")
+        verify = prepare.index("verify-site")
+        upload = prepare.index("actions/upload-pages-artifact")
+        self.assertLess(attest, unpack)
+        self.assertLess(unpack, verify)
+        self.assertLess(verify, upload)
+        self.assertIn('--source-digest "${{ needs.promote.outputs.commit }}"', prepare)
+        self.assertIn("--site .temp/stable-pages/site", prepare)
+        self.assertIn("path: .temp/stable-pages/site", prepare)
+
     def test_old_complete_site_has_approval_gated_keyless_recovery(self):
         recovery = self.stable[self.stable.index("  recover-pages:"):self.stable.index("  deploy-pages:")]
         self.assertIn("environment: release", recovery)
@@ -596,7 +631,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("contents: write", recovery)
         self.assertNotIn("SPARKLE_STABLE", recovery)
         deploy = self.stable[self.stable.index("  deploy-pages:"):]
-        self.assertIn("needs: [promote, recover-pages]", deploy)
+        self.assertIn("needs: [prepare-pages, recover-pages]", deploy)
 
 
 if __name__ == "__main__":
