@@ -5,6 +5,12 @@
 
 ## 2026-08-19
 
+### 1715 — Old-tag stable reruns preserve trusted workflow control (TASK-260810-y3zcg8 cycle 9)
+
+- LIVE FIRST-RED: approved `promote(v0.1.2)` run `32206820075` loaded the protected-main workflow, then correctly detached to immutable tag commit `dae872044c9ccaaf3ffeda65db6babde36af2244`. That tag predates `.scripts/release/release_asset_inventory.py`, so the cycle-8 structured inventory call failed closed with ENOENT before any Release or Pages mutation; existing stable bytes remained unchanged.
+- FIX: before detaching, the stable job now accepts workflow dispatch only from `refs/heads/main` and push publication only from the exact pushed tag workflow ref, binds the checkout to `GITHUB_SHA`, and seals the inventory helper's exact git-object bytes in a canonical run-scoped runner-temp directory. Every post-detach invocation revalidates the non-symlink path, runner-temp containment, and both recorded SHA-256 bindings. The candidate, tag, manifests, payloads, and attestations remain sourced from and verified against the requested immutable tag.
+- RECOVERY: old-tag dispatch uses the sealed workflow-source helper; a future push tag uses the same deterministic source contract from its own immutable workflow revision. The run-scoped control directory is removed by the job's unconditional guarded cleanup, with no permission, secret, signing, Release, or Pages capability expansion.
+
 ### 1515 — Stable reruns use deterministic Release asset inventories (TASK-260810-y3zcg8 cycle 8)
 
 - LIVE FIRST-RED: approved rerun `32204896987` regenerated and matched the existing `v0.1.2` publication, but `gh release view ... | grep -Fxq` ran under `set -o pipefail`. The first matching asset closed the pipe early, the probe reported absence, and the workflow attempted a duplicate upload that GitHub rejected. Release and Pages bytes remained unchanged.
