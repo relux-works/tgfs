@@ -930,11 +930,21 @@ class AppPackager:
             "worktree_clean": (status.strip() == "") if status_code == 0 else None,
         }
 
-    def build_number(self) -> str:
-        """CFBundleVersion: the commit count, monotonic for Sparkle ordering."""
+    def build_number(self, reviewed_override: str | None = None) -> tuple[str, str]:
+        """Resolve CFBundleVersion from git plus an optional reviewed public-floor bump."""
         code, output = self.runner(("git", "rev-list", "--count", "HEAD"), self.repo_root, None)
-        value = output.strip()
-        return value if code == 0 and value.isdigit() else "0"
+        git_floor = output.strip()
+        if code != 0 or not git_floor.isdigit() or int(git_floor) < 1:
+            raise StepFailed("cannot resolve a positive git-derived build floor")
+        if reviewed_override is None:
+            return git_floor, git_floor
+        if not re.fullmatch(r"[1-9][0-9]*", reviewed_override):
+            raise StepFailed("reviewed build number must be a canonical positive integer")
+        if int(reviewed_override) < int(git_floor):
+            raise StepFailed(
+                f"reviewed build number {reviewed_override} is below git-derived floor {git_floor}"
+            )
+        return reviewed_override, git_floor
 
     def toolchain_info(self) -> dict:
         versions: dict[str, str] = {}
@@ -1733,6 +1743,7 @@ def package(
     update_channel: str = "test",
     update_feed_generation: int = 1,
     update_public_key: str | None = None,
+    build_number: str | None = None,
 ) -> dict:
     """Run the whole pipeline and return the manifest.
 
@@ -1769,7 +1780,7 @@ def package(
 
     git = packager.git_info()
     short_version = marketing_version(repo_root)
-    build_version = packager.build_number()
+    build_version, git_build_floor = packager.build_number(build_number)
 
     bin_dir = packager.build_products()
     app = packager.assemble_bundle(bin_dir, (short_version, build_version), update)
@@ -1830,7 +1841,14 @@ def package(
             spctl_verdict = post_staple_verification["gatekeeper"]["app"]
 
     manifest = build_manifest(
-        product_version={"short": short_version, "build": build_version},
+        product_version={
+            "short": short_version,
+            "build": build_version,
+            "git_build_floor": git_build_floor,
+            "build_source": (
+                "reviewed-workflow-override" if build_number is not None else "git-revision-count"
+            ),
+        },
         identity=identity,
         signed=signed,
         git=git,
@@ -1928,6 +1946,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="reviewed EdDSA public key required for generations after v1",
     )
     parser.add_argument(
+        "--build-number",
+        help="reviewed candidate build selected above the git and published-feed floors",
+    )
+    parser.add_argument(
         "--notarize",
         action="store_true",
         help="submit the dmg for notarization and staple it (network; Apple)",
@@ -1984,6 +2006,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             update_channel=args.update_channel,
             update_feed_generation=args.update_feed_generation,
             update_public_key=args.update_public_key,
+            build_number=args.build_number,
         )
     except StepFailed as failure:
         print(f"\nAPP PACKAGING FAILED\n{failure}", file=sys.stderr)

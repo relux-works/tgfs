@@ -22,7 +22,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: gramdrive-stable-publication
+  # Shared with candidate-build through its verified immutable artifact upload.
+  # Stable promotion therefore cannot consume a selected build at that boundary.
+  group: gramdrive-sparkle-publication-handoff
   cancel-in-progress: false
 
 env:
@@ -184,8 +186,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .temp/stable/site
-          previous="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '[.[] | select(.tag_name != "${{ steps.source.outputs.tag }}" and any(.assets[]?; .name == "stable-pages-site.attestation.json"))] | sort_by(.published_at) | last | .tag_name // empty')"
+          mkdir -p .temp/stable/previous
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > .temp/stable/previous/release-pages.json
+          previous="$(python3 .scripts/release/select_stable_release.py \
+            --mode stable-prior \
+            --current-tag "${{ steps.source.outputs.tag }}" \
+            --release-pages .temp/stable/previous/release-pages.json)"
           if [ -n "$previous" ]; then
             gh release download "$previous" \
               --pattern stable-pages-site.tar.gz \
