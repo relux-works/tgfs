@@ -282,7 +282,23 @@ def validate_inputs(
 
     version = app.get("product_version", {})
     build_text = str(version.get("build", ""))
-    require(build_text.isdigit() and int(build_text) > minimum_build, "candidate build is not newer than the applicable feed")
+    require(
+        re.fullmatch(r"[1-9][0-9]*", build_text) is not None
+        and int(build_text) > minimum_build,
+        "candidate build is not newer than the applicable feed",
+    )
+    git_floor_text = str(version.get("git_build_floor", ""))
+    require(
+        re.fullmatch(r"[1-9][0-9]*", git_floor_text) is not None
+        and int(build_text) >= int(git_floor_text),
+        "candidate build does not satisfy its git-derived floor",
+    )
+    build_source = version.get("build_source")
+    require(
+        build_source == "reviewed-workflow-override"
+        or (build_source == "git-revision-count" and build_text == git_floor_text),
+        "candidate build source does not match its git-derived floor",
+    )
     require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(version.get("short", ""))) is not None, "marketing version is not three-component")
 
     require(core.get("git", {}).get("commit") == commit, "core commit does not match requested source")

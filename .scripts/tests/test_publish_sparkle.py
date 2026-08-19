@@ -536,7 +536,7 @@ class WorkflowContractTests(unittest.TestCase):
         combined = self.candidate + self.stable
         self.assertNotIn("prior_args=()", combined)
         self.assertNotIn('${prior_args[@]}', combined)
-        self.assertEqual(combined.count("run_with_optional_file_argument"), 3)
+        self.assertEqual(combined.count("run_with_optional_file_argument"), 5)
 
     def test_stable_promotion_never_builds_or_resigns_apple_code(self):
         promote = self.stable[self.stable.index("  promote:"):self.stable.index("  deploy-pages:")]

@@ -62,8 +62,10 @@ rotation candidate uses the generation and public key from the reviewed
 `--update-feed-generation N --update-public-key KEY`. The packager constructs
 the versioned URL itself, rejects v1 key overrides, and records the
 generation/key in the signed candidate manifest. `Version.json` is the reviewed
-three-part marketing version source,
-while the numeric `CFBundleVersion` remains the commit count.
+three-part marketing version source. Ordinary packaging uses the positive git
+commit count as `CFBundleVersion`. Candidate CI may pass a reviewed
+`--build-number` at or above that git floor after inspecting the public feeds;
+the manifest records both values and the selection source.
 
 Publication never rebuilds those bytes. The candidate workflow first uploads
 one attested exact-byte package. Its downstream `publish-test` job revalidates
@@ -86,7 +88,11 @@ Pages-only job deploys only those authenticated exact files.
 Each stable Release freezes `stable-pages-site.tar.gz`. The next promotion must
 restore it successfully before changing the active versioned feed, so frozen
 old-key feed generations and their bridge items remain byte-identical while a
-new generation is added. Rotation first lands a reviewed higher generation/key
+new generation is added. Restoration deliberately excludes the current source
+tag: an absent, partially uploaded, or complete current Release is regenerated
+and immutable-compared against the latest prior semver site's singular assets.
+An incomplete latest prior Release fails closed, as does rerunning an older tag
+after a newer stable semver has been published. Rotation first lands a reviewed higher generation/key
 in `.github/sparkle-stable.json` and builds the tested candidate from that exact
 binding. A tag publication then derives the sole prior generation/key from the
 authenticated site manifest and automatically performs the one-time bridge;
@@ -97,8 +103,21 @@ final old-key bridge and first new-key item, verifies both signatures, and
 freezes both in one complete site. Later tags read the checked-in active binding
 and mutate only that generation. Never change the signer
 behind an existing versioned URL. Rollback uses the same candidate/test/stable
-path with a new protected-main commit and a greater `CFBundleVersion`; a lower
-build is never published as a downgrade.
+path with a new protected-main commit and a greater `CFBundleVersion`; candidate
+selection advances above the public feed even when the same commit is built for
+both trust channels. Stable-candidate selection separately treats the latest
+published semver Release across the complete paginated GitHub response as its
+fail-closed state head; it never skips an incomplete head. Malformed pages or
+publication timestamps abort before signing or mutation. It authenticates that
+Release's attested stable-site manifest, requires every generation recorded
+there, and verifies each fetched Pages feed against its recorded SHA-256 and
+byte count before using its build floor. An unrecorded generation must remain
+404 until its first authenticated publication. This prevents a replaced or
+rolled-back Pages response from lowering the historical floor and permits the
+reviewed next generation to be absent only until that manifest first records it.
+The candidate/stable workflows serialize the final verified handoff against
+publication; a lower or concurrently consumed build is never uploaded or
+published as a downgrade.
 
 ### Signed and verifiable
 

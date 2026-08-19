@@ -20,18 +20,22 @@ on:
 permissions:
   contents: read
 
-# The gramdrive-mac label belongs to one dedicated runner account.  The fixed
-# group prevents two candidate signing jobs from sharing its credential window;
-# runner administration additionally forbids unrelated agents, interactive
-# sessions, and untrusted jobs while this workflow runs.
+# Candidate handoff and stable publication share this non-cancelling group so a
+# selected build cannot be consumed between final verification and upload.
 concurrency:
-  group: gramdrive-candidate-signing-runner
+  group: gramdrive-sparkle-publication-handoff
   cancel-in-progress: false
 
 jobs:
   candidate:
     name: verified-macos-candidate
     runs-on: [self-hosted, gramdrive-mac]
+    # The gramdrive-mac label belongs to one dedicated runner account. This
+    # second fixed group isolates its signing credential window from any other
+    # candidate job in addition to the cross-workflow publication lock above.
+    concurrency:
+      group: gramdrive-candidate-signing-runner
+      cancel-in-progress: false
     environment: updates-test
     permissions:
       contents: read
@@ -118,9 +122,50 @@ jobs:
             echo "feed_public_key=$public_key"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Restore authenticated stable feed creation state
+        id: stable_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stable_manifest=
+          if [ "${{ steps.source.outputs.mode }}" = stable-candidate ]; then
+            mkdir -p .temp/build-order/stable-state
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              > .temp/build-order/stable-state/release-pages.json
+            previous="$(python3 .scripts/release/select_stable_release.py \
+              --mode candidate-state-head \
+              --release-pages .temp/build-order/stable-state/release-pages.json)"
+            if [ -n "$previous" ]; then
+              gh release download "$previous" \
+                --pattern stable-pages-site-manifest.json \
+                --pattern stable-pages-site.attestation.json \
+                --dir .temp/build-order/stable-state
+              git fetch --force origin "refs/tags/$previous:refs/tags/$previous"
+              previous_commit="$(git rev-list -n 1 "$previous")"
+              test -n "$previous_commit"
+              gh attestation verify \
+                .temp/build-order/stable-state/stable-pages-site-manifest.json \
+                --repo "$GITHUB_REPOSITORY" \
+                --bundle .temp/build-order/stable-state/stable-pages-site.attestation.json \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-digest "$previous_commit"
+              stable_manifest=.temp/build-order/stable-state/stable-pages-site-manifest.json
+            fi
+          fi
+          echo "manifest=$stable_manifest" >> "$GITHUB_OUTPUT"
+
       - name: Check monotonic Sparkle build ordering
         id: build_order
-        run: python3 .scripts/release/check_candidate_build_order.py --mode "${{ steps.source.outputs.mode }}"
+        run: |
+          set -euo pipefail
+          source .github/scripts/run-with-optional-file-argument.sh
+          run_with_optional_file_argument \
+            --stable-site-manifest "${{ steps.stable_state.outputs.manifest }}" \
+            python3 .scripts/release/check_candidate_build_order.py \
+            --mode "${{ steps.source.outputs.mode }}" \
+            --git-build "$(git rev-list --count HEAD)"
 
       - name: Report pinned Rust toolchain
         run: |
@@ -202,13 +247,10 @@ jobs:
             --update-channel "${{ steps.source.outputs.channel }}" \
             --update-feed-generation "${{ steps.source.outputs.feed_generation }}" \
             --update-public-key "${{ steps.source.outputs.feed_public_key }}" \
+            --build-number "${{ steps.build_order.outputs.build_number }}" \
             --notarize \
             --notary-profile gramdrive-candidate-notary \
             --notary-keychain "$KEYCHAIN_PATH"
-
-      - name: Recheck monotonic ordering at the handoff boundary
-        id: final_build_order
-        run: python3 .scripts/release/check_candidate_build_order.py --mode "${{ steps.source.outputs.mode }}"
 
       - name: Build the privacy-safe exact-byte candidate handoff
         id: candidate
@@ -221,7 +263,7 @@ jobs:
             --out-dir .temp/candidate \
             --mode "${{ steps.source.outputs.mode }}" \
             --commit "${{ steps.source.outputs.commit }}" \
-            --minimum-build "${{ steps.final_build_order.outputs.minimum_build }}" \
+            --minimum-build "${{ steps.build_order.outputs.minimum_build }}" \
             --repository "$GITHUB_REPOSITORY" \
             --ref "$GITHUB_REF" \
             --workflow-ref "$GITHUB_WORKFLOW_REF" \
@@ -242,6 +284,16 @@ jobs:
             --attestation-bundle "${{ steps.attest.outputs.bundle-path }}"
           python3 .scripts/release/build_candidate_package.py verify \
             --out-dir .temp/candidate
+
+      - name: Recheck monotonic ordering at the immutable handoff boundary
+        run: |
+          set -euo pipefail
+          source .github/scripts/run-with-optional-file-argument.sh
+          run_with_optional_file_argument \
+            --stable-site-manifest "${{ steps.stable_state.outputs.manifest }}" \
+            python3 .scripts/release/check_candidate_build_order.py \
+            --mode "${{ steps.source.outputs.mode }}" \
+            --candidate-build "${{ steps.build_order.outputs.build_number }}"
 
       - name: Name the immutable handoff
         id: handoff

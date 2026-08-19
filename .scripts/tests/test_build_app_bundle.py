@@ -563,6 +563,28 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(manifest["binary_arch"]["required"], "arm64")
             self.assertIn("lipo -archs", manifest["binary_arch"]["verified_by"])
 
+    def test_reviewed_build_number_agrees_across_bundle_and_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _, out = self.run_pipeline(Path(tmp), build_number="138")
+            self.assertEqual(
+                manifest["product_version"],
+                {
+                    "short": "0.5.0",
+                    "build": "138",
+                    "git_build_floor": "137",
+                    "build_source": "reviewed-workflow-override",
+                },
+            )
+            app_dir = out / "GramDrive.app" / "Contents"
+            self.assertEqual(read_plist(app_dir / "Info.plist")["CFBundleVersion"], "138")
+            extension = app_dir / "PlugIns" / "GramDriveFileProvider.appex" / "Contents"
+            self.assertEqual(read_plist(extension / "Info.plist")["CFBundleVersion"], "138")
+
+    def test_reviewed_build_number_cannot_fall_below_git_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(app.StepFailed, "below git-derived floor"):
+                self.run_pipeline(Path(tmp), build_number="136")
+
     def test_signed_package_refuses_a_core_without_tdjson_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(app.StepFailed) as caught:
