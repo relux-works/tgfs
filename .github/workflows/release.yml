@@ -55,6 +55,54 @@ jobs:
           fetch-depth: 0
           clean: true
 
+      - name: Seal the Release inventory helper from the trusted workflow source
+        id: release_control
+        run: |
+          set -euo pipefail
+          workflow_path=.github/workflows/release.yml
+          helper_path=.scripts/release/release_asset_inventory.py
+          source_commit="$(git rev-parse HEAD)"
+          test "$source_commit" = "$GITHUB_SHA"
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              test "$GITHUB_REF" = refs/heads/main
+              test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$workflow_path@refs/heads/main"
+              ;;
+            push)
+              test "$GITHUB_REF_TYPE" = tag
+              test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+              test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$workflow_path@$GITHUB_REF"
+              ;;
+            *)
+              echo "unsupported stable workflow event: $GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          git cat-file -e "$source_commit:$helper_path"
+          runner_temp_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RUNNER_TEMP")"
+          control_dir="$runner_temp_real/gramdrive-release-control-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "$control_dir" in
+            "$runner_temp_real"/gramdrive-release-control-*) ;;
+            *) echo "unsafe trusted release-control path" >&2; exit 1 ;;
+          esac
+          test ! -e "$control_dir"
+          mkdir -m 700 "$control_dir"
+          helper="$control_dir/release_asset_inventory.py"
+          git show "$source_commit:$helper_path" > "$helper"
+          chmod 500 "$helper"
+          helper_digest="$(shasum -a 256 "$helper")"
+          helper_digest="${helper_digest%% *}"
+          test "$helper_digest" = "$(git show "$source_commit:$helper_path" | shasum -a 256 | sed 's/ .*//')"
+          {
+            echo "RELEASE_CONTROL_DIR=$control_dir"
+            echo "RELEASE_ASSET_INVENTORY_HELPER=$helper"
+            echo "RELEASE_ASSET_INVENTORY_HELPER_SHA256=$helper_digest"
+          } >> "$GITHUB_ENV"
+          {
+            echo "source_commit=$source_commit"
+            echo "helper_sha256=$helper_digest"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Validate the immutable release tag and protected-main source
         id: source
         env:
@@ -77,6 +125,7 @@ jobs:
           git merge-base --is-ancestor "$commit" origin/main
           git checkout --detach "$commit"
           test -z "$(git status --porcelain)"
+          test "${{ steps.release_control.outputs.source_commit }}" = "$GITHUB_SHA"
           test "$(python3 -c 'import json; print(json.load(open("apple/GramDriveSupport/Version.json"))["marketing_version"])')" = "${BASH_REMATCH[1]}"
           generation="$(python3 -c 'import json; print(json.load(open(".github/sparkle-stable.json"))["active_generation"])')"
           public_key="$(python3 -c 'import json; print(json.load(open(".github/sparkle-stable.json"))["active_public_key"])')"
@@ -400,11 +449,28 @@ jobs:
               --notes-file "$notes"
           fi
           asset_inventory=.temp/stable/release-assets.json
-          python3 .scripts/release/release_asset_inventory.py capture \
+          release_inventory() {
+            runner_temp_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RUNNER_TEMP")"
+            case "$RELEASE_CONTROL_DIR" in
+              "$runner_temp_real"/gramdrive-release-control-*) ;;
+              *) echo "trusted Release helper directory escaped runner temp" >&2; return 1 ;;
+            esac
+            test "$RELEASE_ASSET_INVENTORY_HELPER" = "$RELEASE_CONTROL_DIR/release_asset_inventory.py"
+            resolved_helper="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RELEASE_ASSET_INVENTORY_HELPER")"
+            test "$resolved_helper" = "$RELEASE_ASSET_INVENTORY_HELPER"
+            test ! -L "$RELEASE_ASSET_INVENTORY_HELPER"
+            test -f "$RELEASE_ASSET_INVENTORY_HELPER"
+            actual_helper_digest="$(shasum -a 256 "$RELEASE_ASSET_INVENTORY_HELPER")"
+            actual_helper_digest="${actual_helper_digest%% *}"
+            test "$actual_helper_digest" = "$RELEASE_ASSET_INVENTORY_HELPER_SHA256"
+            test "$actual_helper_digest" = "${{ steps.release_control.outputs.helper_sha256 }}"
+            python3 "$RELEASE_ASSET_INVENTORY_HELPER" "$@"
+          }
+          release_inventory capture \
             --release "$tag" --output "$asset_inventory"
           upload_immutable() {
             asset="$1"; name="$2"
-            state="$(python3 .scripts/release/release_asset_inventory.py state \
+            state="$(release_inventory state \
               --inventory "$asset_inventory" --name "$name")"
             case "$state" in
               present)
@@ -422,7 +488,7 @@ jobs:
           upload_immutable .temp/stable/stable-pages-site.tar.gz stable-pages-site.tar.gz
           upload_immutable .temp/stable/stable-pages-site-manifest.json stable-pages-site-manifest.json
           upload_immutable .temp/stable/stable-pages-site-manifest.signature.txt stable-pages-site-manifest.signature.txt
-          attestation_state="$(python3 .scripts/release/release_asset_inventory.py state \
+          attestation_state="$(release_inventory state \
             --inventory "$asset_inventory" --name stable-pages-site.attestation.json)"
           case "$attestation_state" in
             present)
@@ -448,6 +514,8 @@ jobs:
         if: always()
         run: |
           case "${SPARKLE_TOOLS_DIR:-}" in "$RUNNER_TEMP"/gramdrive-stable-sparkle-*) rm -rf "$SPARKLE_TOOLS_DIR" ;; esac
+          runner_temp_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RUNNER_TEMP")"
+          case "${RELEASE_CONTROL_DIR:-}" in "$runner_temp_real"/gramdrive-release-control-*) rm -rf "$RELEASE_CONTROL_DIR" ;; esac
           rm -rf .temp/stable
 
   # The self-hosted macOS signer publishes the frozen authenticated site to the

@@ -625,6 +625,199 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(inventory.exists())
 
+    def test_stable_old_tag_uses_only_the_sealed_workflow_source_helper(self):
+        seal = self.stable.index("Seal the Release inventory helper from the trusted workflow source")
+        detach = self.stable.index('git checkout --detach "$commit"')
+        publication = self.stable.index("Publish exact immutable stable Release assets")
+        self.assertLess(seal, detach)
+        self.assertLess(detach, publication)
+        publish_step = self.stable[publication:self.stable.index("Remove stable signing and candidate state")]
+        self.assertIn('python3 "$RELEASE_ASSET_INVENTORY_HELPER" "$@"', publish_step)
+        self.assertNotIn("python3 .scripts/release/release_asset_inventory.py", publish_step)
+        self.assertIn('test "$actual_helper_digest" = "${{ steps.release_control.outputs.helper_sha256 }}"', publish_step)
+
+        historical = subprocess.run(
+            ["git", "cat-file", "-e", "v0.1.2:.scripts/release/release_asset_inventory.py"],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+        )
+        current = subprocess.run(
+            ["git", "cat-file", "-e", "HEAD:.scripts/release/release_asset_inventory.py"],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+        )
+        self.assertNotEqual(historical.returncode, 0)
+        self.assertEqual(current.returncode, 0, current.stderr.decode())
+
+    def test_stable_helper_source_accepts_only_main_dispatch_or_exact_push_tag(self):
+        seal = self.stable[
+            self.stable.index("Seal the Release inventory helper from the trusted workflow source"):
+            self.stable.index("Validate the immutable release tag and protected-main source")
+        ]
+        self.assertIn('test "$GITHUB_REF" = refs/heads/main', seal)
+        self.assertIn('@refs/heads/main"', seal)
+        self.assertIn('test "$GITHUB_REF_TYPE" = tag', seal)
+        self.assertIn('test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$workflow_path@$GITHUB_REF"', seal)
+        self.assertIn('test "$source_commit" = "$GITHUB_SHA"', seal)
+        self.assertIn('*)\n              echo "unsupported stable workflow event:', seal)
+
+        source_check = r'''
+        set -euo pipefail
+        workflow_path=.github/workflows/release.yml
+        case "$GITHUB_EVENT_NAME" in
+          workflow_dispatch)
+            test "$GITHUB_REF" = refs/heads/main
+            test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$workflow_path@refs/heads/main"
+            ;;
+          push)
+            test "$GITHUB_REF_TYPE" = tag
+            test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+            test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$workflow_path@$GITHUB_REF"
+            ;;
+          *) exit 1 ;;
+        esac
+        '''
+
+        def check(**overrides: str) -> int:
+            environment = dict(
+                os.environ,
+                GITHUB_REPOSITORY="relux-works/tgfs",
+                GITHUB_EVENT_NAME="workflow_dispatch",
+                GITHUB_REF="refs/heads/main",
+                GITHUB_REF_TYPE="branch",
+                GITHUB_REF_NAME="main",
+                GITHUB_WORKFLOW_REF="relux-works/tgfs/.github/workflows/release.yml@refs/heads/main",
+            )
+            environment.update(overrides)
+            return subprocess.run(
+                ["/bin/bash", "-c", source_check],
+                check=False,
+                capture_output=True,
+                env=environment,
+            ).returncode
+
+        self.assertEqual(check(), 0)
+        self.assertEqual(
+            check(
+                GITHUB_EVENT_NAME="push",
+                GITHUB_REF="refs/tags/v1.2.3",
+                GITHUB_REF_TYPE="tag",
+                GITHUB_REF_NAME="v1.2.3",
+                GITHUB_WORKFLOW_REF="relux-works/tgfs/.github/workflows/release.yml@refs/tags/v1.2.3",
+            ),
+            0,
+        )
+        self.assertNotEqual(check(GITHUB_REF="refs/heads/release/unsafe"), 0)
+        self.assertNotEqual(check(GITHUB_WORKFLOW_REF="relux-works/tgfs/.github/workflows/release.yml@refs/tags/v1.2.3"), 0)
+        self.assertNotEqual(check(GITHUB_EVENT_NAME="pull_request"), 0)
+
+    def test_sealed_release_helper_refuses_missing_tampered_escaped_and_mismatched_state(self):
+        verification = r'''
+        set -euo pipefail
+        runner_temp_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RUNNER_TEMP")"
+        case "$RELEASE_CONTROL_DIR" in
+          "$runner_temp_real"/gramdrive-release-control-*) ;;
+          *) exit 31 ;;
+        esac
+        test "$RELEASE_ASSET_INVENTORY_HELPER" = "$RELEASE_CONTROL_DIR/release_asset_inventory.py"
+        resolved_helper="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RELEASE_ASSET_INVENTORY_HELPER")"
+        test "$resolved_helper" = "$RELEASE_ASSET_INVENTORY_HELPER"
+        test ! -L "$RELEASE_ASSET_INVENTORY_HELPER"
+        test -f "$RELEASE_ASSET_INVENTORY_HELPER"
+        actual_helper_digest="$(shasum -a 256 "$RELEASE_ASSET_INVENTORY_HELPER")"
+        actual_helper_digest="${actual_helper_digest%% *}"
+        test "$actual_helper_digest" = "$RELEASE_ASSET_INVENTORY_HELPER_SHA256"
+        test "$actual_helper_digest" = "$WORKFLOW_HELPER_SHA256"
+        python3 "$RELEASE_ASSET_INVENTORY_HELPER" state --inventory "$INVENTORY" --name present.dmg
+        '''
+        with tempfile.TemporaryDirectory() as tmp:
+            runner_temp = Path(tmp).resolve()
+            control = runner_temp / "gramdrive-release-control-1-1"
+            control.mkdir()
+            helper = control / "release_asset_inventory.py"
+            helper.write_bytes(ASSET_INVENTORY_SCRIPT.read_bytes())
+            inventory = runner_temp / "inventory.json"
+            write_json(inventory, {"assets": [{"name": "present.dmg"}]})
+            digest = sha256(helper.read_bytes()).hexdigest()
+
+            def run(candidate: Path, expected: str = digest) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["/bin/bash", "-c", verification],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=dict(
+                        os.environ,
+                        RUNNER_TEMP=str(runner_temp),
+                        RELEASE_CONTROL_DIR=str(control),
+                        RELEASE_ASSET_INVENTORY_HELPER=str(candidate),
+                        RELEASE_ASSET_INVENTORY_HELPER_SHA256=expected,
+                        WORKFLOW_HELPER_SHA256=digest,
+                        INVENTORY=str(inventory),
+                    ),
+                )
+
+            accepted = run(helper)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(accepted.stdout.strip(), "present")
+
+            helper.write_bytes(helper.read_bytes() + b"\n# tampered\n")
+            self.assertNotEqual(run(helper).returncode, 0)
+            helper.write_bytes(ASSET_INVENTORY_SCRIPT.read_bytes())
+            self.assertNotEqual(run(helper, "0" * 64).returncode, 0)
+            outside = runner_temp / "outside.py"
+            outside.write_bytes(helper.read_bytes())
+            self.assertNotEqual(run(outside).returncode, 0)
+            helper.unlink()
+            helper.symlink_to(outside)
+            self.assertNotEqual(run(helper).returncode, 0)
+            helper.unlink()
+            self.assertNotEqual(run(helper).returncode, 0)
+
+    def test_release_control_cleanup_is_guarded_and_runs_after_success_or_failure(self):
+        cleanup = self.stable[
+            self.stable.index("Remove stable signing and candidate state"):
+            self.stable.index("  # The self-hosted macOS signer")
+        ]
+        self.assertIn("if: always()", cleanup)
+        self.assertIn('gramdrive-release-control-*', cleanup)
+        with tempfile.TemporaryDirectory() as tmp:
+            runner_temp = Path(tmp).resolve()
+            for exit_code in (0, 23):
+                control = runner_temp / f"gramdrive-release-control-1-{exit_code}"
+                control.mkdir()
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-c",
+                        'trap \'case "$RELEASE_CONTROL_DIR" in "$RUNNER_TEMP"/gramdrive-release-control-*) rm -rf "$RELEASE_CONTROL_DIR" ;; esac\' EXIT; exit "$1"',
+                        "bash",
+                        str(exit_code),
+                    ],
+                    check=False,
+                    env=dict(os.environ, RUNNER_TEMP=str(runner_temp), RELEASE_CONTROL_DIR=str(control)),
+                )
+                self.assertEqual(result.returncode, exit_code)
+                self.assertFalse(control.exists())
+
+    def test_trusted_helper_boundary_does_not_widen_release_capabilities(self):
+        promote_header = self.stable[
+            self.stable.index("  promote:"):self.stable.index("    steps:", self.stable.index("  promote:"))
+        ]
+        self.assertIn("environment: release", promote_header)
+        self.assertIn("contents: write", promote_header)
+        self.assertIn("id-token: write", promote_header)
+        self.assertIn("attestations: write", promote_header)
+        self.assertNotIn("pages: write", promote_header)
+        seal = self.stable[
+            self.stable.index("Seal the Release inventory helper from the trusted workflow source"):
+            self.stable.index("Validate the immutable release tag and protected-main source")
+        ]
+        for forbidden in ("secrets.", "SPARKLE_STABLE", "pages: write", "gh release", "gh api"):
+            self.assertNotIn(forbidden, seal)
+
     def test_existing_release_assets_never_reach_the_upload_branch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -671,8 +864,10 @@ class WorkflowContractTests(unittest.TestCase):
     def test_publication_asset_probes_are_structured_and_never_pipe_to_grep(self):
         combined = self.candidate + self.stable
         self.assertNotIn("--jq '.assets[].name' | grep", combined)
-        self.assertEqual(combined.count("release_asset_inventory.py capture"), 2)
-        self.assertGreaterEqual(combined.count("release_asset_inventory.py state"), 2)
+        self.assertEqual(combined.count("release_asset_inventory.py capture"), 1)
+        self.assertEqual(self.stable.count("release_inventory capture"), 1)
+        self.assertEqual(combined.count("release_asset_inventory.py state"), 1)
+        self.assertGreaterEqual(self.stable.count("release_inventory state"), 2)
 
     def test_bash_32_optional_prior_file_executes_empty_and_present_branches(self):
         helper = REPO_ROOT / ".github" / "scripts" / "run-with-optional-file-argument.sh"
