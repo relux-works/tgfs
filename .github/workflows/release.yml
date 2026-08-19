@@ -329,7 +329,10 @@ jobs:
           SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64: ${{ secrets.SPARKLE_STABLE_EDDSA_PRIVATE_KEY_B64 || secrets.SPARKLE_STABLE_V1_EDDSA_PRIVATE_KEY_B64 }}
         run: |
           set -euo pipefail
-          find .temp/stable/site -type l -print -quit | grep -q . && exit 1 || true
+          if [ -n "$(find .temp/stable/site -type l -print -quit)" ]; then
+            echo "stable Pages site contains a symbolic link" >&2
+            exit 1
+          fi
           python3 .scripts/release/publish_sparkle.py pack-tree \
             --root .temp/stable/site --output .temp/stable/stable-pages-site.tar.gz
           key_args=()
@@ -396,15 +399,22 @@ jobs:
               --title "GramDrive ${{ steps.source.outputs.version }}" \
               --notes-file "$notes"
           fi
+          asset_inventory=.temp/stable/release-assets.json
+          python3 .scripts/release/release_asset_inventory.py capture \
+            --release "$tag" --output "$asset_inventory"
           upload_immutable() {
             asset="$1"; name="$2"
-            if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
-              mkdir -p .temp/stable/existing
-              gh release download "$tag" --pattern "$name" --dir .temp/stable/existing --clobber
-              cmp "$asset" ".temp/stable/existing/$name"
-            else
-              gh release upload "$tag" "$asset#$name"
-            fi
+            state="$(python3 .scripts/release/release_asset_inventory.py state \
+              --inventory "$asset_inventory" --name "$name")"
+            case "$state" in
+              present)
+                mkdir -p .temp/stable/existing
+                gh release download "$tag" --pattern "$name" --dir .temp/stable/existing --clobber
+                cmp "$asset" ".temp/stable/existing/$name"
+                ;;
+              absent) gh release upload "$tag" "$asset#$name" ;;
+              *) echo "invalid Release asset state: $state" >&2; exit 1 ;;
+            esac
           }
           upload_immutable "$dmg" "${{ steps.candidate.outputs.dmg_name }}"
           upload_immutable "$package" "${{ steps.candidate.outputs.dmg_name }}.candidate.tar.gz"
@@ -412,19 +422,26 @@ jobs:
           upload_immutable .temp/stable/stable-pages-site.tar.gz stable-pages-site.tar.gz
           upload_immutable .temp/stable/stable-pages-site-manifest.json stable-pages-site-manifest.json
           upload_immutable .temp/stable/stable-pages-site-manifest.signature.txt stable-pages-site-manifest.signature.txt
-          if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq stable-pages-site.attestation.json; then
-            gh release download "$tag" --pattern stable-pages-site.attestation.json \
-              --dir .temp/stable/existing --clobber
-            for subject in stable-pages-site.tar.gz stable-pages-site-manifest.json stable-pages-site-manifest.signature.txt; do
-              gh attestation verify ".temp/stable/$subject" \
-                --repo "$GITHUB_REPOSITORY" \
-                --bundle .temp/stable/existing/stable-pages-site.attestation.json \
-                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-                --source-digest "${{ steps.source.outputs.commit }}"
-            done
-            cp .temp/stable/existing/stable-pages-site.attestation.json \
-              .temp/stable/stable-pages-site.attestation.json
-          fi
+          attestation_state="$(python3 .scripts/release/release_asset_inventory.py state \
+            --inventory "$asset_inventory" --name stable-pages-site.attestation.json)"
+          case "$attestation_state" in
+            present)
+              mkdir -p .temp/stable/existing
+              gh release download "$tag" --pattern stable-pages-site.attestation.json \
+                --dir .temp/stable/existing --clobber
+              for subject in stable-pages-site.tar.gz stable-pages-site-manifest.json stable-pages-site-manifest.signature.txt; do
+                gh attestation verify ".temp/stable/$subject" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --bundle .temp/stable/existing/stable-pages-site.attestation.json \
+                  --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                  --source-digest "${{ steps.source.outputs.commit }}"
+              done
+              cp .temp/stable/existing/stable-pages-site.attestation.json \
+                .temp/stable/stable-pages-site.attestation.json
+              ;;
+            absent) ;;
+            *) echo "invalid Release asset state: $attestation_state" >&2; exit 1 ;;
+          esac
           upload_immutable .temp/stable/stable-pages-site.attestation.json stable-pages-site.attestation.json
 
       - name: Remove stable signing and candidate state

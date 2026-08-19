@@ -5,6 +5,12 @@
 
 ## 2026-08-19
 
+### 1515 — Stable reruns use deterministic Release asset inventories (TASK-260810-y3zcg8 cycle 8)
+
+- LIVE FIRST-RED: approved rerun `32204896987` regenerated and matched the existing `v0.1.2` publication, but `gh release view ... | grep -Fxq` ran under `set -o pipefail`. The first matching asset closed the pipe early, the probe reported absence, and the workflow attempted a duplicate upload that GitHub rejected. Release and Pages bytes remained unchanged.
+- FIX: both rolling-test and stable publishers now fully capture `gh release view --json assets` through one checked-in Python boundary before any immutable upload. The helper normalizes safe unique names, rejects CLI/JSON/schema/duplicate failures, and returns an explicit `present` or `absent` state; only `absent` reaches upload, while `present` still downloads and byte-compares before reuse. Stable attestation reuse consults the same snapshot.
+- REGRESSION: executable tests cover first/middle/last/missing names, duplicate/unsafe/malformed inventories, malformed JSON, upstream `gh` failure under Bash `pipefail`, and the invariant that existing assets never enter the upload branch. Equivalent Release/candidate `grep -q` correctness decisions were removed.
+
 ### 1345 — Stable first-pass Pages upload leaves the macOS signing runner (TASK-260810-y3zcg8 cycle 7)
 
 - LIVE FIRST-RED: approved stable run `32202230634` selected and promoted exact tested build `0.1.2 (116)` but `actions/upload-pages-artifact` failed on the self-hosted macOS runner because `gtar` was absent. The immutable stable Release was already valid. Approved run `32202344206` then authenticated those frozen Release assets on Ubuntu and deployed Pages without rebuilding or re-signing; anonymous v1 feed/notes and DMG verification succeeded.

@@ -79,7 +79,11 @@ archive, signed inventory, and GitHub attestation to the immutable stable
 Release, then stops. A keyless GitHub-hosted Ubuntu job downloads and verifies
 those exact Release assets before creating the Pages artifact, so the signing
 runner needs neither Pages permission nor GNU tar. A final keyless job alone
-has `pages: write` and deploys the authenticated complete site.
+has `pages: write` and deploys the authenticated complete site. Test and stable
+reruns capture each Release's complete structured asset inventory before
+upload; malformed, duplicate, or unavailable inventories fail closed, existing
+assets are downloaded and byte-compared, and only an explicit absent state can
+reach `gh release upload`.
 
 If Pages deployment fails—or a previously accepted site must be restored after
 its candidate has aged out of the rolling feed—dispatch `stable-release` with
