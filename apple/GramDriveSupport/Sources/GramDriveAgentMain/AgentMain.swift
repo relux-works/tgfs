@@ -167,12 +167,16 @@ enum AgentMain {
             ),
             contentPolicy: contentPolicy
         )
+        let drainGracePeriod = Duration.milliseconds(
+            integerOption(options, "drain-grace-ms") ?? 10000
+        )
+        let drainCancelWait = Duration.milliseconds(
+            integerOption(options, "drain-cancel-wait-ms") ?? 5000
+        )
         let configuration = AgentConfiguration(
             dataRoot: dataRoot,
-            drainGracePeriod: .milliseconds(integerOption(options, "drain-grace-ms") ?? 10000),
-            drainCancelWait: .milliseconds(
-                integerOption(options, "drain-cancel-wait-ms") ?? 5000
-            ),
+            drainGracePeriod: drainGracePeriod,
+            drainCancelWait: drainCancelWait,
             powerEvents: WorkspacePowerEventSource(),
             controlSeams: seams,
             namespaceBootstrapper: namespaceBootstrapper,
@@ -209,7 +213,12 @@ enum AgentMain {
 
         // launchd delivers shutdown as SIGTERM (unload, logout, update);
         // SIGINT covers interactive runs. Either drains, then exits 0.
-        installShutdownSignals(for: lifecycle)
+        installShutdownSignals(
+            for: lifecycle,
+            watchdog: commitExitWatchdog,
+            hardExitDelay: drainGracePeriod + drainCancelWait + drainCancelWait
+                + drainCancelWait + .seconds(2)
+        )
         dispatchMain()
     }
 
@@ -246,11 +255,20 @@ enum AgentMain {
         }
     }
 
-    private static func installShutdownSignals(for lifecycle: AgentLifecycle) {
+    private static func installShutdownSignals(
+        for lifecycle: AgentLifecycle,
+        watchdog: CommitExitWatchdog,
+        hardExitDelay: Duration
+    ) {
+        let gate = DirectSignalExitGate()
         for sig in [SIGTERM, SIGINT] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
+                guard gate.begin() else { return }
+                guard watchdog.arm(after: hardExitDelay) else {
+                    Darwin._exit(3)
+                }
                 Task {
                     let outcome = await lifecycle.shutdown(reason: .terminate)
                     emit(
@@ -273,6 +291,19 @@ enum AgentMain {
     /// Signal sources must outlive main()'s scope; dispatchMain() never
     /// returns, so a static retain list is the containing scope.
     private nonisolated(unsafe) static var retainedSources: [any DispatchSourceProtocol] = []
+
+    private final class DirectSignalExitGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var started = false
+
+        func begin() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !started else { return false }
+            started = true
+            return true
+        }
+    }
 
     /// Coordinates the one process exit following a control acknowledgement.
     /// It deliberately starts only after the server writes `commandDone`, so the

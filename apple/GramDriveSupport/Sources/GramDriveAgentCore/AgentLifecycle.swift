@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import GramDriveCore
 import GramDriveSupport
@@ -132,6 +133,50 @@ private struct OwnedNamespaceSession: @unchecked Sendable {
     let session: any AgentNamespaceSessionHosting
 }
 
+/// Runs potentially blocking foreign namespace shutdown outside Swift's
+/// cooperative executor. Production `NamespaceSession.shutdown()` joins its
+/// Rust worker; a worker inside a large SQLite projection must not prevent the
+/// lifecycle from reaching its bounded transfer/hydration drain or a committed
+/// process exit.
+private final class NamespaceCloseBatch: @unchecked Sendable {
+    private static let queue = DispatchQueue(
+        label: "works.relux.gramdrive.namespace-close",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    private let group = DispatchGroup()
+
+    init(_ sessions: [any AgentNamespaceSessionHosting]) {
+        for session in sessions {
+            group.enter()
+            Self.queue.async {
+                session.close()
+                self.group.leave()
+            }
+        }
+    }
+
+    var isComplete: Bool {
+        group.wait(timeout: .now()) == .success
+    }
+
+    func wait(timeout: Duration) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if isComplete { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return isComplete
+    }
+
+    func waitUntilComplete() async {
+        while !isComplete {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
 enum NamespaceReadinessDisposition: Equatable {
     case preparing
     case usable(degradation: AgentActionableFailure?)
@@ -207,7 +252,9 @@ public final class AgentLifecycle: @unchecked Sendable {
     private var terminationRequest: ControlTerminationRequest?
     private var terminationCancellationRequested = false
     private var suspendedTerminationNamespaces: Set<Int64> = []
+    private var terminationNamespaceCloseBatch: NamespaceCloseBatch?
     private var terminationLeaseTask: Task<Void, Never>?
+    private var terminationRollbackTask: Task<Void, Never>?
     /// Once a commit wins, cancellation and the ready lease are no longer
     /// permitted to restore the process. Resources deliberately remain owned
     /// until the host has acknowledged the claim and starts its short teardown;
@@ -543,7 +590,7 @@ public final class AgentLifecycle: @unchecked Sendable {
         guard processIdentity.isValidTerminationIdentity,
               request.expectedAgentInstanceID == processIdentity.instanceID
         else { return }
-        let readyNamespaces = setLockedReturning { () -> Set<Int64>? in
+        let readyRollback = setLockedReturning { () -> (Set<Int64>, NamespaceCloseBatch?)? in
             guard self.terminationRequestID == request.requestID else { return nil }
             // A successful commit claim is the irreversible boundary. The host
             // watchdog will terminate this exact process even if the subsequent
@@ -556,10 +603,16 @@ public final class AgentLifecycle: @unchecked Sendable {
             }
             self.terminationLeaseTask?.cancel()
             self.terminationLeaseTask = nil
-            return self.suspendedTerminationNamespaces
+            self.terminationCancellationRequested = true
+            self.state = .draining
+            return (self.suspendedTerminationNamespaces, self.terminationNamespaceCloseBatch)
         }
-        if let readyNamespaces {
-            rollbackTermination(namespaces: readyNamespaces)
+        if let (namespaces, closeBatch) = readyRollback {
+            if closeBatch?.isComplete != false {
+                rollbackTermination(namespaces: namespaces)
+            } else {
+                scheduleTerminationRollback(namespaces: namespaces, after: closeBatch)
+            }
         }
     }
 
@@ -607,11 +660,24 @@ public final class AgentLifecycle: @unchecked Sendable {
         // before the drain. Durable authorization remains the source of truth for
         // a normal restart, while this snapshot also covers an owner that was
         // already active when shutdown began.
-        let suspendedNamespaceAccounts = setLockedReturning {
-            Set(namespaceSessions.keys)
+        let suspended = setLockedReturning { () -> (Set<Int64>, [OwnedNamespaceSession]) in
+            let accounts = Set(namespaceSessions.keys)
+            let owned = Array(namespaceSessions.values)
+            namespaceSessions.removeAll()
+            namespaceProgress.removeAll()
+            namespaceTokens.removeAll()
+            namespaceReadyAccounts.removeAll()
+            namespaceDegradations.removeAll()
+            namespaceRecoveryScheduled.removeAll()
+            namespaceRecoveryAttempts.removeAll()
+            return (accounts, owned)
         }
-        setLocked { self.suspendedTerminationNamespaces = suspendedNamespaceAccounts }
-        stopAllNamespaces()
+        let suspendedNamespaceAccounts = suspended.0
+        let namespaceCloseBatch = NamespaceCloseBatch(suspended.1.map(\.session))
+        setLocked {
+            self.suspendedTerminationNamespaces = suspendedNamespaceAccounts
+            self.terminationNamespaceCloseBatch = namespaceCloseBatch
+        }
 
         let outcome = await transfers.drain(
             gracePeriod: configuration.drainGracePeriod,
@@ -622,23 +688,49 @@ public final class AgentLifecycle: @unchecked Sendable {
             if outcome.abandoned > 0 {
                 record("drain-abandoned:\(outcome.abandoned)")
             }
+            await namespaceCloseBatch.waitUntilComplete()
             rollbackTermination(namespaces: suspendedNamespaceAccounts)
             return outcome
         }
 
-        if let request = setLockedReturning({ self.terminationRequest }) {
+        // Namespace shutdown gets the same bounded cancellation interval as
+        // transfers. A committed process may exit after that boundary, but a
+        // rollback must wait for the old owner before creating a replacement.
+        let namespaceCloseCompleted = await namespaceCloseBatch.wait(
+            timeout: configuration.drainCancelWait
+        )
+        let completion = setLockedReturning { () -> (
+            cancellationRequested: Bool, request: ControlTerminationRequest?
+        ) in
+            if terminationCancellationRequested {
+                return (true, nil)
+            }
+            if let terminationRequest {
+                state = .terminationReady
+                return (false, terminationRequest)
+            }
+            return (false, nil)
+        }
+        if completion.cancellationRequested {
+            await namespaceCloseBatch.waitUntilComplete()
+            rollbackTermination(namespaces: suspendedNamespaceAccounts)
+            return outcome
+        }
+
+        if let request = completion.request {
             // The completed transfer drain is intentionally reversible until the
             // companion has observed this request-correlated state and sent commit.
             // If that companion or its response path vanishes, the lease below
             // restores admission and namespace owners instead of permitting a late
             // helper exit after AppKit has replied false.
-            setLocked { self.state = .terminationReady }
             scheduleTerminationLease(for: request)
             record("termination-ready")
             return outcome
         }
 
-        let (observation, server, hydration, control, instance) = releaseResourcesAndStop()
+        let (observation, server, hydration, control, instance) = releaseResourcesAndStop(
+            releaseDurableOwnership: namespaceCloseCompleted
+        )
         observation?.cancel()
         control?.stop()
         // Generated paths are retained through ordinary materialization EOF. The
@@ -676,7 +768,9 @@ public final class AgentLifecycle: @unchecked Sendable {
             self.terminationCancellationRequested = false
             self.terminationLeaseTask?.cancel()
             self.terminationLeaseTask = nil
+            self.terminationRollbackTask = nil
             self.terminationCommitClaimed = false
+            self.terminationNamespaceCloseBatch = nil
         }
         transfers.resumeAdmission()
         restartNamespaces(including: namespaces)
@@ -685,6 +779,26 @@ public final class AgentLifecycle: @unchecked Sendable {
             self.state = .terminationCancelled
         }
         record("termination-cancelled")
+    }
+
+    private func scheduleTerminationRollback(
+        namespaces: Set<Int64>,
+        after closeBatch: NamespaceCloseBatch?
+    ) {
+        let task = Task { [weak self] in
+            await closeBatch?.waitUntilComplete()
+            guard let self else { return }
+            let shouldRollback = self.setLockedReturning {
+                self.terminationCancellationRequested && !self.terminationCommitClaimed
+            }
+            if shouldRollback {
+                self.rollbackTermination(namespaces: namespaces)
+            }
+        }
+        setLocked {
+            self.terminationRollbackTask?.cancel()
+            self.terminationRollbackTask = task
+        }
     }
 
     /// Re-reads the durable settings document and applies it to the
@@ -1303,7 +1417,10 @@ public final class AgentLifecycle: @unchecked Sendable {
     /// Synchronous teardown bookkeeping for ``shutdown(reason:)`` —
     /// `NSLock` may not be taken from an async context, so the locked
     /// extraction lives in this sync helper.
-    private func releaseResourcesAndStop(publishStopped: Bool = true) -> (
+    private func releaseResourcesAndStop(
+        publishStopped: Bool = true,
+        releaseDurableOwnership: Bool = true
+    ) -> (
         PowerEventObservation?, AgentHealthServer?, HydrationServer?, ControlServer?,
         SingleInstanceLock?
     ) {
@@ -1316,11 +1433,20 @@ public final class AgentLifecycle: @unchecked Sendable {
         healthServer = nil
         hydrationServer = nil
         controlServer = nil
-        instanceLock = nil
-        store = nil
-        core = nil
+        if releaseDurableOwnership {
+            instanceLock = nil
+            store = nil
+            core = nil
+            terminationNamespaceCloseBatch = nil
+        }
         if publishStopped { state = .stopped }
-        return resources
+        return (
+            resources.0,
+            resources.1,
+            resources.2,
+            resources.3,
+            releaseDurableOwnership ? resources.4 : nil
+        )
     }
 
     /// Atomically claims the prepared termination before any endpoint is
