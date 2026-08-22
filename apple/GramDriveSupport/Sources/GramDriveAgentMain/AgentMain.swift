@@ -22,6 +22,7 @@ import GramDriveSupport
 ///                             roughly N ms (the contract's boundary
 ///                             probe), so shutdown-drain behavior is
 ///                             observable end to end (smoke, diagnostics)
+///     --test-namespace-close-delay-ms N  DEBUG-only blocking close fixture
 ///     --timeout-ms N          health fetch timeout (health; default 5000)
 ///
 /// Exit codes: 0 success/clean shutdown; 2 another agent already runs over
@@ -79,6 +80,9 @@ enum AgentMain {
             let testTerminationHardExitWatchdog = integerOption(
                 options, "test-termination-hard-exit-watchdog-ms"
             ).map { Duration.milliseconds($0) }
+            let testNamespaceCloseDelay = integerOption(
+                options, "test-namespace-close-delay-ms"
+            )
             let testFinderHierarchyReady =
                 boolOption(options, "test-finder-hierarchy-ready") ?? false
             if testFinderHierarchyReady {
@@ -110,7 +114,12 @@ enum AgentMain {
                 guard let state = ObservedAuthorizationState(rawValue: rawState) else {
                     fail("test-observed-authorization has an invalid state", code: 64)
                 }
-                namespaceBootstrapper = AuthorizationHealthProbeBootstrapper(state: state)
+                namespaceBootstrapper = AuthorizationHealthProbeBootstrapper(
+                    state: state,
+                    closeDelayMilliseconds: testNamespaceCloseDelay,
+                    closeEnteredMarker: AgentRuntimeLayout(dataRoot: dataRoot).agentDirectory
+                        .appendingPathComponent("test-namespace-close-entered")
+                )
             } else {
                 namespaceBootstrapper = CoreNamespaceBootstrapper(
                     configuration: authConfiguration, vault: vault)
@@ -510,6 +519,8 @@ enum AgentMain {
     /// account on CI.
     private struct AuthorizationHealthProbeBootstrapper: AgentNamespaceBootstrapping {
         let state: ObservedAuthorizationState
+        let closeDelayMilliseconds: Int?
+        let closeEnteredMarker: URL
 
         func start(
             accountId _: Int64,
@@ -525,19 +536,39 @@ enum AgentMain {
             case .unavailable:
                 onProgress(.preparing)
             }
-            return AuthorizationHealthProbeSession()
+            return AuthorizationHealthProbeSession(
+                closeDelayMilliseconds: closeDelayMilliseconds,
+                closeEnteredMarker: closeEnteredMarker
+            )
         }
     }
 
     private final class AuthorizationHealthProbeSession: AgentNamespaceSessionHosting,
         @unchecked Sendable
     {
+        private let closeDelayMilliseconds: Int?
+        private let closeEnteredMarker: URL
+
+        init(closeDelayMilliseconds: Int?, closeEnteredMarker: URL) {
+            self.closeDelayMilliseconds = closeDelayMilliseconds
+            self.closeEnteredMarker = closeEnteredMarker
+        }
+
         func setChatHistoryPriority(
             chatId _: Int64,
             priority _: AgentChatHistoryPriority
         ) throws {}
 
-        func close() {}
+        func close() {
+            guard let closeDelayMilliseconds else { return }
+            _ = FileManager.default.createFile(
+                atPath: closeEnteredMarker.path,
+                contents: Data()
+            )
+            Thread.sleep(
+                forTimeInterval: Double(max(0, closeDelayMilliseconds)) / 1000
+            )
+        }
     }
 #endif
 
