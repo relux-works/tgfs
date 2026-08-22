@@ -779,7 +779,7 @@ class WorkflowContractTests(unittest.TestCase):
     def test_release_control_cleanup_is_guarded_and_runs_after_success_or_failure(self):
         cleanup = self.stable[
             self.stable.index("Remove stable signing and candidate state"):
-            self.stable.index("  # The self-hosted macOS signer")
+            self.stable.index("  # Promotion publishes")
         ]
         self.assertIn("if: always()", cleanup)
         self.assertIn('gramdrive-release-control-*', cleanup)
@@ -913,7 +913,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(combined.count("run_with_optional_file_argument"), 5)
 
     def test_stable_promotion_never_builds_or_resigns_apple_code(self):
-        promote = self.stable[self.stable.index("  promote:"):self.stable.index("  deploy-pages:")]
+        promote = self.stable[self.stable.index("  promote:"):self.stable.index("  recover-pages:")]
         for forbidden in ("MACOS_CERT_P12", "APPSTORE_PRIVATE_KEY", "notarytool", "codesign", "make package", "swift build", "cargo build"):
             self.assertNotIn(forbidden, promote)
         self.assertIn("steps.candidate.outputs.dmg_name", promote)
@@ -955,44 +955,40 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("id-token: write", deploy)
         self.assertNotIn("contents: write", deploy)
         self.assertNotIn("SPARKLE_STABLE", deploy)
-        promote = self.stable[self.stable.index("  promote:"):self.stable.index("  deploy-pages:")]
+        promote = self.stable[self.stable.index("  promote:"):self.stable.index("  recover-pages:")]
         self.assertNotIn("pages: write", promote)
         self.assertIn("environment: release", promote)
 
     def test_promote_has_no_gnu_tar_pages_upload_dependency(self):
         promote = self.stable[
-            self.stable.index("  promote:"):self.stable.index("  prepare-pages:")
+            self.stable.index("  promote:"):self.stable.index("  recover-pages:")
         ]
         self.assertIn("runs-on: [self-hosted, gramdrive-mac]", promote)
         self.assertNotIn("actions/upload-pages-artifact", promote)
         self.assertNotIn("gtar", promote)
 
-    def test_ubuntu_pages_preparation_uploads_only_the_authenticated_release_site(self):
-        prepare = self.stable[
-            self.stable.index("  prepare-pages:"):self.stable.index("  recover-pages:")
-        ]
-        self.assertIn("needs: promote", prepare)
-        self.assertIn("runs-on: ubuntu-latest", prepare)
-        self.assertIn("contents: read", prepare)
-        self.assertNotIn("contents: write", prepare)
-        self.assertNotIn("SPARKLE_STABLE", prepare)
-        for asset in (
-            "stable-pages-site.tar.gz",
-            "stable-pages-site-manifest.json",
-            "stable-pages-site-manifest.signature.txt",
-            "stable-pages-site.attestation.json",
-        ):
-            self.assertIn(asset, prepare)
-        attest = prepare.index("gh attestation verify")
-        unpack = prepare.index("unpack-tree")
-        verify = prepare.index("verify-site")
-        upload = prepare.index("actions/upload-pages-artifact")
-        self.assertLess(attest, unpack)
-        self.assertLess(unpack, verify)
-        self.assertLess(verify, upload)
-        self.assertIn('--source-digest "${{ needs.promote.outputs.commit }}"', prepare)
-        self.assertIn("--site .temp/stable-pages/site", prepare)
-        self.assertIn("path: .temp/stable-pages/site", prepare)
+    def test_tag_promotion_stops_before_pages_and_main_redeploy_is_the_only_deploy_path(self):
+        promote = self.stable[self.stable.index("  promote:"):self.stable.index("  recover-pages:")]
+        self.assertNotIn("actions/upload-pages-artifact", promote)
+        self.assertNotIn("actions/deploy-pages", promote)
+        self.assertNotIn("  prepare-pages:", self.stable)
+
+        recovery = self.stable[self.stable.index("  recover-pages:"):self.stable.index("  deploy-pages:")]
+        self.assertIn("github.event_name == 'workflow_dispatch'", recovery)
+        self.assertIn("github.ref == 'refs/heads/main'", recovery)
+        self.assertIn("inputs.operation == 'redeploy-site'", recovery)
+        self.assertIn("ref: ${{ github.sha }}", recovery)
+        self.assertNotIn("ref: main", recovery)
+        self.assertIn("environment: release", recovery)
+        self.assertIn("actions/upload-pages-artifact", recovery)
+
+        deploy = self.stable[self.stable.index("  deploy-pages:"):]
+        self.assertIn("needs: recover-pages", deploy)
+        self.assertIn("github.event_name == 'workflow_dispatch'", deploy)
+        self.assertIn("github.ref == 'refs/heads/main'", deploy)
+        self.assertIn("inputs.operation == 'redeploy-site'", deploy)
+        self.assertIn("needs.recover-pages.result == 'success'", deploy)
+        self.assertNotIn("needs.promote", deploy)
 
     def test_old_complete_site_has_approval_gated_keyless_recovery(self):
         recovery = self.stable[self.stable.index("  recover-pages:"):self.stable.index("  deploy-pages:")]
@@ -1005,7 +1001,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("contents: write", recovery)
         self.assertNotIn("SPARKLE_STABLE", recovery)
         deploy = self.stable[self.stable.index("  deploy-pages:"):]
-        self.assertIn("needs: [prepare-pages, recover-pages]", deploy)
+        self.assertIn("needs: recover-pages", deploy)
 
 
 if __name__ == "__main__":

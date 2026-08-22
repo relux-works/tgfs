@@ -518,67 +518,17 @@ jobs:
           case "${RELEASE_CONTROL_DIR:-}" in "$runner_temp_real"/gramdrive-release-control-*) rm -rf "$RELEASE_CONTROL_DIR" ;; esac
           rm -rf .temp/stable
 
-  # The self-hosted macOS signer publishes the frozen authenticated site to the
-  # immutable stable Release, then stops. A GitHub-hosted Ubuntu job downloads
-  # and re-verifies those exact assets before invoking the Pages artifact action,
-  # so first-pass promotion has no GNU tar dependency on the signing runner.
-  prepare-pages:
-    name: verify-and-upload-promoted-stable-site
-    needs: promote
-    if: needs.promote.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout the exact promoted publication verifier
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ needs.promote.outputs.tag }}
-          fetch-depth: 1
-          clean: true
-
-      - name: Download and authenticate the exact promoted complete site
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ needs.promote.outputs.commit }}"
-          mkdir -p .temp/stable-pages
-          gh release download "${{ needs.promote.outputs.tag }}" \
-            --pattern stable-pages-site.tar.gz \
-            --pattern stable-pages-site-manifest.json \
-            --pattern stable-pages-site-manifest.signature.txt \
-            --pattern stable-pages-site.attestation.json \
-            --dir .temp/stable-pages
-          for subject in stable-pages-site.tar.gz stable-pages-site-manifest.json stable-pages-site-manifest.signature.txt; do
-            gh attestation verify ".temp/stable-pages/$subject" \
-              --repo "$GITHUB_REPOSITORY" \
-              --bundle .temp/stable-pages/stable-pages-site.attestation.json \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "${{ needs.promote.outputs.commit }}"
-          done
-          python3 .scripts/release/publish_sparkle.py unpack-tree \
-            --archive .temp/stable-pages/stable-pages-site.tar.gz \
-            --output .temp/stable-pages/site
-          python3 .scripts/release/publish_sparkle.py verify-site \
-            --site .temp/stable-pages/site \
-            --archive .temp/stable-pages/stable-pages-site.tar.gz \
-            --manifest .temp/stable-pages/stable-pages-site-manifest.json \
-            --manifest-signature .temp/stable-pages/stable-pages-site-manifest.signature.txt \
-            --repository "$GITHUB_REPOSITORY"
-
-      - name: Upload the authenticated promoted site for isolated Pages deployment
-        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
-        with:
-          path: .temp/stable-pages/site
-
+  # Promotion publishes the frozen authenticated site to the immutable stable
+  # Release and then stops. Pages remains branch-scoped: an approved
+  # redeploy-site dispatch from protected main is the only path that uploads a
+  # Pages artifact or requests deployment.
   # Recovery never regenerates or re-signs a feed. After release approval it
   # materializes the exact complete-site archive frozen on the selected stable
   # Release, so an old valid Pages deployment remains recoverable even after
   # its candidate has aged out of the eleven-item rolling test feed.
   recover-pages:
     name: approve-exact-stable-site-redeployment
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'redeploy-site'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.operation == 'redeploy-site'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -587,7 +537,7 @@ jobs:
       - name: Checkout publication verifier
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 1
           clean: true
 
@@ -637,8 +587,8 @@ jobs:
   # artifact prepared after release-environment approval.
   deploy-pages:
     name: deploy-complete-stable-site
-    needs: [prepare-pages, recover-pages]
-    if: always() && (needs.prepare-pages.result == 'success' || needs.recover-pages.result == 'success')
+    needs: recover-pages
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.operation == 'redeploy-site' && needs.recover-pages.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       pages: write
