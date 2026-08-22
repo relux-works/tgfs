@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 @testable import GramDriveAgentCore
 import GramDriveSupport
+import SQLite3
 import Testing
 
 private final class ProcessExitFlag: @unchecked Sendable {
@@ -27,14 +28,26 @@ private final class ProcessExitFlag: @unchecked Sendable {
 /// pins the production executable boundary that AppKit observes.
 @Suite(.serialized)
 struct AgentProcessTerminationTests {
-    @Test func directSIGTERMExitsTheObservedAgentWithinItsDrainDeadline() throws {
+    @Test func directSignalsExitPastBlockedNamespaceCloseAndReleaseProcessOwnership() throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        try seedAuthorizedAccount(dataRoot: root, accountId: 42)
 
-        let agent = try startAgent(root: root)
+        let agent = try startAgent(
+            root: root,
+            extraArguments: [
+                "--test-observed-authorization", "authorized",
+                "--test-namespace-close-delay-ms", "10000",
+            ]
+        )
         defer { stopIfNeeded(agent) }
         let layout = AgentRuntimeLayout(dataRoot: root)
-        let identity = try #require(try waitForHealth(socketURL: layout.healthSocket).processIdentity)
+        let running = try waitForHealth(socketURL: layout.healthSocket) { snapshot in
+            snapshot.accounts?.count == 1
+                && snapshot.accounts?.first?.observedAuthorization == .authorized
+                && snapshot.namespaceOwnersRestored == true
+        }
+        let identity = try #require(running.processIdentity)
         let exited = ProcessExitFlag()
         let observer = DispatchSource.makeProcessSource(
             identifier: pid_t(identity.pid), eventMask: .exit, queue: .global(qos: .userInitiated)
@@ -45,11 +58,29 @@ struct AgentProcessTerminationTests {
 
         let signalledAt = ContinuousClock.now
         #expect(Darwin.kill(identity.pid, SIGTERM) == 0)
+        let closeEnteredMarker = layout.agentDirectory.appendingPathComponent(
+            "test-namespace-close-entered"
+        )
+        try waitForFile(closeEnteredMarker)
+        #expect(Darwin.kill(identity.pid, SIGINT) == 0)
         try waitForExit(identity: identity, observer: exited)
 
         #expect(signalledAt.duration(to: ContinuousClock.now) < .seconds(3))
         #expect(!processStillMatches(identity))
         #expect(exited.isMarked)
+
+        let replacement = try startAgent(
+            root: root,
+            extraArguments: ["--test-observed-authorization", "authorized"]
+        )
+        defer { stopIfNeeded(replacement) }
+        let replacementHealth = try waitForHealth(socketURL: layout.healthSocket) { snapshot in
+            snapshot.processIdentity?.pid == replacement.processIdentifier
+                && snapshot.namespaceOwnersRestored == true
+        }
+        #expect(replacementHealth.processIdentity != identity)
+        #expect(Darwin.kill(replacement.processIdentifier, SIGTERM) == 0)
+        try waitForProcessMismatch(#require(replacementHealth.processIdentity))
     }
 
     @Test func exactIdentityPrepareCommitExitsTheObservedAgentProcess() throws {
@@ -251,6 +282,43 @@ struct AgentProcessTerminationTests {
         return agent
     }
 
+    private func seedAuthorizedAccount(dataRoot: URL, accountId: Int64) throws {
+        do {
+            let store = try SharedState.open(dataRoot: dataRoot, role: .coordinator)
+            _ = try store.schemaVersion()
+        }
+        let layout = try SharedState.layout(dataRoot: dataRoot)
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(
+            layout.databaseFile,
+            &database,
+            SQLITE_OPEN_READWRITE,
+            nil
+        ) == SQLITE_OK, let database else {
+            throw AgentProcessTestError.databaseUnavailable
+        }
+        defer { sqlite3_close(database) }
+
+        let statementSQL = """
+        INSERT INTO accounts (
+            account_id, source_kind, display_name, auth_state, namespace_version,
+            retention_mode, archive_mode, created_at_ms, updated_at_ms, display_timezone
+        ) VALUES (?, 'local_tdlib', 'Private', 'authorized', 0, 'mirror', 0, 1, 1, 'UTC')
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, statementSQL, -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw AgentProcessTestError.databaseUnavailable
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_bind_int64(statement, 1, accountId) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_DONE
+        else {
+            throw AgentProcessTestError.databaseUnavailable
+        }
+    }
+
     private func stopIfNeeded(_ agent: Process) {
         let identity = processIdentity(pid: agent.processIdentifier)
         if processStillMatches(identity) {
@@ -277,10 +345,16 @@ struct AgentProcessTerminationTests {
         return executable
     }
 
-    private func waitForHealth(socketURL: URL) throws -> AgentHealthSnapshot {
+    private func waitForHealth(
+        socketURL: URL,
+        where predicate: (AgentHealthSnapshot) -> Bool = { _ in true }
+    ) throws -> AgentHealthSnapshot {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
-            if let snapshot = try? AgentHealthClient.fetch(socketURL: socketURL, timeout: .milliseconds(100)) {
+            if let snapshot = try? AgentHealthClient.fetch(
+                socketURL: socketURL,
+                timeout: .milliseconds(100)
+            ), predicate(snapshot) {
                 return snapshot
             }
             Thread.sleep(forTimeInterval: 0.02)
@@ -335,6 +409,24 @@ struct AgentProcessTerminationTests {
         throw AgentProcessTestError.processDidNotExit
     }
 
+    private func waitForProcessMismatch(_ identity: AgentProcessIdentity) throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if !processStillMatches(identity) { return }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        throw AgentProcessTestError.processDidNotExit
+    }
+
+    private func waitForFile(_ url: URL) throws {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline {
+            if FileManager.default.fileExists(atPath: url.path) { return }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        throw AgentProcessTestError.namespaceCloseDidNotStart
+    }
+
     private func processIdentity(pid: Int32) -> AgentProcessIdentity {
         var info = proc_bsdinfo()
         let count = proc_pidinfo(
@@ -363,7 +455,9 @@ struct AgentProcessTerminationTests {
 
     private enum AgentProcessTestError: Error {
         case agentExecutableMissing
+        case databaseUnavailable
         case healthUnavailable
+        case namespaceCloseDidNotStart
         case terminationNotReady
         case terminationDidNotRollBack
         case processDidNotExit
