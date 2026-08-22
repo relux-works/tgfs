@@ -27,6 +27,31 @@ private final class ProcessExitFlag: @unchecked Sendable {
 /// pins the production executable boundary that AppKit observes.
 @Suite(.serialized)
 struct AgentProcessTerminationTests {
+    @Test func directSIGTERMExitsTheObservedAgentWithinItsDrainDeadline() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let agent = try startAgent(root: root)
+        defer { stopIfNeeded(agent) }
+        let layout = AgentRuntimeLayout(dataRoot: root)
+        let identity = try #require(try waitForHealth(socketURL: layout.healthSocket).processIdentity)
+        let exited = ProcessExitFlag()
+        let observer = DispatchSource.makeProcessSource(
+            identifier: pid_t(identity.pid), eventMask: .exit, queue: .global(qos: .userInitiated)
+        )
+        observer.setEventHandler { exited.mark() }
+        observer.resume()
+        defer { observer.cancel() }
+
+        let signalledAt = ContinuousClock.now
+        #expect(Darwin.kill(identity.pid, SIGTERM) == 0)
+        try waitForExit(identity: identity, observer: exited)
+
+        #expect(signalledAt.duration(to: ContinuousClock.now) < .seconds(3))
+        #expect(!processStillMatches(identity))
+        #expect(exited.isMarked)
+    }
+
     @Test func exactIdentityPrepareCommitExitsTheObservedAgentProcess() throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
