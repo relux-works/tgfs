@@ -435,6 +435,22 @@ public final class AgentLifecycle: @unchecked Sendable {
         }
 
         do {
+            #if GRAMDRIVE_QA_FAULT_CONTROL
+            let server = try HydrationServer.startQAFaultControlled(
+                socketURL: layout.hydrationSocket,
+                registry: transfers,
+                admission: { [weak self] request in
+                    self?.admitHydration(request)
+                        ?? .refuse(
+                            HydrationFailure(
+                                category: .draining, detail: "agent is gone"
+                            )
+                        )
+                },
+                hydrator: contentHydrator,
+                faultControl: QAHydrationFaultControl(dataRoot: configuration.dataRoot)
+            )
+            #else
             let server = try HydrationServer.start(
                 socketURL: layout.hydrationSocket,
                 registry: transfers,
@@ -448,6 +464,7 @@ public final class AgentLifecycle: @unchecked Sendable {
                 },
                 hydrator: contentHydrator
             )
+            #endif
             setLocked { self.hydrationServer = server }
         } catch {
             teardownAfterFailedStart()

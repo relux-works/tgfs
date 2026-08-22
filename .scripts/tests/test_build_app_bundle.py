@@ -228,6 +228,72 @@ class FileProviderEntryPointTest(unittest.TestCase):
         self.assertIn("GramDriveFileProviderExtension.self", source)
 
 
+class QAFaultPackagingBoundaryTest(unittest.TestCase):
+    def packager(self, root: Path, *, secret=None, environ=None):
+        core = root / "core"
+        core.mkdir()
+        return app.AppPackager(
+            root,
+            root / "out",
+            identity="unsigned",
+            core_package=core,
+            runner=lambda _argv, _cwd, _env=None: (0, ""),
+            echo=lambda _line: None,
+            environ=environ or {},
+            qa_fault_secret=secret,
+        )
+
+    def bundle(self, root: Path, payload: bytes) -> Path:
+        bundle = root / "GramDrive.app"
+        for target in app.first_party_executable_paths(bundle):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        return bundle
+
+    def test_ordinary_packaging_scrubs_inherited_qa_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            packager = self.packager(
+                Path(tmp),
+                environ={
+                    app.QA_FAULT_CONTROL_ENV: "1",
+                    app.QA_FAULT_SECRET_ENV: "f" * 64,
+                },
+            )
+            env = packager.build_env()
+            self.assertNotIn(app.QA_FAULT_CONTROL_ENV, env)
+            self.assertNotIn(app.QA_FAULT_SECRET_ENV, env)
+
+    def test_explicit_qa_packaging_sets_both_compile_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            packager = self.packager(Path(tmp), secret="a" * 64)
+            env = packager.build_env()
+            self.assertEqual(env[app.QA_FAULT_CONTROL_ENV], "1")
+            self.assertEqual(env[app.QA_FAULT_SECRET_ENV], "a" * 64)
+
+    def test_ordinary_candidate_rejects_any_qa_symbol_endpoint_or_parser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            packager = self.packager(root)
+            bundle = self.bundle(root, b"ordinary-binary")
+            result = packager.verify_qa_fault_surface(bundle)
+            self.assertFalse(result["enabled"])
+            self.assertEqual(result["marker_count"], 0)
+            for marker in app.QA_FAULT_BINARY_MARKERS:
+                app.first_party_executable_paths(bundle)[0].write_bytes(marker)
+                with self.assertRaisesRegex(app.StepFailed, "non-shipping QA"):
+                    packager.verify_qa_fault_surface(bundle)
+                app.first_party_executable_paths(bundle)[0].write_bytes(b"ordinary-binary")
+
+    def test_qa_candidate_requires_all_boundary_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            packager = self.packager(root, secret="b" * 64)
+            bundle = self.bundle(root, b"\n".join(app.QA_FAULT_BINARY_MARKERS))
+            result = packager.verify_qa_fault_surface(bundle)
+            self.assertTrue(result["enabled"])
+            self.assertEqual(result["marker_count"], len(app.QA_FAULT_BINARY_MARKERS))
+
+
 class SigningOrderTest(unittest.TestCase):
     def test_nested_code_is_signed_before_the_app(self):
         # codesign refuses to seal a bundle whose nested code is unsigned, so the
