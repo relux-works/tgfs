@@ -5,6 +5,13 @@
 
 ## 2026-08-22
 
+### 2230 — Installed File Provider fault acceptance stays non-shipping (BUG-260729-3uclm3)
+
+- DECISION: the approved QA seam is compiled only when `GRAMDRIVE_QA_FAULT_CONTROL=1` and a per-build 32-byte secret are both present. The agent then accepts one owner-only App-Group-local HMAC-authenticated record scoped to an account, stable item, content/thumbnail purpose, fault class, nonce, and expiry; durable admission still runs first. No listener, testing entitlement, release error-classification change, public feed, or installed user profile is added.
+- PACKAGING BOUNDARY: ordinary app packaging deletes inherited QA build variables and scans all three first-party executables for the QA C symbol, endpoint, and parser schema, failing if any survives. The separate QA wrapper requires a mode-0600 per-build secret and marks the manifest as QA-enabled; it has no notarization/publication path.
+- ACCEPTANCE: deterministic Swift tests cover timeout, transport, renderer source-not-found, source not-found, and unavailable content over the real hydration socket, including explicit-clear recovery and admission precedence. The installed harness drives real `open` and Quick Look callbacks over ten named synthetic PNG fixtures, retains no content/identity/path evidence, asserts retryable mappings with unchanged `noSuchItem`, verifies durable parent/version/live identity, clears the fault, and proves success. Installing/running that QA bundle remains the documented external dedicated-profile action required by the owner decision.
+- LOCAL SIGNING LIMIT: an ordinary Developer ID packaging attempt reached Sparkle nested-code signing but `codesign` returned `errSecInternalComponent` for `Installer.xpc`; a prior attempt with the default staged TDLib was correctly rejected for builder-local paths. Hermetic ordinary and QA unsigned assemblies passed the same post-assembly binary marker/entitlement gates, while actual signing and installed Preview remain external acceptance actions.
+
 ### 2058 — Stable promotion and Pages deployment use separate approved refs (TASK-260810-y3zcg8 cycle 11)
 
 - LIVE FIRST-RED: tag-triggered stable run `32251770361` published the exact-byte `v0.1.3` Release and authenticated complete-site assets, but `deploy-complete-stable-site` was rejected before execution because branch-scoped `github-pages` does not allow tag ref `v0.1.3`. The prior valid Pages site remained live and byte-identical.

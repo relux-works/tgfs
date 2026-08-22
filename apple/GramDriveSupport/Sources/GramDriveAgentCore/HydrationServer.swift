@@ -163,6 +163,9 @@ public final class HydrationServer: @unchecked Sendable {
     private let admission: @Sendable (HydrationRequest) -> HydrationAdmission
     private let hydrator: any ContentHydrating
     private let configuration: HydrationServerConfiguration
+    #if GRAMDRIVE_QA_FAULT_CONTROL
+    private var qaFaultControl: QAHydrationFaultControl?
+    #endif
 
     private var listener: Int32?
     private var acceptSource: (any DispatchSourceRead)?
@@ -179,6 +182,46 @@ public final class HydrationServer: @unchecked Sendable {
         admission: @escaping @Sendable (HydrationRequest) -> HydrationAdmission,
         hydrator: any ContentHydrating,
         configuration: HydrationServerConfiguration = HydrationServerConfiguration()
+    ) throws -> HydrationServer {
+        let server = try makeServer(
+            socketURL: socketURL,
+            registry: registry,
+            admission: admission,
+            hydrator: hydrator,
+            configuration: configuration)
+        server.startAccepting()
+        return server
+    }
+
+    #if GRAMDRIVE_QA_FAULT_CONTROL
+    /// QA-only start surface. The symbol and its fault parser are not emitted
+    /// unless the package was built with `GRAMDRIVE_QA_FAULT_CONTROL`.
+    static func startQAFaultControlled(
+        socketURL: URL,
+        registry: TransferRegistry,
+        admission: @escaping @Sendable (HydrationRequest) -> HydrationAdmission,
+        hydrator: any ContentHydrating,
+        faultControl: QAHydrationFaultControl,
+        configuration: HydrationServerConfiguration = HydrationServerConfiguration()
+    ) throws -> HydrationServer {
+        let server = try makeServer(
+            socketURL: socketURL,
+            registry: registry,
+            admission: admission,
+            hydrator: hydrator,
+            configuration: configuration)
+        server.qaFaultControl = faultControl
+        server.startAccepting()
+        return server
+    }
+    #endif
+
+    private static func makeServer(
+        socketURL: URL,
+        registry: TransferRegistry,
+        admission: @escaping @Sendable (HydrationRequest) -> HydrationAdmission,
+        hydrator: any ContentHydrating,
+        configuration: HydrationServerConfiguration
     ) throws -> HydrationServer {
         let path = socketURL.path
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -206,7 +249,6 @@ public final class HydrationServer: @unchecked Sendable {
             admission: admission,
             hydrator: hydrator,
             configuration: configuration)
-        server.startAccepting()
         return server
     }
 
@@ -365,6 +407,28 @@ public final class HydrationServer: @unchecked Sendable {
             remove(connection)
             return
         }
+
+        #if GRAMDRIVE_QA_FAULT_CONTROL
+        if let disposition = qaFaultControl?.disposition(for: request) {
+            switch disposition {
+            case .timeout:
+                // The QA File Provider client uses a one-second idle bound.
+                // Hold the real connection without an event long enough for
+                // its transport timeout, then retire this worker.
+                Thread.sleep(forTimeInterval: 2)
+                connection.finish()
+            case .transport:
+                // EOF without a terminal event exercises the real client
+                // transport mapping, not a wire-level synthetic failure.
+                connection.finish()
+            case .failure(let category):
+                connection.refuse(
+                    HydrationFailure(category: category, detail: "qa injected failure"))
+            }
+            remove(connection)
+            return
+        }
+        #endif
 
         let ticket: TransferTicket
         do {

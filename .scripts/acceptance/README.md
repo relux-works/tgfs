@@ -1,6 +1,6 @@
 # Acceptance runners
 
-Seven scripts live here, one per kind of acceptance the project gates on:
+Eight scripts live here, one per kind of acceptance the project gates on:
 
 | Script | Kind | Runs unattended? |
 |---|---|---|
@@ -10,6 +10,7 @@ Seven scripts live here, one per kind of acceptance the project gates on:
 | `run_installed_history_convergence.py` | Installed authorized-profile account-wide history convergence, bounded CPU/Finder enumeration, dataless-media, and relaunch comparison | **Yes, on the authorized local macOS profile.** Chat identities and cursor bounds remain only in its temporary private state; public evidence is aggregate-only. |
 | `run_installed_index_metadata.py` | Installed authorized-profile chat-index convergence reach, directory size rollups, and correspondence dates, compared across an app + agent relaunch | **Yes, on the authorized local macOS profile.** Public evidence is counts, booleans, and byte totals only; cursor bounds live behind a per-run salted digest in a caller-chosen private directory. |
 | `run_installed_foreground_demand.py` | Installed authorized-profile check that using a chat in Finder buys it a history turn, with no control-socket hint anywhere: reading one generated document inside it (`--gesture read`, the acceptance boolean) or only opening its folder (`--gesture open`, the platform-truth record) | **Yes, on the authorized local macOS profile.** Public evidence is counts, booleans, seconds, and message deltas only; the chosen chat's identity, the document read, and its raw cursor readings stay in a caller-chosen private file. |
+| `run_installed_fault_recovery.py` | QA-only installed Open/content and Quick Look/thumbnail failure-preservation matrix | **Only in a dedicated QA macOS profile with the compile-time QA bundle.** Uses synthetic image fixtures; publishes no identities, paths, or content. |
 | `run_native_macos.py` | The macOS **native manual acceptance** — the ten File Provider Finder flows the release gate requires | **No.** Human-in-the-loop by necessity (below). |
 
 This README covers `run_native_macos.py`. For the gate runner, see the repo
@@ -109,6 +110,59 @@ Which gesture to run, and why there are two:
 
 Its `before` phase deliberately asserts nothing — it is a measurement of the
 build being replaced, and a pre-fix build is expected to fail every check.
+
+## BUG-260729-3uclm3 installed fault-recovery acceptance
+
+This runner cannot arm an ordinary GramDrive candidate. The QA parser, fixed
+record endpoint, and per-build authentication secret are compiled only by
+`build_qa_fault_bundle.py`; ordinary packaging scrubs the build variables and
+scans the assembled binaries to prove all three markers are absent. Neither
+bundle uses `com.apple.developer.fileprovider.testing-mode`, a listener, or a
+new entitlement.
+
+Exact external procedure (not run on a preserved user profile):
+
+1. Use a dedicated macOS QA user/profile. In a synthetic Telegram fixture chat,
+   provide ten small PNG attachments named
+   `gramdrive-qa-fault-{content,thumbnail}-{timeout,transport,renderer_source_not_found,source_not_found,unavailable_content}.png`.
+2. From a clean task worktree, create a private per-build key and stage the
+   real TDLib-linked core:
+
+   ```bash
+   umask 077
+   openssl rand -hex -out .temp/BUG-260729-3uclm3_qa-secret 32
+   GRAMDRIVE_TDLIB_ARTIFACT_DIR=.temp/tdlib/out make package
+   ```
+
+3. Build the non-shipping signed QA bundle. It is never notarized or published:
+
+   ```bash
+   python3 .scripts/apple-app/build_qa_fault_bundle.py \
+     --secret-file .temp/BUG-260729-3uclm3_qa-secret \
+     --out-dir .temp/BUG-260729-3uclm3_qa-package
+   ```
+
+4. Inspect `manifest.json`: `qa_fault_control.enabled` and
+   `binary_boundary_verified` must both be true. Verify app/agent/appex
+   entitlements contain no File Provider testing-mode entitlement. Install this
+   QA artifact only in the dedicated QA profile, authorize the synthetic
+   account, and wait until all ten fixture placeholders are visible and
+   dataless.
+5. Run the matrix:
+
+   ```bash
+   python3 .scripts/acceptance/run_installed_fault_recovery.py \
+     --secret-file .temp/BUG-260729-3uclm3_qa-secret \
+     --evidence .temp/BUG-260729-3uclm3_installed-fault-recovery.json
+   ```
+
+The runner arms one authenticated fault for one stable item and operation,
+triggers `open -g` for the real content callback or `qlmanage -t` for the real
+thumbnail callback, checks aggregate provider telemetry plus the durable row,
+clears the record, and retries. Quick Look output is confined to a mode-0700
+temporary directory and deleted immediately. Evidence contains only fixed fault
+labels, counts, and booleans. A safe installed run remains an external action
+because this developer run must not replace the preserved installed profile.
 
 ## What `run_native_macos.py` is for
 

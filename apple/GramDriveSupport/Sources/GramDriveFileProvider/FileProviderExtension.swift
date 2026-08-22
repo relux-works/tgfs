@@ -90,10 +90,7 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
                 AgentControlEndpoint.socketURL(dataRoot: try dataRoot())
             })
         self.providerFetchHealth = healthSignaler
-        let hydrationClient = hydration
-            ?? AgentHydrationClient(socketURL: {
-                HydrationContract.socketURL(dataRoot: try dataRoot())
-            })
+        let hydrationClient = hydration ?? Self.agentHydrationClient(dataRoot: dataRoot)
         self.contentFetcher = ContentFetcher(
             hydration: hydrationClient,
             scratchDirectory: fetchScratchDirectory
@@ -104,6 +101,22 @@ public final class GramDriveFileProviderExtension: NSObject, NSFileProviderRepli
             hydration: hydrationClient,
             telemetry: ProviderFetchTelemetry(health: healthSignaler))
         super.init()
+    }
+
+    private static func agentHydrationClient(
+        dataRoot: @escaping @Sendable () throws -> URL
+    ) -> AgentHydrationClient {
+        #if GRAMDRIVE_QA_FAULT_CONTROL
+        // QA-only bound makes the installed timeout fault deterministic and
+        // bounded. Ordinary builds retain the production 60-second idle cap.
+        return AgentHydrationClient(
+            socketURL: { HydrationContract.socketURL(dataRoot: try dataRoot()) },
+            idleTimeout: .seconds(1))
+        #else
+        return AgentHydrationClient(socketURL: {
+            HydrationContract.socketURL(dataRoot: try dataRoot())
+        })
+        #endif
     }
 
     /// The default scratch location for fetched content: the domain's

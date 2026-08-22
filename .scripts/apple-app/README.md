@@ -6,6 +6,14 @@ the File Provider extension appex — assembled from the `apple/GramDriveSupport
 SwiftPM package over the staged Rust core, and the provenance that makes the
 result attributable to a commit without embedding any credential.
 
+`build_qa_fault_bundle.py` is the explicit non-shipping wrapper used only for
+BUG-260729-3uclm3 installed File Provider fault acceptance. It requires a
+private mode-0600 per-build secret and enables a compile-time Swift target that
+ordinary `build_app_bundle.py` actively scrubs and rejects at the binary-byte
+boundary. QA builds must not be notarized, uploaded, or installed over a real
+user profile; see `.scripts/acceptance/README.md` for the dedicated-profile
+procedure.
+
 Owned by TASK-260715-1dk9ik (STORY-260715-2ca0k9, EPIC-260715-3i9uyp). The
 tag-triggered GitHub `release.yml` that *invokes* this script is a separate task
 (TASK-260715-3bhbkv); this directory owns the pipeline, not the CI wiring.

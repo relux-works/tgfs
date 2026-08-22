@@ -92,6 +92,13 @@ FORBIDDEN_RUNTIME_PATH_MARKERS = (
     b"/private/tmp/",
     b"/var/folders/",
 )
+QA_FAULT_CONTROL_ENV = "GRAMDRIVE_QA_FAULT_CONTROL"
+QA_FAULT_SECRET_ENV = "GRAMDRIVE_QA_FAULT_SECRET"
+QA_FAULT_BINARY_MARKERS = (
+    b"_gramdrive_qa_fault_secret",
+    b"qa-fault-control-v1.json",
+    b"gramdrive.qa-fault-control.v1",
+)
 
 # Identity and naming, all sourced from .spec/platform-requirements.md and
 # TASK-260716-1jswke, never invented here.
@@ -271,6 +278,16 @@ BINARIES: tuple[BinarySpec, ...] = (
 # appex's — both read GramDrive*, never the SwiftPM product name.
 APP_EXECUTABLE_NAME = "GramDrive"
 APPEX_EXECUTABLE_NAME = "GramDriveFileProvider"
+
+
+def first_party_executable_paths(app: Path) -> tuple[Path, ...]:
+    """The three executable files (not their app/appex signing bundles)."""
+    return (
+        app
+        / f"Contents/PlugIns/{APPEX_BUNDLE_NAME}/Contents/MacOS/{APPEX_EXECUTABLE_NAME}",
+        app / "Contents/MacOS/gramdrive-agent",
+        app / "Contents/MacOS" / APP_EXECUTABLE_NAME,
+    )
 
 Runner = Callable[[Sequence[str], Path, "dict[str, str] | None"], "tuple[int, str]"]
 
@@ -725,6 +742,7 @@ class AppPackager:
         runner: Runner = default_runner,
         echo: Callable[[str], None] = print,
         environ: dict[str, str] | None = None,
+        qa_fault_secret: str | None = None,
     ):
         self.repo_root = repo_root
         self.out_dir = out_dir
@@ -733,6 +751,9 @@ class AppPackager:
         self.runner = runner
         self.echo = echo
         self.environ = environ
+        if qa_fault_secret is not None and not re.fullmatch(r"[0-9a-f]{64}", qa_fault_secret):
+            raise StepFailed("QA fault secret must be exactly 32 lowercase hex bytes")
+        self.qa_fault_secret = qa_fault_secret
         self.log_dir = out_dir / "logs"
 
     def run(self, name: str, argv: Sequence[str], *, cwd: Path | None = None, env=None) -> str:
@@ -758,6 +779,13 @@ class AppPackager:
         artifact.
         """
         env = dict(self.environ if self.environ is not None else os.environ)
+        # Ordinary packaging fails closed even if a caller's shell happens to
+        # carry QA variables. Only the separate QA packager can opt in.
+        env.pop(QA_FAULT_CONTROL_ENV, None)
+        env.pop(QA_FAULT_SECRET_ENV, None)
+        if self.qa_fault_secret is not None:
+            env[QA_FAULT_CONTROL_ENV] = "1"
+            env[QA_FAULT_SECRET_ENV] = self.qa_fault_secret
         env["GRAMDRIVE_CORE_PACKAGE"] = str(self.core_package)
         if self.core_tdjson_linked():
             env["LIBRARY_PATH"] = str(self.core_package / "lib")
@@ -1069,6 +1097,32 @@ class AppPackager:
             agent_launchd_plist(),
         )
         return app
+
+    def verify_qa_fault_surface(self, app: Path) -> dict:
+        """Prove the compile-time QA parser is present only in QA bytes.
+
+        This reads every first-party executable after assembly. Normal signed
+        candidates must contain none of the C symbol, endpoint, or schema
+        marker; the dedicated QA build must contain all three. No build secret
+        is returned or written to the manifest.
+        """
+        targets = first_party_executable_paths(app)
+        payload = b"".join(target.read_bytes() for target in targets)
+        found = {marker.decode("ascii"): marker in payload for marker in QA_FAULT_BINARY_MARKERS}
+        expected = self.qa_fault_secret is not None
+        if expected and not all(found.values()):
+            missing = [name for name, present in found.items() if not present]
+            raise StepFailed("QA fault-control build is missing markers: " + ", ".join(missing))
+        if not expected and any(found.values()):
+            leaked = [name for name, present in found.items() if present]
+            raise StepFailed(
+                "ordinary candidate contains non-shipping QA fault-control surface: "
+                + ", ".join(leaked))
+        return {
+            "enabled": expected,
+            "binary_boundary_verified": True,
+            "marker_count": sum(found.values()),
+        }
 
     # -- Sparkle ---------------------------------------------------------
 
@@ -1744,6 +1798,7 @@ def package(
     update_feed_generation: int = 1,
     update_public_key: str | None = None,
     build_number: str | None = None,
+    qa_fault_secret: str | None = None,
 ) -> dict:
     """Run the whole pipeline and return the manifest.
 
@@ -1760,6 +1815,7 @@ def package(
         runner=runner,
         echo=echo,
         environ=environ,
+        qa_fault_secret=qa_fault_secret,
     )
     environ = environ if environ is not None else os.environ
     update = update_configuration(
@@ -1840,6 +1896,8 @@ def package(
             post_staple_verification = packager.verify_notarized_targets(app, dmg)
             spctl_verdict = post_staple_verification["gatekeeper"]["app"]
 
+    qa_fault_surface = packager.verify_qa_fault_surface(app)
+
     manifest = build_manifest(
         product_version={
             "short": short_version,
@@ -1880,6 +1938,7 @@ def package(
         ),
     }
     manifest["third_party"] = third_party
+    manifest["qa_fault_control"] = qa_fault_surface
 
     checksums: dict[str, str] = {}
     if dmg is not None:
