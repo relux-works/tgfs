@@ -3,6 +3,14 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-08-22
+
+### 2058 — Stable promotion and Pages deployment use separate approved refs (TASK-260810-y3zcg8 cycle 11)
+
+- LIVE FIRST-RED: tag-triggered stable run `32251770361` published the exact-byte `v0.1.3` Release and authenticated complete-site assets, but `deploy-complete-stable-site` was rejected before execution because branch-scoped `github-pages` does not allow tag ref `v0.1.3`. The prior valid Pages site remained live and byte-identical.
+- RECOVERY: approved protected-main `redeploy-site(v0.1.3)` run `32252023197` downloaded and authenticated the frozen Release site, then deployed it successfully without rebuilding, re-signing, moving the tag, replacing Release assets, or downgrading the feed.
+- CONTRACT: stable publication is now an explicit two-step operation. A `v*` tag or protected-main promotion publishes the immutable Release and stops; a separately approved `redeploy-site` dispatch from protected `main` is the only path that uploads and deploys Pages. The `release` environment therefore permits reviewed `v*` tags and protected `main`, while `github-pages` remains restricted to protected `main`.
+
 ## 2026-08-19
 
 ### 1715 — Old-tag stable reruns preserve trusted workflow control (TASK-260810-y3zcg8 cycle 9)

@@ -4,7 +4,7 @@ This public runbook is the operator contract for Sparkle update delivery. Never 
 
 ## One-time bootstrap
 
-1. Create `updates-test`, restricted to protected `main`, with no approval rule. Create `release`, restricted to validated `v*` tags, with an owner reviewer and no self-review/bypass where GitHub supports it. Enable Pages from GitHub Actions.
+1. Create `updates-test`, restricted to protected `main`, with no approval rule. Create `release` with an owner reviewer and no self-review/bypass where GitHub supports it; its deployment-ref policy must permit both protected `main` workflow dispatches and validated `v*` tag promotions. Create `github-pages` with a deployment-ref policy restricted to protected `main`, and enable Pages from GitHub Actions.
 2. Provision a dedicated runner account and label. Permit only trusted signing workflows; block untrusted concurrent jobs, interactive access, unrelated processes, and untrusted runner administration while signing runs. Treat workflow and runner-admin changes as signing-key access.
 3. Use a local operator machine and a non-synchronised, owner-only staging directory. Its directory mode must be `0700` and each named input file mode `0600`; obtain the bytes out of band and never type them into a terminal. The file contents are, respectively, the base64 Developer ID `.p12`, its export password, and the three replacement notary fields. Do not leave this directory on the runner.
 4. Store the five Apple credentials with the repository helper. It validates the permissions before reading each file, streams each value to `gh secret set NAME --env updates-test` on stdin, and prints only public names:
@@ -51,6 +51,23 @@ This public runbook is the operator contract for Sparkle update delivery. Never 
 7. A `release` owner approves stable promotion only after the candidate's exact checksum, commit, build, Apple verification, test-feed verification, and second-Mac evidence are recorded.
 
 After storage, remove the staging files and directory using the organisation's approved local destruction procedure, then record only generation, custodian, authorization, and time for offline escrow. The preflight calls only `gh secret list --env ...`, compares names, and returns non-zero for a missing or unexpected name.
+
+## Stable promotion and Pages deployment
+
+Stable publication is deliberately two-step so the `github-pages` environment remains restricted to protected `main`:
+
+1. Push the reviewed immutable `vMAJOR.MINOR.PATCH` tag, or dispatch `promote`/`rotate-key` from protected `main`, and approve the `release` environment. The promotion must publish and attest the exact candidate DMG plus the complete frozen Pages site on the immutable stable Release. It intentionally does not request a Pages deployment.
+2. Verify that the Release contains the complete expected immutable asset inventory and that promotion recorded no byte mismatch. If promotion stopped partway through Release publication, rerun the same tag or main-based promotion operation; immutable comparison makes the rerun resumable. Do not deploy an incomplete Release.
+3. From protected `main`, dispatch the approved site deployment for that exact tag:
+
+   ```sh
+   gh workflow run release.yml --ref main \
+     --field operation=redeploy-site \
+     --field tag=vMAJOR.MINOR.PATCH
+   ```
+
+4. Approve the `release` environment for the `redeploy-site` job. It downloads only the frozen Release site, verifies the tag-bound GitHub attestations, stable-key manifest signature, archive, and exact inventory, then uploads the authenticated site. The dependent `deploy-pages` job is the only Pages/OIDC holder and reaches branch-scoped `github-pages` from protected `main`.
+5. Verify the anonymous versioned stable feed, notes, and enclosure bytes and signatures. If authentication or Pages deployment fails, stop and repair or rerun `redeploy-site`; the previous valid Pages site remains live. Never move the tag, overwrite Release assets, rebuild, re-sign, or downgrade the feed as recovery.
 
 ## Exact value-safe setter interface
 
