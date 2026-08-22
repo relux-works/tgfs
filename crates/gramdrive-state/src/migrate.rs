@@ -227,6 +227,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "auth_finalization_journal",
         step: MigrationStep::Sql(include_str!("schema/v22.sql")),
     },
+    // v23 — generated publication reclamation checks every obsolete immutable
+    // path against current cache ownership while holding the hand-off lease
+    // mutex. The path lookup must therefore be an indexed point probe: a full
+    // cache table scan both burns the namespace worker and prevents foreground
+    // File Provider reads from acquiring their generated-file lease.
+    Migration {
+        version: 23,
+        name: "generated_materialization_reference_lookup",
+        step: MigrationStep::Sql(include_str!("schema/v23.sql")),
+    },
 ];
 
 /// [`SCHEMA_VERSION`] and [`MIGRATIONS`] are one fact stated twice, so the
