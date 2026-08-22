@@ -220,6 +220,25 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
                 AND chat.kind = 'chat' AND chat.deleted_at_ms IS NULL
                 AND child.kind = 'generated_doc' AND child.deleted_at_ms IS NULL",
     },
+    RequiredQuery {
+        name: "generated_documents_of_chat",
+        serves: "privacy transitions over one chat without scanning or sorting the account catalog",
+        sql: "SELECT document.item_id
+              FROM items AS chat
+              JOIN items AS document ON document.parent_item_id = chat.item_id
+              WHERE chat.canonical_item_id = ?1
+                AND chat.kind = 'chat' AND chat.deleted_at_ms IS NULL
+                AND document.kind = 'generated_doc' AND document.deleted_at_ms IS NULL
+              UNION ALL
+              SELECT document.item_id
+              FROM items AS chat
+              JOIN items AS month ON month.parent_item_id = chat.item_id
+              JOIN items AS document ON document.parent_item_id = month.item_id
+              WHERE chat.canonical_item_id = ?1
+                AND chat.kind = 'chat' AND chat.deleted_at_ms IS NULL
+                AND month.kind = 'month_dir' AND month.deleted_at_ms IS NULL
+                AND document.kind = 'generated_doc' AND document.deleted_at_ms IS NULL",
+    },
 ];
 
 #[test]
@@ -410,6 +429,39 @@ fn required_queries_return_real_rows_from_the_fixture() {
     assert_eq!(
         actual, expected,
         "catalog entries and ItemId order are stable"
+    );
+
+    let months: BTreeSet<_> = target
+        .messages
+        .iter()
+        .map(|message| partition_of(message.sent_at_ms))
+        .collect();
+    let mut expected_all = Vec::new();
+    for entry in &target.list_entries {
+        expected_all.push(appearance_id(
+            entry.list,
+            common::doc_key(target.chat_id.0, DocPartition::Chat, DocFormat::Json),
+        ));
+        for &(year, month) in &months {
+            for format in [DocFormat::Markdown, DocFormat::Ndjson] {
+                expected_all.push(appearance_id(
+                    entry.list,
+                    common::doc_key(
+                        target.chat_id.0,
+                        DocPartition::Month { year, month },
+                        format,
+                    ),
+                ));
+            }
+        }
+    }
+    expected_all.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let actual_all = read
+        .generated_document_items_of_chat(&common::chat_key(target.chat_id.0))
+        .expect("all generated documents of chat");
+    assert_eq!(
+        actual_all, expected_all,
+        "bounded chat-subtree lookup preserves every appearance and stable ItemId order"
     );
 }
 

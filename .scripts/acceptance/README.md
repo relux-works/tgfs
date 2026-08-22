@@ -1,6 +1,6 @@
 # Acceptance runners
 
-Eight scripts live here, one per kind of acceptance the project gates on:
+Nine scripts live here, one per kind of acceptance the project gates on:
 
 | Script | Kind | Runs unattended? |
 |---|---|---|
@@ -10,6 +10,7 @@ Eight scripts live here, one per kind of acceptance the project gates on:
 | `run_installed_history_convergence.py` | Installed authorized-profile account-wide history convergence, bounded CPU/Finder enumeration, dataless-media, and relaunch comparison | **Yes, on the authorized local macOS profile.** Chat identities and cursor bounds remain only in its temporary private state; public evidence is aggregate-only. |
 | `run_installed_index_metadata.py` | Installed authorized-profile chat-index convergence reach, directory size rollups, and correspondence dates, compared across an app + agent relaunch | **Yes, on the authorized local macOS profile.** Public evidence is counts, booleans, and byte totals only; cursor bounds live behind a per-run salted digest in a caller-chosen private directory. |
 | `run_installed_foreground_demand.py` | Installed authorized-profile check that using a chat in Finder buys it a history turn, with no control-socket hint anywhere: reading one generated document inside it (`--gesture read`, the acceptance boolean) or only opening its folder (`--gesture open`, the platform-truth record) | **Yes, on the authorized local macOS profile.** Public evidence is counts, booleans, seconds, and message deltas only; the chosen chat's identity, the document read, and its raw cursor readings stay in a caller-chosen private file. |
+| `run_installed_generated_hydration.py` | Bounded 20-read installed acceptance for dataless Markdown, NDJSON, and chat JSON under active backfill, repeated after relaunch | **Yes, on the authorized local macOS profile.** Every provider read has a killable deadline. Public evidence contains only aggregate latency, errno, timeout, hint, cursor, identity, and backfill facts; item paths, identifiers, and digests stay in caller-owned private state. |
 | `run_installed_fault_recovery.py` | QA-only installed Open/content and Quick Look/thumbnail failure-preservation matrix | **Only in a dedicated QA macOS profile with the compile-time QA bundle.** Uses synthetic image fixtures; publishes no identities, paths, or content. |
 | `run_native_macos.py` | The macOS **native manual acceptance** — the ten File Provider Finder flows the release gate requires | **No.** Human-in-the-loop by necessity (below). |
 
@@ -110,6 +111,19 @@ Which gesture to run, and why there are two:
 
 Its `before` phase deliberately asserts nothing — it is a measurement of the
 build being replaced, and a pre-fix build is expected to fail every check.
+
+For generated-document saturation, run
+`run_installed_generated_hydration.py before` with task-scoped `--private` and
+`--evidence` paths while the installed agent is actively backfilling. Relaunch
+the app and agent without resetting the profile or File Provider domain, then
+run `after` with the same private path and a new public evidence path. Each
+phase selects 20 distinct, initially dataless documents: 7 Markdown, 7 NDJSON,
+and 6 hidden chat JSON files, split across active pending/syncing chats and
+history-complete chats. Every read runs in a child process with a 10-second
+deadline and is compared byte-for-byte with its verified local cache entry.
+The gate requires zero timeouts and errnos, p95 below 1 second, p99 below 3
+seconds, balanced requested/background hint counters, a target chat turn,
+monotonic cursors, and preserved account/domain/item identity across relaunch.
 
 ## BUG-260729-3uclm3 installed fault-recovery acceptance
 
