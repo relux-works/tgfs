@@ -553,37 +553,45 @@ impl ReadTxn<'_> {
     /// Every live generated-document appearance belonging to one chat,
     /// independent of civil partition.
     ///
-    /// Chat-protection transitions use this account-scoped scan to revoke
+    /// Chat-protection transitions use this chat-subtree lookup to revoke
     /// already-published Markdown/NDJSON ownership without relying on a
-    /// possibly stale month planner.
+    /// possibly stale month planner. The two branches cover the fixed
+    /// date-first tree shape: `.chat.json` directly below each chat appearance
+    /// and the Markdown/NDJSON pair below each direct month directory.
     pub fn generated_document_items_of_chat(
         &self,
         chat: &ChatKey,
     ) -> Result<Vec<ItemId>, StateError> {
-        let (account_id, namespace) = scope_columns(&chat.scope);
+        let canonical_chat = ItemKey::Canonical(CanonicalKey::Chat(*chat)).id();
         let mut statement = self.conn().prepare_cached(
-            "SELECT item_id FROM items
-             WHERE account_id = ?1 AND namespace_version = ?2
-               AND kind = 'generated_doc' AND deleted_at_ms IS NULL
-             ORDER BY item_id",
+            "SELECT document.item_id
+             FROM items AS chat
+             JOIN items AS document ON document.parent_item_id = chat.item_id
+             WHERE chat.canonical_item_id = ?1
+               AND chat.kind = 'chat' AND chat.deleted_at_ms IS NULL
+               AND document.kind = 'generated_doc' AND document.deleted_at_ms IS NULL
+             UNION ALL
+             SELECT document.item_id
+             FROM items AS chat
+             JOIN items AS month ON month.parent_item_id = chat.item_id
+             JOIN items AS document ON document.parent_item_id = month.item_id
+             WHERE chat.canonical_item_id = ?1
+               AND chat.kind = 'chat' AND chat.deleted_at_ms IS NULL
+               AND month.kind = 'month_dir' AND month.deleted_at_ms IS NULL
+               AND document.kind = 'generated_doc' AND document.deleted_at_ms IS NULL",
         )?;
-        let rows = statement.query_map(params![account_id, namespace], |row| {
+        let rows = statement.query_map(params![canonical_chat.as_bytes()], |row| {
             row.get::<_, Vec<u8>>(0)
         })?;
         let mut items = Vec::new();
         for bytes in rows {
             let item = item_id_from_column("items", &bytes?)?;
-            let belongs = matches!(
-                item.key(),
-                ItemKey::Appearance(AppearanceKey {
-                    item: CanonicalKey::GeneratedDoc(document),
-                    ..
-                }) if document.chat == *chat
-            );
-            if belongs {
-                items.push(item);
-            }
+            items.push(item);
         }
+        // The former account-wide query promised stable ItemId ordering.
+        // SQLite can serve the bounded joins without a temp sort; restore the
+        // same observable order over only this chat's small result set.
+        items.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         Ok(items)
     }
 }
