@@ -606,6 +606,93 @@ fn the_v1_fixture_opens_at_the_current_version_with_its_rows_intact() {
 }
 
 #[test]
+fn v23_indexes_generated_materialization_claims_without_rewriting_cache_rows() {
+    let db = TempDb::new();
+    let store = db.seeded();
+    store
+        .connection()
+        .execute_batch(
+            "INSERT INTO items (
+                 item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name, is_directory,
+                 mime_type, logical_size, metadata_version, content_version, availability
+             )
+             SELECT X'F0', account_id, namespace_version, 'account', NULL, NULL, NULL,
+                    'migration fixture', 'migration-fixture-root', 1,
+                    NULL, NULL, 'migration-root-v1', NULL, 'fetchable'
+             FROM accounts LIMIT 1;
+             INSERT INTO items (
+                 item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name, is_directory,
+                 mime_type, logical_size, metadata_version, content_version, availability
+             )
+             SELECT X'F1', account_id, namespace_version, 'generated_doc', X'F0', X'F2',
+                    'main', 'migration fixture.txt', 'migration-fixture.txt', 0,
+                    'text/plain', 1, 'migration-file-v1', 'migration-content-v1', 'fetchable'
+             FROM accounts LIMIT 1;
+             INSERT INTO cache_entries (
+                 item_id, account_id, content_version, kind, size, verification,
+                 pinned, last_access_at_ms, materialized_at_ms, materialization_ref
+             )
+             SELECT X'F1', account_id, 'migration-content-v1', 'generated_doc', 1,
+                    'verified', 0, 1, 1, '/privacy-safe-migration-fixture'
+             FROM accounts LIMIT 1;",
+        )
+        .expect("seed one materialization owner");
+    let cache_rows_before: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM cache_entries", [], |row| row.get(0))
+        .expect("cache count before migration");
+    drop(store);
+
+    // Recreate the exact installed v22 boundary. Only the v23 index and its
+    // history/version stamps are removed; all representative rows stay put.
+    let legacy = Connection::open(&db.path).expect("open v22 boundary");
+    legacy
+        .execute_batch(
+            "DROP INDEX cache_entries_by_materialization_ref;
+             DELETE FROM schema_history WHERE version = 23;
+             PRAGMA user_version = 22;",
+        )
+        .expect("downgrade fixture stamp to v22");
+    drop(legacy);
+
+    let migrated = StateStore::open(&db.path).expect("migrate v22 to v23");
+    assert_eq!(migrated.schema_version().expect("schema version"), 23);
+    let cache_rows_after: i64 = migrated
+        .connection()
+        .query_row("SELECT count(*) FROM cache_entries", [], |row| row.get(0))
+        .expect("cache count after migration");
+    assert_eq!(cache_rows_after, cache_rows_before);
+
+    let plan: Vec<String> = migrated
+        .connection()
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT EXISTS (
+                 SELECT 1 FROM cache_entries WHERE materialization_ref = ?1)",
+        )
+        .expect("prepare claim plan")
+        .query_map(["/privacy-safe-absent"], |row| row.get(3))
+        .expect("query claim plan")
+        .collect::<Result<_, _>>()
+        .expect("collect claim plan");
+    assert!(
+        plan.iter().any(|step| {
+            step.contains(
+                "SEARCH cache_entries USING COVERING INDEX \
+                           cache_entries_by_materialization_ref",
+            )
+        }),
+        "v23 must turn the lease-critical ownership check into an indexed point probe: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .all(|step| !(step == "SCAN cache_entries" || step.contains("USE TEMP B-TREE"))),
+        "v23 must not retain the installed full scan or introduce a temp sort: {plan:?}"
+    );
+}
+
+#[test]
 fn a_file_written_before_the_journal_existed_gets_one() {
     let db = TempDb::new();
     let store = db.seeded();

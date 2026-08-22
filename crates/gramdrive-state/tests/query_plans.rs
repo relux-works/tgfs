@@ -152,7 +152,14 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
     RequiredQuery {
         name: "cache_accounting",
         serves: "quota accounting by category (SYNC-050)",
-        sql: "SELECT kind, sum(size) FROM cache_entries WHERE account_id = ?1 GROUP BY kind",
+        sql: "SELECT kind, sum(size) FROM cache_entries
+              WHERE account_id = ?1 GROUP BY kind",
+    },
+    RequiredQuery {
+        name: "generated_materialization_reference_claim",
+        serves: "generated publication reclamation without starving foreground hydration",
+        sql: "SELECT EXISTS (
+              SELECT 1 FROM cache_entries WHERE materialization_ref = ?1)",
     },
     RequiredQuery {
         name: "cursor_lookup",
@@ -245,7 +252,7 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
 fn required_queries_avoid_full_scans_on_the_large_account() {
     let account = synthetic::generate(&SyntheticSpec::large_account());
     let mut store = StateStore::open_in_memory().expect("open");
-    let stats = load_account(&mut store, &account);
+    let stats = load_account(&mut store, &account, 6_609);
 
     // The planner should see real table shapes, as a deployed database
     // would after PRAGMA optimize.
@@ -263,7 +270,8 @@ fn required_queries_avoid_full_scans_on_the_large_account() {
          | rows | count |\n|---|---|\n\
          | chats | {} |\n| messages | {} |\n| message_events | {} |\n\
          | attachments | {} |\n| items | {} |\n| transfers | {} |\n\
-         | cache_entries | {} |\n| render_state | {} |\n",
+         | cache_entries | {} |\n| render_state | {} |\n\
+         | active backfills | {} |\n",
         SyntheticSpec::large_account().seed,
         stats.chats,
         stats.messages,
@@ -273,10 +281,15 @@ fn required_queries_avoid_full_scans_on_the_large_account() {
         stats.transfers,
         stats.cache_entries,
         stats.render_state,
+        stats.active_backfills,
     );
 
     assert!(stats.chats >= 2_000, "AC: thousands of chats");
     assert!(stats.messages >= 100_000, "AC: 100k+ messages");
+    assert!(
+        stats.active_backfills >= 6_609,
+        "AC: preserved-profile-scale active backfills"
+    );
 
     let mut failures = Vec::new();
     for query in REQUIRED_QUERIES {
@@ -293,7 +306,8 @@ fn required_queries_avoid_full_scans_on_the_large_account() {
             // SEARCH is an index probe. A SCAN is acceptable only when it
             // walks an index (partial or covering) rather than the table;
             // a temp b-tree means an ORDER BY the schema failed to serve.
-            let scan_without_index = line.starts_with("SCAN") && !line.contains("USING");
+            let scan_without_index =
+                line.starts_with("SCAN") && !line.contains("USING") && line != "SCAN CONSTANT ROW";
             let temp_btree = line.contains("USE TEMP B-TREE");
             if scan_without_index || temp_btree {
                 failures.push(format!("{}: {line}", query.name));
@@ -320,7 +334,7 @@ fn required_queries_return_real_rows_from_the_fixture() {
     // shape, not volume, is under test here.
     let account = synthetic::generate(&SyntheticSpec::small());
     let mut store = StateStore::open_in_memory().expect("open");
-    load_account(&mut store, &account);
+    load_account(&mut store, &account, 0);
     let conn = store.connection();
 
     // Root enumeration sees the four fixed roots (Main, Archive, Stories,
@@ -493,6 +507,7 @@ struct LoadStats {
     transfers: i64,
     cache_entries: i64,
     render_state: i64,
+    active_backfills: i64,
 }
 
 /// Maps the synthetic account onto the schema: canonical facts, the event
@@ -501,7 +516,11 @@ struct LoadStats {
 /// DOM-022), and engine state (blobs, cache, pins, transfers, render
 /// state, cursors, sync windows) derived deterministically from the same
 /// data.
-fn load_account(store: &mut StateStore, account: &SyntheticAccount) -> LoadStats {
+fn load_account(
+    store: &mut StateStore,
+    account: &SyntheticAccount,
+    additional_active_backfills: usize,
+) -> LoadStats {
     let tx = store.connection_mut().transaction().expect("begin");
 
     tx.execute(
@@ -518,6 +537,29 @@ fn load_account(store: &mut StateStore, account: &SyntheticAccount) -> LoadStats
     for chat in &account.chats {
         insert_chat_facts(&tx, chat);
         insert_chat_projection(&tx, chat, &mut attachment_counter);
+    }
+
+    // The installed regression had 6,609 simultaneously runnable backfills.
+    // These metadata-only listed chats exercise that scheduler cardinality
+    // without inflating the already representative 100k-message payload.
+    for offset in 0..additional_active_backfills {
+        let chat_id = 9_000_000_i64 + i64::try_from(offset).expect("backfill offset");
+        tx.execute(
+            "INSERT INTO chats (
+                 account_id, namespace_version, chat_id, chat_type, title,
+                 is_protected, metadata_version, last_update_at_ms
+             ) VALUES (?1, ?2, ?3, 'private', 'synthetic backfill', 0, 'm1', 0)",
+            params![ACCOUNT_ID, NAMESPACE, chat_id],
+        )
+        .expect("saturated backfill chat");
+        tx.execute(
+            "INSERT INTO chat_list_entries (
+                 account_id, namespace_version, list_kind, folder_id,
+                 chat_id, sort_order, pinned
+             ) VALUES (?1, ?2, 'main', 0, ?3, ?4, 0)",
+            params![ACCOUNT_ID, NAMESPACE, chat_id, -chat_id],
+        )
+        .expect("saturated backfill membership");
     }
 
     tx.execute(
@@ -545,6 +587,14 @@ fn load_account(store: &mut StateStore, account: &SyntheticAccount) -> LoadStats
         transfers: count("transfers"),
         cache_entries: count("cache_entries"),
         render_state: count("render_state"),
+        active_backfills: store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM chat_sync_state WHERE history_complete = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("active backfill count"),
     }
 }
 

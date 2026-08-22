@@ -26,7 +26,7 @@ amalgamation (version rationale in the workspace `Cargo.toml`).
 Platform-specific code: forbidden — the database location is chosen by the
 embedding host. See `crates/README.md`.
 
-## The schema (v14)
+## The schema (v23)
 
 `src/schema/v1.sql` is the baseline; v2 adds the item change journal, v3 the
 Telegram folder/bootstrap metadata, v4 the date-first content contract, and v5
@@ -49,6 +49,12 @@ so a repeatedly changing low-sorting chat rotates behind never-published and
 less-advanced months. Authoritative attachment
 restriction cleanup reuses the same transaction journal while releasing only
 the affected account's cache, pin, and blob ownership.
+v15–v22 add hidden chat metadata, directory rollups, independent backfill-turn
+ordering, aggregate provider diagnostics, render-policy skips, bounded direct
+chat catalogs, the Stories view, and recoverable authorization finalization.
+v23 indexes non-null cache materialization references so generated-generation
+reclamation performs one ownership point probe while holding the native
+hand-off lease boundary instead of scanning every cached item.
 Each file
 carries the full rationale per table — this is the map. `StateStore::open` applies it atomically to a fresh file
 (`PRAGMA user_version` 0 → 1), migrates an older file forward, recognizes a
@@ -66,7 +72,7 @@ every connection; file databases run in WAL with `synchronous=NORMAL`.
 | Provider projection | `items` | Every provider-visible node under its stable binary `ItemId` (DEC-008): canonical structural roots and appearance rows in one table (DOM-002/022), a real parent self-FK for the tree, live-sibling name uniqueness (SYNC-012), one appearance per (canonical, view); Archive pins follow allowed attachment appearances, and protection atomically restricts items and removes those pins. `logical_size` stays a file's own bytes while `aggregate_size` carries a directory's exact indexed-descendant rollup, so a chat folder's size is answerable from one item read and neither fact can ever be mistaken for the other |
 | Item change journal | `item_change_journal`, `item_changes` | Durable change enumeration for provider sync anchors (PLAT-MAC-004): one coalesced row per item at its latest `AUTOINCREMENT` sequence — bounded by item count, never rewound — refreshed by the item write paths only on provider-visible change, so an engine re-baseline replays nothing; the identity row names the database life so anchors from a quarantined file expire explicitly |
 | Hydration | `transfers` | Durable transfer journal pinned to a content version (SYNC-042), JSON-validated ranges, the SYNC-044 failure taxonomy, a partial index over live states for the queue head |
-| Cache | `cache_entries`, `pins`, `retention_purge_queue` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; `pins` is durable offline intent independent of materialization; destructive retention queues physical deletion before dropping cache ownership |
+| Cache | `cache_entries`, `pins`, `retention_purge_queue` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; generated materialization ownership is a partial-index point probe so reclamation cannot monopolize the lease boundary; `pins` is durable offline intent independent of materialization; destructive retention queues physical deletion before dropping cache ownership |
 | Sync positions | `change_cursors`, `chat_sync_state`, `chat_content_progress` | One durable feed position per (account, stream) — scope verification stays with `ChangeCursor::require_scope` (SYNC-004); a chat gets bounded resumable history and privacy-safe pending/ready/retry/protected state when its first live Telegram list membership makes it provider-eligible, while an existing cursor survives later membership removal/reappearance (SYNC-021). The backward-crawl rotation is keyed on `last_backfill_at_ms` — when a chat was last handed a turn — and never on `last_sync_at_ms`, which live delivery also stamps: ordering on the latter let incoming messages reset a chat's place in the queue, so the busiest correspondences were the ones that never crawled backward |
 | Backfill control | `backfill_control` | The engine backfill scheduler's durable per-scope pause switch, request spacer, and honored flood-wait deadline — a restart resumes neither paused work nor a violated flood wait (SYNC-043/SYNC-005 pause, SEC-031 spacer, NFR-033 flood, NFR-031/SYNC-070 restart durability) |
 | Rendering | `message_events`, `items`, `render_state`, `cache_entries` | One-transaction monthly snapshots pin message watermark plus account policy generation; paired appearance catalog; renderer/schema versions and dirty worklist; chat privacy transitions walk only the indexed direct/month subtree and retain stable ItemId order instead of scanning and sorting every generated document in the account; publication rechecks policy and ignores unrelated-month event races while item facts/cache locators/change-journal rows advance atomically (SYNC-024, SYNC-030..033) |
@@ -78,7 +84,7 @@ Forward-only (NFR-013). `v1.sql` creates version 1 and is frozen; every
 version after it is a `Migration` in `src/migrate.rs`, applied in order by
 `StateStore::open`. There is no downgrade: an older build meeting a newer
 file refuses it rather than guessing what the newer schema's data means in
-an older shape. `MIGRATIONS` contains the contiguous v2–v11 steps, and a const
+an older shape. `MIGRATIONS` contains the contiguous v2–v23 steps, and a const
 assertion fails the build if that list and the version ever disagree. The v4
 atomic rebuild retires live legacy year/media/whole-chat rows, creates direct
 months and both bounded documents, and preserves existing account/chat/item
@@ -258,7 +264,8 @@ Two primitives support cross-process coordination directly:
   trigger, and cascades proven against the real database.
 - `tests/query_plans.rs` — every required query path EXPLAIN-verified as
   index-driven (no bare table scans, no temp sorts) on the synthetic large
-  account from `gramdrive-testkit` (2,048 chats, 110k messages). Set
+  account from `gramdrive-testkit` (2,048 content-bearing chats, 110k
+  messages) plus 6,609 additional runnable metadata-only backfills. Set
   `GRAMDRIVE_PLAN_EVIDENCE=/path/file.md` to capture the plans.
 - `tests/store_lifecycle.rs` — WAL, idempotent reopen, version-skew
   refusal.
@@ -270,8 +277,9 @@ Two primitives support cross-process coordination directly:
   preamble, or dropping the interruption marker each fail this suite.
 - `tests/migrations.rs` — the public surface: a v1 file opens untouched, a
   journal-less file (one written before the runner existed) gets a journal,
-  a file from the future is refused *without being written to*, and repair
-  markers round-trip.
+  v22→v23 preserves cache rows while installing the covering materialization
+  reference plan, a file from the future is refused *without being written
+  to*, and repair markers round-trip.
 - `tests/repo_changes.rs` — atomic cursor application through the failure
   path (a rejected cursor rolls back the whole batch), idempotent replay
   (exact, post-deletion, and stale-revision), scope rejections, sync
