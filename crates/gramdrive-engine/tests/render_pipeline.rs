@@ -23,7 +23,7 @@ use gramdrive_engine::render_pipeline::{
 use gramdrive_engine::state::StateStore;
 use gramdrive_engine::state::repo::{
     AccountRecord, ChatRecord, ChatType, FileFacts, ItemAvailability, ItemRecord, MessageChange,
-    MessagePayload, MessageRevision, RetentionMode, SourceKind,
+    MessageEventKind, MessagePayload, MessageRevision, RetentionMode, SourceKind,
 };
 
 fn scope() -> AccountScope {
@@ -517,6 +517,58 @@ fn one_snapshot_replays_identically_and_publishes_the_pair_atomically() {
     assert!(!staged.markdown.exists());
     assert!(!staged.ndjson.exists());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn monthly_snapshot_keeps_multi_revision_delete_order_deterministic() {
+    let mut store = seeded_store();
+    let tx = store.write_txn().expect("write");
+    tx.apply_message_changes(
+        &chat(),
+        &[
+            observe(b"original", None),
+            observe(b"first edit", Some(1_784_116_801_000)),
+            observe(b"second edit", Some(1_784_116_802_000)),
+            MessageChange::Deleted {
+                message_id: MessageId(44),
+                observed_at_ms: 1_784_116_803_000,
+            },
+        ],
+    )
+    .expect("revision history");
+    tx.commit().expect("commit");
+
+    let timezone = DisplayTimeZone::named("Asia/Tbilisi").expect("timezone");
+    let (start_ms, end_ms) = timezone.month_bounds_ms(2026, 7).expect("bounds");
+    let snapshot = store
+        .read_txn()
+        .expect("read")
+        .month_render_snapshot(chat(), start_ms, end_ms)
+        .expect("snapshot");
+    assert_eq!(snapshot.messages.len(), 1);
+    let events = &snapshot.messages[0].events;
+    assert_eq!(
+        events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+        vec![
+            MessageEventKind::Observed,
+            MessageEventKind::Edited,
+            MessageEventKind::Edited,
+            MessageEventKind::Deleted,
+        ]
+    );
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].event_seq < pair[1].event_seq)
+    );
+    assert!(events.last().expect("deletion").payload.is_none());
+
+    let first = compose_month(&snapshot, 2026, 7, &Decoder).expect("compose");
+    let replay = compose_month(&snapshot, 2026, 7, &Decoder).expect("replay");
+    assert_eq!(
+        first, replay,
+        "ordered revisions must render deterministically"
+    );
 }
 
 #[test]
