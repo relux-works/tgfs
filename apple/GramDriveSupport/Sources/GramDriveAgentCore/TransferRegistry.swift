@@ -40,6 +40,7 @@ public final class TransferRegistry: @unchecked Sendable {
     private var nextId: UInt64 = 0
     private var entries: [UInt64: CancellationToken?] = [:]
     private var draining = false
+    private var drainReadinessWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init() {}
 
@@ -97,6 +98,24 @@ public final class TransferRegistry: @unchecked Sendable {
         return !draining
     }
 
+    /// Suspends until a drain has synchronously closed new-work admission.
+    ///
+    /// This is an internal lifecycle synchronization seam. Unlike polling
+    /// ``isDraining``, it does not depend on the observing task winning
+    /// repeated executor slices while a drain task is waiting to start.
+    func waitUntilDraining() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if draining {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                drainReadinessWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
     /// Drains the registry: refuses new work, waits `gracePeriod` for
     /// in-flight operations to end, cancels the remainder, then waits
     /// `cancelWait` for the cancellations to land.
@@ -131,9 +150,16 @@ public final class TransferRegistry: @unchecked Sendable {
 
     private func closeToNewWork() -> Int {
         lock.lock()
-        defer { lock.unlock() }
         draining = true
-        return entries.count
+        let pendingCount = entries.count
+        let readinessWaiters = drainReadinessWaiters
+        drainReadinessWaiters.removeAll(keepingCapacity: true)
+        lock.unlock()
+
+        for waiter in readinessWaiters {
+            waiter.resume()
+        }
+        return pendingCount
     }
 
     private func survivingTokens() -> [CancellationToken?] {
