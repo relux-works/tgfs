@@ -28,13 +28,18 @@ fn live_generated_documents_have_a_parent_scoped_catalog_index() {
         .connection()
         .query_row(
             "SELECT sql FROM sqlite_schema
-             WHERE type = 'index' AND name = 'items_live_generated_docs_by_parent'",
+             WHERE type = 'index' AND tbl_name = 'items'
+               AND replace(sql, '\"', '') LIKE '%ON items%parent_item_id, item_id%'
+               AND sql LIKE '%WHERE kind = ''generated_doc'' AND deleted_at_ms IS NULL%'",
             [],
             |row| row.get(0),
         )
         .expect("chat render catalog index");
 
-    assert!(sql.contains("ON items (parent_item_id, item_id)"));
+    assert!(
+        sql.replace('"', "")
+            .contains("ON items (parent_item_id, item_id)")
+    );
     assert!(
         sql.contains("WHERE kind = 'generated_doc' AND deleted_at_ms IS NULL"),
         "the catalog index contains only live generated documents"

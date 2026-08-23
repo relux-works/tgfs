@@ -216,7 +216,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 21,
         name: "story_list_provider_view",
-        step: MigrationStep::AtomicRebuild(migrate_story_list_provider_view),
+        step: MigrationStep::ResumableRebuild {
+            prepare: include_str!("schema/v21.sql"),
+            chunk: migrate_story_list_provider_view,
+        },
     },
     // v22 — authorization finalization spans SQLite, the OS keychain, and
     // TDLib's directory tree. This journal supplies the durable decision
@@ -304,6 +307,16 @@ pub enum MigrationStep {
         prepare: Option<&'static str>,
         /// The work itself, called in a loop until it reports
         /// [`ChunkOutcome::Done`].
+        chunk: ChunkFn,
+    },
+    /// A table rebuild whose shadow copy is too large for one transaction.
+    /// Foreign-key enforcement is disabled only while the migration runner
+    /// owns the connection; the last chunk validates the swapped schema
+    /// before it earns the new version.
+    ResumableRebuild {
+        /// Creates empty shadow tables and copies only bounded metadata.
+        prepare: &'static str,
+        /// Copies or finalizes one independently committed chunk.
         chunk: ChunkFn,
     },
 }
@@ -411,6 +424,7 @@ fn apply(conn: &mut Connection, migration: &Migration) -> Result<(), StateError>
         MigrationStep::Resumable { prepare, chunk } => {
             apply_resumable(conn, migration, prepare, chunk)
         }
+        MigrationStep::ResumableRebuild { .. } => apply_resumable_rebuild(conn, migration),
     }
 }
 
@@ -696,9 +710,176 @@ fn migrate_date_first_contract(tx: &Transaction<'_>) -> Result<(), StateError> {
     Ok(())
 }
 
-fn migrate_story_list_provider_view(tx: &Transaction<'_>) -> Result<(), StateError> {
-    tx.execute_batch(include_str!("schema/v21.sql"))?;
+const V21_ITEM_CHUNK_ROWS: usize = 4_096;
+
+fn migrate_story_list_provider_view(
+    tx: &Transaction<'_>,
+    checkpoint: Option<&str>,
+) -> Result<ChunkOutcome, StateError> {
+    if let Some(phase) = checkpoint.and_then(|value| value.strip_prefix("index:")) {
+        let (sql, next) = match phase {
+            "children" => (
+                "CREATE UNIQUE INDEX items_v21_sibling_name
+                     ON items_v21 (parent_item_id, safe_name)
+                     WHERE parent_item_id IS NOT NULL AND deleted_at_ms IS NULL",
+                "sibling-name",
+            ),
+            "sibling-name" => (
+                "CREATE INDEX items_v21_by_scope
+                     ON items_v21 (account_id, namespace_version)",
+                "scope",
+            ),
+            "scope" => (
+                "CREATE UNIQUE INDEX items_v21_appearance
+                     ON items_v21 (
+                         canonical_item_id, view_kind, COALESCE(view_folder_id, 0)
+                     )
+                     WHERE canonical_item_id IS NOT NULL AND kind <> 'story_appearance'",
+                "appearance",
+            ),
+            "appearance" => (
+                "CREATE INDEX items_v21_by_canonical_item
+                     ON items_v21 (canonical_item_id, item_id)
+                     WHERE canonical_item_id IS NOT NULL",
+                "canonical",
+            ),
+            "canonical" => (
+                "CREATE INDEX items_v21_live_generated_docs_by_parent
+                     ON items_v21 (parent_item_id, item_id)
+                     WHERE kind = 'generated_doc' AND deleted_at_ms IS NULL",
+                "generated",
+            ),
+            "generated" => {
+                validate_v21_shadow(tx)?;
+                return Ok(ChunkOutcome::More {
+                    checkpoint: "validated".to_owned(),
+                });
+            }
+            _ => {
+                return Err(StateError::CorruptRow {
+                    table: "migration_progress",
+                    detail: "v21 index checkpoint names an unknown phase".to_owned(),
+                });
+            }
+        };
+        tx.execute(sql, [])?;
+        return Ok(ChunkOutcome::More {
+            checkpoint: format!("index:{next}"),
+        });
+    }
+    if checkpoint == Some("validated") {
+        tx.execute_batch(include_str!("schema/v21_finalize.sql"))?;
+        return Ok(ChunkOutcome::Done);
+    }
+
+    let after = checkpoint.map_or_else(
+        || Ok(Vec::new()),
+        |checkpoint| {
+            checkpoint
+                .strip_prefix("items:")
+                .and_then(decode_hex)
+                .ok_or_else(|| StateError::CorruptRow {
+                    table: "migration_progress",
+                    detail: "v21 item cursor is not a valid hex checkpoint".to_owned(),
+                })
+        },
+    )?;
+    let last: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT item_id
+             FROM (
+                 SELECT item_id FROM items
+                 WHERE item_id > ?1
+                 ORDER BY item_id
+                 LIMIT ?2
+             )
+             ORDER BY item_id DESC
+             LIMIT 1",
+            params![after, V21_ITEM_CHUNK_ROWS as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let Some(last) = last else {
+        tx.execute(
+            "CREATE INDEX items_v21_children_by_id
+                 ON items_v21 (parent_item_id, item_id)",
+            [],
+        )?;
+        return Ok(ChunkOutcome::More {
+            checkpoint: "index:children".to_owned(),
+        });
+    };
+
+    tx.execute(
+        "INSERT INTO items_v21 (
+             item_id, account_id, namespace_version, kind, parent_item_id,
+             canonical_item_id, view_kind, view_folder_id, display_name, safe_name,
+             is_directory, mime_type, logical_size, metadata_version, content_version,
+             availability, created_at_ms, modified_at_ms, deleted_at_ms, aggregate_size,
+             tombstone_provenance
+         )
+         SELECT
+             item_id, account_id, namespace_version, kind, parent_item_id,
+             canonical_item_id, view_kind, view_folder_id, display_name, safe_name,
+             is_directory, mime_type, logical_size, metadata_version, content_version,
+             availability, created_at_ms, modified_at_ms, deleted_at_ms, aggregate_size,
+             tombstone_provenance
+         FROM items
+         WHERE item_id > ?1 AND item_id <= ?2
+         ORDER BY item_id",
+        params![after, last],
+    )?;
+    Ok(ChunkOutcome::More {
+        checkpoint: format!("items:{}", encode_hex(&last)),
+    })
+}
+
+fn validate_v21_shadow(tx: &Transaction<'_>) -> Result<(), StateError> {
+    let source_rows: i64 = tx.query_row("SELECT count(*) FROM items", [], |row| row.get(0))?;
+    let copied_rows: i64 = tx.query_row("SELECT count(*) FROM items_v21", [], |row| row.get(0))?;
+    if copied_rows != source_rows {
+        return Err(StateError::CorruptRow {
+            table: "items_v21",
+            detail: "v21 shadow-copy row count does not match its source".to_owned(),
+        });
+    }
+    for table in ["chat_list_entries_v21", "items_v21"] {
+        let sql = format!("PRAGMA foreign_key_check({table})");
+        let violation: Option<String> = tx.query_row(&sql, [], |row| row.get(0)).optional()?;
+        if violation.is_some() {
+            return Err(StateError::CorruptRow {
+                table: "foreign_key_check",
+                detail: format!("migration 21 shadow table {table} has a violation"),
+            });
+        }
+    }
     Ok(())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            u8::try_from((high << 4) | low).ok()
+        })
+        .collect()
 }
 
 fn month_directory(
@@ -843,44 +1024,73 @@ fn apply_resumable(
     prepare: Option<&'static str>,
     chunk: ChunkFn,
 ) -> Result<(), StateError> {
-    loop {
-        let tx = conn.transaction()?;
-        let checkpoint = read_checkpoint(&tx, migration.version)?;
-        if checkpoint.is_none() {
-            // No committed chunk yet, so the preamble either has never run
-            // or was rolled back with the chunk that would have committed it.
-            if let Some(sql) = prepare {
-                tx.execute_batch(sql)?;
-            }
-        }
+    while !apply_one_resumable_chunk(conn, migration, prepare, chunk)? {}
+    Ok(())
+}
 
-        match chunk(&tx, checkpoint.as_deref())? {
-            ChunkOutcome::More { checkpoint: next } => {
-                if checkpoint.as_deref() == Some(next.as_str()) {
-                    return Err(StateError::MigrationStalled { checkpoint: next });
-                }
-                save_checkpoint(&tx, migration, &next)?;
-                // Raised with the first checkpoint that commits and cleared
-                // by the transaction that finishes the migration: the marker
-                // is durable for exactly as long as an unfinished tail is.
-                repair::raise(
-                    &tx,
-                    RepairKind::MigrationInterrupted,
-                    &interrupted(migration),
-                )?;
-                tx.commit()?;
+fn apply_resumable_rebuild(conn: &mut Connection, migration: &Migration) -> Result<(), StateError> {
+    while !apply_one_resumable_rebuild_chunk(conn, migration)? {}
+    Ok(())
+}
+
+fn apply_one_resumable_rebuild_chunk(
+    conn: &mut Connection,
+    migration: &Migration,
+) -> Result<bool, StateError> {
+    let MigrationStep::ResumableRebuild { prepare, chunk } = migration.step else {
+        return Err(StateError::InvalidArgument {
+            what: "resumable rebuild helper requires a resumable rebuild migration",
+        });
+    };
+    let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = apply_one_resumable_chunk(conn, migration, Some(prepare), chunk);
+    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
+    result
+}
+
+fn apply_one_resumable_chunk(
+    conn: &mut Connection,
+    migration: &Migration,
+    prepare: Option<&'static str>,
+    chunk: ChunkFn,
+) -> Result<bool, StateError> {
+    let tx = conn.transaction()?;
+    let checkpoint = read_checkpoint(&tx, migration.version)?;
+    if checkpoint.is_none() {
+        // No committed chunk yet, so the preamble either has never run or
+        // was rolled back with the chunk that would have committed it.
+        if let Some(sql) = prepare {
+            tx.execute_batch(sql)?;
+        }
+    }
+
+    match chunk(&tx, checkpoint.as_deref())? {
+        ChunkOutcome::More { checkpoint: next } => {
+            if checkpoint.as_deref() == Some(next.as_str()) {
+                return Err(StateError::MigrationStalled { checkpoint: next });
             }
-            ChunkOutcome::Done => {
-                clear_checkpoint(&tx, migration.version)?;
-                repair::clear(
-                    &tx,
-                    RepairKind::MigrationInterrupted,
-                    &interrupted(migration),
-                )?;
-                finish(&tx, migration)?;
-                tx.commit()?;
-                return Ok(());
-            }
+            save_checkpoint(&tx, migration, &next)?;
+            // Raised with the first checkpoint that commits and cleared by
+            // the transaction that finishes the migration.
+            repair::raise(
+                &tx,
+                RepairKind::MigrationInterrupted,
+                &interrupted(migration),
+            )?;
+            tx.commit()?;
+            Ok(false)
+        }
+        ChunkOutcome::Done => {
+            clear_checkpoint(&tx, migration.version)?;
+            repair::clear(
+                &tx,
+                RepairKind::MigrationInterrupted,
+                &interrupted(migration),
+            )?;
+            finish(&tx, migration)?;
+            tx.commit()?;
+            Ok(true)
         }
     }
 }
@@ -1890,6 +2100,137 @@ mod tests {
         assert!(
             indexes(&conn).contains(&"items_live_generated_docs_by_parent".to_owned()),
             "installed databases index the direct live generated-document children that chat rendering reads"
+        );
+    }
+
+    #[test]
+    fn v21_large_item_rebuild_commits_resumable_progress_at_the_schema20_boundary() {
+        let db = TempDb::new();
+        let mut conn = db.open_v1();
+        run(&mut conn, MIGRATIONS, 20).expect("migrate fixture to v20");
+        conn.execute_batch(
+            "INSERT INTO items (
+                 item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name,
+                 is_directory, metadata_version, availability
+             )
+             SELECT X'F0', account_id, namespace_version, 'account', NULL,
+                    NULL, NULL, 'migration fixture', 'migration-fixture-root',
+                    1, 'migration-v20', 'fetchable'
+             FROM accounts LIMIT 1;
+
+             WITH RECURSIVE sequence(value) AS (
+                 VALUES(1)
+                 UNION ALL
+                 SELECT value + 1 FROM sequence WHERE value < 4097
+             )
+             INSERT INTO items (
+                 item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name,
+                 is_directory, mime_type, logical_size, metadata_version,
+                 content_version, availability
+             )
+             SELECT CAST(printf('bulk-%08d', value) AS BLOB),
+                    account_id, namespace_version, 'generated_doc', X'F0',
+                    NULL, NULL, printf('bulk %08d', value),
+                    printf('bulk-%08d', value), 0, 'text/plain', 1,
+                    'migration-v20', 'content-v1', 'fetchable'
+             FROM sequence CROSS JOIN (
+                 SELECT account_id, namespace_version FROM accounts LIMIT 1
+             );",
+        )
+        .expect("representative large v20 namespace");
+        let source_rows: i64 = conn
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .expect("source item count");
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 21)
+            .expect("v21 migration");
+        let finished = apply_one_resumable_rebuild_chunk(&mut conn, migration)
+            .expect("first committed v21 chunk");
+
+        assert!(!finished, "more than one representative chunk must remain");
+        assert_eq!(version_of(&conn), 20);
+        let (checkpoint, chunks_done): (String, i64) = conn
+            .query_row(
+                "SELECT checkpoint, chunks_done FROM migration_progress WHERE version = 21",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("durable v21 checkpoint");
+        assert!(checkpoint.starts_with("items:"));
+        assert_eq!(chunks_done, 1);
+        let copied_rows: i64 = conn
+            .query_row("SELECT count(*) FROM items_v21", [], |row| row.get(0))
+            .expect("copied item count");
+        assert_eq!(copied_rows, V21_ITEM_CHUNK_ROWS as i64);
+        assert!(copied_rows < source_rows);
+        assert!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))
+                .expect("foreign-key enforcement restored")
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'index'
+                   AND name IN ('items_sibling_name', 'items_live_generated_docs_by_parent')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("authoritative v20 invariant indexes"),
+            2,
+            "the old schema retains its uniqueness and hot-path indexes until the swap"
+        );
+        drop(conn);
+
+        let mut conn = Connection::open(&db.path).expect("reopen interrupted v21 database");
+        run(&mut conn, MIGRATIONS, 21).expect("resume v21 to completion");
+        assert_eq!(version_of(&conn), 21);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .expect("migrated item count"),
+            source_rows
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            },)
+                .expect("foreign key check"),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM accounts WHERE auth_state = 'authorized'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("durable authorization count"),
+            1
+        );
+        let render_plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT item_id FROM items
+                 WHERE parent_item_id = X'F0'
+                   AND kind = 'generated_doc'
+                   AND deleted_at_ms IS NULL
+                 ORDER BY item_id",
+                [],
+                |row| row.get(3),
+            )
+            .expect("v21 generated-document plan");
+        assert!(
+            render_plan.contains("items_v21_live_generated_docs_by_parent"),
+            "the rebuilt namespace must retain the indexed direct-child probe: {render_plan}"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM migration_progress", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("cleared migration progress"),
+            0
         );
     }
 
