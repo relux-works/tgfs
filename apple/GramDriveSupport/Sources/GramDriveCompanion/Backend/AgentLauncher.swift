@@ -226,21 +226,33 @@ public actor AgentEnsurer {
         pollInterval: Duration,
         startupTimeout: Duration
     ) async -> AgentEnsureOutcome {
-        if case .running = await probe() {
+        let first = await probe()
+        if isOperational(first) {
             return .alreadyRunning
         }
-        do {
-            try starter.startAgent(loginItemPreferred: loginItemPreferred())
-        } catch {
-            return .failed("agent start failed: \(error)")
+        let processAlreadyPresent: Bool
+        if case .running = first {
+            processAlreadyPresent = true
+        } else {
+            processAlreadyPresent = false
+            do {
+                try starter.startAgent(loginItemPreferred: loginItemPreferred())
+            } catch {
+                return .failed("agent start failed: \(error)")
+            }
         }
         let deadline = ContinuousClock.now + startupTimeout
         while ContinuousClock.now < deadline {
-            if case .running = await probe() {
-                return .started
+            if isOperational(await probe()) {
+                return processAlreadyPresent ? .alreadyRunning : .started
             }
             try? await Task.sleep(for: pollInterval)
         }
         return .failed("the agent did not become healthy in time")
+    }
+
+    private static func isOperational(_ readout: HealthReadout) -> Bool {
+        guard case let .running(snapshot) = readout else { return false }
+        return snapshot.state == .running
     }
 }

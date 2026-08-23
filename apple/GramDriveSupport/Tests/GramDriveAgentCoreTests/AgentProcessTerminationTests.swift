@@ -354,7 +354,7 @@ struct AgentProcessTerminationTests {
             if let snapshot = try? AgentHealthClient.fetch(
                 socketURL: socketURL,
                 timeout: .milliseconds(100)
-            ), predicate(snapshot) {
+            ), snapshot.state == .running, predicate(snapshot) {
                 return snapshot
             }
             Thread.sleep(forTimeInterval: 0.02)

@@ -719,7 +719,15 @@ fn migrate_date_first_contract(tx: &Transaction<'_>) -> Result<(), StateError> {
     Ok(())
 }
 
-const V21_ITEM_CHUNK_ROWS: usize = 4_096;
+// A preserved 3.2M-item profile must not spend most of its startup budget on
+// hundreds of WAL commit/checkpoint cycles. This still keeps each writer
+// reservation bounded well below the installed five-second busy timeout while
+// reducing the representative copy from 782 commits to 49.
+const V21_ITEM_CHUNK_ROWS: usize = 65_536;
+#[cfg(test)]
+const V21_INSTALLED_PROFILE_ROWS: usize = 3_200_000;
+#[cfg(test)]
+const V21_MAX_INSTALLED_COPY_CHUNKS: usize = 64;
 
 fn migrate_story_list_provider_view(
     tx: &Transaction<'_>,
@@ -2308,7 +2316,7 @@ mod tests {
              WITH RECURSIVE sequence(value) AS (
                  VALUES(1)
                  UNION ALL
-                 SELECT value + 1 FROM sequence WHERE value < 4097
+                 SELECT value + 1 FROM sequence WHERE value < 65537
              )
              INSERT INTO items (
                  item_id, account_id, namespace_version, kind, parent_item_id,
@@ -2587,6 +2595,118 @@ mod tests {
             )
             .expect("v21 delta schema cleanup"),
             0
+        );
+    }
+
+    #[test]
+    fn v21_installed_profile_copy_has_a_bounded_resumable_slice_budget() {
+        let copy_chunks = V21_INSTALLED_PROFILE_ROWS.div_ceil(V21_ITEM_CHUNK_ROWS);
+        assert!(
+            copy_chunks <= V21_MAX_INSTALLED_COPY_CHUNKS,
+            "a representative preserved profile needs {copy_chunks} v21 copy commits; \
+             the installed startup budget permits at most {V21_MAX_INSTALLED_COPY_CHUNKS}"
+        );
+    }
+
+    #[test]
+    #[ignore = "representative 3.2M-item installed migration; run explicitly"]
+    fn v21_representative_installed_profile_resumes_to_current_schema() {
+        let db = TempDb::new();
+        let mut conn = db.open_v1();
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
+        run(&mut conn, MIGRATIONS, 20).expect("migrate fixture to v20");
+        conn.execute_batch(&format!(
+            "INSERT INTO items (
+                 item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name,
+                 is_directory, metadata_version, availability
+             )
+             SELECT X'F0', account_id, namespace_version, 'account', NULL,
+                    NULL, NULL, 'scale fixture', 'scale-fixture-root',
+                    1, 'migration-v20', 'fetchable'
+             FROM accounts LIMIT 1;
+
+             WITH RECURSIVE sequence(value) AS (
+                 VALUES(1)
+                 UNION ALL
+                 SELECT value + 1 FROM sequence WHERE value < {V21_INSTALLED_PROFILE_ROWS}
+             )
+             INSERT INTO items (
+                 item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name,
+                 is_directory, mime_type, logical_size, metadata_version,
+                 content_version, availability
+             )
+             SELECT CAST(printf('scale-%08d', value) AS BLOB),
+                    account_id, namespace_version, 'generated_doc', X'F0',
+                    NULL, NULL, printf('scale %08d', value),
+                    printf('scale-%08d', value), 0, 'text/plain', 1,
+                    'migration-v20', 'content-v1', 'fetchable'
+             FROM sequence CROSS JOIN (
+                 SELECT account_id, namespace_version FROM accounts LIMIT 1
+             );"
+        ))
+        .expect("representative installed v20 namespace");
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 21)
+            .expect("v21 migration");
+        assert!(
+            !apply_one_resumable_rebuild_chunk(&mut conn, migration)
+                .expect("first durable v21 slice")
+        );
+        assert_eq!(version_of(&conn), 20);
+        assert_eq!(
+            conn.query_row(
+                "SELECT chunks_done FROM migration_progress WHERE version = 21",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("durable first-slice progress"),
+            1
+        );
+        drop(conn);
+
+        let mut conn = Connection::open(&db.path).expect("restart interrupted profile");
+        conn.busy_timeout(crate::store::BUSY_TIMEOUT)
+            .expect("installed busy timeout");
+        conn.pragma_update(None, "foreign_keys", true)
+            .expect("foreign keys");
+        let mut total_v21_slices = 1usize;
+        loop {
+            total_v21_slices += 1;
+            if apply_one_resumable_rebuild_chunk(&mut conn, migration).expect("resumed v21 slice") {
+                break;
+            }
+        }
+        assert!(
+            total_v21_slices <= V21_MAX_INSTALLED_COPY_CHUNKS + 8,
+            "v21 used {total_v21_slices} total bounded slices"
+        );
+        run(&mut conn, MIGRATIONS, SCHEMA_VERSION).expect("finish current schema");
+        assert_eq!(version_of(&conn), SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM migration_progress", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("cleared migration progress"),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .expect("preserved item count"),
+            V21_INSTALLED_PROFILE_ROWS as i64 + 1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM accounts WHERE auth_state = 'authorized'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("preserved authorization"),
+            1
         );
     }
 

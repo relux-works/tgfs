@@ -361,7 +361,10 @@ struct LiveControlTests {
         case agentHealthUnavailable
     }
 
-    private static func snapshot(accounts: [AccountHealthSummary]? = nil) -> AgentHealthSnapshot {
+    private static func snapshot(
+        accounts: [AccountHealthSummary]? = nil,
+        state: AgentRunState = .running
+    ) -> AgentHealthSnapshot {
         AgentHealthSnapshot(
             payloadVersion: 1,
             agentVersion: AgentVersion.current,
@@ -371,7 +374,7 @@ struct LiveControlTests {
             processIdentity: AgentProcessIdentity(
                 instanceID: UUID(), pid: Int32.max, kernelStartSeconds: 1, kernelStartMicroseconds: 1
             ),
-            state: .running,
+            state: state,
             startedAtMs: 0,
             launchAtLogin: nil,
             stateSchemaVersion: nil,
@@ -472,6 +475,25 @@ struct LiveControlTests {
         )
         #expect(await ensurer.ensureRunning() == .started)
         #expect(starter.askedPreferences == [false], "the preference is honored, not upgraded")
+    }
+
+    @Test func ensurerDoesNotTreatMigrationHealthAsOperationalReadiness() async {
+        let probes = IntBox()
+        let starter = ScriptedStarter()
+        let ensurer = AgentEnsurer(
+            probe: {
+                let count = probes.increment()
+                return .running(Self.snapshot(state: count < 3 ? .recovering : .running))
+            },
+            starter: starter,
+            loginItemPreferred: { false },
+            pollInterval: .milliseconds(1),
+            startupTimeout: .seconds(1)
+        )
+
+        #expect(await ensurer.ensureRunning() == .alreadyRunning)
+        #expect(probes.value >= 3)
+        #expect(starter.askedPreferences.isEmpty)
     }
 
     @Test func ensurerReportsAStartFailureTyped() async {
@@ -948,6 +970,24 @@ private final class FlagBox: @unchecked Sendable {
         lock.lock()
         flag = true
         lock.unlock()
+    }
+}
+
+private final class IntBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func increment() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        storage += 1
+        return storage
     }
 }
 
