@@ -5,6 +5,13 @@
 
 ## 2026-08-23
 
+### 0715 — Schema-21 rebuild exposes bounded resumable progress (BUG-260823-kd815p)
+
+- ROOT CAUSE: the observed schema-20 boundary was the next step, v21, copying 3.2M `items` rows, rebuilding six indexes, and checking foreign keys in one transaction. The prior v20 partial-index step had already committed; killing the candidate during v21 rolled the entire expensive rebuild back and exposed no progress.
+- FIX: v21 now copies `items` in primary-key-ordered 4,096-row transactions, commits a privacy-safe cursor and repair marker with every chunk, builds each shadow index in its own resumable phase, validates row counts and shadow foreign keys, then atomically swaps tables and stamps schema 21. Existing schema, authorization, Keychain/domain state, and timeouts are unchanged until that swap.
+- REGRESSION/EVIDENCE: an expected-red representative v20 test now interrupts after one chunk, relaunches from the durable schema-20 checkpoint, and proves schema 21, unchanged item/authorized-account counts, zero FK violations, cleared progress, and the indexed render plan. On the read-only failed-build artifact's CoW clone, 3,203,405 items advanced schema 20 to 23 in 142.337s; 783 data chunks plus six index phases were observable, the authorized-account count remained one, and the post-migration full FK scan reported zero violations. Evidence is aggregate-only; no account/chat/content identifier, filename, private path, secret, or digest was retained.
+- INSTALL BOUNDARY: the live installed profile was not mutated. Signed exact-main installation, namespace readiness, Finder/hydration acceptance, rollback, and CI/candidate publication remain later post-review tester/release gates.
+
 ### 0655 — First-bootstrap snapshot failures resume without invalidating Finder (BUG-260729-28hnfq)
 
 - ROOT CAUSE: namespace recovery required `namespaceReadyAccounts` membership. A preserved authorized profile whose first schema-23 snapshot failed closed with retryable `snapshot-membership-incomplete` therefore emitted `namespace-failed` but never recreated its owner, so Finder readiness could not recover during the process lifetime.

@@ -93,7 +93,10 @@ an older shape. `MIGRATIONS` contains the contiguous v2–v23 steps, and a const
 assertion fails the build if that list and the version ever disagree. The v4
 atomic rebuild retires live legacy year/media/whole-chat rows, creates direct
 months and both bounded documents, and preserves existing account/chat/item
-identities as live rows or migration tombstones.
+identities as live rows or migration tombstones. The v21 installed-profile
+rebuild copies `items` through its primary-key order in 4,096-row transactions,
+then builds each shadow index and validates the shadow foreign keys in separate
+resumable phases before one short table swap earns schema 21.
 
 Crash safety (SYNC-072) rests on one rule: `PRAGMA user_version` advances
 only in the same transaction as the work that earns it, so the version is
@@ -104,11 +107,14 @@ never a claim the data cannot back.
 | `MigrationStep::Sql` | DDL and bounded data work — one transaction | Rolls back whole; the next open starts it over |
 | `MigrationStep::AtomicRebuild` | Bounded table/projection rebuild requiring temporary FK suspension | Commits schema, projection, version, and history together; foreign keys are checked before acceptance |
 | `MigrationStep::Resumable` | Data too large for one transaction (a backfill across 110k messages) | Committed chunks stay; `migration_progress` holds the last checkpoint and the next open resumes from it |
+| `MigrationStep::ResumableRebuild` | Multi-million-row table rebuild requiring temporary FK suspension | Shadow-copy and index phases commit independently; the old version remains authoritative until validated shadows swap atomically |
 
 A resumable step commits each chunk's data changes together with the
 checkpoint it resumes from, so the pair can never disagree. Its `prepare`
 DDL runs in the same transaction as the first chunk's commit — applied once,
-and rolled back with it if that commit never happens.
+and rolled back with it if that commit never happens. A resumable rebuild also
+restores the connection's prior foreign-key enforcement setting after every
+chunk, including error paths.
 
 Repair markers (`repair_markers`, `StateStore::repair_markers`) are the
 handoff to reconciliation: a migration that changes the shape of a
