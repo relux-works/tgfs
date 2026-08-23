@@ -6,7 +6,7 @@ Nine scripts live here, one per kind of acceptance the project gates on:
 |---|---|---|
 | `run_automated.py` | The automated gate suites — format, lint, test, architecture, supply-chain, traceability, script self-tests, the macOS `swift build`/`swift test` leg, secret scan | **Yes.** This is CI's single entrypoint; documented in the top-level `README.md`. |
 | `run_live_content.py` | Combined pre-install synthetic live-content matrix across focused Rust conformance/integration suites and the full Swift package/provider regression suite | **Yes.** Invoke through `run_automated.py --suite live-content`; it persists only fixed labels, counts, booleans, timings, versions, and bounds. |
-| `run_installed_live_content.py` | Installed authorized-profile date-first enumeration, one fresh placeholder hydration, and relaunch comparison | **Yes, on the authorized local macOS profile.** Its public evidence excludes identifiers, paths, names, and content; raw comparison keys remain only in its temporary private state. |
+| `run_installed_live_content.py` | Bounded installed authorized-profile date-first enumeration, one fresh placeholder hydration, generated-cache accounting, and relaunch comparison | **Yes, on the authorized local macOS profile.** The phase has a 120-second overall deadline, runs in an exactly cleaned process group, and emits fixed per-stage timings and a bounded failure category. Public evidence excludes identifiers, paths, names, and content; bulk identity/cursor keys remain in an indexed SQLite sidecar beside the temporary private state. |
 | `run_installed_history_convergence.py` | Installed authorized-profile account-wide history convergence, bounded CPU/Finder enumeration, dataless-media, and relaunch comparison | **Yes, on the authorized local macOS profile.** Chat identities and cursor bounds remain only in its temporary private state; public evidence is aggregate-only. |
 | `run_installed_index_metadata.py` | Installed authorized-profile chat-index convergence reach, directory size rollups, and correspondence dates, compared across an app + agent relaunch | **Yes, on the authorized local macOS profile.** Public evidence is counts, booleans, and byte totals only; cursor bounds live behind a per-run salted digest in a caller-chosen private directory. |
 | `run_installed_foreground_demand.py` | Installed authorized-profile check that using a chat in Finder buys it a history turn, with no control-socket hint anywhere: reading one generated document inside it (`--gesture read`, the acceptance boolean) or only opening its folder (`--gesture open`, the platform-truth record) | **Yes, on the authorized local macOS profile.** Public evidence is counts, booleans, seconds, and message deltas only; the chosen chat's identity, the document read, and its raw cursor readings stay in a caller-chosen private file. |
@@ -34,7 +34,24 @@ regressions. Every child process has a 900-second deadline. Its
 and the schema rejects any field outside aggregate counts, booleans, timings,
 tool versions, and fixed synthetic scenario labels.
 
-The installed-profile runner is intentionally separate from CI. Run its
+The installed-profile runner is intentionally separate from CI. Every phase
+runs in a dedicated process group with a default 120-second hard deadline
+(`--deadline-seconds` may lower the bound for diagnosis). Timeout cleanup first
+terminates and then kills that exact group. Every TERM wait, SIGKILL reap, and
+pipe drain carries the remaining absolute bound; none extends the caller
+deadline. A rare unreaped leader is reported as
+`worker-cleanup-deadline-exceeded`, distinct from an ordinary stage timeout.
+Private progress records the fixed stage plus its monotonic start, so a killed
+blocking stage still emits a current non-stale duration. The public evidence
+contains every fixed stage with a duration or `null`; a private SQLite sidecar beside `--state`
+stores active item and cursor keys without building account-wide Python lists.
+Relaunch comparison uses indexed anti-joins against that sidecar. Generated
+cache references stream through an indexed temporary table, and the physical
+inventory uses an iterative scan capped at 1,000,000 entries, so the former
+unbounded recursive walk now either proves exact quota/orphan/reference truth
+or fails with a bounded category.
+
+Run its
 `before` phase against the installed Developer ID candidate, relaunch the
 agent without resetting the profile, then run `after`. If unrelated live
 discovery changes the global item set, run `stability-snapshot` after it
