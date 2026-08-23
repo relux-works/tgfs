@@ -88,6 +88,23 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
                 AND sent_at_ms >= ?4 AND sent_at_ms < ?5",
     },
     RequiredQuery {
+        name: "monthly_render_snapshot",
+        serves: "one bounded, already-ordered monthly render input without an SQLite temp sort",
+        sql: "SELECT m.message_id, m.sender_id, m.sent_at_ms,
+                     e.event_seq, e.event_kind, e.observed_at_ms,
+                     e.payload_schema, e.payload
+              FROM messages AS m INDEXED BY messages_by_time
+              CROSS JOIN message_events AS e
+                ON e.account_id = m.account_id
+               AND e.namespace_version = m.namespace_version
+               AND e.chat_id = m.chat_id
+               AND e.message_id = m.message_id
+              WHERE m.account_id = ?1 AND m.namespace_version = ?2 AND m.chat_id = ?3
+                AND m.sent_at_ms >= ?4 AND m.sent_at_ms < ?5
+                AND e.event_seq <= ?6
+              ORDER BY m.sent_at_ms, m.message_id",
+    },
+    RequiredQuery {
         name: "chat_event_tail",
         serves: "render catch-up from a watermark (SYNC-022, SYNC-024)",
         sql: "SELECT event_seq, event_kind FROM message_events

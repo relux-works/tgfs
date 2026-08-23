@@ -350,8 +350,8 @@ impl ReadTxn<'_> {
             "SELECT m.message_id, m.sender_id, m.sent_at_ms,
                     e.event_seq, e.event_kind, e.observed_at_ms,
                     e.payload_schema, e.payload
-             FROM messages m
-             JOIN message_events e
+             FROM messages AS m INDEXED BY messages_by_time
+             CROSS JOIN message_events AS e
                ON e.account_id = m.account_id
               AND e.namespace_version = m.namespace_version
               AND e.chat_id = m.chat_id
@@ -359,7 +359,7 @@ impl ReadTxn<'_> {
              WHERE m.account_id = ?1 AND m.namespace_version = ?2 AND m.chat_id = ?3
                AND m.sent_at_ms >= ?4 AND m.sent_at_ms < ?5
                AND e.event_seq <= ?6
-             ORDER BY m.sent_at_ms, m.message_id, e.event_seq",
+             ORDER BY m.sent_at_ms, m.message_id",
         )?;
         type RawRow = (
             i64,
@@ -445,6 +445,14 @@ impl ReadTxn<'_> {
                 observed_at_ms,
                 payload,
             });
+        }
+        // The outer messages index already streams the month in its final
+        // document order. SQLite cannot prove that the inner revision probe
+        // also supplies the last ORDER BY term and otherwise materializes a
+        // temporary B-tree for the whole joined month. Keep that ordering
+        // local to each message's normally tiny revision history instead.
+        for message in &mut messages {
+            message.events.sort_unstable_by_key(|event| event.event_seq);
         }
         Ok(MonthRenderSnapshot {
             chat,
