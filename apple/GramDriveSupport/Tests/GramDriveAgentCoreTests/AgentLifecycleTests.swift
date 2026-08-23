@@ -340,6 +340,51 @@ private func seedAuthorizedAccount(dataRoot: URL, accountId: Int64) throws {
         }
     }
 
+    @Test func preservedAuthorizedBootstrapRecoversFromIncompleteSnapshotBeforeFirstReady()
+        async throws
+    {
+        try await withTemporaryDirectoryAsync { root in
+            let bootstrapper = FakeNamespaceBootstrapper()
+            let lifecycle = AgentLifecycle(
+                configuration: AgentConfiguration(
+                    dataRoot: root,
+                    namespaceBootstrapper: bootstrapper,
+                    namespaceRecoveryDelay: .milliseconds(1)))
+            try lifecycle.start()
+            // Reproduce the material state that matters after an installed
+            // migration: authorization is durable before the first namespace
+            // owner attempts snapshot bootstrap.
+            try seedAuthorizedAccount(dataRoot: root, accountId: 7)
+            lifecycle.startNamespace(accountId: 7)
+
+            #expect(bootstrapper.startCount(accountId: 7) == 1)
+            let first = try #require(bootstrapper.session(accountId: 7))
+            bootstrapper.emit(
+                .failed(category: "snapshot-membership-incomplete", retryable: true),
+                accountId: 7)
+
+            for _ in 0..<200 where bootstrapper.startCount(accountId: 7) < 2 {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(
+                bootstrapper.startCount(accountId: 7) == 2,
+                "a retryable first-bootstrap failure must resume without relaunch or login")
+            #expect(first.closed)
+            #expect(lifecycle.namespaceStatus(accountId: 7) == .preparing)
+            #expect(lifecycle.healthSnapshot().finderContentState == .preparing)
+            #expect(lifecycle.healthSnapshot().finderContentFailure == nil)
+
+            bootstrapper.emit(
+                .ready(canonicalChatCount: 2, appearanceCount: 3), accountId: 7)
+            #expect(
+                lifecycle.namespaceStatus(accountId: 7)
+                    == .ready(canonicalChatCount: 2, appearanceCount: 3))
+            #expect(lifecycle.observedAuthorizationState(accountId: 7) == .authorized)
+
+            await lifecycle.shutdown(reason: .terminate)
+        }
+    }
+
     @Test func finderReadinessStaysUsableAcrossPostReadyFailureAndRecovery() {
         let sourceFailure = AgentActionableFailure(
             category: "source",
@@ -373,7 +418,7 @@ private func seedAuthorizedAccount(dataRoot: URL, accountId: Int64) throws {
             AgentLifecycle.namespaceReadinessDisposition(
                 progress: .failed(category: "source", retryable: true),
                 hasReachedReady: false)
-                == .failed(sourceFailure))
+                == .preparing)
         // Authorization expiry is the core's canonical *non*-retryable
         // failure: restarting the owner would meet the same wall, so proven
         // readiness is genuinely invalidated and the user has to act.
@@ -531,7 +576,7 @@ private func seedAuthorizedAccount(dataRoot: URL, accountId: Int64) throws {
 
             #expect(
                 lifecycle.namespaceStatus(accountId: 9)
-                    == .failed(category: "auth-required", retryable: true))
+                    == .failed(category: "auth-required", retryable: false))
             #expect(
                 lifecycle.observedAuthorizationState(accountId: 9)
                     == .authorizationRequired)
