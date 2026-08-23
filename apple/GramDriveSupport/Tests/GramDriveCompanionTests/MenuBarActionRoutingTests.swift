@@ -32,19 +32,22 @@ import Testing
         #expect(recorder.events == ["open-in-finder"])
     }
 
-    @Test func manualUpdateActionTracksAvailabilityAndRoutesOnlyWhenEnabled() {
+    @Test func manualUpdateActionActivatesImmediatelyBeforeCheckingWhenEnabled() {
         let availability = UpdateAvailability()
-        var calls = 0
-        let action = ManualUpdateAction(availability: availability) { calls += 1 }
+        var events: [String] = []
+        let action = ManualUpdateAction(
+            availability: availability,
+            activateApplication: { events.append("activate") },
+            invokeUpdater: { events.append("check") })
 
         #expect(!action.isEnabled)
         action.invoke()
-        #expect(calls == 0)
+        #expect(events.isEmpty)
 
         availability.setCanCheckForUpdates(true)
         #expect(action.isEnabled)
         action.invoke()
-        #expect(calls == 1)
+        #expect(events == ["activate", "check"])
     }
 }
 

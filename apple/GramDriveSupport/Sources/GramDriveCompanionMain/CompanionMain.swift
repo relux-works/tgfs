@@ -51,12 +51,7 @@ private final class GramDriveApplicationDelegate: NSObject, NSApplicationDelegat
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    let intent: CompanionTerminationCoordinator.Intent
-    if let pendingUpdateBuild {
-      intent = .update(targetBuild: pendingUpdateBuild)
-    } else {
-      intent = .userQuit
-    }
+    let intent = CompanionTerminationCoordinator.Intent.fromPendingUpdateBuild(pendingUpdateBuild)
     guard terminationDriver.applicationShouldTerminate(intent: intent, reply: { [weak self] allowed in
       self?.replyToTerminationOnce(allowed)
     }) else { return .terminateLater }
@@ -65,7 +60,11 @@ private final class GramDriveApplicationDelegate: NSObject, NSApplicationDelegat
   }
 
   func checkForUpdates() {
-    updaterController.checkForUpdates(nil)
+    ManualUpdateAction(
+      availability: updateAvailability,
+      activateApplication: { CompanionApplicationActivation.activate() },
+      invokeUpdater: { [updaterController] in updaterController.checkForUpdates(nil) }
+    ).invoke()
   }
 
   /// An in-flight AppKit termination has an explicit recovery route for a

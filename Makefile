@@ -11,7 +11,7 @@
 GATE := python3 .scripts/acceptance/run_automated.py
 
 .PHONY: check check-core check-repo check-security check-apple check-live-content gates fmt build test bindings \
-        smoke-bindings smoke-shared-state smoke-agent-lifecycle smoke-control-auth \
+        smoke-bindings smoke-shared-state smoke-agent-lifecycle smoke-control-auth smoke-sparkle-manual-update \
         package package-host-test \
         package-reproducible package-app package-app-unsigned package-app-notarize \
         release-provenance updates-secret-inventory tdlib tdlib-smoke tdlib-smoke-link tdjson-smoke tdlib-verify \
@@ -118,6 +118,14 @@ smoke-control-auth:
 # (see .scripts/smoke/run_agent_lifecycle_smoke.py).
 smoke-agent-lifecycle:
 	python3 .scripts/smoke/run_agent_lifecycle_smoke.py
+
+# smoke-sparkle-manual-update — packages an isolated LSUIElement accessory host
+# against pinned Sparkle 2.9.5, serves a fixture-key signed local appcast, and
+# proves a manual check from zero windows produces a visible key-capable
+# standard Sparkle window within a bounded deadline. No installed profile or
+# shipping trust anchor is used.
+smoke-sparkle-manual-update: package
+	python3 .scripts/smoke/run_sparkle_manual_update_smoke.py
 
 # --- Native macOS acceptance (human-in-the-loop) -----------------------------
 # The release-gate manual acceptance for the macOS File Provider drive

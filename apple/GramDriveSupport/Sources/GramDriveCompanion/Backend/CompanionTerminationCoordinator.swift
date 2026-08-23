@@ -38,6 +38,13 @@ public final class CompanionTerminationCoordinator {
         case userQuit
         case update(targetBuild: String)
 
+        public static func fromPendingUpdateBuild(_ pendingUpdateBuild: String?) -> Self {
+            if let pendingUpdateBuild {
+                return .update(targetBuild: pendingUpdateBuild)
+            }
+            return .userQuit
+        }
+
         func controlRequest(expectedAgentInstanceID: UUID) -> ControlTerminationRequest {
             switch self {
             case .userQuit:

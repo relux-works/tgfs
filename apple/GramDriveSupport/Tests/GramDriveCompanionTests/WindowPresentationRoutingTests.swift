@@ -109,6 +109,37 @@ import Testing
         #expect(harness.activationAttemptCount == 3)
         #expect(harness.scheduledActionCount == 0)
     }
+
+    @Test func manualUpdateRetriesFromZeroWindowsUntilSparkleWindowAppears() {
+        let availability = UpdateAvailability(canCheckForUpdates: true)
+        let harness = WindowActivationRetryHarness()
+        var events: [String] = []
+        let action = ManualUpdateAction(
+            availability: availability,
+            activateApplication: {
+                events.append("activate")
+                harness.retrier.activate()
+            },
+            invokeUpdater: {
+                events.append("check")
+                harness.completePresentationOnNextAttempt = true
+            })
+
+        action.invoke()
+
+        #expect(events == ["activate", "check"])
+        #expect(harness.activationAttemptCount == 1)
+        #expect(harness.scheduledActionCount == 1)
+
+        harness.runNextScheduledAction()
+
+        #expect(harness.activationAttemptCount == 2)
+        #expect(harness.scheduledActionCount == 0)
+
+        harness.isPresentationComplete = false
+        #expect(harness.activationAttemptCount == 2)
+        #expect(harness.scheduledActionCount == 0)
+    }
 }
 
 @MainActor
