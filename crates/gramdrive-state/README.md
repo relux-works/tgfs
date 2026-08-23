@@ -55,6 +55,11 @@ chat catalogs, the Stories view, and recoverable authorization finalization.
 v23 indexes non-null cache materialization references so generated-generation
 reclamation performs one ownership point probe while holding the native
 hand-off lease boundary instead of scanning every cached item.
+At the same schema boundary, monthly render snapshots force the existing
+chat/time and per-message-event indexes as a streaming nested loop and sort
+only each message's local revision list. This avoids a full joined-month
+temporary sort without rewriting an installed database or changing rendered
+document order.
 Each file
 carries the full rationale per table — this is the map. `StateStore::open` applies it atomically to a fresh file
 (`PRAGMA user_version` 0 → 1), migrates an older file forward, recognizes a
@@ -75,7 +80,7 @@ every connection; file databases run in WAL with `synchronous=NORMAL`.
 | Cache | `cache_entries`, `pins`, `retention_purge_queue` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; generated materialization ownership is a partial-index point probe so reclamation cannot monopolize the lease boundary; `pins` is durable offline intent independent of materialization; destructive retention queues physical deletion before dropping cache ownership |
 | Sync positions | `change_cursors`, `chat_sync_state`, `chat_content_progress` | One durable feed position per (account, stream) — scope verification stays with `ChangeCursor::require_scope` (SYNC-004); a chat gets bounded resumable history and privacy-safe pending/ready/retry/protected state when its first live Telegram list membership makes it provider-eligible, while an existing cursor survives later membership removal/reappearance (SYNC-021). The backward-crawl rotation is keyed on `last_backfill_at_ms` — when a chat was last handed a turn — and never on `last_sync_at_ms`, which live delivery also stamps: ordering on the latter let incoming messages reset a chat's place in the queue, so the busiest correspondences were the ones that never crawled backward |
 | Backfill control | `backfill_control` | The engine backfill scheduler's durable per-scope pause switch, request spacer, and honored flood-wait deadline — a restart resumes neither paused work nor a violated flood wait (SYNC-043/SYNC-005 pause, SEC-031 spacer, NFR-033 flood, NFR-031/SYNC-070 restart durability) |
-| Rendering | `message_events`, `items`, `render_state`, `cache_entries` | One-transaction monthly snapshots pin message watermark plus account policy generation; paired appearance catalog; renderer/schema versions and dirty worklist; chat privacy transitions walk only the indexed direct/month subtree and retain stable ItemId order instead of scanning and sorting every generated document in the account; publication rechecks policy and ignores unrelated-month event races while item facts/cache locators/change-journal rows advance atomically (SYNC-024, SYNC-030..033) |
+| Rendering | `message_events`, `items`, `render_state`, `cache_entries` | One-transaction monthly snapshots pin message watermark plus account policy generation and stream the selected chat/month in document order without a joined-month temp sort; paired appearance catalog; renderer/schema versions and dirty worklist; chat privacy transitions walk only the indexed direct/month subtree and retain stable ItemId order instead of scanning and sorting every generated document in the account; publication rechecks policy and ignores unrelated-month event races while item facts/cache locators/change-journal rows advance atomically (SYNC-024, SYNC-030..033) |
 | Versioning | `schema_history` + `user_version` | The pragma answers "what is current"; the table answers "how did we get here" for the migration runner (SYNC-072) |
 
 ## Migrations

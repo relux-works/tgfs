@@ -292,11 +292,20 @@ impl ContentDemandState {
         )
     }
 
-    /// The live view plus every unspent admission, at the stronger of the two
-    /// priorities, together with the watermark the snapshot was taken at. This
-    /// is what the scheduler plans against.
+    /// Every unspent admission plus live `Visible` demand, together with the
+    /// watermark the snapshot was taken at. A live `Requested` edge still
+    /// preempts the active background slice through [`Self::live_snapshot`],
+    /// but its one admitted scheduler turn must not repeat until the read
+    /// settles; one content read is one promised turn. A visible folder stays
+    /// foreground while it remains on screen.
     fn scheduling_snapshot(&self) -> DemandPlan {
-        let mut merged = self.priorities.clone();
+        let mut merged = self
+            .priorities
+            .iter()
+            .filter_map(|(&chat_id, &priority)| {
+                matches!(priority, ChatHistoryPriority::Visible).then_some((chat_id, priority))
+            })
+            .collect::<BTreeMap<_, _>>();
         for (&chat_id, admission) in &self.unspent {
             let slot = merged.entry(chat_id).or_insert(admission.priority);
             if matches!(admission.priority, ChatHistoryPriority::Visible) {
@@ -11485,6 +11494,88 @@ mod tests {
             first,
             "with every chat turned once, the rotation comes back round to \
              the one whose turn was longest ago"
+        );
+    }
+
+    /// The installed build-127 profile carried 6,610 runnable chats while a
+    /// sequential burst of twenty generated reads failed to buy even one turn
+    /// for the selected crawling chat. Keep the production scheduler boundary
+    /// honest at that cardinality: a read that settles (or is cancelled by its
+    /// caller timeout) before the worker snapshots demand still owns one turn,
+    /// live reads stay requested, and background work resumes immediately
+    /// after the bounded burst rather than being disabled.
+    #[test]
+    fn twenty_foreground_turns_preempt_6609_backfills_then_background_resumes() {
+        const ACTIVE_BACKFILLS: i64 = 6_609;
+        const FOREGROUND_READS: i64 = 20;
+
+        let mut store = store();
+        let txn = store.write_txn().expect("saturated fixture transaction");
+        let main = ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Main,
+        };
+        for offset in 0..ACTIVE_BACKFILLS {
+            let chat_id = 10_000 + offset;
+            txn.upsert_chat(
+                &snapshot_chat_record(scope(), &chat(chat_id, "Synthetic backfill"))
+                    .expect("synthetic chat record"),
+            )
+            .expect("saturated backfill chat");
+            txn.upsert_chat_list_entry(
+                &main,
+                &ChatListEntry {
+                    chat_id: ChatId(chat_id),
+                    sort_order: -chat_id,
+                    pinned: false,
+                },
+            )
+            .expect("saturated backfill membership");
+        }
+        txn.commit().expect("commit saturated fixture");
+        initialize_content_progress(&mut store, scope()).expect("saturated progress");
+
+        let first_target = 10_000 + ACTIVE_BACKFILLS - FOREGROUND_READS;
+        let targets = (first_target..first_target + FOREGROUND_READS).collect::<BTreeSet<_>>();
+        let demand = Mutex::new(ContentDemandState::default());
+        {
+            let mut held = demand.lock().expect("foreground demand");
+            for (index, target) in targets.iter().copied().enumerate() {
+                held.set(target, ChatHistoryPriority::Requested);
+                if index % 2 == 0 {
+                    // Models the release/cancellation racing ahead of the
+                    // namespace snapshot after a bounded caller timeout.
+                    held.set(target, ChatHistoryPriority::Background);
+                }
+            }
+        }
+
+        let scheduler = BackfillScheduler::with_defaults();
+        let mut served = BTreeSet::new();
+        for call in 0..FOREGROUND_READS {
+            let turn =
+                open_next_history_turn(&mut store, scope(), &scheduler, &demand, 1_000 + call)
+                    .expect("foreground plan")
+                    .expect("foreground work");
+            assert_eq!(turn.1, BackfillPriority::Requested);
+            assert!(
+                served.insert(turn.0.0),
+                "one read must buy at most one turn"
+            );
+        }
+        assert_eq!(served, targets, "all twenty selected chats get a turn");
+        assert!(
+            demand.lock().expect("spent demand").unspent.is_empty(),
+            "twenty reads require exactly twenty foreground scheduler calls"
+        );
+
+        let background = open_next_history_turn(&mut store, scope(), &scheduler, &demand, 2_000)
+            .expect("background plan")
+            .expect("background remains runnable");
+        assert_eq!(background.1, BackfillPriority::Background);
+        assert!(
+            !targets.contains(&background.0.0),
+            "least-served background work must progress after the foreground burst"
         );
     }
 
