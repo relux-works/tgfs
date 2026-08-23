@@ -120,6 +120,13 @@ const MAX_RENDER_WORKLIST_ITEMS_PER_TICK: u32 = 4;
 // provider tree after every 100-message page.
 const MAX_BACKGROUND_HISTORY_PAGES_PER_SLICE: u64 = 8;
 const MAX_FOREGROUND_HISTORY_PAGES_PER_SLICE: u64 = 16;
+const MAX_PROJECTION_CHATS_PER_SLICE: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionDepth {
+    Shallow,
+    Deep,
+}
 
 #[derive(Clone, Copy)]
 struct SessionIo<'a> {
@@ -377,6 +384,18 @@ struct DemandPlan {
 pub enum NamespaceProgress {
     /// Roots exist and the source metadata snapshot is in flight.
     Preparing,
+    /// TDLib crossed its live authorization boundary. This does not claim
+    /// namespace or projection readiness.
+    Authorized,
+    /// The complete Telegram folder catalog was observed and persisted.
+    FolderCatalog,
+    /// The bounded chat-list snapshot stage is in flight.
+    SnapshotList,
+    /// One bounded post-ready deep-projection slice committed.
+    ProjectionSlice {
+        /// Number of chats committed by this slice (aggregate only).
+        processed_chat_count: u64,
+    },
     /// Metadata is durable and live updates are being applied.
     Ready {
         /// Canonical chat rows, counted without names.
@@ -725,6 +744,7 @@ fn run_session(
         io.updates,
         io.cancelled,
     )?;
+    listener.on_progress(NamespaceProgress::Authorized);
     let pending = io
         .client
         .request(json!({"@type": "getMe"}))
@@ -768,16 +788,19 @@ fn run_session(
         io.cancelled,
     )
     .map_err(|failure| failure.storage_stage("folder-catalog-storage"))?;
+    listener.on_progress(NamespaceProgress::FolderCatalog);
 
-    // Root/list/chat metadata is durable before any history request starts.
-    persist_folders_and_projection(&mut store, scope, &folders)
-        .map_err(|failure| failure.storage_stage("catalog-projection-storage"))?;
+    // The source catalog is durable before its bounded membership snapshot.
+    // Provider projection waits for the snapshot's atomic ready boundary.
+    persist_folders(&mut store, scope, &folders)
+        .map_err(|failure| failure.storage_stage("folder-catalog-storage"))?;
     // A crash may have committed story retention before its provider/cache
-    // cleanup. Reapplying canonical policy after the relaunch projection
+    // cleanup. Reapplying canonical policy after the relaunch catalog update
     // converges that window without fetching or opening any story.
     purge_disallowed_materializations(hydrator, scope.account)
         .map_err(|failure| failure.storage_stage("cache-policy-storage"))?;
     let _ = folders.take_batch();
+    listener.on_progress(NamespaceProgress::SnapshotList);
     run_snapshot_cycle(
         &mut store,
         scope,
@@ -943,6 +966,12 @@ fn run_content_loop(
         if cancelled.load(Ordering::Acquire) {
             return Ok(());
         }
+        let projected = converge_projection_slice(store, scope)?;
+        if projected > 0 {
+            listener.on_progress(NamespaceProgress::ProjectionSlice {
+                processed_chat_count: projected as u64,
+            });
+        }
         let live_changed = drive_live_steps(
             store, scope, folders, metadata, content, client, updates, cancelled, listener,
         )?;
@@ -999,7 +1028,7 @@ fn run_content_loop(
                     // Folder definitions are complete-state. Persist the new
                     // catalog, then snapshot only because a new folder list
                     // may introduce chats absent from main/archive.
-                    persist_folders_and_projection(store, scope, folders)?;
+                    persist_folders(store, scope, folders)?;
                     let _ = folders.take_batch();
                     run_snapshot_cycle(
                         store, scope, folders, metadata, content, client, updates, cancelled,
@@ -1039,6 +1068,56 @@ fn run_content_loop(
             std::thread::sleep(delay);
         }
     }
+}
+
+fn converge_projection_slice(
+    store: &mut StateStore,
+    scope: gramdrive_model::identity::AccountScope,
+) -> Result<usize, SessionFailure> {
+    let (generation, after, chats) = {
+        let txn = store.read_txn().map_err(|_| SessionFailure::STORAGE)?;
+        let Some(readiness) = txn
+            .namespace_readiness(scope)
+            .map_err(|_| SessionFailure::STORAGE)?
+        else {
+            return Ok(0);
+        };
+        if readiness.convergence_complete {
+            return Ok(0);
+        }
+        let chats = txn
+            .listed_chats(scope)
+            .map_err(|_| SessionFailure::STORAGE)?
+            .into_iter()
+            .filter(|chat| {
+                readiness
+                    .projection_after_chat_id
+                    .is_none_or(|after| chat.key.chat_id.0 > after.0)
+            })
+            .take(MAX_PROJECTION_CHATS_PER_SLICE)
+            .map(|chat| chat.key)
+            .collect::<Vec<_>>();
+        (
+            readiness.generation,
+            readiness.projection_after_chat_id,
+            chats,
+        )
+    };
+    let txn = store.write_txn().map_err(|_| SessionFailure::STORAGE)?;
+    if chats.is_empty() {
+        txn.advance_namespace_projection(scope, generation, after, true, now_ms())
+            .map_err(|_| SessionFailure::STORAGE)?;
+        txn.commit().map_err(|_| SessionFailure::STORAGE)?;
+        return Ok(0);
+    }
+    for chat in &chats {
+        reconcile_chat_projection_txn(&txn, *chat)?;
+    }
+    let cursor = chats.last().map(|chat| chat.chat_id);
+    txn.advance_namespace_projection(scope, generation, cursor, false, now_ms())
+        .map_err(|_| SessionFailure::STORAGE)?;
+    txn.commit().map_err(|_| SessionFailure::STORAGE)?;
+    Ok(chats.len())
 }
 
 fn content_loop_delay(received_update: bool) -> Duration {
@@ -3980,27 +4059,32 @@ fn run_snapshot_cycle(
                 .map_err(|failure| failure.storage_stage("snapshot-live-content-storage"))?;
                 purge_disallowed_materializations(hydrator, scope.account)
                     .map_err(|failure| failure.storage_stage("snapshot-cache-policy-storage"))?;
-                listener.on_progress(
-                    namespace_counts(store, scope)
-                        .map_err(|failure| failure.storage_stage("snapshot-count-storage"))?,
-                );
             }
             SnapshotStep::Done => {
-                rebuild_projection(store, scope)
-                    .map_err(|failure| failure.storage_stage("snapshot-projection-storage"))?;
                 let txn = store.write_txn().map_err(|_| SessionFailure {
                     category: "snapshot-checkpoint-storage",
                     retryable: true,
                 })?;
+                reconcile_projection_scope_txn(&txn, scope, None, ProjectionDepth::Shallow)
+                    .map_err(|failure| failure.storage_stage("snapshot-projection-storage"))?;
                 txn.clear_namespace_bootstrap(scope)
                     .map_err(|_| SessionFailure {
                         category: "snapshot-checkpoint-storage",
+                        retryable: true,
+                    })?;
+                txn.publish_namespace_readiness(scope, now_ms())
+                    .map_err(|_| SessionFailure {
+                        category: "namespace-readiness-storage",
                         retryable: true,
                     })?;
                 txn.commit().map_err(|_| SessionFailure {
                     category: "snapshot-checkpoint-storage",
                     retryable: true,
                 })?;
+                listener.on_progress(
+                    namespace_counts(store, scope)
+                        .map_err(|failure| failure.storage_stage("snapshot-count-storage"))?,
+                );
                 return Ok(());
             }
         }
@@ -4579,7 +4663,7 @@ fn live_chat_record(
     })
 }
 
-fn persist_folders_and_projection(
+fn persist_folders(
     store: &mut StateStore,
     scope: gramdrive_model::identity::AccountScope,
     folders: &FolderCatalogMachine,
@@ -4597,8 +4681,17 @@ fn persist_folders_and_projection(
     let txn = store.write_txn().map_err(|_| SessionFailure::STORAGE)?;
     txn.replace_folders(scope, &records)
         .map_err(|_| SessionFailure::STORAGE)?;
-    txn.commit().map_err(|_| SessionFailure::STORAGE)?;
-    rebuild_projection(store, scope)
+    txn.commit().map_err(|_| SessionFailure::STORAGE)
+}
+
+#[cfg(test)]
+fn rebuild_shallow_projection(
+    store: &mut StateStore,
+    scope: gramdrive_model::identity::AccountScope,
+) -> Result<(), SessionFailure> {
+    let txn = store.write_txn().map_err(|_| SessionFailure::STORAGE)?;
+    reconcile_projection_scope_txn(&txn, scope, None, ProjectionDepth::Shallow)?;
+    txn.commit().map_err(|_| SessionFailure::STORAGE)
 }
 
 fn rebuild_projection(
@@ -4755,7 +4848,7 @@ fn reconcile_projection_txn(
     txn: &gramdrive_state::WriteTxn<'_>,
     scope: gramdrive_model::identity::AccountScope,
 ) -> Result<(), SessionFailure> {
-    reconcile_projection_scope_txn(txn, scope, None)
+    reconcile_projection_scope_txn(txn, scope, None, ProjectionDepth::Deep)
 }
 
 fn reconcile_chat_projection_txn(
@@ -4772,15 +4865,16 @@ fn reconcile_chat_projection_txn(
         })?
         .is_empty();
     if !has_projected_appearance {
-        return reconcile_projection_scope_txn(txn, chat.scope, None);
+        return reconcile_projection_scope_txn(txn, chat.scope, None, ProjectionDepth::Deep);
     }
-    reconcile_projection_scope_txn(txn, chat.scope, Some(chat.chat_id.0))
+    reconcile_projection_scope_txn(txn, chat.scope, Some(chat.chat_id.0), ProjectionDepth::Deep)
 }
 
 fn reconcile_projection_scope_txn(
     txn: &gramdrive_state::WriteTxn<'_>,
     scope: gramdrive_model::identity::AccountScope,
     target_chat_id: Option<i64>,
+    depth: ProjectionDepth,
 ) -> Result<(), SessionFailure> {
     let account = txn
         .read()
@@ -4853,6 +4947,19 @@ fn reconcile_projection_scope_txn(
     let mut tree_stories: BTreeMap<i64, Vec<TreeStoryRecord>> = BTreeMap::new();
     let mut story_metadata = HashMap::new();
     for chat in &chats {
+        if depth == ProjectionDepth::Shallow {
+            message_months.insert(chat.key.chat_id.0, Vec::new());
+            correspondence.insert(
+                chat.key.chat_id.0,
+                CorrespondenceBounds {
+                    metadata_fallback_ms: chat.last_update_at_ms,
+                    ..CorrespondenceBounds::default()
+                },
+            );
+            tree_attachments.insert(chat.key.chat_id.0, Vec::new());
+            tree_stories.insert(chat.key.chat_id.0, Vec::new());
+            continue;
+        }
         let mut months = BTreeSet::new();
         // One pass over the chat's distinct message instants answers both
         // questions the namespace has about time: which civil months exist,
@@ -5134,6 +5241,7 @@ fn reconcile_projection_scope_txn(
         story_metadata: &story_metadata,
         protected_chats: &protected_chats,
         account_created_at_ms,
+        preserve_existing_directory_facts: depth == ProjectionDepth::Shallow,
         directory_facts: HashMap::new(),
     };
     if target_chat_id.is_none() {
@@ -5173,6 +5281,9 @@ fn reconcile_projection_scope_txn(
                 refresh_directory_row(txn, chat_node, &list.id, &context)?;
             }
         }
+        if depth == ProjectionDepth::Shallow {
+            continue;
+        }
         for chat_node in &nodes {
             let chat_children = tree
                 .children(&chat_node.id, None, NonZeroUsize::MAX)
@@ -5210,6 +5321,8 @@ struct ProjectionContext<'a> {
     /// hold no correspondence of their own, and the account's own creation
     /// time is the one truthful non-epoch answer available.
     account_created_at_ms: i64,
+    /// Shallow list publication keeps already-computed chat rollups/dates.
+    preserve_existing_directory_facts: bool,
     /// Correspondence dates and descendant size rollups, keyed by node id
     /// (appearance-scoped: the same chat under Main and under a folder is
     /// two nodes with the same facts).
@@ -5517,10 +5630,27 @@ fn reconcile_nodes(
             // creation time, which beats the epoch Finder shows for an
             // absent timestamp — but it claims no size rollup, exactly as
             // the v16 backfill leaves it NULL.
-            Some(context.directory(&node.id).unwrap_or(DirectoryFacts {
-                created_at_ms: Some(*account_created_at_ms),
-                modified_at_ms: Some(*account_created_at_ms),
-                aggregate_size: None,
+            Some(context.directory(&node.id).unwrap_or_else(|| {
+                if context.preserve_existing_directory_facts {
+                    existing.as_ref().map_or(
+                        DirectoryFacts {
+                            created_at_ms: Some(*account_created_at_ms),
+                            modified_at_ms: Some(*account_created_at_ms),
+                            aggregate_size: None,
+                        },
+                        |item| DirectoryFacts {
+                            created_at_ms: item.created_at_ms,
+                            modified_at_ms: item.modified_at_ms,
+                            aggregate_size: item.aggregate_size,
+                        },
+                    )
+                } else {
+                    DirectoryFacts {
+                        created_at_ms: Some(*account_created_at_ms),
+                        modified_at_ms: Some(*account_created_at_ms),
+                        aggregate_size: None,
+                    }
+                }
             }))
         } else {
             None
@@ -8018,6 +8148,8 @@ mod tests {
             updated_at_ms: 11 * 60 * 60 * 1_000,
         })
         .expect("baseline checkpoint");
+        txn.publish_namespace_readiness(scope(), 1_000)
+            .expect("last-known-good readiness");
         txn.commit().expect("seed commit");
         rebuild_projection(&mut store, scope()).expect("baseline projection");
         let anchor = store
@@ -8072,9 +8204,16 @@ mod tests {
                 b"baseline-resume",
                 "the unsafe commit cannot advance the resumable checkpoint"
             );
+            let readiness = read
+                .namespace_readiness(scope())
+                .expect("readiness")
+                .expect("last-known-good readiness");
+            assert_eq!(readiness.generation, 1);
+            assert_eq!(readiness.projection_after_chat_id, None);
+            assert!(!readiness.convergence_complete);
         }
 
-        rebuild_projection(&mut store, scope()).expect("stable reconciliation");
+        rebuild_shallow_projection(&mut store, scope()).expect("stable shallow reconciliation");
         let changes = store
             .read_txn()
             .expect("read changes")
@@ -8086,6 +8225,74 @@ mod tests {
                 .all(|change| change.item.deleted_at_ms.is_none()),
             "a rejected snapshot emits no provider didDeleteItems"
         );
+    }
+
+    #[test]
+    fn post_ready_projection_convergence_is_bounded_and_resumes_from_durable_cursor() {
+        let mut store = store();
+        let txn = store.write_txn().expect("seed convergence");
+        let entries = (1..=3)
+            .map(|chat_id| ChatListEntry {
+                chat_id: ChatId(chat_id),
+                sort_order: chat_id,
+                pinned: false,
+            })
+            .collect::<Vec<_>>();
+        for chat_id in 1..=3 {
+            txn.upsert_chat(
+                &snapshot_chat_record(scope(), &chat(chat_id, &format!("Chat {chat_id}")))
+                    .expect("chat"),
+            )
+            .expect("chat row");
+        }
+        txn.replace_chat_list(
+            &ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Main,
+            },
+            &entries,
+        )
+        .expect("membership");
+        txn.commit().expect("seed commit");
+        rebuild_shallow_projection(&mut store, scope()).expect("shallow publication");
+        let txn = store.write_txn().expect("publish readiness");
+        txn.publish_namespace_readiness(scope(), 2_000)
+            .expect("readiness");
+        txn.commit().expect("readiness commit");
+
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("slice one"),
+            1
+        );
+        let first_cursor = store
+            .read_txn()
+            .expect("restart read")
+            .namespace_readiness(scope())
+            .expect("readiness")
+            .expect("record")
+            .projection_after_chat_id;
+        assert_eq!(first_cursor, Some(ChatId(1)));
+
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("slice two"),
+            1
+        );
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("slice three"),
+            1
+        );
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("finish"),
+            0
+        );
+        let readiness = store
+            .read_txn()
+            .expect("read completion")
+            .namespace_readiness(scope())
+            .expect("readiness")
+            .expect("record");
+        assert_eq!(readiness.generation, 1);
+        assert!(readiness.convergence_complete);
     }
 
     #[test]

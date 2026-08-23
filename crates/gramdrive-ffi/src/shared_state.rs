@@ -40,6 +40,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gramdrive_model::identity::{
     AccountId, AccountKey, AccountScope, CanonicalKey, ChatListKey, ChatListKind, FolderCatalogKey,
@@ -53,6 +54,14 @@ use crate::api::DriveError;
 
 /// Hard provider-facing cap for one child page (NFR-021).
 const MAX_CHILD_PAGE_SIZE: u32 = 256;
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
 
 /// Which process is opening the shared state, in terms of the one right
 /// that differs: recovery. See the module docs (§ Roles).
@@ -647,6 +656,26 @@ impl SharedStateStore {
             for account in &authorized {
                 let scope = account.scope();
                 let root = ItemKey::Canonical(CanonicalKey::Account(scope.account)).id();
+                if txn.read().item(&root).map_err(map_state_error)?.is_none() {
+                    txn.upsert_item(&ItemRecord {
+                        id: root.clone(),
+                        parent: None,
+                        display_name: account.display_name.clone(),
+                        safe_name: account.display_name.clone(),
+                        metadata_version: MetadataVersion::new("root-structure-v2").map_err(
+                            |error| DriveError::Internal {
+                                detail: format!("account root metadata version: {error}"),
+                            },
+                        )?,
+                        content: None,
+                        aggregate_size: None,
+                        availability: StoredItemAvailability::Fetchable,
+                        created_at_ms: Some(account.created_at_ms),
+                        modified_at_ms: Some(account.created_at_ms),
+                        deleted_at_ms: None,
+                    })
+                    .map_err(map_state_error)?;
+                }
                 upsert_fixed_root_structure(&txn, scope, root, account.created_at_ms)?;
             }
             txn.commit().map_err(map_state_error)?;
@@ -811,11 +840,43 @@ pub(crate) fn upsert_fixed_root_structure(
 }
 
 impl SharedStateStore {
+    fn namespace_is_usable_internal(&self, account_id: i64) -> Result<bool, DriveError> {
+        let mut store = self.store()?;
+        let account = {
+            let txn = store.read_txn().map_err(map_state_error)?;
+            txn.account(AccountKey {
+                account_id: AccountId(account_id),
+            })
+            .map_err(map_state_error)?
+        };
+        let Some(account) = account else {
+            return Ok(false);
+        };
+        if account.auth_state != "authorized" {
+            return Ok(false);
+        }
+        let scope = account.scope();
+        let txn = store.write_txn().map_err(map_state_error)?;
+        let usable = txn
+            .adopt_namespace_readiness(scope, unix_time_ms())
+            .map_err(map_state_error)?;
+        txn.commit().map_err(map_state_error)?;
+        Ok(usable)
+    }
+
     fn store(&self) -> Result<MutexGuard<'_, StateStore>, DriveError> {
         self.store.lock().map_err(|_| DriveError::Internal {
             detail: "shared state handle poisoned by an earlier panic".to_owned(),
         })
     }
+}
+
+/// Whether the coordinator can serve this account's structurally valid
+/// last-known-good namespace, conservatively adopting a pre-v24 hierarchy.
+#[uniffi::export]
+pub fn durable_namespace_is_usable(data_root: String, account_id: i64) -> Result<bool, DriveError> {
+    SharedStateStore::open(data_root, StateRole::Coordinator)?
+        .namespace_is_usable_internal(account_id)
 }
 
 /// Quarantines the database under `data_root` if — and only if — SQLite

@@ -240,6 +240,15 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "generated_materialization_reference_lookup",
         step: MigrationStep::Sql(include_str!("schema/v23.sql")),
     },
+    // v24 — namespace usability survives process restart independently from
+    // source convergence. The record contains only generation/checkpoint
+    // metadata keyed by already-owned numeric scope/cursor identities; it
+    // never stores Telegram display data, content, or secrets.
+    Migration {
+        version: 24,
+        name: "durable_namespace_readiness",
+        step: MigrationStep::Sql(include_str!("schema/v24.sql")),
+    },
 ];
 
 /// [`SCHEMA_VERSION`] and [`MIGRATIONS`] are one fact stated twice, so the

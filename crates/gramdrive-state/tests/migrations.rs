@@ -606,7 +606,7 @@ fn the_v1_fixture_opens_at_the_current_version_with_its_rows_intact() {
 }
 
 #[test]
-fn v23_indexes_generated_materialization_claims_without_rewriting_cache_rows() {
+fn v22_migrates_through_cache_index_and_durable_readiness_without_rewriting_cache_rows() {
     let db = TempDb::new();
     let store = db.seeded();
     store
@@ -645,25 +645,37 @@ fn v23_indexes_generated_materialization_claims_without_rewriting_cache_rows() {
         .expect("cache count before migration");
     drop(store);
 
-    // Recreate the exact installed v22 boundary. Only the v23 index and its
-    // history/version stamps are removed; all representative rows stay put.
+    // Recreate the exact installed v22 boundary. The v23 index and v24
+    // readiness table plus their history/version stamps are removed; all
+    // representative rows stay put.
     let legacy = Connection::open(&db.path).expect("open v22 boundary");
     legacy
         .execute_batch(
             "DROP INDEX cache_entries_by_materialization_ref;
-             DELETE FROM schema_history WHERE version = 23;
+             DROP TABLE namespace_readiness;
+             DELETE FROM schema_history WHERE version IN (23, 24);
              PRAGMA user_version = 22;",
         )
         .expect("downgrade fixture stamp to v22");
     drop(legacy);
 
-    let migrated = StateStore::open(&db.path).expect("migrate v22 to v23");
-    assert_eq!(migrated.schema_version().expect("schema version"), 23);
+    let migrated = StateStore::open(&db.path).expect("migrate v22 to current");
+    assert_eq!(
+        migrated.schema_version().expect("schema version"),
+        SCHEMA_VERSION
+    );
     let cache_rows_after: i64 = migrated
         .connection()
         .query_row("SELECT count(*) FROM cache_entries", [], |row| row.get(0))
         .expect("cache count after migration");
     assert_eq!(cache_rows_after, cache_rows_before);
+    let readiness_rows: i64 = migrated
+        .connection()
+        .query_row("SELECT count(*) FROM namespace_readiness", [], |row| {
+            row.get(0)
+        })
+        .expect("readiness table after migration");
+    assert_eq!(readiness_rows, 0, "migration never invents readiness");
 
     let plan: Vec<String> = migrated
         .connection()

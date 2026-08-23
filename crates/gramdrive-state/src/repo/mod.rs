@@ -56,6 +56,7 @@ mod cursors;
 mod folders;
 mod item_changes;
 mod items;
+mod namespace_readiness;
 mod provider_health;
 mod ranges;
 mod render;
@@ -90,6 +91,7 @@ pub use item_changes::{ChangeJournalState, ItemChangeRecord};
 pub use items::{
     FileFacts, ItemAvailability, ItemKind, ItemRecord, TombstoneProvenance, item_kind,
 };
+pub use namespace_readiness::NamespaceReadinessRecord;
 pub use provider_health::{ProviderFetchHealthCounters, ProviderFetchHealthObservation};
 pub use render::{
     MonthRenderSnapshot, RenderCatalogEntry, RenderEventInput, RenderMessageInput, RenderOutput,

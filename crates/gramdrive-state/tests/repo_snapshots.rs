@@ -15,15 +15,16 @@ mod common;
 
 use common::{account_record, chat_record, revision, scope};
 use gramdrive_state::model::identity::{
-    AccountId, AccountKey, AttachmentIndex, AttachmentKey, ChatId, ChatListKey, ChatListKind,
-    ContentHash, DocFormat, DocPartition, FolderId, ItemId, MessageId, MessageKey,
-    NamespaceVersion,
+    AccountId, AccountKey, AttachmentIndex, AttachmentKey, CanonicalKey as ModelCanonicalKey,
+    ChatId, ChatListKey, ChatListKind, ContentHash, DocFormat, DocPartition, FolderCatalogKey,
+    FolderId, ItemId, ItemKey as ModelItemKey, MessageId, MessageKey, NamespaceVersion,
 };
 use gramdrive_state::model::version::{ContentVersion, MetadataVersion};
 use gramdrive_state::repo::{
     AttachmentAvailability, AttachmentFacts, AttachmentFidelity, AttachmentLogicalKind,
     ChatListEntry, FileFacts, ItemAvailability, ItemRecord, MessageChange,
-    ProviderFetchHealthObservation, TelegramRepresentation, TombstoneProvenance,
+    NamespaceReadinessRecord, ProviderFetchHealthObservation, TelegramRepresentation,
+    TombstoneProvenance,
 };
 use gramdrive_state::{StateError, StateStore};
 
@@ -35,6 +36,123 @@ fn store() -> StateStore {
     tx.upsert_account(&account_record()).expect("account");
     tx.commit().expect("commit");
     store
+}
+
+#[test]
+fn namespace_readiness_is_durable_generation_scoped_and_resumable() {
+    let mut store = store();
+    let tx = store.write_txn().expect("write readiness");
+    let first = tx
+        .publish_namespace_readiness(scope(), 10_000)
+        .expect("publish readiness");
+    assert_eq!(
+        first,
+        NamespaceReadinessRecord {
+            scope: scope(),
+            generation: 1,
+            published_at_ms: 10_000,
+            projection_after_chat_id: None,
+            convergence_complete: false,
+        }
+    );
+    tx.advance_namespace_projection(scope(), 1, Some(ChatId(100)), false, 10_001)
+        .expect("checkpoint projection slice");
+    tx.commit().expect("commit readiness");
+
+    let read = store.read_txn().expect("read readiness");
+    assert_eq!(
+        read.namespace_readiness(scope()).expect("read record"),
+        Some(NamespaceReadinessRecord {
+            scope: scope(),
+            generation: 1,
+            published_at_ms: 10_000,
+            projection_after_chat_id: Some(ChatId(100)),
+            convergence_complete: false,
+        })
+    );
+    drop(read);
+
+    let tx = store.write_txn().expect("finish convergence");
+    tx.advance_namespace_projection(scope(), 1, None, true, 10_002)
+        .expect("finish convergence");
+    tx.commit().expect("commit convergence");
+    assert!(
+        store
+            .read_txn()
+            .expect("read completion")
+            .namespace_readiness(scope())
+            .expect("read record")
+            .expect("record")
+            .convergence_complete
+    );
+}
+
+#[test]
+fn preserved_namespace_adoption_requires_complete_audit_and_live_fixed_structure() {
+    let mut store = store();
+    let tx = store.write_txn().expect("seed preserved namespace");
+    let root = ModelItemKey::Canonical(ModelCanonicalKey::Account(scope().account)).id();
+    tx.upsert_item(&dir_item(&root, None, "account-root"))
+        .expect("account root");
+    let fixed = [
+        ModelCanonicalKey::ChatList(ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Main,
+        }),
+        ModelCanonicalKey::ChatList(ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Archive,
+        }),
+        ModelCanonicalKey::ChatList(ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Stories,
+        }),
+        ModelCanonicalKey::FolderCatalog(FolderCatalogKey { scope: scope() }),
+    ];
+    for (index, canonical) in fixed.into_iter().enumerate() {
+        let id = ModelItemKey::Canonical(canonical).id();
+        tx.upsert_item(&dir_item(&id, Some(&root), &format!("root-{index}")))
+            .expect("fixed root child");
+    }
+    tx.replace_chat_list_with_audit(
+        &ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Main,
+        },
+        &[],
+        true,
+        1_000,
+    )
+    .expect("complete historical audit");
+    assert!(
+        !tx.adopt_namespace_readiness(scope(), 2_000)
+            .expect("one complete audit is insufficient")
+    );
+    tx.replace_chat_list_with_audit(
+        &ChatListKey {
+            scope: scope(),
+            kind: ChatListKind::Archive,
+        },
+        &[],
+        true,
+        1_001,
+    )
+    .expect("complete archive audit");
+    assert!(
+        tx.adopt_namespace_readiness(scope(), 2_000)
+            .expect("adopt structurally valid namespace")
+    );
+    tx.commit().expect("commit adoption");
+
+    let mut incomplete = StateStore::open_in_memory().expect("open incomplete");
+    let seed = incomplete.write_txn().expect("seed account");
+    seed.upsert_account(&account_record()).expect("account");
+    seed.commit().expect("seed account commit");
+    let tx = incomplete.write_txn().expect("incomplete namespace");
+    assert!(
+        !tx.adopt_namespace_readiness(scope(), 2_000)
+            .expect("fail closed")
+    );
 }
 
 fn version(text: &str) -> MetadataVersion {
