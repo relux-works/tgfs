@@ -20,14 +20,23 @@ public final class UpdateAvailability {
 }
 
 /// The small testable action surface shared by the menu, settings toolbar,
-/// and app command. A disabled Sparkle updater never receives a manual check.
+/// and app command. A disabled Sparkle updater never receives a manual check
+/// or an activation request. An enabled action activates immediately before
+/// invoking Sparkle so its asynchronously-created standard window is covered
+/// by the companion's bounded activation retrier.
 @MainActor
 public struct ManualUpdateAction {
   private let availability: UpdateAvailability
+  private let activateApplication: () -> Void
   private let invokeUpdater: () -> Void
 
-  public init(availability: UpdateAvailability, invokeUpdater: @escaping () -> Void) {
+  public init(
+    availability: UpdateAvailability,
+    activateApplication: @escaping () -> Void = {},
+    invokeUpdater: @escaping () -> Void
+  ) {
     self.availability = availability
+    self.activateApplication = activateApplication
     self.invokeUpdater = invokeUpdater
   }
 
@@ -35,6 +44,7 @@ public struct ManualUpdateAction {
 
   public func invoke() {
     guard isEnabled else { return }
+    activateApplication()
     invokeUpdater()
   }
 }

@@ -5,6 +5,20 @@ import GramDriveAgentCore
 import GramDriveSupport
 import Testing
 
+@Suite struct UpdateTerminationIntentProjectionTests {
+    @Test func ordinaryQuitWithoutAStagedUpdateRemainsAUserQuit() {
+        #expect(
+            CompanionTerminationCoordinator.Intent.fromPendingUpdateBuild(nil)
+                == .userQuit)
+    }
+
+    @Test func stagedUpdatePreservesTheTargetBuildWithoutChangingRelaunchSemantics() {
+        #expect(
+            CompanionTerminationCoordinator.Intent.fromPendingUpdateBuild("137")
+                == .update(targetBuild: "137"))
+    }
+}
+
 private final class TerminationProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var prepared: [ControlTerminationRequest] = []
