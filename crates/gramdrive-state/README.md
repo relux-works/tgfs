@@ -96,7 +96,7 @@ assertion fails the build if that list and the version ever disagree. The v4
 atomic rebuild retires live legacy year/media/whole-chat rows, creates direct
 months and both bounded documents, and preserves existing account/chat/item
 identities as live rows or migration tombstones. The v21 installed-profile
-rebuild copies `items` through its primary-key order in 4,096-row transactions.
+rebuild copies `items` through its primary-key order in 65,536-row transactions.
 Durable source-table triggers journal keys changed by already-open WAL peers
 between chunks. After building each shadow index in a separate resumable phase,
 one short `BEGIN IMMEDIATE` chunk replays those keys, proves whole-table counts

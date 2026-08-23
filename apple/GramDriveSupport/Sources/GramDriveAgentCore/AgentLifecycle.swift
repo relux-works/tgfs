@@ -338,12 +338,26 @@ public final class AgentLifecycle: @unchecked Sendable {
         // once against the cleared path.
         setLocked { self.state = .recovering }
         do {
+            let server = try AgentHealthServer.start(
+                socketURL: layout.healthSocket
+            ) { [weak self] in
+                self?.healthSnapshot() ?? Self.placeholderSnapshot()
+            }
+            setLocked { self.healthServer = server }
+            record("health-listening")
+        } catch {
+            teardownAfterFailedStart()
+            throw AgentStartError.healthEndpoint(underlying: error)
+        }
+        record("state-opening")
+        do {
             let opened = try openStoreWithRecovery()
             let version = try? opened.dataVersion()
             setLocked {
                 self.store = opened
                 self.lastKnownDataVersion = version
             }
+            record("state-opened")
             do {
                 _ = try opened.ensureRootStructure()
                 setLocked { self.finderContentFailure = nil }
@@ -467,18 +481,6 @@ public final class AgentLifecycle: @unchecked Sendable {
         } catch {
             teardownAfterFailedStart()
             throw AgentStartError.controlEndpoint(underlying: error)
-        }
-
-        do {
-            let server = try AgentHealthServer.start(
-                socketURL: layout.healthSocket
-            ) { [weak self] in
-                self?.healthSnapshot() ?? Self.placeholderSnapshot()
-            }
-            setLocked { self.healthServer = server }
-        } catch {
-            teardownAfterFailedStart()
-            throw AgentStartError.healthEndpoint(underlying: error)
         }
 
         do {
