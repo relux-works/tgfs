@@ -26,7 +26,7 @@ amalgamation (version rationale in the workspace `Cargo.toml`).
 Platform-specific code: forbidden — the database location is chosen by the
 embedding host. See `crates/README.md`.
 
-## The schema (v23)
+## The schema (v24)
 
 `src/schema/v1.sql` is the baseline; v2 adds the item change journal, v3 the
 Telegram folder/bootstrap metadata, v4 the date-first content contract, and v5
@@ -55,11 +55,12 @@ chat catalogs, the Stories view, and recoverable authorization finalization.
 v23 indexes non-null cache materialization references so generated-generation
 reclamation performs one ownership point probe while holding the native
 hand-off lease boundary instead of scanning every cached item.
-No v24 migration is required for the monthly render correction: snapshots force
-the existing v23 chat/time and per-message-event indexes as a streaming nested
-loop and sort only each message's local revision list. This avoids a full
-joined-month temporary sort without rewriting an installed database or changing
-rendered document order.
+v24 adds a privacy-safe durable namespace-readiness generation and bounded deep
+projection cursor. Readiness is published only after an authorized scope has a
+complete Main/Archive membership audit and all fixed live roots; migration never
+invents it. A structurally valid preserved hierarchy can therefore remain usable
+across process restart while retryable snapshot recovery and post-ready deep
+convergence resume without deleting unwitnessed chat subtrees.
 Each file
 carries the full rationale per table — this is the map. `StateStore::open` applies it atomically to a fresh file
 (`PRAGMA user_version` 0 → 1), migrates an older file forward, recognizes a
@@ -75,6 +76,7 @@ every connection; file databases run in WAL with `synchronous=NORMAL`.
 | Attachments and bytes | `attachments`, `blobs` | Logical kind, Telegram representation, fidelity, source name, MIME, exact size, and availability are orthogonal; locators remain refreshable, and blobs link only after verification |
 | Stories | `stories`, `story_content_locators`, `story_appearances`, `story_tombstones`, `story_sync_progress`, `story_list_progress` | Canonical `(poster_chat_id, story_id)` owns the optional blob and one typed primary content source; byte-free active/month appearances transition without copying content and retain first-page profile pin order, restricted stories atomically lose locators and bytes, completed profile generations remove stale rows retention-safely, and privacy-safe per-chat/account cursors resume bounded scans after a crash |
 | Provider projection | `items` | Every provider-visible node under its stable binary `ItemId` (DEC-008): canonical structural roots and appearance rows in one table (DOM-002/022), a real parent self-FK for the tree, live-sibling name uniqueness (SYNC-012), one appearance per (canonical, view); Archive pins follow allowed attachment appearances, and protection atomically restricts items and removes those pins. `logical_size` stays a file's own bytes while `aggregate_size` carries a directory's exact indexed-descendant rollup, so a chat folder's size is answerable from one item read and neither fact can ever be mistaken for the other |
+| Namespace readiness | `namespace_readiness` | A privacy-safe generation proves that the current account/namespace already has a structurally valid durable root and complete Main/Archive membership audit. Its chat-only cursor makes deep projection bounded and resumable after readiness; new or incomplete profiles have no record and remain fail-closed |
 | Item change journal | `item_change_journal`, `item_changes` | Durable change enumeration for provider sync anchors (PLAT-MAC-004): one coalesced row per item at its latest `AUTOINCREMENT` sequence — bounded by item count, never rewound — refreshed by the item write paths only on provider-visible change, so an engine re-baseline replays nothing; the identity row names the database life so anchors from a quarantined file expire explicitly |
 | Hydration | `transfers` | Durable transfer journal pinned to a content version (SYNC-042), JSON-validated ranges, the SYNC-044 failure taxonomy, a partial index over live states for the queue head |
 | Cache | `cache_entries`, `pins`, `retention_purge_queue` | POL-2: LRU eviction scans a partial index that pinned/unverified content never enters; generated materialization ownership is a partial-index point probe so reclamation cannot monopolize the lease boundary; `pins` is durable offline intent independent of materialization; destructive retention queues physical deletion before dropping cache ownership |
@@ -89,7 +91,7 @@ Forward-only (NFR-013). `v1.sql` creates version 1 and is frozen; every
 version after it is a `Migration` in `src/migrate.rs`, applied in order by
 `StateStore::open`. There is no downgrade: an older build meeting a newer
 file refuses it rather than guessing what the newer schema's data means in
-an older shape. `MIGRATIONS` contains the contiguous v2–v23 steps, and a const
+an older shape. `MIGRATIONS` contains the contiguous v2–v24 steps, and a const
 assertion fails the build if that list and the version ever disagree. The v4
 atomic rebuild retires live legacy year/media/whole-chat rows, creates direct
 months and both bounded documents, and preserves existing account/chat/item

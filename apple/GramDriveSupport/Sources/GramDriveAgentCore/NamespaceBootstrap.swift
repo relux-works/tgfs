@@ -6,6 +6,10 @@ import Network
 /// Privacy-safe state emitted by one account's owned content namespace.
 public enum AgentNamespaceProgress: Equatable, Sendable {
     case preparing
+    case authorized
+    case folderCatalog
+    case snapshotList
+    case projectionSlice(processedChatCount: UInt64)
     case ready(canonicalChatCount: UInt64, appearanceCount: UInt64)
     case degraded(category: String, retryable: Bool)
     case failed(category: String, retryable: Bool)
@@ -193,6 +197,14 @@ private final class CoreNamespaceProgressRelay: NamespaceProgressListener,
         switch progress {
         case .preparing:
             onProgress(.preparing)
+        case .authorized:
+            onProgress(.authorized)
+        case .folderCatalog:
+            onProgress(.folderCatalog)
+        case .snapshotList:
+            onProgress(.snapshotList)
+        case let .projectionSlice(processedChatCount):
+            onProgress(.projectionSlice(processedChatCount: processedChatCount))
         case .ready(let canonicalChatCount, let appearanceCount):
             onProgress(
                 .ready(

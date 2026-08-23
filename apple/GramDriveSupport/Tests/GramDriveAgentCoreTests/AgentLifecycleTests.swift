@@ -168,6 +168,29 @@ private func seedAuthorizedAccount(dataRoot: URL, accountId: Int64) throws {
     }
 }
 
+private func seedDurableNamespaceReadiness(dataRoot: URL, accountId: Int64) throws {
+    let layout = try sharedStateLayout(dataRoot: dataRoot.path)
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(layout.databaseFile, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+          let database
+    else { throw CocoaError(.fileReadUnknown) }
+    defer { sqlite3_close(database) }
+    let sql = """
+        INSERT INTO namespace_readiness (
+            account_id, namespace_version, generation, published_at_ms,
+            projection_after_chat_id, convergence_complete, updated_at_ms
+        ) VALUES (?, 0, 1, 1000, NULL, 0, 1000)
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+          let statement
+    else { throw CocoaError(.fileReadCorruptFile) }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_bind_int64(statement, 1, accountId) == SQLITE_OK,
+          sqlite3_step(statement) == SQLITE_DONE
+    else { throw CocoaError(.fileWriteUnknown) }
+}
+
 @Suite struct AgentLifecycleTests {
     @Test func namespaceProgressSignalsReadinessAndShutdownClosesTheOwner() async throws {
         try await withTemporaryDirectoryAsync { root in
@@ -380,6 +403,45 @@ private func seedAuthorizedAccount(dataRoot: URL, accountId: Int64) throws {
                 lifecycle.namespaceStatus(accountId: 7)
                     == .ready(canonicalChatCount: 2, appearanceCount: 3))
             #expect(lifecycle.observedAuthorizationState(accountId: 7) == .authorized)
+
+            await lifecycle.shutdown(reason: .terminate)
+        }
+    }
+
+    @Test func durableReadinessSurvivesRestartFailureAndAuthorizationPublishesIndependently()
+        async throws
+    {
+        try await withTemporaryDirectoryAsync { root in
+            let bootstrapper = FakeNamespaceBootstrapper()
+            let lifecycle = AgentLifecycle(
+                configuration: AgentConfiguration(
+                    dataRoot: root,
+                    namespaceBootstrapper: bootstrapper,
+                    namespaceRecoveryDelay: .milliseconds(1)))
+            try lifecycle.start()
+            try seedAuthorizedAccount(dataRoot: root, accountId: 11)
+            _ = try lifecycle.store?.ensureRootStructure()
+            try seedDurableNamespaceReadiness(dataRoot: root, accountId: 11)
+
+            lifecycle.startNamespace(accountId: 11)
+            bootstrapper.emit(.authorized, accountId: 11)
+            bootstrapper.emit(.folderCatalog, accountId: 11)
+            bootstrapper.emit(.snapshotList, accountId: 11)
+            bootstrapper.emit(
+                .failed(category: "snapshot-membership-incomplete", retryable: true),
+                accountId: 11)
+
+            #expect(lifecycle.observedAuthorizationState(accountId: 11) == .authorized)
+            #expect(lifecycle.healthSnapshot().finderContentState == .ready)
+            #expect(
+                lifecycle.healthSnapshot().finderSourceDegradation?.category
+                    == "snapshot-membership-incomplete")
+            for _ in 0 ..< 200 where bootstrapper.startCount(accountId: 11) < 2 {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(bootstrapper.startCount(accountId: 11) == 2)
+            bootstrapper.emit(.projectionSlice(processedChatCount: 16), accountId: 11)
+            #expect(lifecycle.healthSnapshot().finderContentState == .ready)
 
             await lifecycle.shutdown(reason: .terminate)
         }

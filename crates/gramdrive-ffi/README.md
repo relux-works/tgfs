@@ -203,7 +203,16 @@ bounded slice boundaries (eight background or sixteen foreground pages);
 snapshot pages likewise keep their restart checkpoint but publish once at the
 snapshot boundary. This keeps deep metadata-only backfill crash-resumable
 without rebuilding the account-wide tree per page or making File Provider
-callbacks wait for TDLib. Exported session teardown is
+callbacks wait for TDLib.
+
+Namespace bootstrap publishes a shallow list projection and durable readiness
+in one transaction. A strict-subset Main/folder/archive snapshot without a
+positive departure witness rolls back membership, readiness, and cursors and
+emits no provider deletion. Once ready, deep chat projection advances one
+bounded durable slice per content-loop turn, so restart resumes from the last
+committed chat instead of replaying a full pre-ready projection. Authorization
+progress is emitted immediately after the native boundary and is independent of
+aggregate namespace readiness. Exported session teardown is
 named `shutdown`: generated Kotlin objects already implement
 `AutoCloseable.close()`, so exporting a second `close` produces conflicting
 overloads. The native agent keeps its own `close` host seam and delegates it to

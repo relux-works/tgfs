@@ -1085,7 +1085,7 @@ public final class AgentLifecycle: @unchecked Sendable {
         switch progress {
         case .ready:
             return .usable(degradation: nil)
-        case .preparing, .stopped:
+        case .preparing, .authorized, .folderCatalog, .snapshotList, .projectionSlice, .stopped:
             return hasReachedReady ? .usable(degradation: existingDegradation) : .preparing
         case let .degraded(category, retryable), let .failed(category, retryable):
             let sourceFailure = failure(category, retryable)
@@ -1241,10 +1241,21 @@ public final class AgentLifecycle: @unchecked Sendable {
             })
         else { return }
         let token = UUID()
+        let durableReady =
+            (try? durableNamespaceIsUsable(
+                dataRoot: configuration.dataRoot.path,
+                accountId: accountId
+            )) ?? false
         setLocked {
             namespaceProgress[accountId] = .preparing
             recordNamespaceAuthorizationLocked(.unavailable, accountId: accountId)
             namespaceTokens[accountId] = token
+            if durableReady {
+                namespaceReadyAccounts.insert(accountId)
+            }
+        }
+        if durableReady {
+            record("namespace-readiness-restored")
         }
         do {
             let session = try bootstrapper.start(accountId: accountId) { [weak self] progress in
@@ -1288,8 +1299,9 @@ public final class AgentLifecycle: @unchecked Sendable {
             // rejects callbacks from an owner that has since been stopped.
             guard namespaceTokens[accountId] == token else { return (false, false) }
             namespaceProgress[accountId] = progress
-            recordNamespaceAuthorizationLocked(
-                Self.observedAuthorization(for: progress), accountId: accountId)
+            if let authorization = Self.observedAuthorization(for: progress) {
+                recordNamespaceAuthorizationLocked(authorization, accountId: accountId)
+            }
             switch progress {
             case .ready:
                 namespaceReadyAccounts.insert(accountId)
@@ -1321,7 +1333,8 @@ public final class AgentLifecycle: @unchecked Sendable {
                     )
                 }
                 return (true, recover)
-            case .preparing, .stopped:
+            case .authorized, .folderCatalog, .snapshotList, .projectionSlice,
+                 .preparing, .stopped:
                 return (true, false)
             }
         }
@@ -1329,6 +1342,15 @@ public final class AgentLifecycle: @unchecked Sendable {
         switch progress {
         case .preparing:
             record("namespace-preparing")
+        case .authorized:
+            record("namespace-authorized")
+        case .folderCatalog:
+            record("namespace-folder-catalog")
+        case .snapshotList:
+            record("namespace-snapshot-list")
+        case .projectionSlice:
+            record("namespace-projection-slice")
+            ChangeSignal.post()
         case .ready:
             record("namespace-ready")
             ChangeSignal.post()
@@ -1346,15 +1368,16 @@ public final class AgentLifecycle: @unchecked Sendable {
 
     private static func observedAuthorization(
         for progress: AgentNamespaceProgress
-    ) -> ObservedAuthorizationState {
+    ) -> ObservedAuthorizationState? {
         switch progress {
-        case .ready:
+        case .authorized, .ready:
             return .authorized
         case let .failed(category, _)
             where category == "auth-required":
             return .authorizationRequired
-        case .preparing, .degraded, .failed, .stopped:
-            return .unavailable
+        case .preparing, .folderCatalog, .snapshotList, .projectionSlice,
+             .degraded, .failed, .stopped:
+            return nil
         }
     }
 
