@@ -32,30 +32,30 @@ import Testing
         }
     }
 
+    @Test func drainReadinessDoesNotMissAnAlreadyClosedAdmissionGate() async {
+        let registry = TransferRegistry()
+        _ = await registry.drain(gracePeriod: .zero, cancelWait: .zero)
+
+        await registry.waitUntilDraining()
+
+        #expect(registry.isDraining)
+    }
+
     @Test func workFinishingWithinGraceCountsAsCompleted() async throws {
         let registry = TransferRegistry()
         let ticket = try registry.begin(token: nil)
-        let workerReady = TestSignal()
-        let releaseWorker = TestSignal()
-        let worker = Task {
-            workerReady.signal()
-            await releaseWorker.wait()
-            registry.end(ticket)
-        }
-
-        await waitUntil("the worker reaches its completion gate") {
-            workerReady.isSignalled
-        }
         let drain = Task {
             await registry.drain(gracePeriod: .seconds(5), cancelWait: .seconds(5))
         }
-        await waitUntil("the registry starts draining") {
-            registry.isDraining
-        }
-        releaseWorker.signal()
+
+        // The test owns the registered operation, so it also owns completion.
+        // Waiting on the registry's readiness continuation suspends this task
+        // until admission is closed instead of polling for a child worker to
+        // receive a cooperative-executor slice under full-suite load.
+        await registry.waitUntilDraining()
+        registry.end(ticket)
 
         let outcome = await drain.value
-        await worker.value
         #expect(outcome == DrainOutcome(completed: 1, cancelled: 0, abandoned: 0))
     }
 
@@ -85,52 +85,4 @@ import Testing
             gracePeriod: .milliseconds(30), cancelWait: .milliseconds(60))
         #expect(outcome == DrainOutcome(completed: 0, cancelled: 0, abandoned: 1))
     }
-}
-
-private final class TestSignal: @unchecked Sendable {
-    private let lock = NSLock()
-    private var signalled = false
-    private var waiter: CheckedContinuation<Void, Never>?
-
-    var isSignalled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return signalled
-    }
-
-    func signal() {
-        lock.lock()
-        signalled = true
-        let waiter = self.waiter
-        self.waiter = nil
-        lock.unlock()
-        waiter?.resume()
-    }
-
-    func wait() async {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if signalled {
-                lock.unlock()
-                continuation.resume()
-            } else {
-                waiter = continuation
-                lock.unlock()
-            }
-        }
-    }
-}
-
-private func waitUntil(
-    _ description: String,
-    within bound: Duration = .seconds(5),
-    condition: @escaping @Sendable () -> Bool,
-    sourceLocation: Testing.SourceLocation = #_sourceLocation
-) async {
-    let deadline = ContinuousClock.now + bound
-    while ContinuousClock.now < deadline {
-        if condition() { return }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    Issue.record("timed out waiting for \(description)", sourceLocation: sourceLocation)
 }
