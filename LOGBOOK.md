@@ -5,6 +5,13 @@
 
 ## 2026-08-23
 
+### 0945 — Schema-21 replays inter-chunk WAL peer mutations (BUG-260823-mja9j1)
+
+- ROOT CAUSE: v21 committed each 4,096-row copy chunk and resumed strictly after its primary-key cursor. An already-open WAL peer could therefore update or delete a copied item, insert an item behind the cursor, or mutate the prepare-time chat-list snapshot; count/FK validation could still accept and publish stale shadows.
+- FIX: prepare now installs durable source-table delta triggers. The final bounded `BEGIN IMMEDIATE` chunk replays every changed key, validates whole-table counts plus exact full-column equality for all journaled mutations and both shadow FKs, removes the temporary capture schema, swaps both tables, clears progress, and stamps schema 21 before releasing the writer lock.
+- REGRESSION/EVIDENCE: the deterministic two-connection test failed before the fix with exit 101 on the stale updated row, then passed with exact full-table source snapshots covering update, delete, insert-behind-cursor, and chat-list mutation after interruption/resume. A first intentionally bounded timing attempt exposed an over-expensive full-table double comparison and was stopped at 180s (exit 130); the bounded delta-equivalence validation then migrated the aggregate-only 3,203,405-item CoW profile from schema 20 to 23 in 82.995s. Authorization remained one account, progress/delta objects cleared, all six indexes and both query plans remained valid, and the separate full FK scan returned zero violations.
+- PRIVACY/INSTALL BOUNDARY: evidence contains aggregate counts, timings, schema categories, and query-plan categories only. The live installed profile, Keychain, domain, identifiers, names, filenames, content, private paths, secrets, and digests were not touched or retained.
+
 ### 0715 — Schema-21 rebuild exposes bounded resumable progress (BUG-260823-kd815p)
 
 - ROOT CAUSE: the observed schema-20 boundary was the next step, v21, copying 3.2M `items` rows, rebuilding six indexes, and checking foreign keys in one transaction. The prior v20 partial-index step had already committed; killing the candidate during v21 rolled the entire expensive rebuild back and exposed no progress.

@@ -94,9 +94,13 @@ assertion fails the build if that list and the version ever disagree. The v4
 atomic rebuild retires live legacy year/media/whole-chat rows, creates direct
 months and both bounded documents, and preserves existing account/chat/item
 identities as live rows or migration tombstones. The v21 installed-profile
-rebuild copies `items` through its primary-key order in 4,096-row transactions,
-then builds each shadow index and validates the shadow foreign keys in separate
-resumable phases before one short table swap earns schema 21.
+rebuild copies `items` through its primary-key order in 4,096-row transactions.
+Durable source-table triggers journal keys changed by already-open WAL peers
+between chunks. After building each shadow index in a separate resumable phase,
+one short `BEGIN IMMEDIATE` chunk replays those keys, proves whole-table counts
+plus exact full-column equivalence for every journaled mutation and foreign-key
+integrity, and swaps the tables before releasing the writer lock and earning
+schema 21.
 
 Crash safety (SYNC-072) rests on one rule: `PRAGMA user_version` advances
 only in the same transaction as the work that earns it, so the version is

@@ -1,6 +1,15 @@
 -- Final swap for the resumable v21 shadow copy. This script and the
--- schema/version stamps commit together after row-count and foreign-key
--- validation in the migration runner.
+-- schema/version stamps commit together after source/delta equivalence and
+-- foreign-key validation in the migration runner.
+
+DROP TRIGGER chat_list_entries_v21_delta_insert;
+DROP TRIGGER chat_list_entries_v21_delta_update;
+DROP TRIGGER chat_list_entries_v21_delta_delete;
+DROP TRIGGER items_v21_delta_insert;
+DROP TRIGGER items_v21_delta_update;
+DROP TRIGGER items_v21_delta_delete;
+DROP TABLE chat_list_entries_v21_deltas;
+DROP TABLE items_v21_deltas;
 
 DROP TABLE chat_list_entries;
 ALTER TABLE chat_list_entries_v21 RENAME TO chat_list_entries;
