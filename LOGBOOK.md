@@ -5,6 +5,12 @@
 
 ## 2026-08-23
 
+### 1255 — Retry owner replacement preserves definitive authorization (BUG-260729-28hnfq rework)
+
+- REVIEW FINDING: schema v24 lacked the repository-mandated v23 migration fixture, and retryable namespace owner replacement unconditionally reset a previously definitive live `authorized` observation to transitional `unavailable` before the replacement reached TDLib's authorization boundary.
+- CORRECTION: the chained v23 fixture is restored. Transitional owner startup now preserves either definitive observation (`authorized` or `authorizationRequired`); the replacement owner's later definitive result still supersedes the held value. A stage-driven regression asserts `authorized` after owner 2 starts but before it emits authorization, then proves a later `auth-required` result wins.
+- VALIDATION: the focused migration-fixture and Swift lifecycle regressions, full state/FFI/Swift suites, canonical `make check` 8/8, live-content, security, packaging, and package-host gates exited 0. The first Apple aggregate run exited 2 because an unrelated process-observation test raised ENOENT; its immediate unchanged rerun passed 2/2, and the red run remains disclosed. No installed app/profile, Telegram session, Keychain, File Provider domain, or rollback evidence was accessed or mutated.
+
 ### 0945 — Schema-21 replays inter-chunk WAL peer mutations (BUG-260823-mja9j1)
 
 - ROOT CAUSE: v21 committed each 4,096-row copy chunk and resumed strictly after its primary-key cursor. An already-open WAL peer could therefore update or delete a copied item, insert an item behind the cursor, or mutate the prepare-time chat-list snapshot; count/FK validation could still accept and publish stale shadows.

@@ -1383,9 +1383,9 @@ public final class AgentLifecycle: @unchecked Sendable {
 
     /// A replacement namespace commonly emits `preparing` before TDLib has
     /// reached a terminal authorization answer. Do not let that transitional
-    /// `unavailable` result hide a definitive stored-session probe refusal:
-    /// the companion must see it during the next health interval. The new
-    /// owner clears the hold only by reaching its own definitive terminal
+    /// `unavailable` result hide either kind of definitive live or stored-session
+    /// observation: the companion must see it during the next health interval.
+    /// The new owner clears the hold only by reaching its own definitive terminal
     /// authorization result.
     ///
     /// Call only while `lock` is held.
@@ -1393,10 +1393,13 @@ public final class AgentLifecycle: @unchecked Sendable {
         _ state: ObservedAuthorizationState,
         accountId: Int64
     ) {
-        if state == .unavailable,
-           namespaceAuthorization[accountId] == .authorizationRequired
-        {
-            return
+        if state == .unavailable {
+            switch namespaceAuthorization[accountId] {
+            case .authorized, .authorizationRequired:
+                return
+            case .unavailable, .none:
+                break
+            }
         }
         namespaceAuthorization[accountId] = state
     }
