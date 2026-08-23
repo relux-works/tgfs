@@ -4,20 +4,35 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import io
+import json
+import os
+import resource
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RUNNER_PATH = REPO_ROOT / ".scripts/acceptance/run_installed_live_content.py"
+RUNNER_PATH = Path(
+    os.environ.get(
+        "GRAMDRIVE_LIVE_CONTENT_RUNNER",
+        REPO_ROOT / ".scripts/acceptance/run_installed_live_content.py",
+    )
+)
 
 
 def load_runner_module():
-    spec = importlib.util.spec_from_file_location("run_installed_live_content", RUNNER_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "run_installed_live_content", RUNNER_PATH
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -107,7 +122,9 @@ class CandidateSelectionTests(unittest.TestCase):
             live.select_uncached_dataless_candidate(
                 self.db, self.cloud, dataless_probe=lambda _path: True
             )
-        self.assertEqual(str(caught.exception), "no-fresh-uncached-dataless-placeholder")
+        self.assertEqual(
+            str(caught.exception), "no-fresh-uncached-dataless-placeholder"
+        )
 
     def test_uncached_candidate_must_also_have_the_finder_dataless_flag(self):
         self.seed_date_first_tree()
@@ -119,9 +136,7 @@ class CandidateSelectionTests(unittest.TestCase):
     def test_placeholder_read_failure_uses_a_fixed_actionable_label(self):
         with self.assertRaises(live.AcceptanceFailure) as caught:
             live.read_placeholder_once(self.root / "missing-placeholder")
-        self.assertEqual(
-            str(caught.exception), "placeholder-hydration-read-failed"
-        )
+        self.assertEqual(str(caught.exception), "placeholder-hydration-read-failed")
 
 
 class GeneratedDocumentContractTests(unittest.TestCase):
@@ -300,9 +315,7 @@ class GeneratedStorageContractTests(unittest.TestCase):
         self.generated = self.root / "cache/generated"
         self.generated.mkdir(parents=True)
         (self.root / "agent").mkdir()
-        (self.root / "agent/settings.json").write_text(
-            '{"cacheQuotaBytes": 1024}\n'
-        )
+        (self.root / "agent/settings.json").write_text('{"cacheQuotaBytes": 1024}\n')
         self.db = sqlite3.connect(":memory:")
         self.addCleanup(self.db.close)
         self.db.executescript(
@@ -314,6 +327,9 @@ class GeneratedStorageContractTests(unittest.TestCase):
                 verification TEXT NOT NULL,
                 materialization_ref TEXT
             );
+            CREATE INDEX cache_entries_by_materialization_ref
+                ON cache_entries(materialization_ref)
+                WHERE materialization_ref IS NOT NULL;
             """
         )
 
@@ -361,6 +377,903 @@ class GeneratedStorageContractTests(unittest.TestCase):
         self.assertFalse(facts.within_quota)
         self.assertEqual(facts.orphan_file_count, 1)
 
+    def test_physical_inventory_has_an_explicit_entry_bound(self):
+        self.add_current(1, "Messages.md", b"one")
+        extra = self.generated / "extra"
+        extra.mkdir()
+        with self.assertRaises(live.AcceptanceFailure) as caught:
+            live.verify_generated_storage(self.db, self.root, scan_entry_limit=1)
+        self.assertEqual(str(caught.exception), "generated-cache-entry-limit-exceeded")
+
+    def test_verified_generated_row_without_materialization_fails_preservation(self):
+        self.db.execute(
+            "INSERT INTO cache_entries VALUES"
+            "(?, 'generated_doc', 1, 'verified', NULL)",
+            (bytes([1]),),
+        )
+        self.db.commit()
+        facts = live.verify_generated_storage(self.db, self.root)
+        self.assertEqual(facts.current_reference_count, 1)
+        self.assertFalse(facts.current_materializations_preserved)
+
+
+class IndexedSnapshotContractTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.database = self.root / "live.sqlite3"
+        self.snapshot = self.root / "private.snapshot.sqlite3"
+        db = sqlite3.connect(self.database)
+        db.executescript(
+            """
+            CREATE TABLE items (
+                item_id BLOB PRIMARY KEY,
+                deleted_at_ms INTEGER
+            );
+            CREATE TABLE chat_sync_state (
+                account_id INTEGER NOT NULL,
+                namespace_version INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                oldest_loaded_message_id INTEGER,
+                newest_loaded_message_id INTEGER,
+                history_complete INTEGER NOT NULL,
+                PRIMARY KEY (account_id, namespace_version, chat_id)
+            );
+            INSERT INTO items VALUES (x'01', NULL), (x'02', NULL);
+            INSERT INTO chat_sync_state VALUES
+                (1, 1, 10, 100, 200, 0),
+                (1, 1, 11, 50, 60, 1);
+            """
+        )
+        db.commit()
+        db.close()
+
+    def test_sqlite_sidecar_proves_additions_deletions_and_cursor_monotonicity(self):
+        counts = live.create_indexed_snapshot(self.database, self.snapshot)
+        self.assertEqual(counts, {"item_count": 2, "cursor_count": 2})
+        self.assertEqual(self.snapshot.stat().st_mode & 0o777, 0o600)
+
+        db = sqlite3.connect(self.database)
+        db.executescript(
+            """
+            UPDATE items SET deleted_at_ms=1 WHERE item_id=x'02';
+            INSERT INTO items VALUES (x'03', NULL);
+            UPDATE chat_sync_state
+               SET oldest_loaded_message_id=90,
+                   newest_loaded_message_id=210,
+                   history_complete=1
+             WHERE chat_id=10;
+            DELETE FROM chat_sync_state WHERE chat_id=11;
+            """
+        )
+        db.commit()
+        db.close()
+
+        check = live.connection(self.database)
+        live.attach_snapshot(check, self.snapshot)
+        try:
+            items = live.compare_items_indexed(check)
+            cursors = live.compare_cursors_indexed(check)
+        finally:
+            check.close()
+        self.assertEqual(items.before_count, 2)
+        self.assertEqual(items.after_count, 2)
+        self.assertFalse(items.prior_items_preserved)
+        self.assertFalse(items.additive_only)
+        self.assertEqual(cursors.missing_count, 1)
+        self.assertEqual(cursors.progressed_count, 1)
+        self.assertFalse(cursors.preserved)
+
+    def test_identity_and_cursor_comparisons_use_keyed_point_lookups(self):
+        live.create_indexed_snapshot(self.database, self.snapshot)
+        check = live.connection(self.database)
+        live.attach_snapshot(check, self.snapshot)
+        try:
+            item_plan = " ".join(
+                row[3]
+                for row in check.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT count(*)
+                    FROM acceptance_snapshot.active_items prior
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM items current
+                        WHERE current.item_id=prior.item_id
+                          AND current.deleted_at_ms IS NULL
+                    )
+                    """
+                )
+            )
+            cursor_plan = " ".join(
+                row[3]
+                for row in check.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT 1 FROM acceptance_snapshot.cursors prior
+                    JOIN chat_sync_state current
+                      ON current.account_id=prior.account_id
+                     AND current.namespace_version=prior.namespace_version
+                     AND current.chat_id=prior.chat_id
+                    """
+                )
+            )
+        finally:
+            check.close()
+        self.assertIn("item_id=?", item_plan)
+        self.assertIn("account_id=? AND namespace_version=? AND chat_id=?", cursor_plan)
+
+    def test_private_json_is_atomic_and_owner_only(self):
+        private = self.root / "private.json"
+        live.write_private_json(private, {"sample_item": "private"})
+        self.assertEqual(private.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(private.with_name("private.json.writing").exists())
+        self.assertEqual(live.json.loads(private.read_text())["sample_item"], "private")
+
+
+class InstalledPhaseEndToEndTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.data = self.root / "data"
+        self.cloud = self.root / "cloud"
+        self.database = self.data / "state/gramdrive.sqlite3"
+        self.state = self.root / "private.json"
+        self.evidence = self.root / "evidence.json"
+        self.database.parent.mkdir(parents=True)
+        self.cloud.mkdir()
+        (self.data / "agent").mkdir()
+        (self.data / "agent/settings.json").write_text('{"cacheQuotaBytes": 1000000}\n')
+        self.db = sqlite3.connect(self.database)
+        self.addCleanup(self.close_database)
+        self.db.executescript(
+            """
+            CREATE TABLE items (
+                item_id BLOB PRIMARY KEY,
+                parent_item_id BLOB,
+                safe_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                availability TEXT NOT NULL DEFAULT 'local',
+                logical_size INTEGER,
+                deleted_at_ms INTEGER,
+                mime_type TEXT,
+                content_version TEXT,
+                created_at_ms INTEGER,
+                modified_at_ms INTEGER
+            );
+            CREATE UNIQUE INDEX items_sibling_name
+                ON items(parent_item_id, safe_name)
+                WHERE parent_item_id IS NOT NULL AND deleted_at_ms IS NULL;
+            CREATE TABLE cache_entries (
+                item_id BLOB PRIMARY KEY,
+                content_version TEXT,
+                size INTEGER NOT NULL,
+                verification TEXT NOT NULL,
+                materialization_ref TEXT,
+                kind TEXT NOT NULL,
+                blob_hash BLOB
+            );
+            CREATE INDEX cache_entries_by_materialization_ref
+                ON cache_entries(materialization_ref)
+                WHERE materialization_ref IS NOT NULL;
+            CREATE TABLE chat_sync_state (
+                account_id INTEGER NOT NULL,
+                namespace_version INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                oldest_loaded_message_id INTEGER,
+                newest_loaded_message_id INTEGER,
+                history_complete INTEGER NOT NULL,
+                PRIMARY KEY(account_id, namespace_version, chat_id)
+            );
+            CREATE TABLE accounts (
+                auth_state TEXT NOT NULL,
+                retention_mode TEXT NOT NULL,
+                archive_mode INTEGER NOT NULL
+            );
+            CREATE TABLE story_appearances (location TEXT NOT NULL);
+            INSERT INTO accounts VALUES('authorized', 'mirror', 0);
+            INSERT INTO story_appearances VALUES('active');
+            INSERT INTO chat_sync_state VALUES(1, 1, 10, 100, 200, 0);
+            """
+        )
+        self.add_item(1, None, "Account", "account")
+        self.add_item(2, 1, "Chats", "chat_list")
+        self.add_item(3, 2, "Chat", "chat")
+        self.add_item(4, 3, ".chat.json", "generated_doc", payload=b'{"chat":1}\n')
+        self.add_item(5, 3, "2026-08", "month_dir")
+        self.add_item(6, 5, "Messages.md", "generated_doc", payload=b"# Messages\n")
+        self.add_item(
+            7,
+            5,
+            "Messages.ndjson",
+            "generated_doc",
+            payload=b'{"message":1}\n',
+        )
+        self.add_item(
+            8,
+            5,
+            "sample.bin",
+            "attachment",
+            availability="fetchable",
+            payload=b"sample",
+            generated=False,
+        )
+        self.add_item(9, 3, "Active Stories", "active_stories")
+        self.add_item(10, 9, "Story.jpg", "story_appearance")
+        self.add_item(11, 2, "Zero", "chat")
+        self.add_item(12, 11, ".chat.json", "generated_doc")
+        self.db.commit()
+        self.attachment = self.cloud / "Chats/Chat/2026-08/sample.bin"
+
+    def close_database(self):
+        try:
+            self.db.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+    def add_item(
+        self,
+        value: int,
+        parent: int | None,
+        name: str,
+        kind: str,
+        *,
+        availability: str = "local",
+        payload: bytes | None = None,
+        generated: bool = True,
+    ) -> None:
+        item_id = bytes([value])
+        parent_id = None if parent is None else bytes([parent])
+        mime = {
+            "Messages.md": "text/markdown",
+            "Messages.ndjson": "application/x-ndjson",
+            ".chat.json": "application/json",
+        }.get(name)
+        version = f"v{value}" if payload is not None and generated else None
+        self.db.execute(
+            "INSERT INTO items VALUES(?, ?, ?, ?, ?, ?, NULL, ?, ?, 10, 20)",
+            (
+                item_id,
+                parent_id,
+                name,
+                kind,
+                availability,
+                None if payload is None else len(payload),
+                mime,
+                version,
+            ),
+        )
+        if payload is None:
+            return
+        finder = live.item_path(self.db, self.cloud, item_id)
+        finder.parent.mkdir(parents=True, exist_ok=True)
+        finder.write_bytes(payload)
+        if not generated:
+            return
+        generated_name = "chat.json" if name == ".chat.json" else name
+        materialization = self.data / "cache/generated" / str(value) / generated_name
+        materialization.parent.mkdir(parents=True, exist_ok=True)
+        materialization.write_bytes(payload)
+        self.db.execute(
+            "INSERT INTO cache_entries VALUES"
+            "(?, ?, ?, 'verified', ?, 'generated_doc', ?)",
+            (
+                item_id,
+                version,
+                len(payload),
+                str(materialization),
+                hashlib.sha256(payload).digest(),
+            ),
+        )
+
+    def test_before_and_after_preserve_every_contract_without_python_bulk_lists(self):
+        original_read = live.read_placeholder_once
+
+        def read_and_publish(path: Path):
+            result = original_read(path)
+            if path == self.attachment:
+                digest, size = result
+                publisher = sqlite3.connect(self.database)
+                publisher.execute(
+                    "INSERT OR REPLACE INTO cache_entries VALUES"
+                    "(?, 'attachment-v1', ?, 'verified', ?, 'blob', ?)",
+                    (bytes([8]), size, str(path), bytes.fromhex(digest)),
+                )
+                publisher.commit()
+                publisher.close()
+            return result
+
+        self.db.close()
+        with mock.patch.object(
+            live, "read_placeholder_once", side_effect=read_and_publish
+        ):
+            before = live.run_before(
+                self.database,
+                self.data,
+                self.cloud,
+                self.state,
+                self.evidence,
+                dataless_probe=lambda _path: True,
+            )
+        self.assertTrue(live.evidence_passed("before", before))
+        private = live.json.loads(self.state.read_text())
+        self.assertNotIn("item_ids", private)
+        self.assertNotIn("cursors", private)
+        self.assertTrue(live.snapshot_database_path(self.state).is_file())
+
+        update = sqlite3.connect(self.database)
+        update.execute(
+            "UPDATE chat_sync_state SET oldest_loaded_message_id=90, "
+            "newest_loaded_message_id=210, history_complete=1"
+        )
+        update.execute(
+            "INSERT INTO items VALUES"
+            "(x'0D', x'05', 'new.bin', 'attachment', 'fetchable', 1, NULL, "
+            "'application/octet-stream', 'new-v1', 10, 20)"
+        )
+        update.commit()
+        update.close()
+        after = live.run_after(
+            self.database, self.data, self.cloud, self.state, self.evidence
+        )
+        self.assertTrue(live.evidence_passed("after", after))
+        self.assertTrue(after["relaunch_prior_item_identity_preserved"])
+        self.assertTrue(after["relaunch_item_set_additive_only"])
+        self.assertTrue(after["relaunch_cursor_progress_preserved"])
+
+
+class DeadlineAndCleanupTests(unittest.TestCase):
+    def test_parent_classifies_hard_timeout_with_fixed_category(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_path = root / "evidence.json"
+            timed_out = live.WorkerProcessResult(
+                returncode=-signal.SIGKILL,
+                stdout="",
+                stderr="",
+                timed_out=True,
+                cleanup_complete=True,
+                elapsed_ms=250,
+            )
+            with mock.patch.object(
+                live, "run_worker_process", return_value=timed_out
+            ), mock.patch("sys.stdout", io.StringIO()), mock.patch(
+                "sys.stderr", io.StringIO()
+            ):
+                result = live.main(
+                    (
+                        "after",
+                        "--data-root",
+                        str(root),
+                        "--state",
+                        str(root / "private.json"),
+                        "--evidence",
+                        str(evidence_path),
+                        "--deadline-seconds",
+                        "0.25",
+                    )
+                )
+            evidence = live.json.loads(evidence_path.read_text())
+            self.assertEqual(result, 1)
+            self.assertEqual(evidence["failure_category"], "overall-deadline-exceeded")
+            self.assertEqual(evidence["deadline_ms"], 250)
+            self.assertTrue(evidence["child_cleanup_complete"])
+
+    def test_parent_classifies_cleanup_deadline_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_path = root / "evidence.json"
+            timed_out = live.WorkerProcessResult(
+                returncode=-1,
+                stdout="",
+                stderr="",
+                timed_out=True,
+                cleanup_complete=False,
+                elapsed_ms=250,
+            )
+            with mock.patch.object(
+                live, "run_worker_process", return_value=timed_out
+            ), mock.patch("sys.stdout", io.StringIO()), mock.patch(
+                "sys.stderr", io.StringIO()
+            ):
+                result = live.main(
+                    (
+                        "after",
+                        "--data-root",
+                        str(root),
+                        "--state",
+                        str(root / "private.json"),
+                        "--evidence",
+                        str(evidence_path),
+                        "--deadline-seconds",
+                        "0.25",
+                    )
+                )
+            evidence = json.loads(evidence_path.read_text())
+            self.assertEqual(result, 1)
+            self.assertEqual(
+                evidence["failure_category"], "worker-cleanup-deadline-exceeded"
+            )
+            self.assertFalse(evidence["child_cleanup_complete"])
+
+    def test_cleanup_wait_and_pipe_drain_are_always_deadline_bounded(self):
+        class NeverReapedProcess:
+            pid = 999_999
+
+            def __init__(self):
+                self.returncode = None
+                self.stdout = mock.Mock()
+                self.stderr = mock.Mock()
+                self.wait_timeouts = []
+                self.communicate_timeouts = []
+
+            def poll(self):
+                return None
+
+            def wait(self, *, timeout):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired(("worker",), timeout)
+
+            def communicate(self, *, timeout):
+                self.communicate_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired(("worker",), timeout)
+
+        process = NeverReapedProcess()
+        deadline = time.monotonic() + 0.01
+        with mock.patch.object(live.os, "killpg"):
+            self.assertFalse(live.terminate_process_group(process, deadline))
+            self.assertEqual(live.collect_worker_output(process, deadline), ("", ""))
+        self.assertTrue(process.wait_timeouts)
+        self.assertTrue(process.communicate_timeouts)
+        self.assertTrue(all(timeout >= 0 for timeout in process.wait_timeouts))
+        self.assertTrue(all(timeout >= 0 for timeout in process.communicate_timeouts))
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+
+    def test_parent_emits_fixed_failure_evidence_and_reaps_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_path = root / "evidence.json"
+            with mock.patch("sys.stdout", io.StringIO()), mock.patch(
+                "sys.stderr", io.StringIO()
+            ):
+                result = live.main(
+                    (
+                        "before",
+                        "--data-root",
+                        str(root / "missing-data"),
+                        "--cloud-root",
+                        str(root / "missing-cloud"),
+                        "--state",
+                        str(root / "private.json"),
+                        "--evidence",
+                        str(evidence_path),
+                        "--deadline-seconds",
+                        "2",
+                    )
+                )
+            evidence = live.json.loads(evidence_path.read_text())
+            self.assertEqual(result, 1)
+            self.assertEqual(evidence["failure_category"], "acceptance-io-failed")
+            self.assertEqual(evidence["timeout_stage"], "select_candidate")
+            self.assertTrue(evidence["child_cleanup_complete"])
+            self.assertNotEqual(evidence["worker_exit_code"], 0)
+            self.assertEqual(
+                set(evidence["stage_timings_ms"]), set(live.PHASE_STAGES["before"])
+            )
+
+    def test_expired_snapshot_deadline_uses_fixed_category_and_removes_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "live.sqlite3"
+            snapshot = root / "snapshot.sqlite3"
+            db = sqlite3.connect(database)
+            db.executescript(
+                """
+                CREATE TABLE items (item_id BLOB PRIMARY KEY, deleted_at_ms INTEGER);
+                CREATE TABLE chat_sync_state (
+                    account_id INTEGER,
+                    namespace_version INTEGER,
+                    chat_id INTEGER,
+                    oldest_loaded_message_id INTEGER,
+                    newest_loaded_message_id INTEGER,
+                    history_complete INTEGER
+                );
+                """
+            )
+            db.close()
+            deadline = live.Deadline(0)
+            with self.assertRaises(live.DeadlineExceeded) as caught:
+                live.create_indexed_snapshot(database, snapshot, deadline)
+            self.assertEqual(str(caught.exception), "overall-deadline-exceeded")
+            self.assertFalse(snapshot.exists())
+            self.assertFalse(live._snapshot_build_path(snapshot).exists())
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-only")
+    def test_hard_timeout_kills_exact_worker_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "grandchild.pid"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,subprocess,sys,time;"
+                    "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+                    "pathlib.Path(sys.argv[1]).write_text(str(p.pid));"
+                    "time.sleep(60)"
+                ),
+                str(pid_file),
+            ]
+            result = live.run_worker_process(command, timeout=0.2)
+            self.assertTrue(result.timed_out)
+            self.assertTrue(result.cleanup_complete)
+            grandchild = int(pid_file.read_text())
+            try:
+                for _ in range(100):
+                    try:
+                        os.kill(grandchild, 0)
+                    except ProcessLookupError:
+                        break
+                    status = subprocess.run(
+                        ("ps", "-o", "stat=", "-p", str(grandchild)),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    ).stdout.strip()
+                    if not status or status.startswith("Z"):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("worker grandchild survived exact process-group cleanup")
+            finally:
+                try:
+                    os.kill(grandchild, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-only")
+    def test_sigterm_resistant_worker_is_reaped_inside_overall_deadline(self):
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import signal,time;"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+                "time.sleep(60)"
+            ),
+        ]
+        deadline = 0.25
+        started = time.monotonic()
+        result = live.run_worker_process(command, timeout=deadline)
+        wall_elapsed = time.monotonic() - started
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.cleanup_complete)
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+        self.assertLessEqual(result.elapsed_ms, round(deadline * 1000) + 25)
+        self.assertLessEqual(wall_elapsed, deadline + 0.025)
+
+    def test_parent_derives_non_stale_timed_out_stage_duration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_path = root / "evidence.json"
+            progress_path = evidence_path.with_name(
+                f"{evidence_path.name}.progress.json"
+            )
+            timed_out = live.WorkerProcessResult(
+                returncode=-signal.SIGKILL,
+                stdout="",
+                stderr="",
+                timed_out=True,
+                cleanup_complete=True,
+                elapsed_ms=250,
+            )
+
+            def record_timed_out_stage(*_args, **_kwargs):
+                progress_path.write_text(
+                    live.json.dumps(
+                        {
+                            "phase": "before",
+                            "current_stage": "select_candidate",
+                            "current_stage_elapsed_ms": 0,
+                            "current_stage_started_monotonic_ns": (
+                                time.monotonic_ns() - 200_000_000
+                            ),
+                            "stage_timings_ms": {
+                                stage: None for stage in live.PHASE_STAGES["before"]
+                            },
+                        }
+                    )
+                )
+                return timed_out
+
+            with mock.patch.object(
+                live, "run_worker_process", side_effect=record_timed_out_stage
+            ), mock.patch("sys.stdout", io.StringIO()), mock.patch(
+                "sys.stderr", io.StringIO()
+            ):
+                result = live.main(
+                    (
+                        "before",
+                        "--data-root",
+                        str(root),
+                        "--state",
+                        str(root / "private.json"),
+                        "--evidence",
+                        str(evidence_path),
+                        "--deadline-seconds",
+                        "0.25",
+                    )
+                )
+            evidence = live.json.loads(evidence_path.read_text())
+            elapsed = evidence["stage_timings_ms"]["select_candidate"]
+            self.assertEqual(result, 1)
+            self.assertGreaterEqual(elapsed, 150)
+            self.assertLessEqual(elapsed, evidence["elapsed_ms"])
+            self.assertFalse(progress_path.exists())
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-only")
+    def test_end_to_end_timeout_is_bounded_diagnostic_and_leaves_no_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_path = root / "evidence.json"
+            pid_path = root / "worker.pid"
+            stages = repr(list(live.PHASE_STAGES["before"]))
+            resistant_worker = [
+                sys.executable,
+                "-c",
+                (
+                    "import json,os,pathlib,signal,sys,time;"
+                    "progress,pid=sys.argv[1:3];"
+                    "pathlib.Path(pid).write_text(str(os.getpid()));"
+                    f"stages={stages};"
+                    "pathlib.Path(progress).write_text(json.dumps({"
+                    "'phase':'before','current_stage':'select_candidate',"
+                    "'current_stage_elapsed_ms':0,"
+                    "'current_stage_started_monotonic_ns':time.monotonic_ns(),"
+                    "'stage_timings_ms':dict.fromkeys(stages)}));"
+                    "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                    "time.sleep(60)"
+                ),
+            ]
+            deadline = 0.4
+            with mock.patch.object(
+                live,
+                "worker_command",
+                side_effect=lambda _args, progress, _budget: [
+                    *resistant_worker,
+                    str(progress),
+                    str(pid_path),
+                ],
+            ), mock.patch("sys.stdout", io.StringIO()), mock.patch(
+                "sys.stderr", io.StringIO()
+            ):
+                started = time.monotonic()
+                result = live.main(
+                    (
+                        "before",
+                        "--data-root",
+                        str(root),
+                        "--state",
+                        str(root / "private.json"),
+                        "--evidence",
+                        str(evidence_path),
+                        "--deadline-seconds",
+                        str(deadline),
+                    )
+                )
+                wall_elapsed = time.monotonic() - started
+            evidence = live.json.loads(evidence_path.read_text())
+            worker_pid = int(pid_path.read_text())
+            self.assertEqual(result, 1)
+            self.assertLessEqual(wall_elapsed, deadline + 0.025)
+            self.assertTrue(evidence["child_cleanup_complete"])
+            self.assertEqual(evidence["worker_exit_code"], -signal.SIGKILL)
+            self.assertEqual(evidence["timeout_stage"], "select_candidate")
+            self.assertGreater(evidence["stage_timings_ms"]["select_candidate"], 0)
+            self.assertLessEqual(
+                evidence["stage_timings_ms"]["select_candidate"],
+                evidence["elapsed_ms"],
+            )
+            with self.assertRaises(ProcessLookupError):
+                os.kill(worker_pid, 0)
+
+    def test_public_stage_timings_require_the_fixed_phase_schema(self):
+        evidence = {
+            "privacy_safe": True,
+            "phase": "after",
+            "stage_timings_ms": {stage: 1 for stage in live.PHASE_STAGES["after"]},
+        }
+        live.validate_public_evidence(evidence)
+        evidence["stage_timings_ms"]["raw-chat-name"] = 1
+        with self.assertRaises(live.AcceptanceFailure):
+            live.validate_public_evidence(evidence)
+
+
+@unittest.skipUnless(
+    os.environ.get("GRAMDRIVE_LIVE_CONTENT_SCALE_TEST") == "1",
+    "representative 3M-item/100k-document profile is opt-in",
+)
+class RepresentativeScaleTests(unittest.TestCase):
+    def test_indexed_proofs_stay_inside_declared_deadline_at_profile_scale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            snapshot = root / "private.snapshot.sqlite3"
+            generated = root / "cache/generated"
+            generated.mkdir(parents=True)
+            (root / "agent").mkdir()
+            (root / "agent/settings.json").write_text('{"cacheQuotaBytes": 1000000}\n')
+            db = sqlite3.connect(database)
+            db.executescript(
+                """
+                CREATE TABLE items (
+                    item_id BLOB PRIMARY KEY,
+                    parent_item_id BLOB,
+                    safe_name TEXT NOT NULL DEFAULT 'filler',
+                    kind TEXT NOT NULL DEFAULT 'filler',
+                    availability TEXT NOT NULL DEFAULT 'local',
+                    logical_size INTEGER NOT NULL DEFAULT 0,
+                    deleted_at_ms INTEGER,
+                    mime_type TEXT,
+                    content_version TEXT,
+                    created_at_ms INTEGER,
+                    modified_at_ms INTEGER
+                );
+                CREATE INDEX items_children_by_id ON items(parent_item_id, item_id);
+                CREATE UNIQUE INDEX items_sibling_name
+                    ON items(parent_item_id, safe_name)
+                    WHERE parent_item_id IS NOT NULL AND deleted_at_ms IS NULL;
+                CREATE TABLE chat_sync_state (
+                    account_id INTEGER NOT NULL,
+                    namespace_version INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    oldest_loaded_message_id INTEGER,
+                    newest_loaded_message_id INTEGER,
+                    history_complete INTEGER NOT NULL,
+                    PRIMARY KEY (account_id, namespace_version, chat_id)
+                );
+                CREATE TABLE cache_entries (
+                    item_id BLOB PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    verification TEXT NOT NULL,
+                    materialization_ref TEXT,
+                    blob_hash BLOB
+                );
+                CREATE INDEX cache_entries_by_materialization_ref
+                    ON cache_entries(materialization_ref)
+                    WHERE materialization_ref IS NOT NULL;
+                CREATE TABLE accounts (
+                    auth_state TEXT NOT NULL,
+                    retention_mode TEXT NOT NULL,
+                    archive_mode INTEGER NOT NULL
+                );
+                INSERT INTO accounts VALUES ('authorized', 'forever', 0);
+                CREATE TABLE story_appearances (location TEXT NOT NULL);
+                INSERT INTO story_appearances VALUES ('active');
+                WITH RECURSIVE ids(value) AS (
+                    VALUES(1)
+                    UNION ALL SELECT value + 1 FROM ids WHERE value < 2999988
+                )
+                INSERT INTO items(item_id, deleted_at_ms)
+                SELECT CAST(printf('%016x', value) AS BLOB), NULL FROM ids;
+                INSERT INTO items(
+                    item_id,parent_item_id,safe_name,kind,availability,logical_size,
+                    deleted_at_ms,mime_type,content_version,created_at_ms,modified_at_ms
+                ) VALUES
+                    (x'FF01',NULL,'Account','account','local',0,NULL,NULL,NULL,10,20),
+                    (x'FF02',x'FF01','Chats','chat_list','local',0,NULL,NULL,NULL,10,20),
+                    (x'FF03',x'FF02','Active','chat','local',0,NULL,NULL,NULL,10,20),
+                    (x'FF04',x'FF03','2026-08','month_dir','local',0,NULL,NULL,NULL,10,20),
+                    (x'FF05',x'FF04','Messages.md','generated_doc','local',1,NULL,'text/markdown','md',10,20),
+                    (x'FF06',x'FF04','Messages.ndjson','generated_doc','local',1,NULL,'application/x-ndjson','nd',10,20),
+                    (x'FF07',x'FF03','.chat.json','generated_doc','local',1,NULL,'application/json','chat',10,20),
+                    (x'FF08',x'FF04','sample.bin','attachment','fetchable',1,NULL,'application/octet-stream','sample',10,20),
+                    (x'FF09',x'FF03','Active Stories','active_stories','local',0,NULL,NULL,NULL,10,20),
+                    (x'FF0A',x'FF09','Story.jpg','story_appearance','local',1,NULL,'image/jpeg','story',10,20),
+                    (x'FF0B',x'FF02','Zero','chat','local',0,NULL,NULL,NULL,10,20),
+                    (x'FF0C',x'FF0B','.chat.json','generated_doc','local',0,NULL,'application/json','zero-chat',10,20);
+                WITH RECURSIVE cursors(value) AS (
+                    VALUES(1)
+                    UNION ALL SELECT value + 1 FROM cursors WHERE value < 10000
+                )
+                INSERT INTO chat_sync_state
+                SELECT 1, 1, value, 100, 200, 0 FROM cursors;
+                """
+            )
+            names = ("Messages.md", "Messages.ndjson", "chat.json")
+            pending = []
+            for value in range(100_000):
+                path = generated / str(value // 3) / "current" / names[value % 3]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x")
+                pending.append((value.to_bytes(8, "big"), 1, str(path)))
+                if len(pending) == 1_000:
+                    db.executemany(
+                        "INSERT INTO cache_entries("
+                        "item_id,kind,size,verification,materialization_ref) VALUES "
+                        "(?, 'generated_doc', ?, 'verified', ?)",
+                        pending,
+                    )
+                    pending.clear()
+            if pending:
+                db.executemany(
+                    "INSERT INTO cache_entries("
+                    "item_id,kind,size,verification,materialization_ref) VALUES "
+                    "(?, 'generated_doc', ?, 'verified', ?)",
+                    pending,
+                )
+            db.execute(
+                "INSERT INTO cache_entries VALUES "
+                "(CAST('0000000000000001' AS BLOB), "
+                "'attachment', 1, 'verified', NULL, x'00')"
+            )
+            db.commit()
+            db.close()
+
+            state = root / "private.json"
+            evidence = root / "evidence.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "sample_item": "30303030303030303030303030303031",
+                        "expected_size": 1,
+                        "hydrated_digest": "00",
+                        "generated_records": [],
+                    }
+                )
+            )
+            evidence.write_text("{}")
+            with mock.patch.object(
+                live, "QUIESCENCE_STABLE_POLLS", 1
+            ), mock.patch.object(live, "QUIESCENCE_WAIT_SECONDS", 0):
+                phase = live.run_stability_snapshot(database, state, evidence)
+            max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            max_rss_bytes = max_rss if sys.platform == "darwin" else max_rss * 1024
+            print(
+                "representative-scale-foreground "
+                f"items={phase['before_item_count']} "
+                f"python_max_rss_bytes={max_rss_bytes} "
+                "python_max_rss_limit_bytes=402653184"
+            )
+            self.assertEqual(phase["before_item_count"], 3_000_000)
+            self.assertLess(max_rss_bytes, 384 * 1024 * 1024)
+            self.assertTrue(live.snapshot_database_path(state).is_file())
+
+            deadline = live.Deadline(90)
+            started = time.monotonic()
+            counts = live.create_indexed_snapshot(database, snapshot, deadline)
+            check = live.connection(database, deadline)
+            live.attach_snapshot(check, snapshot)
+            items = live.compare_items_indexed(check)
+            cursors = live.compare_cursors_indexed(check)
+            storage = live.verify_generated_storage(check, root, deadline)
+            candidates = live.candidate_rows(check)
+            namespace = live.namespace_facts(check)
+            check.close()
+            elapsed = time.monotonic() - started
+            print(
+                "representative-scale-proof "
+                f"items={counts['item_count']} "
+                f"generated_documents={storage.physical_file_count} "
+                f"proof_elapsed_ms={round(elapsed * 1000)} "
+                "deadline_ms=90000"
+            )
+
+            self.assertEqual(counts["item_count"], 3_000_000)
+            self.assertEqual(storage.current_reference_count, 100_000)
+            self.assertEqual(storage.physical_file_count, 100_000)
+            self.assertEqual(storage.orphan_file_count, 0)
+            self.assertTrue(storage.current_materializations_preserved)
+            self.assertTrue(items.additive_only)
+            self.assertTrue(cursors.preserved)
+            self.assertEqual(len(candidates), 1)
+            self.assertTrue(namespace.hidden_metadata_complete)
+            self.assertTrue(namespace.zero_story_containers_omitted)
+            self.assertTrue(namespace.story_containers_truthful)
+            self.assertLess(elapsed, 90)
+
 
 class RelaunchComparisonTests(unittest.TestCase):
     def test_public_evidence_rejects_free_form_content_fields(self):
@@ -386,9 +1299,7 @@ class RelaunchComparisonTests(unittest.TestCase):
         self.assertTrue(changed.prior_items_preserved)
         self.assertTrue(changed.additive_only)
 
-        regressed = live.compare_items(
-            "before", 2, ["a", "b"], "after", 2, ["a", "c"]
-        )
+        regressed = live.compare_items("before", 2, ["a", "b"], "after", 2, ["a", "c"])
         self.assertFalse(regressed.prior_items_preserved)
         self.assertFalse(regressed.additive_only)
 
@@ -548,9 +1459,7 @@ class StabilitySnapshotTests(unittest.TestCase):
 
     def run_snapshot(self):
         with mock.patch.object(live, "QUIESCENCE_STABLE_POLLS", 1):
-            return live.run_stability_snapshot(
-                self.database, self.state, self.evidence
-            )
+            return live.run_stability_snapshot(self.database, self.state, self.evidence)
 
     def test_newer_unrelated_cache_row_does_not_replace_original_sample(self):
         self.add_cache_rows()
@@ -565,9 +1474,7 @@ class StabilitySnapshotTests(unittest.TestCase):
         self.add_cache_rows(include_original=False)
         with self.assertRaises(live.AcceptanceFailure) as caught:
             self.run_snapshot()
-        self.assertEqual(
-            str(caught.exception), "hydrated-sample-cache-entry-missing"
-        )
+        self.assertEqual(str(caught.exception), "hydrated-sample-cache-entry-missing")
 
     def test_mismatched_original_size_or_digest_fails(self):
         cases = (
@@ -581,9 +1488,7 @@ class StabilitySnapshotTests(unittest.TestCase):
                     db.execute("DELETE FROM cache_entries")
                     db.commit()
                     db.close()
-                self.add_cache_rows(
-                    original_size=size, original_digest=digest
-                )
+                self.add_cache_rows(original_size=size, original_digest=digest)
                 with self.assertRaises(live.AcceptanceFailure) as caught:
                     self.run_snapshot()
                 self.assertEqual(str(caught.exception), expected)
