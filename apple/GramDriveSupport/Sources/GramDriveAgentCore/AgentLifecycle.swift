@@ -395,10 +395,12 @@ public final class AgentLifecycle: @unchecked Sendable {
 
         // The control endpoint runs unconditionally: status and settings
         // are lifecycle-owned, and each engine-backed seam answers its own
-        // absence truthfully (BUG-260720-3i74u1). It is established before
-        // health is published: the companion uses a successful health read as
-        // the process-readiness barrier, so exposing health first would let a
-        // clean first launch race the still-missing control socket.
+        // absence truthfully (BUG-260720-3i74u1). Health is already externally
+        // readable while state is `.recovering`; control and hydration remain
+        // unavailable until their owners exist. The process transitions to
+        // `.running` only after both endpoints are established, and companion
+        // operational readiness must require that state rather than any
+        // successful health read.
         do {
             let seams = configuration.controlSeams
             let server = try ControlServer.start(
