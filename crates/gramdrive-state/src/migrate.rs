@@ -49,7 +49,7 @@ use gramdrive_model::identity::{
     ItemKey, MonthDirKey, SchemaFamily,
 };
 use gramdrive_model::naming::{NameKind, SiblingName, resolve_siblings};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::error::StateError;
 use crate::repair::{self, RepairKind};
@@ -750,9 +750,8 @@ fn migrate_story_list_provider_view(
                 "generated",
             ),
             "generated" => {
-                validate_v21_shadow(tx)?;
                 return Ok(ChunkOutcome::More {
-                    checkpoint: "validated".to_owned(),
+                    checkpoint: "finalize".to_owned(),
                 });
             }
             _ => {
@@ -767,7 +766,9 @@ fn migrate_story_list_provider_view(
             checkpoint: format!("index:{next}"),
         });
     }
-    if checkpoint == Some("validated") {
+    if checkpoint == Some("finalize") {
+        replay_v21_deltas(tx)?;
+        validate_v21_shadow(tx)?;
         tx.execute_batch(include_str!("schema/v21_finalize.sql"))?;
         return Ok(ChunkOutcome::Done);
     }
@@ -835,15 +836,84 @@ fn migrate_story_list_provider_view(
     })
 }
 
+fn replay_v21_deltas(tx: &Transaction<'_>) -> Result<(), StateError> {
+    tx.execute_batch(
+        "DELETE FROM chat_list_entries_v21
+         WHERE (account_id, namespace_version, list_kind, folder_id, chat_id) IN (
+             SELECT account_id, namespace_version, list_kind, folder_id, chat_id
+             FROM chat_list_entries_v21_deltas
+         );
+         INSERT INTO chat_list_entries_v21
+         SELECT source.account_id, source.namespace_version, source.list_kind,
+                source.folder_id, source.chat_id, source.sort_order, source.pinned
+         FROM chat_list_entries AS source
+         INNER JOIN chat_list_entries_v21_deltas AS delta
+           ON delta.account_id = source.account_id
+          AND delta.namespace_version = source.namespace_version
+          AND delta.list_kind = source.list_kind
+          AND delta.folder_id = source.folder_id
+          AND delta.chat_id = source.chat_id;
+
+         DELETE FROM items_v21
+         WHERE item_id IN (SELECT item_id FROM items_v21_deltas);
+         INSERT INTO items_v21 (
+             item_id, account_id, namespace_version, kind, parent_item_id,
+             canonical_item_id, view_kind, view_folder_id, display_name, safe_name,
+             is_directory, mime_type, logical_size, metadata_version, content_version,
+             availability, created_at_ms, modified_at_ms, deleted_at_ms, aggregate_size,
+             tombstone_provenance
+         )
+         SELECT
+             source.item_id, source.account_id, source.namespace_version, source.kind,
+             source.parent_item_id, source.canonical_item_id, source.view_kind,
+             source.view_folder_id, source.display_name, source.safe_name,
+             source.is_directory, source.mime_type, source.logical_size,
+             source.metadata_version, source.content_version, source.availability,
+             source.created_at_ms, source.modified_at_ms, source.deleted_at_ms,
+             source.aggregate_size, source.tombstone_provenance
+         FROM items AS source
+         INNER JOIN items_v21_deltas AS delta ON delta.item_id = source.item_id;",
+    )?;
+    Ok(())
+}
+
 fn validate_v21_shadow(tx: &Transaction<'_>) -> Result<(), StateError> {
-    let source_rows: i64 = tx.query_row("SELECT count(*) FROM items", [], |row| row.get(0))?;
-    let copied_rows: i64 = tx.query_row("SELECT count(*) FROM items_v21", [], |row| row.get(0))?;
-    if copied_rows != source_rows {
-        return Err(StateError::CorruptRow {
-            table: "items_v21",
-            detail: "v21 shadow-copy row count does not match its source".to_owned(),
-        });
-    }
+    validate_v21_table_equivalence(
+        tx,
+        V21Equivalence {
+            source: "chat_list_entries",
+            shadow: "chat_list_entries_v21",
+            deltas: "chat_list_entries_v21_deltas",
+            source_key_match: "expected.account_id = delta.account_id
+                 AND expected.namespace_version = delta.namespace_version
+                 AND expected.list_kind = delta.list_kind
+                 AND expected.folder_id = delta.folder_id
+                 AND expected.chat_id = delta.chat_id",
+            shadow_key_match: "candidate.account_id = delta.account_id
+                 AND candidate.namespace_version = delta.namespace_version
+                 AND candidate.list_kind = delta.list_kind
+                 AND candidate.folder_id = delta.folder_id
+                 AND candidate.chat_id = delta.chat_id",
+            presence_column: "account_id",
+            columns: "account_id, namespace_version, list_kind, folder_id, chat_id, sort_order, pinned",
+        },
+    )?;
+    validate_v21_table_equivalence(
+        tx,
+        V21Equivalence {
+            source: "items",
+            shadow: "items_v21",
+            deltas: "items_v21_deltas",
+            source_key_match: "expected.item_id = delta.item_id",
+            shadow_key_match: "candidate.item_id = delta.item_id",
+            presence_column: "item_id",
+            columns: "item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, view_folder_id, display_name, safe_name,
+                 is_directory, mime_type, logical_size, metadata_version, content_version,
+                 availability, created_at_ms, modified_at_ms, deleted_at_ms, aggregate_size,
+                 tombstone_provenance",
+        },
+    )?;
     for table in ["chat_list_entries_v21", "items_v21"] {
         let sql = format!("PRAGMA foreign_key_check({table})");
         let violation: Option<String> = tx.query_row(&sql, [], |row| row.get(0)).optional()?;
@@ -853,6 +923,80 @@ fn validate_v21_shadow(tx: &Transaction<'_>) -> Result<(), StateError> {
                 detail: format!("migration 21 shadow table {table} has a violation"),
             });
         }
+    }
+    Ok(())
+}
+
+struct V21Equivalence {
+    source: &'static str,
+    shadow: &'static str,
+    deltas: &'static str,
+    source_key_match: &'static str,
+    shadow_key_match: &'static str,
+    presence_column: &'static str,
+    columns: &'static str,
+}
+
+fn validate_v21_table_equivalence(
+    tx: &Transaction<'_>,
+    contract: V21Equivalence,
+) -> Result<(), StateError> {
+    // Prepare establishes an exact baseline before the first checkpoint, and
+    // every later source mutation journals its old/new key in the mutation's
+    // own transaction. Equal whole-table counts plus full-column equality (or
+    // equal absence) for every journaled key therefore proves that replay
+    // preserved the complete source, without another multi-million-row join.
+    let V21Equivalence {
+        source,
+        shadow,
+        deltas,
+        source_key_match,
+        shadow_key_match,
+        presence_column,
+        columns,
+    } = contract;
+    let (source_rows, shadow_rows): (i64, i64) = tx.query_row(
+        &format!(
+            "SELECT (SELECT count(*) FROM {source}),
+                    (SELECT count(*) FROM {shadow})"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if source_rows != shadow_rows {
+        return Err(StateError::CorruptRow {
+            table: shadow,
+            detail: "v21 shadow row count does not match its source".to_owned(),
+        });
+    }
+
+    let value_match = columns
+        .split(',')
+        .map(str::trim)
+        .map(|column| format!("candidate.{column} IS expected.{column}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM {deltas} AS delta
+             LEFT JOIN {source} AS expected ON {source_key_match}
+             LEFT JOIN {shadow} AS candidate ON {shadow_key_match}
+             WHERE (expected.{presence_column} IS NULL
+                    AND candidate.{presence_column} IS NOT NULL)
+                OR (expected.{presence_column} IS NOT NULL
+                    AND candidate.{presence_column} IS NULL)
+                OR (expected.{presence_column} IS NOT NULL
+                    AND NOT ({value_match}))
+         )"
+    );
+    let differs: bool = tx.query_row(&sql, [], |row| row.get(0))?;
+    if differs {
+        return Err(StateError::CorruptRow {
+            table: shadow,
+            detail: "v21 replayed shadow rows are not exactly equivalent to their source"
+                .to_owned(),
+        });
     }
     Ok(())
 }
@@ -1024,7 +1168,13 @@ fn apply_resumable(
     prepare: Option<&'static str>,
     chunk: ChunkFn,
 ) -> Result<(), StateError> {
-    while !apply_one_resumable_chunk(conn, migration, prepare, chunk)? {}
+    while !apply_one_resumable_chunk(
+        conn,
+        migration,
+        prepare,
+        chunk,
+        TransactionBehavior::Deferred,
+    )? {}
     Ok(())
 }
 
@@ -1044,7 +1194,17 @@ fn apply_one_resumable_rebuild_chunk(
     };
     let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
     conn.pragma_update(None, "foreign_keys", false)?;
-    let result = apply_one_resumable_chunk(conn, migration, Some(prepare), chunk);
+    // Every rebuild chunk is bounded. Taking the writer reservation before
+    // reading its checkpoint is especially important for the final chunk:
+    // no already-open peer can commit after delta replay/validation but
+    // before the authoritative table swap.
+    let result = apply_one_resumable_chunk(
+        conn,
+        migration,
+        Some(prepare),
+        chunk,
+        TransactionBehavior::Immediate,
+    );
     conn.pragma_update(None, "foreign_keys", foreign_keys)?;
     result
 }
@@ -1054,8 +1214,9 @@ fn apply_one_resumable_chunk(
     migration: &Migration,
     prepare: Option<&'static str>,
     chunk: ChunkFn,
+    behavior: TransactionBehavior,
 ) -> Result<bool, StateError> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(behavior)?;
     let checkpoint = read_checkpoint(&tx, migration.version)?;
     if checkpoint.is_none() {
         // No committed chunk yet, so the preamble either has never run or
@@ -1170,7 +1331,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use rusqlite::Connection;
+    use rusqlite::{Connection, types::Value};
 
     use super::*;
 
@@ -1380,6 +1541,20 @@ mod tests {
     fn version_of(conn: &Connection) -> i64 {
         conn.query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version")
+    }
+
+    fn query_value_rows(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
+        let mut statement = conn.prepare(sql).expect("prepare exact row snapshot");
+        let column_count = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..column_count)
+                    .map(|column| row.get::<_, Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("query exact row snapshot")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect exact row snapshot")
     }
 
     /// Every message and the hint the migration gave it, in a stable order.
@@ -2104,9 +2279,11 @@ mod tests {
     }
 
     #[test]
-    fn v21_large_item_rebuild_commits_resumable_progress_at_the_schema20_boundary() {
+    fn v21_large_item_rebuild_replays_interchunk_peer_mutations_after_resume() {
         let db = TempDb::new();
         let mut conn = db.open_v1();
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
         run(&mut conn, MIGRATIONS, 20).expect("migrate fixture to v20");
         conn.execute_batch(
             "INSERT INTO items (
@@ -2143,6 +2320,9 @@ mod tests {
         let source_rows: i64 = conn
             .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
             .expect("source item count");
+        let peer = Connection::open(&db.path).expect("already-open peer connection");
+        peer.pragma_update(None, "foreign_keys", true)
+            .expect("peer foreign keys");
 
         let migration = MIGRATIONS
             .iter()
@@ -2183,7 +2363,90 @@ mod tests {
             2,
             "the old schema retains its uniqueness and hot-path indexes until the swap"
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE (type = 'table' AND name IN (
+                     'items_v21_deltas', 'chat_list_entries_v21_deltas'
+                 )) OR (type = 'trigger' AND name LIKE '%_v21_delta_%')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("durable v21 delta capture schema"),
+            8
+        );
+        peer.execute(
+            "UPDATE items
+             SET display_name = 'peer-updated', safe_name = 'peer-updated',
+                 metadata_version = 'peer-v21'
+             WHERE item_id = CAST('bulk-00000001' AS BLOB)",
+            [],
+        )
+        .expect("peer updates an already-copied item");
+        peer.execute(
+            "DELETE FROM items WHERE item_id = CAST('bulk-00000002' AS BLOB)",
+            [],
+        )
+        .expect("peer deletes an already-copied item");
+        peer.execute(
+            "INSERT INTO items (
+                 item_id, account_id, namespace_version, kind, parent_item_id,
+                 canonical_item_id, view_kind, display_name, safe_name,
+                 is_directory, mime_type, logical_size, metadata_version,
+                 content_version, availability
+             )
+             SELECT CAST('bulk-00000000' AS BLOB), account_id, namespace_version,
+                    'generated_doc', X'F0', NULL, NULL, 'peer inserted',
+                    'bulk-00000000', 0, 'text/plain', 1, 'peer-v21',
+                    'content-v2', 'fetchable'
+             FROM accounts LIMIT 1",
+            [],
+        )
+        .expect("peer inserts an item ordered behind the committed cursor");
+        peer.execute(
+            "UPDATE chat_list_entries
+             SET sort_order = 12345, pinned = 1
+             WHERE account_id = 7 AND namespace_version = 1
+               AND list_kind = 'main' AND folder_id = 0 AND chat_id = 200",
+            [],
+        )
+        .expect("peer mutates a chat-list row copied during prepare");
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM items_v21_deltas", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("durable item deltas"),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM chat_list_entries_v21_deltas",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("durable chat-list delta"),
+            1
+        );
+        let item_columns = "item_id, account_id, namespace_version, kind, parent_item_id,
+             canonical_item_id, view_kind, view_folder_id, display_name, safe_name,
+             is_directory, mime_type, logical_size, metadata_version, content_version,
+             availability, created_at_ms, modified_at_ms, deleted_at_ms, aggregate_size,
+             tombstone_provenance";
+        let expected_items = query_value_rows(
+            &conn,
+            &format!("SELECT {item_columns} FROM items ORDER BY item_id"),
+        );
+        let chat_list_columns =
+            "account_id, namespace_version, list_kind, folder_id, chat_id, sort_order, pinned";
+        let expected_chat_list = query_value_rows(
+            &conn,
+            &format!(
+                "SELECT {chat_list_columns} FROM chat_list_entries
+                 ORDER BY account_id, namespace_version, list_kind, folder_id, chat_id"
+            ),
+        );
         drop(conn);
+        drop(peer);
 
         let mut conn = Connection::open(&db.path).expect("reopen interrupted v21 database");
         run(&mut conn, MIGRATIONS, 21).expect("resume v21 to completion");
@@ -2192,6 +2455,74 @@ mod tests {
             conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
                 .expect("migrated item count"),
             source_rows
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT display_name, safe_name, metadata_version
+                 FROM items WHERE item_id = CAST('bulk-00000001' AS BLOB)",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                )),
+            )
+            .expect("updated item after migration"),
+            (
+                "peer-updated".to_owned(),
+                "peer-updated".to_owned(),
+                "peer-v21".to_owned(),
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM items
+                 WHERE item_id = CAST('bulk-00000002' AS BLOB)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("deleted item after migration"),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT display_name FROM items
+                 WHERE item_id = CAST('bulk-00000000' AS BLOB)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("behind-cursor insert after migration"),
+            "peer inserted"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT sort_order, pinned FROM chat_list_entries
+                 WHERE account_id = 7 AND namespace_version = 1
+                   AND list_kind = 'main' AND folder_id = 0 AND chat_id = 200",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("chat-list mutation after migration"),
+            (12345, 1)
+        );
+        assert_eq!(
+            query_value_rows(
+                &conn,
+                &format!("SELECT {item_columns} FROM items ORDER BY item_id"),
+            ),
+            expected_items,
+            "every item source column must survive replay and swap exactly"
+        );
+        assert_eq!(
+            query_value_rows(
+                &conn,
+                &format!(
+                    "SELECT {chat_list_columns} FROM chat_list_entries
+                     ORDER BY account_id, namespace_version, list_kind, folder_id, chat_id"
+                ),
+            ),
+            expected_chat_list,
+            "every chat-list source column must survive replay and swap exactly"
         );
         assert_eq!(
             conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
@@ -2230,6 +2561,22 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("cleared migration progress"),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE name IN (
+                     'items_v21_deltas', 'chat_list_entries_v21_deltas',
+                     'items_v21_delta_insert', 'items_v21_delta_update',
+                     'items_v21_delta_delete', 'chat_list_entries_v21_delta_insert',
+                     'chat_list_entries_v21_delta_update',
+                     'chat_list_entries_v21_delta_delete'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("v21 delta schema cleanup"),
             0
         );
     }
