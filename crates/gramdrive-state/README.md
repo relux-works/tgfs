@@ -55,11 +55,11 @@ chat catalogs, the Stories view, and recoverable authorization finalization.
 v23 indexes non-null cache materialization references so generated-generation
 reclamation performs one ownership point probe while holding the native
 hand-off lease boundary instead of scanning every cached item.
-At the same schema boundary, monthly render snapshots force the existing
-chat/time and per-message-event indexes as a streaming nested loop and sort
-only each message's local revision list. This avoids a full joined-month
-temporary sort without rewriting an installed database or changing rendered
-document order.
+No v24 migration is required for the monthly render correction: snapshots force
+the existing v23 chat/time and per-message-event indexes as a streaming nested
+loop and sort only each message's local revision list. This avoids a full
+joined-month temporary sort without rewriting an installed database or changing
+rendered document order.
 Each file
 carries the full rationale per table — this is the map. `StateStore::open` applies it atomically to a fresh file
 (`PRAGMA user_version` 0 → 1), migrates an older file forward, recognizes a
