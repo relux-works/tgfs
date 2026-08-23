@@ -35,7 +35,7 @@ lifecycle is `launching → recovering → running → draining → stopped`:
 
 | Type | Owns |
 |---|---|
-| `AgentLifecycle` | The coordinator process's lifecycle: single-instance guard first, then shared state as `.coordinator` with corruption recovery (quarantine + one retry), the `DriveCore` handle, the health endpoint, the hydration endpoint (when a hydrator is wired), power observation. `shutdown(reason:)` drains before tearing anything down |
+| `AgentLifecycle` | The coordinator process's lifecycle: single-instance guard first, then shared state as `.coordinator` with corruption recovery (quarantine + one retry), the `DriveCore` handle, the health endpoint, the hydration endpoint (when a hydrator is wired), power observation. Retryable namespace failures use bounded exponential owner recreation even before the first ready snapshot; health stays preparing until that durable bootstrap resumes, while non-retryable authorization failures remain actionable. `shutdown(reason:)` drains before tearing anything down |
 | `AgentRuntimeLayout` | Host-owned runtime paths beside the core's layout: `agent/agent.lock`, `agent/health.sock`, `agent/hydration.sock`, `agent/settings.json` under the same data root |
 | `SingleInstanceLock` | One coordinator per container, via `flock` — the kernel releases a crashed agent's lock, so recovery needs no stale-lock cleanup |
 | `TransferRegistry` | The in-flight transfer ledger and the drain: admission refusal once draining, a grace period, then cancellation through each operation's FFI `CancellationToken`. Process-local by design; durable transfer state is the engine's, which is why a crash cannot duplicate work |

@@ -3,6 +3,15 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-08-23
+
+### 0655 — First-bootstrap snapshot failures resume without invalidating Finder (BUG-260729-28hnfq)
+
+- ROOT CAUSE: namespace recovery required `namespaceReadyAccounts` membership. A preserved authorized profile whose first schema-23 snapshot failed closed with retryable `snapshot-membership-incomplete` therefore emitted `namespace-failed` but never recreated its owner, so Finder readiness could not recover during the process lifetime.
+- FIX: every core-declared retryable namespace failure now schedules the existing single-flight exponential owner recreation, including before first readiness. Pre-ready health remains `preparing` without a false terminal failure; post-ready failures retain the existing usable-degradation behavior. Synchronous `auth-required` construction failures are explicitly non-retryable, so the generalized contract does not hide a real login requirement.
+- REGRESSION: a deterministic Swift fixture starts from a durable Authorized account, fails its first owner with `snapshot-membership-incomplete`, proves the owner is closed/recreated without relaunch or login, and reaches namespace ready. The pre-fix focused command exited 1 with the owner stuck at one start; the post-fix command and the full `AgentLifecycleTests` suite exit 0.
+- PRIVACY/INSTALL BOUNDARY: no installed app/profile was mutated and no account/chat/content identifier, filename, user-data path, or secret was captured. Signed exact-main installed migration/readiness validation remains a later tester action after review and merge, per the build-129 recovery directive.
+
 ## 2026-08-22
 
 ### 2230 — Installed File Provider fault acceptance stays non-shipping (BUG-260729-3uclm3)

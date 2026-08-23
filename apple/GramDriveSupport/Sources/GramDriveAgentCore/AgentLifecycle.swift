@@ -30,9 +30,9 @@ public struct AgentConfiguration {
     /// Long-lived Telegram namespace and normalized-content owner. The shipped
     /// agent supplies the core-backed implementation; tests may inject a fake.
     public var namespaceBootstrapper: (any AgentNamespaceBootstrapping)?
-    /// Delay before recreating a post-ready namespace whose source owner
-    /// stopped with a retryable source failure. Only one recovery is scheduled
-    /// per account at a time.
+    /// Delay before recreating a namespace whose source owner stopped with a
+    /// retryable failure, including during first bootstrap. Only one recovery
+    /// is scheduled per account at a time.
     public var namespaceRecoveryDelay: Duration
     /// Called after the control server has acknowledged a termination request.
     /// The executable host owns process exit; the lifecycle owns the drain.
@@ -240,9 +240,9 @@ public final class AgentLifecycle: @unchecked Sendable {
     private var namespaceReadyAccounts: Set<Int64> = []
     private var namespaceDegradations: [Int64: AgentActionableFailure] = [:]
     private var namespaceRecoveryScheduled: Set<Int64> = []
-    /// Consecutive recovery attempts per account since the last `ready`. Drives
-    /// the recovery backoff so a deterministically failing namespace cannot
-    /// become a restart loop.
+    /// Consecutive recovery attempts per account since process start or the
+    /// last `ready`. Drives the recovery backoff so a deterministically failing
+    /// namespace cannot become a restart loop.
     private var namespaceRecoveryAttempts: [Int64: Int] = [:]
     /// Foreground history hints this agent has been handed, by kind. Counts
     /// only — the chat a hint names never reaches health (BUG-260728-2qfzbd).
@@ -1089,12 +1089,10 @@ public final class AgentLifecycle: @unchecked Sendable {
             return hasReachedReady ? .usable(degradation: existingDegradation) : .preparing
         case let .degraded(category, retryable), let .failed(category, retryable):
             let sourceFailure = failure(category, retryable)
-            guard
-                hasReachedReady,
-                Self.isRecoverableSourceFailure(category: category, retryable: retryable)
-            else {
+            guard Self.isRecoverableSourceFailure(category: category, retryable: retryable) else {
                 return .failed(sourceFailure)
             }
+            guard hasReachedReady else { return .preparing }
             return .usable(degradation: sourceFailure)
         }
     }
@@ -1262,7 +1260,9 @@ public final class AgentLifecycle: @unchecked Sendable {
         } catch {
             let category = namespaceStartFailureCategory(error)
             receiveNamespaceProgress(
-                .failed(category: category, retryable: true), accountId: accountId, token: token
+                .failed(category: category, retryable: category != "auth-required"),
+                accountId: accountId,
+                token: token
             )
             record("namespace-start-failed")
         }
@@ -1311,10 +1311,9 @@ public final class AgentLifecycle: @unchecked Sendable {
                 }
                 return (true, false)
             case let .failed(category, retryable):
-                let recover =
-                    namespaceReadyAccounts.contains(accountId)
-                        && Self.isRecoverableSourceFailure(category: category, retryable: retryable)
-                if recover {
+                let recover = Self.isRecoverableSourceFailure(
+                    category: category, retryable: retryable)
+                if recover, namespaceReadyAccounts.contains(accountId) {
                     namespaceDegradations[accountId] = AgentActionableFailure(
                         category: category,
                         message: Self.namespaceFailureMessage(category: category),
