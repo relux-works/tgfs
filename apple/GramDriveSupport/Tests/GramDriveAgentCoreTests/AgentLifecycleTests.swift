@@ -440,8 +440,17 @@ private func seedDurableNamespaceReadiness(dataRoot: URL, accountId: Int64) thro
                 try await Task.sleep(for: .milliseconds(5))
             }
             #expect(bootstrapper.startCount(accountId: 11) == 2)
+            #expect(
+                lifecycle.observedAuthorizationState(accountId: 11) == .authorized,
+                "replacement startup must not hide the prior definitive live authorization")
             bootstrapper.emit(.projectionSlice(processedChatCount: 16), accountId: 11)
             #expect(lifecycle.healthSnapshot().finderContentState == .ready)
+            bootstrapper.emit(
+                .failed(category: "auth-required", retryable: false), accountId: 11)
+            #expect(
+                lifecycle.observedAuthorizationState(accountId: 11)
+                    == .authorizationRequired,
+                "the replacement owner's definitive auth refusal must supersede authorized")
 
             await lifecycle.shutdown(reason: .terminate)
         }
