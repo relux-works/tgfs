@@ -3,6 +3,17 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-08-27
+
+### 0220 — Fresh product state adopts one retained authorized TDLib session (BUG-260827-2oajc3)
+
+- ROOT CAUSE: agent startup restored namespace owners only from durable `accounts`; a retained `telegram/account-<id>/tdlib` directory and Keychain database key were therefore unreachable after the product database was absent or recreated.
+- FIX: the Rust startup boundary now scans at most 64 direct Telegram-root entries, requires exactly one canonical readable non-empty real account directory, opens it with the existing key, and adopts it only after TDLib reaches `Ready` without phone, QR, code, or password requests and `getMe` proves the directory identity. The authorized account, account root, and four fixed Finder children commit in one SQLite transaction; restart bypasses discovery once an account exists.
+- FAIL-CLOSED CONTRACT: absent storage remains a normal fresh state. Malformed, unreadable, symlinked, oversized, ambiguous, unauthorized, missing-key, and identity-mismatched candidates persist no account. Swift startup invokes the Rust boundary only for an empty durable account set, records fixed privacy-safe outcomes, and reloads the ordinary namespace-owner path after adoption.
+- REGRESSION: the new Rust production-seam fixtures cover fresh Ready adoption, exact one-account/four-child persistence, idempotent restart, no interactive auth requests, absence, malformed/unreadable/unauthorized storage, ambiguity, scan-bound overflow, and forged directory identity. A Swift `AgentLifecycle.start()` regression proves an adopted durable row is re-read and starts the normal namespace bootstrapper.
+- REVIEW REWORK: strict `getMe` identity proof is now exclusive to retained-session adoption; the established repair probe still treats TDLib `Ready` as authoritative and keeps identity/display-name enrichment best-effort. The Apple regression drives the adopted owner through namespace `ready`, asserts a usable four-child durable root and Finder first-page readiness over health IPC, then relaunches and proves discovery is not called again. A source attestation pins the shipped `AgentMain` composition to the generated FFI call. Negative storage coverage now creates an actual permission-denied directory and a real symlink instead of representing unreadability with a regular file.
+- LIFECYCLE REWORK: shutdown now joins the internally bounded retained-session task before releasing endpoints, durable ownership, or the TDLib client. Completion during a reversible termination drain is held without health/namespace mutation and applied only if cancellation rolls the lifecycle back; an ordinary or committed stop discards the pending result. A suspended-adopter regression was red before the fix because shutdown returned with work still active, and now proves join/suppression plus termination-cancel resumption.
+
 ## 2026-08-23
 
 ### 1255 — Retry owner replacement preserves definitive authorization (BUG-260729-28hnfq rework)
@@ -2436,6 +2447,19 @@
 - REGRESSION: State coverage exercises Main, Archive, and folder shrink rejection; the FFI fixture reproduces the 11:53 folder and 11:56 Main short-snapshot bursts across 140 chats and verifies a journal with no tombstones. A positive departure witness still tombstones the legitimate projected branch. The guarded `replace_chat_list_with_audit` function records 72/83 executed regions (86.74%) in the focused coverage run.
 - VALIDATION: focused state, TDLib folder-catalog, FFI, and Swift File Provider tests, rustfmt, and scoped Clippy passed. `make check-core` had a separate workspace failure in `shared_state::tests::coordinator_repairs_fixed_root_structure_once_across_relaunches` (journal sequence expected +6, observed +7); it is outside the snapshot-membership path and is recorded rather than masked.
 - INSTALLED LIMITATION: schema-18 installed/backfill acceptance still needs a verifiably Developer-ID-signed candidate. `make package-app` remains blocked at `libcrypto.3.dylib` signing with `errSecInternalComponent`; an unsigned replacement is not acceptable for the preserved authorized-profile run. Evidence remains aggregate-only and excludes identifiers, content, local paths, and secrets.
+
+### 0827 — Exact-main build 139 does not adopt the retained TDLib session (BUG-260729-28hnfq)
+
+- INSTALLED RED BOUNDARY: The signed, notarized, stapled exact-main build 139 candidate from `dec6de632dbf81756daea505635a5e09f4daabde` reached schema 24 and published health immediately, but the unchanged 180-second gate ended with zero durable or observed authorized accounts, Finder waiting for authorization, and an empty first page. The retained TDLib session directory remained present and the database stayed healthy.
+- SYNTHETIC CONTROL: The isolated representative schema-20 fixture resumed 3.2M items to the current schema in 99.09 seconds with authorization and item preservation. The installed harness's 3M-item/100k-document indexed proof completed in 22.599 seconds inside its 90-second bound. This narrows the recurrence to fresh-state adoption of the retained session rather than the repaired schema-20 migration wall or harness scale.
+- SAFETY: No login, reset, Keychain mutation, File Provider domain removal, content deletion, or timeout increase occurred. Hydration was not attempted after the authorization/readiness prerequisite failed. Candidate state was preserved task-private; build 75/schema19 and the exact auth-session-only baseline were restored and relaunched with `quick_check=ok`.
+- EVIDENCE: Board outcome `BUG-260729-28hnfq_exact-main-build139-installed-tester-outcome.md` contains only aggregate counts, booleans, timings, fixed failure categories, and public build/run/SHA identifiers.
+
+### 0827 — Retained-session fix worktree is behind the build-139 baseline (BUG-260827-2oajc3)
+
+- BLOCKER: The managed Story worktree is at `a2361e397fc1730e676849ae76a27f49217ecc26`, 63 commits behind build-139 exact-main `dec6de632dbf81756daea505635a5e09f4daabde`. The missing history contains schema 24, atomic authorization finalization, durable namespace readiness, live namespace ownership, and bounded preserved-profile migration — the exact contracts this Bug must extend.
+- DECISION: No product implementation was attempted against the stale schema/lifecycle, and no unrelated history was imported into the Bug delta. The orchestrator must refresh or recreate the managed Story workspace from the exact-main lineage and reroute the developer task.
+- EVIDENCE: Board outcome `BUG-260827-2oajc3_blocker.md` records the revision counts, concrete API deltas, rejected forced fits, recovery options, and exact external action required.
 
 ### 0810 — Sparkle delivery converges on the approved public source repository (TASK-260810-k12znn)
 

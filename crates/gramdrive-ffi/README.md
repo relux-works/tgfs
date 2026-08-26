@@ -21,6 +21,21 @@ On-demand attachment hydration composition: TASK-260721-1yp75l.
 Non-viewing canonical story ingestion: TASK-260721-3e9bi8.
 Per-account retention and Archive-Mode control: TASK-260721-2tamdj.
 
+## Retained-session startup adoption
+
+When durable product state has no accounts, the agent calls the exported
+`adopt_retained_authorization` boundary once at startup. Rust examines at most
+64 direct entries under `telegram/` and accepts only one canonical
+`account-<positive-id>/tdlib` directory that is real, readable, and non-empty.
+Malformed, unreadable, oversized, symlinked, or ambiguous layouts fail closed.
+
+The candidate is opened with its existing read-only Keychain lookup and must
+reach TDLib `Ready` without phone, QR, code, or password input. `getMe` must
+prove the directory identity. Only then does one SQLite transaction insert the
+authorized account, account root, and four fixed Finder namespace children.
+Existing durable accounts bypass discovery, and a restart observes the row and
+makes no adoption write.
+
 ## Binding style: proc-macros, not UDL
 
 The contract is declared with UniFFI proc-macros (`#[uniffi::export]`,

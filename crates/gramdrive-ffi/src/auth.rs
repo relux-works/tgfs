@@ -81,6 +81,11 @@ const PLUMBING_TIMEOUT: Duration = Duration::from_secs(30);
 /// input before classifying the silence as a network failure.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(75);
 
+/// Startup examines at most this many direct entries under `telegram/`.
+/// A larger or ambiguous retained layout is refused instead of turning a
+/// broad filesystem scan into startup work.
+const MAX_RETAINED_ROOT_ENTRIES: usize = 64;
+
 /// The subtree of the data root that holds per-account Telegram state
 /// (`<data_dir>/telegram/account-<id>/{tdlib,files}`), beside — never
 /// inside — the core-owned `state/` and `cache/` layout.
@@ -331,6 +336,30 @@ pub enum AuthProbeOutcome {
         /// The state the probe observed instead of `Ready` (stable
         /// diagnostic name).
         kind: String,
+    },
+}
+
+/// Startup disposition for a retained TDLib authorization directory when
+/// durable product account state is empty.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum RetainedSessionAdoptionOutcome {
+    /// No retained account directory exists. Fresh authorization remains the
+    /// only available path.
+    NoCandidate,
+    /// Durable account state already exists, so startup discovery made no
+    /// changes and left ordinary account restoration authoritative.
+    AlreadyConfigured,
+    /// The one retained session reached a definitive authorization state that
+    /// requires user input. Nothing was persisted or mutated.
+    NotAuthorized {
+        /// Stable TDLib authorization-state name observed by the probe.
+        kind: String,
+    },
+    /// The retained session reached `Ready` without input and its minimal
+    /// durable account and Finder root structure were adopted atomically.
+    Adopted {
+        /// Telegram identity proven by `getMe` on the retained session.
+        account_id: i64,
     },
 }
 
@@ -1391,6 +1420,181 @@ pub async fn probe_authorization(
         })?
 }
 
+/// Discovers and adopts one retained TDLib authorization when durable product
+/// account state is empty. The implementation is intentionally exercised over
+/// the same runtime seam as [`probe_authorization`].
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn adopt_retained_authorization(
+    config: AuthSessionConfig,
+    vault: Arc<dyn SecretVault>,
+) -> Result<RetainedSessionAdoptionOutcome, DriveError> {
+    let runtime = shared_runtime()?;
+    tokio::task::spawn_blocking(move || {
+        adopt_retained_authorization_over(&runtime, &config, &vault)
+    })
+    .await
+    .map_err(|error| DriveError::Internal {
+        detail: format!("retained-session adoption task: {error}"),
+    })?
+}
+
+fn adopt_retained_authorization_over(
+    runtime: &Arc<TdRuntime>,
+    config: &AuthSessionConfig,
+    vault: &Arc<dyn SecretVault>,
+) -> Result<RetainedSessionAdoptionOutcome, DriveError> {
+    config.validate()?;
+    if durable_accounts_exist(config)? {
+        return Ok(RetainedSessionAdoptionOutcome::AlreadyConfigured);
+    }
+
+    let Some(account) = discover_retained_account(config)? else {
+        return Ok(RetainedSessionAdoptionOutcome::NoCandidate);
+    };
+    let _guard = ScopeGuard::acquire(&config.data_dir, account)?;
+    recover_auth_finalization_locked(config, vault, account)?;
+    let outcome = probe_over_locked(
+        runtime,
+        config,
+        account,
+        vault,
+        ProbeIdentityPolicy::RequireMatching,
+    )?;
+    let AuthProbeOutcome::Authorized {
+        account_id,
+        display_name,
+    } = outcome
+    else {
+        let AuthProbeOutcome::SignedOut { kind } = outcome else {
+            unreachable!("authorization probe outcomes are exhaustive")
+        };
+        return Ok(RetainedSessionAdoptionOutcome::NotAuthorized { kind });
+    };
+    if account_id != account.0 {
+        return Err(DriveError::Integrity {
+            detail: "retained TDLib identity does not match its account directory".to_owned(),
+        });
+    }
+    let display_name = display_name.ok_or_else(|| DriveError::Integrity {
+        detail: "retained TDLib session reached ready without a readable identity".to_owned(),
+    })?;
+
+    // The account row, account root, and fixed Finder children share one
+    // SQLite commit. Re-read inside that transaction so a concurrent sign-in
+    // cannot be overwritten by discovery that began against an empty schema.
+    let mut store = shared_state_store(&config.data_dir)?;
+    let txn = store.write_txn().map_err(storage_error)?;
+    if !txn.read().accounts().map_err(storage_error)?.is_empty() {
+        return Ok(RetainedSessionAdoptionOutcome::AlreadyConfigured);
+    }
+    write_account_row(&txn, account, &display_name)?;
+    txn.commit().map_err(storage_error)?;
+    Ok(RetainedSessionAdoptionOutcome::Adopted { account_id })
+}
+
+fn durable_accounts_exist(config: &AuthSessionConfig) -> Result<bool, DriveError> {
+    let mut store = shared_state_store(&config.data_dir)?;
+    let txn = store.read_txn().map_err(storage_error)?;
+    Ok(!txn.accounts().map_err(storage_error)?.is_empty())
+}
+
+/// Classifies the retained layout without opening or rewriting any TDLib
+/// bytes. Only one canonical positive account directory with a readable,
+/// non-empty real `tdlib/` directory is eligible; every ambiguous or malformed
+/// account-shaped layout is refused.
+fn discover_retained_account(config: &AuthSessionConfig) -> Result<Option<AccountId>, DriveError> {
+    let telegram = config.storage_layout().root().to_owned();
+    let entries = match std::fs::read_dir(&telegram) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(DriveError::Storage {
+                detail: format!("retained Telegram directory is unreadable: {error}"),
+            });
+        }
+    };
+    let mut candidate = None;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_RETAINED_ROOT_ENTRIES {
+            return Err(DriveError::Integrity {
+                detail: "retained Telegram directory exceeds the startup discovery bound"
+                    .to_owned(),
+            });
+        }
+        let entry = entry.map_err(|error| DriveError::Storage {
+            detail: format!("retained Telegram directory entry is unreadable: {error}"),
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(DriveError::Integrity {
+                detail: "retained Telegram directory contains a non-UTF-8 entry".to_owned(),
+            });
+        };
+        if name.starts_with('.') || name == "account-0" {
+            continue;
+        }
+        let Some(raw_account) = name.strip_prefix("account-") else {
+            continue;
+        };
+        let account_id = raw_account
+            .parse::<i64>()
+            .map_err(|_| DriveError::Integrity {
+                detail: "retained Telegram account directory has a malformed identity".to_owned(),
+            })?;
+        if account_id <= 0 || raw_account != account_id.to_string() {
+            return Err(DriveError::Integrity {
+                detail: "retained Telegram account directory is not canonical".to_owned(),
+            });
+        }
+        let file_type = entry.file_type().map_err(|error| DriveError::Storage {
+            detail: format!("retained Telegram account directory is unreadable: {error}"),
+        })?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return Err(DriveError::Integrity {
+                detail: "retained Telegram account entry is not a real directory".to_owned(),
+            });
+        }
+        let account = AccountId(account_id);
+        let tdlib = config
+            .storage_layout()
+            .account_paths(account)
+            .database_directory()
+            .to_owned();
+        let tdlib_type = std::fs::symlink_metadata(&tdlib)
+            .map_err(|error| DriveError::Storage {
+                detail: format!("retained TDLib directory is unreadable: {error}"),
+            })?
+            .file_type();
+        if tdlib_type.is_symlink() {
+            return Err(DriveError::Integrity {
+                detail: "retained TDLib directory must not be a symlink".to_owned(),
+            });
+        }
+        let mut tdlib_entries = std::fs::read_dir(&tdlib).map_err(|error| DriveError::Storage {
+            detail: format!("retained TDLib directory is unreadable: {error}"),
+        })?;
+        match tdlib_entries.next() {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                return Err(DriveError::Storage {
+                    detail: format!("retained TDLib directory entry is unreadable: {error}"),
+                });
+            }
+            None => {
+                return Err(DriveError::Integrity {
+                    detail: "retained TDLib directory is empty".to_owned(),
+                });
+            }
+        }
+        if candidate.replace(account).is_some() {
+            return Err(DriveError::Integrity {
+                detail: "multiple retained Telegram account directories are ambiguous".to_owned(),
+            });
+        }
+    }
+    Ok(candidate)
+}
+
 pub(crate) fn probe_over(
     runtime: &Arc<TdRuntime>,
     config: &AuthSessionConfig,
@@ -1407,6 +1611,32 @@ pub(crate) fn probe_over(
     let _guard = ScopeGuard::acquire(&config.data_dir, account)?;
     recover_auth_finalization_locked(config, vault, account)?;
 
+    probe_over_locked(
+        runtime,
+        config,
+        account,
+        vault,
+        ProbeIdentityPolicy::BestEffort,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ProbeIdentityPolicy {
+    /// Preserve the established repair/probe contract: TDLib `Ready` is
+    /// authoritative and identity is optional diagnostic enrichment.
+    BestEffort,
+    /// Adoption creates a durable owner, so the retained directory identity
+    /// must be proved by `getMe` before any product state is written.
+    RequireMatching,
+}
+
+fn probe_over_locked(
+    runtime: &Arc<TdRuntime>,
+    config: &AuthSessionConfig,
+    account: AccountId,
+    vault: &Arc<dyn SecretVault>,
+    identity_policy: ProbeIdentityPolicy,
+) -> Result<AuthProbeOutcome, DriveError> {
     let secrets = VaultSecrets {
         vault: Arc::clone(vault),
         create_missing_key: false,
@@ -1450,16 +1680,43 @@ pub(crate) fn probe_over(
         }
         match step.entered {
             Some(AuthState::Ready) => {
-                let display_name = client
-                    .request(json!({"@type": "getMe"}))
-                    .ok()
-                    .and_then(|pending| pending.wait_timeout(PLUMBING_TIMEOUT).ok())
-                    .and_then(Result::ok)
-                    .as_ref()
-                    .map(display_name_of);
+                let identity = match identity_policy {
+                    ProbeIdentityPolicy::BestEffort => client
+                        .request(json!({"@type": "getMe"}))
+                        .ok()
+                        .and_then(|pending| pending.wait_timeout(PLUMBING_TIMEOUT).ok())
+                        .and_then(Result::ok)
+                        .map(|user| (account.0, display_name_of(&user))),
+                    ProbeIdentityPolicy::RequireMatching => {
+                        let user = client
+                            .request(json!({"@type": "getMe"}))
+                            .map_err(td_to_drive_error)?
+                            .wait_timeout(PLUMBING_TIMEOUT)
+                            .map_err(|_| DriveError::SourceUnavailable {
+                                detail: "retained-session identity request timed out".to_owned(),
+                            })?
+                            .map_err(td_to_drive_error)?;
+                        let confirmed_account = user
+                            .get("id")
+                            .and_then(Value::as_i64)
+                            .filter(|id| *id > 0)
+                            .ok_or_else(|| DriveError::Integrity {
+                                detail: "retained-session identity response is malformed"
+                                    .to_owned(),
+                            })?;
+                        if confirmed_account != account.0 {
+                            break Err(DriveError::Integrity {
+                                detail:
+                                    "retained TDLib identity does not match its account directory"
+                                        .to_owned(),
+                            });
+                        }
+                        Some((confirmed_account, display_name_of(&user)))
+                    }
+                };
                 break Ok(AuthProbeOutcome::Authorized {
-                    account_id: account.0,
-                    display_name,
+                    account_id: identity.as_ref().map_or(account.0, |(id, _)| *id),
+                    display_name: identity.map(|(_, display_name)| display_name),
                 });
             }
             Some(
@@ -2590,6 +2847,53 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_probe_keeps_ready_authoritative_when_optional_identity_is_unreadable() {
+        let (runtime, handle) = start_runtime();
+        handle.set_responder(|sent: &SentRequest| {
+            let extra = sent.extra().expect("extra");
+            let cid = sent.client_id;
+            match sent.request_type().as_deref() {
+                Some("setTdlibParameters") => {
+                    vec![ok_response(extra, cid), auth_update(cid, READY)]
+                }
+                Some("getMe") => vec![error_response(extra, cid, 500, "GETME_FAILED")],
+                Some("close") => vec![
+                    ok_response(extra, cid),
+                    auth_update(cid, CLOSING),
+                    auth_update(cid, CLOSED),
+                ],
+                _ => vec![ok_response(extra, cid)],
+            }
+        });
+        let root = TempRoot::new();
+        let vault = Arc::new(FakeVault::default());
+        vault
+            .store_database_key(777000123, vec![7u8; 32])
+            .expect("seed key");
+        let handle_for_kick = handle;
+        let kick_thread = std::thread::spawn(move || {
+            let cid = client_id_of(&handle_for_kick);
+            kick(&handle_for_kick, cid);
+        });
+
+        let outcome = probe_over(
+            &runtime,
+            &config(&root),
+            777000123,
+            &(vault as Arc<dyn SecretVault>),
+        )
+        .expect("Ready remains authoritative for the ordinary probe");
+        kick_thread.join().expect("kick thread");
+        assert_eq!(
+            outcome,
+            AuthProbeOutcome::Authorized {
+                account_id: 777000123,
+                display_name: None,
+            }
+        );
+    }
+
+    #[test]
     fn probe_without_a_key_is_signed_out_and_creates_nothing() {
         let (runtime, _handle) = start_runtime();
         let root = TempRoot::new();
@@ -2652,5 +2956,323 @@ mod tests {
                 kind: "wait-phone-number".to_owned()
             }
         );
+    }
+
+    fn seed_retained_session(root: &TempRoot, account_id: i64) {
+        let layout = config(root).storage_layout();
+        let tdlib = layout
+            .account_paths(AccountId(account_id))
+            .database_directory()
+            .to_owned();
+        std::fs::create_dir_all(&tdlib).expect("retained TDLib directory");
+        std::fs::write(tdlib.join("db.binlog"), b"retained-state").expect("retained TDLib state");
+    }
+
+    fn assert_no_interactive_auth_requests(handle: &MockHandle) {
+        let forbidden = [
+            "setAuthenticationPhoneNumber",
+            "requestQrCodeAuthentication",
+            "checkAuthenticationCode",
+            "checkAuthenticationPassword",
+        ];
+        let observed: Vec<_> = handle
+            .take_sent()
+            .into_iter()
+            .filter_map(|request| request.request_type())
+            .collect();
+        assert!(
+            observed
+                .iter()
+                .all(|kind| !forbidden.contains(&kind.as_str())),
+            "startup adoption sent an interactive authorization request: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn startup_adopts_one_ready_retained_session_and_is_idempotent_across_restart() {
+        let (runtime, handle) = start_runtime();
+        handle.set_responder(|sent: &SentRequest| {
+            let extra = sent.extra().expect("extra");
+            let cid = sent.client_id;
+            match sent.request_type().as_deref() {
+                Some("setTdlibParameters") => {
+                    vec![ok_response(extra, cid), auth_update(cid, READY)]
+                }
+                Some("getMe") => vec![me_response(extra, cid)],
+                Some("close") => vec![
+                    ok_response(extra, cid),
+                    auth_update(cid, CLOSING),
+                    auth_update(cid, CLOSED),
+                ],
+                _ => vec![ok_response(extra, cid)],
+            }
+        });
+        let root = TempRoot::new();
+        let config = config(&root);
+        drop(
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Coordinator)
+                .expect("fresh product state"),
+        );
+        seed_retained_session(&root, 777000123);
+        let vault = Arc::new(FakeVault::default());
+        vault
+            .store_database_key(777000123, vec![7u8; 32])
+            .expect("seed retained key");
+        let handle_for_kick = handle;
+        let kick_thread = std::thread::spawn(move || {
+            let cid = client_id_of(&handle_for_kick);
+            kick(&handle_for_kick, cid);
+            handle_for_kick
+        });
+
+        let outcome = adopt_retained_authorization_over(
+            &runtime,
+            &config,
+            &(Arc::clone(&vault) as Arc<dyn SecretVault>),
+        )
+        .expect("adoption");
+        let handle = kick_thread.join().expect("kick thread");
+        assert_no_interactive_auth_requests(&handle);
+        assert_eq!(
+            outcome,
+            RetainedSessionAdoptionOutcome::Adopted {
+                account_id: 777000123
+            }
+        );
+
+        let store = SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider)
+            .expect("provider state");
+        let accounts = store.accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, 777000123);
+        assert_eq!(accounts[0].auth_state, "authorized");
+        assert_eq!(
+            store
+                .children(accounts[0].root_item_id.clone(), None, 256)
+                .expect("fixed root children")
+                .len(),
+            4
+        );
+        let before_restart = accounts[0].clone();
+
+        let restarted =
+            adopt_retained_authorization_over(&runtime, &config, &(vault as Arc<dyn SecretVault>))
+                .expect("restart adoption");
+        assert_eq!(restarted, RetainedSessionAdoptionOutcome::AlreadyConfigured);
+        assert_eq!(
+            store.accounts().expect("restart accounts"),
+            vec![before_restart]
+        );
+    }
+
+    #[test]
+    fn startup_retained_session_discovery_is_fail_closed_for_negative_shapes() {
+        let (runtime, handle) = start_runtime();
+        let root = TempRoot::new();
+        let config = config(&root);
+        drop(
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Coordinator)
+                .expect("fresh product state"),
+        );
+        let vault = Arc::new(FakeVault::default());
+
+        assert_eq!(
+            adopt_retained_authorization_over(
+                &runtime,
+                &config,
+                &(Arc::clone(&vault) as Arc<dyn SecretVault>),
+            )
+            .expect("absent session is a normal fresh state"),
+            RetainedSessionAdoptionOutcome::NoCandidate
+        );
+
+        let telegram = config.storage_layout().root().to_owned();
+        std::fs::create_dir_all(telegram.join("account-not-an-id"))
+            .expect("malformed account directory");
+        let malformed = adopt_retained_authorization_over(
+            &runtime,
+            &config,
+            &(Arc::clone(&vault) as Arc<dyn SecretVault>),
+        )
+        .expect_err("malformed candidate must refuse adoption");
+        assert!(matches!(malformed, DriveError::Integrity { .. }));
+        std::fs::remove_dir_all(telegram.join("account-not-an-id"))
+            .expect("remove malformed fixture");
+
+        let account_dir = config.storage_layout().account_dir(AccountId(777000123));
+        let tdlib_dir = account_dir.join("tdlib");
+        std::fs::create_dir_all(&tdlib_dir).expect("account directory");
+        std::fs::write(tdlib_dir.join("db.binlog"), b"retained-state")
+            .expect("retained TDLib state");
+        assert!(
+            std::process::Command::new("chmod")
+                .args(["000", tdlib_dir.to_str().expect("UTF-8 test path")])
+                .status()
+                .expect("run chmod")
+                .success(),
+            "make TDLib directory unreadable"
+        );
+        let unreadable = adopt_retained_authorization_over(
+            &runtime,
+            &config,
+            &(Arc::clone(&vault) as Arc<dyn SecretVault>),
+        );
+        assert!(
+            std::process::Command::new("chmod")
+                .args(["700", tdlib_dir.to_str().expect("UTF-8 test path")])
+                .status()
+                .expect("run chmod")
+                .success(),
+            "restore TDLib directory permissions"
+        );
+        let unreadable = unreadable.expect_err("unreadable candidate must refuse adoption");
+        assert!(matches!(unreadable, DriveError::Storage { .. }));
+        std::fs::remove_dir_all(&account_dir).expect("remove unreadable fixture");
+
+        let symlink_target = telegram.join("retained-target");
+        std::fs::create_dir_all(&symlink_target).expect("symlink target");
+        std::fs::write(symlink_target.join("db.binlog"), b"retained-state")
+            .expect("symlink target state");
+        std::fs::create_dir_all(&account_dir).expect("symlink account directory");
+        assert!(
+            std::process::Command::new("ln")
+                .args([
+                    "-s",
+                    symlink_target.to_str().expect("UTF-8 test path"),
+                    account_dir.join("tdlib").to_str().expect("UTF-8 test path"),
+                ])
+                .status()
+                .expect("run ln")
+                .success(),
+            "create TDLib symlink fixture"
+        );
+        let symlinked = adopt_retained_authorization_over(
+            &runtime,
+            &config,
+            &(Arc::clone(&vault) as Arc<dyn SecretVault>),
+        )
+        .expect_err("symlinked TDLib directory must refuse adoption");
+        assert!(matches!(symlinked, DriveError::Integrity { .. }));
+        std::fs::remove_dir_all(&account_dir).expect("remove symlink fixture");
+        std::fs::remove_dir_all(&symlink_target).expect("remove symlink target");
+
+        seed_retained_session(&root, 777000123);
+        vault
+            .store_database_key(777000123, vec![7u8; 32])
+            .expect("seed retained key");
+        handle.set_responder(|sent: &SentRequest| {
+            let extra = sent.extra().expect("extra");
+            let cid = sent.client_id;
+            match sent.request_type().as_deref() {
+                Some("setTdlibParameters") => {
+                    vec![ok_response(extra, cid), auth_update(cid, WAIT_PHONE)]
+                }
+                Some("close") => vec![
+                    ok_response(extra, cid),
+                    auth_update(cid, CLOSING),
+                    auth_update(cid, CLOSED),
+                ],
+                _ => vec![ok_response(extra, cid)],
+            }
+        });
+        let kick_thread = std::thread::spawn(move || {
+            let cid = client_id_of(&handle);
+            kick(&handle, cid);
+            handle
+        });
+        assert_eq!(
+            adopt_retained_authorization_over(&runtime, &config, &(vault as Arc<dyn SecretVault>),)
+                .expect("unauthorized probe"),
+            RetainedSessionAdoptionOutcome::NotAuthorized {
+                kind: "wait-phone-number".to_owned()
+            }
+        );
+        let handle = kick_thread.join().expect("kick thread");
+        assert_no_interactive_auth_requests(&handle);
+        let store = SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider)
+            .expect("provider state");
+        assert!(store.accounts().expect("accounts").is_empty());
+    }
+
+    #[test]
+    fn startup_retained_session_discovery_refuses_ambiguity_and_bound_overflow() {
+        let (runtime, _handle) = start_runtime();
+        let root = TempRoot::new();
+        let config = config(&root);
+        drop(
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Coordinator)
+                .expect("fresh product state"),
+        );
+        let vault = Arc::new(FakeVault::default()) as Arc<dyn SecretVault>;
+        seed_retained_session(&root, 777000123);
+        seed_retained_session(&root, 777000124);
+        let ambiguous = adopt_retained_authorization_over(&runtime, &config, &vault)
+            .expect_err("multiple candidates must not pick an account");
+        assert!(matches!(ambiguous, DriveError::Integrity { .. }));
+        std::fs::remove_dir_all(config.storage_layout().root()).expect("clear ambiguous fixture");
+
+        std::fs::create_dir_all(config.storage_layout().root()).expect("Telegram root");
+        for index in 0..=MAX_RETAINED_ROOT_ENTRIES {
+            std::fs::write(
+                config
+                    .storage_layout()
+                    .root()
+                    .join(format!("unrelated-{index}")),
+                b"bounded-entry",
+            )
+            .expect("bounded root entry");
+        }
+        let overflow = adopt_retained_authorization_over(&runtime, &config, &vault)
+            .expect_err("root entry overflow must refuse discovery");
+        assert!(matches!(overflow, DriveError::Integrity { .. }));
+    }
+
+    #[test]
+    fn startup_retained_session_rejects_a_directory_identity_not_proven_by_tdlib() {
+        let (runtime, handle) = start_runtime();
+        handle.set_responder(|sent: &SentRequest| {
+            let extra = sent.extra().expect("extra");
+            let cid = sent.client_id;
+            match sent.request_type().as_deref() {
+                Some("setTdlibParameters") => {
+                    vec![ok_response(extra, cid), auth_update(cid, READY)]
+                }
+                // The directory claims 777000124, while this retained TDLib
+                // session proves the different identity 777000123.
+                Some("getMe") => vec![me_response(extra, cid)],
+                Some("close") => vec![
+                    ok_response(extra, cid),
+                    auth_update(cid, CLOSING),
+                    auth_update(cid, CLOSED),
+                ],
+                _ => vec![ok_response(extra, cid)],
+            }
+        });
+        let root = TempRoot::new();
+        let config = config(&root);
+        drop(
+            SharedStateStore::open(root.as_str().to_owned(), StateRole::Coordinator)
+                .expect("fresh product state"),
+        );
+        seed_retained_session(&root, 777000124);
+        let vault = Arc::new(FakeVault::default());
+        vault
+            .store_database_key(777000124, vec![7u8; 32])
+            .expect("seed retained key");
+        let kick_thread = std::thread::spawn(move || {
+            let cid = client_id_of(&handle);
+            kick(&handle, cid);
+            handle
+        });
+
+        let mismatch =
+            adopt_retained_authorization_over(&runtime, &config, &(vault as Arc<dyn SecretVault>))
+                .expect_err("TDLib identity mismatch must refuse adoption");
+        let handle = kick_thread.join().expect("kick thread");
+        assert_no_interactive_auth_requests(&handle);
+        assert!(matches!(mismatch, DriveError::Integrity { .. }));
+        let store = SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider)
+            .expect("provider state");
+        assert!(store.accounts().expect("accounts").is_empty());
     }
 }

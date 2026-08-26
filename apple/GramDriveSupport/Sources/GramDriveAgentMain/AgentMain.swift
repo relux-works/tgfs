@@ -189,6 +189,20 @@ enum AgentMain {
             powerEvents: WorkspacePowerEventSource(),
             controlSeams: seams,
             namespaceBootstrapper: namespaceBootstrapper,
+            retainedSessionAdopter: {
+                switch try await adoptRetainedAuthorization(
+                    config: authConfiguration.sessionConfig(), vault: vault)
+                {
+                case .noCandidate:
+                    return .noCandidate
+                case .alreadyConfigured:
+                    return .alreadyConfigured
+                case .notAuthorized(_):
+                    return .notAuthorized
+                case let .adopted(accountId):
+                    return .adopted(accountId: accountId)
+                }
+            },
             onTerminationAccepted: { request in
                 terminationExit.request(request)
             },

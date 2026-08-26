@@ -3,6 +3,24 @@ import Foundation
 import GramDriveCore
 import GramDriveSupport
 
+/// Privacy-safe startup result from retained-session discovery. The Rust
+/// boundary owns filesystem classification, TDLib probing, and persistence;
+/// the native lifecycle only decides whether namespace owners need reloading.
+public enum AgentRetainedSessionAdoption: Equatable, Sendable {
+    case noCandidate
+    case alreadyConfigured
+    case notAuthorized
+    case adopted(accountId: Int64)
+}
+
+public typealias AgentRetainedSessionAdopter =
+    @Sendable () async throws -> AgentRetainedSessionAdoption
+
+private enum RetainedSessionAdoptionCompletion: Sendable {
+    case outcome(AgentRetainedSessionAdoption)
+    case refused
+}
+
 /// Configuration of one agent run.
 public struct AgentConfiguration {
     /// The data root the agent coordinates (the same root every GramDrive
@@ -30,6 +48,10 @@ public struct AgentConfiguration {
     /// Long-lived Telegram namespace and normalized-content owner. The shipped
     /// agent supplies the core-backed implementation; tests may inject a fake.
     public var namespaceBootstrapper: (any AgentNamespaceBootstrapping)?
+    /// Bounded Rust startup recovery for a retained TDLib session when the
+    /// durable account table is empty. The shipped agent supplies it; tests
+    /// may inject a deterministic operation.
+    public var retainedSessionAdopter: AgentRetainedSessionAdopter?
     /// Delay before recreating a namespace whose source owner stopped with a
     /// retryable failure, including during first bootstrap. Only one recovery
     /// is scheduled per account at a time.
@@ -56,6 +78,7 @@ public struct AgentConfiguration {
         hydrator: (any ContentHydrating)? = nil,
         controlSeams: AgentControlSeams = AgentControlSeams(),
         namespaceBootstrapper: (any AgentNamespaceBootstrapping)? = nil,
+        retainedSessionAdopter: AgentRetainedSessionAdopter? = nil,
         namespaceRecoveryDelay: Duration = .seconds(1),
         onTerminationAccepted: (@Sendable (ControlTerminationRequest) -> Void)? = nil,
         onTerminationCommitAccepted: (@Sendable (ControlTerminationRequest) -> Bool)? = nil,
@@ -69,6 +92,7 @@ public struct AgentConfiguration {
         self.hydrator = hydrator
         self.controlSeams = controlSeams
         self.namespaceBootstrapper = namespaceBootstrapper
+        self.retainedSessionAdopter = retainedSessionAdopter
         self.namespaceRecoveryDelay = namespaceRecoveryDelay
         self.onTerminationAccepted = onTerminationAccepted
         self.onTerminationCommitAccepted = onTerminationCommitAccepted
@@ -244,6 +268,8 @@ public final class AgentLifecycle: @unchecked Sendable {
     /// last `ready`. Drives the recovery backoff so a deterministically failing
     /// namespace cannot become a restart loop.
     private var namespaceRecoveryAttempts: [Int64: Int] = [:]
+    private var retainedSessionAdoptionTask: Task<Void, Never>?
+    private var pendingRetainedSessionAdoption: RetainedSessionAdoptionCompletion?
     /// Foreground history hints this agent has been handed, by kind. Counts
     /// only — the chat a hint names never reaches health (BUG-260728-2qfzbd).
     private var historyPriorityHints = HistoryPriorityHintCounts()
@@ -535,6 +561,67 @@ public final class AgentLifecycle: @unchecked Sendable {
         }
         startAuthorizedNamespaces()
         record("started")
+        startRetainedSessionAdoptionIfNeeded()
+    }
+
+    /// Starts the one bounded adoption pass only for a genuinely empty durable
+    /// account set. Rust re-checks the same precondition transactionally before
+    /// writing, so this native read is scheduling only, never authorization.
+    private func startRetainedSessionAdoptionIfNeeded() {
+        guard let adopter = configuration.retainedSessionAdopter else { return }
+        let accounts = setLockedReturning { self.store }.flatMap { try? $0.accounts() } ?? []
+        guard accounts.isEmpty else { return }
+        let task = Task { [weak self] in
+            let completion: RetainedSessionAdoptionCompletion
+            do {
+                completion = .outcome(try await adopter())
+            } catch {
+                completion = .refused
+            }
+            self?.receiveRetainedSessionAdoption(completion)
+        }
+        setLocked { self.retainedSessionAdoptionTask = task }
+    }
+
+    /// Applies a completed adoption only while serving. A reversible drain
+    /// retains the fixed result until rollback; an irreversible stop discards
+    /// it after joining the bounded Rust/TDLib operation.
+    private func receiveRetainedSessionAdoption(
+        _ completion: RetainedSessionAdoptionCompletion
+    ) {
+        let restart = setLockedReturning { () -> Bool in
+            guard state == .running || state == .terminationCancelled else {
+                if state == .draining || state == .terminationReady {
+                    pendingRetainedSessionAdoption = completion
+                }
+                return false
+            }
+            return applyRetainedSessionAdoptionLocked(completion)
+        }
+        if restart { restartNamespaces() }
+        setLocked { retainedSessionAdoptionTask = nil }
+    }
+
+    private func applyRetainedSessionAdoptionLocked(
+        _ completion: RetainedSessionAdoptionCompletion
+    ) -> Bool {
+        switch completion {
+        case let .outcome(.adopted(accountId)):
+            namespaceAuthorization[accountId] = .authorized
+            recordLocked("retained-session-adopted")
+            return true
+        case .outcome(.noCandidate):
+            recordLocked("retained-session-absent")
+        case .outcome(.alreadyConfigured):
+            recordLocked("retained-session-already-configured")
+        case .outcome(.notAuthorized):
+            recordLocked("retained-session-not-authorized")
+        case .refused:
+            // Details may contain filesystem or keychain material. Publish
+            // only this fixed fail-closed category in process health.
+            recordLocked("retained-session-adoption-refused")
+        }
+        return false
     }
 
     /// Drains and stops the agent. Safe to call once per run; the health
@@ -660,6 +747,12 @@ public final class AgentLifecycle: @unchecked Sendable {
 
     private func performShutdown(reason: ShutdownReason) async -> DrainOutcome {
         record("draining:\(reason.rawValue)")
+        // The Rust operation owns a TDLib client and completes under explicit
+        // internal timeouts. Joining it here prevents durable writes or client
+        // closure from escaping the lifecycle's teardown boundary.
+        if let adoption = setLockedReturning({ retainedSessionAdoptionTask }) {
+            await adoption.value
+        }
         // A cancellation must restore the same namespace owners that were serving
         // before the drain. Durable authorization remains the source of truth for
         // a normal restart, while this snapshot also covers an owner that was
@@ -775,6 +868,10 @@ public final class AgentLifecycle: @unchecked Sendable {
             self.terminationRollbackTask = nil
             self.terminationCommitClaimed = false
             self.terminationNamespaceCloseBatch = nil
+            if let pending = self.pendingRetainedSessionAdoption {
+                self.pendingRetainedSessionAdoption = nil
+                _ = self.applyRetainedSessionAdoptionLocked(pending)
+            }
         }
         transfers.resumeAdmission()
         restartNamespaces(including: namespaces)
@@ -1462,6 +1559,8 @@ public final class AgentLifecycle: @unchecked Sendable {
         healthServer = nil
         hydrationServer = nil
         controlServer = nil
+        retainedSessionAdoptionTask = nil
+        pendingRetainedSessionAdoption = nil
         if releaseDurableOwnership {
             instanceLock = nil
             store = nil
@@ -1497,6 +1596,7 @@ public final class AgentLifecycle: @unchecked Sendable {
         guard armWatchdog() else { return false }
         terminationLeaseTask?.cancel()
         terminationLeaseTask = nil
+        pendingRetainedSessionAdoption = nil
         terminationCommitClaimed = true
         return true
     }
@@ -1621,6 +1721,10 @@ public final class AgentLifecycle: @unchecked Sendable {
     private func record(_ code: String) {
         lock.lock()
         defer { lock.unlock() }
+        recordLocked(code)
+    }
+
+    private func recordLocked(_ code: String) {
         events.append(code)
         if events.count > Self.eventWindow * 4 {
             events.removeFirst(events.count - Self.eventWindow * 4)

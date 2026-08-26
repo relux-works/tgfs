@@ -60,7 +60,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // 0.17.0: generated-document hydration carries an opaque hand-off lease
     // until the native File Provider clone has completed. Additive, hence
     // minor.
-    minor: 17,
+    // 0.18.0: bounded retained-session discovery/adoption lets agent startup
+    // reconstruct minimal durable account and Finder-root state after product
+    // state loss, but only after TDLib reaches Ready without user input.
+    minor: 18,
     patch: 0,
 };
 
