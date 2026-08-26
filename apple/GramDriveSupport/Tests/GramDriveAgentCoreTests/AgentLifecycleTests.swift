@@ -107,6 +107,61 @@ private enum FakeNamespaceError: Error {
     case unavailable
 }
 
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+private actor SuspendedAdopterGate {
+    private var started = false
+    private var released = false
+    private var active = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func suspendUntilReleased() async {
+        active = true
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        if !released {
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+        active = false
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func isActive() -> Bool { active }
+}
+
 private enum TestCommitWatchdog {
     static func armed() -> Bool { true }
     static func failedToArm() -> Bool { false }
@@ -742,6 +797,173 @@ private func seedDurableNamespaceReadiness(dataRoot: URL, accountId: Int64) thro
 
             await lifecycle.shutdown(reason: .terminate)
         }
+    }
+
+    @Test func startupAdoptionReloadsDurableAccountsAndStartsTheRealNamespacePath() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let bootstrapper = FakeNamespaceBootstrapper()
+            let adoptionCalls = LockedCounter()
+            let lifecycle = AgentLifecycle(
+                configuration: AgentConfiguration(
+                    dataRoot: root,
+                    namespaceBootstrapper: bootstrapper,
+                    retainedSessionAdopter: {
+                        adoptionCalls.increment()
+                        try seedAuthorizedAccount(dataRoot: root, accountId: 777_000_123)
+                        let adoptedStore = try SharedState.open(
+                            dataRoot: root, role: .coordinator)
+                        _ = try adoptedStore.ensureRootStructure()
+                        return .adopted(accountId: 777_000_123)
+                    }
+                ))
+            try lifecycle.start()
+
+            let deadline = ContinuousClock.now + .seconds(5)
+            while bootstrapper.startCount(accountId: 777_000_123) == 0,
+                  ContinuousClock.now < deadline
+            {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+
+            #expect(bootstrapper.startCount(accountId: 777_000_123) == 1)
+            bootstrapper.emit(
+                .ready(canonicalChatCount: 0, appearanceCount: 0),
+                accountId: 777_000_123)
+            let health = try AgentHealthClient.fetch(
+                socketURL: lifecycle.runtimeLayout.healthSocket)
+            #expect(health.accounts?.count == 1)
+            #expect(health.finderContentState == .ready)
+            #expect(health.finderFirstPageItemCount == 3)
+            #expect(lifecycle.healthSnapshot().recentEvents.contains("retained-session-adopted"))
+            let account = try #require(lifecycle.store?.accounts().first)
+            #expect(
+                try lifecycle.store?.children(
+                    parent: account.rootItemId, after: nil, limit: 256
+                ).count == 4)
+
+            await lifecycle.shutdown(reason: .terminate)
+
+            let restartedBootstrapper = FakeNamespaceBootstrapper()
+            let restarted = AgentLifecycle(
+                configuration: AgentConfiguration(
+                    dataRoot: root,
+                    namespaceBootstrapper: restartedBootstrapper,
+                    retainedSessionAdopter: {
+                        adoptionCalls.increment()
+                        return .noCandidate
+                    }
+                ))
+            try restarted.start()
+            #expect(restartedBootstrapper.startCount(accountId: 777_000_123) == 1)
+            restartedBootstrapper.emit(
+                .ready(canonicalChatCount: 0, appearanceCount: 0),
+                accountId: 777_000_123)
+            let restartedHealth = try AgentHealthClient.fetch(
+                socketURL: restarted.runtimeLayout.healthSocket)
+            #expect(restartedHealth.accounts?.count == 1)
+            #expect(restartedHealth.finderContentState == .ready)
+            #expect(restartedHealth.finderFirstPageItemCount == 3)
+            #expect(adoptionCalls.value == 1)
+
+            await restarted.shutdown(reason: .terminate)
+        }
+    }
+
+    @Test func shutdownJoinsSuspendedAdoptionAndSuppressesItsLateResult() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let gate = SuspendedAdopterGate()
+            let bootstrapper = FakeNamespaceBootstrapper()
+            let shutdownReturns = LockedCounter()
+            let lifecycle = AgentLifecycle(
+                configuration: AgentConfiguration(
+                    dataRoot: root,
+                    namespaceBootstrapper: bootstrapper,
+                    retainedSessionAdopter: {
+                        await gate.suspendUntilReleased()
+                        try seedAuthorizedAccount(dataRoot: root, accountId: 777_000_123)
+                        return .adopted(accountId: 777_000_123)
+                    }
+                ))
+            try lifecycle.start()
+            await gate.waitUntilStarted()
+
+            let shutdown = Task {
+                let outcome = await lifecycle.shutdown(reason: .terminate)
+                shutdownReturns.increment()
+                return outcome
+            }
+            try await Task.sleep(for: .milliseconds(20))
+
+            #expect(await gate.isActive())
+            #expect(shutdownReturns.value == 0)
+
+            await gate.release()
+            _ = await shutdown.value
+            #expect(!(await gate.isActive()))
+            #expect(shutdownReturns.value == 1)
+            #expect(lifecycle.currentState == .stopped)
+            #expect(bootstrapper.startCount(accountId: 777_000_123) == 0)
+            #expect(
+                !lifecycle.healthSnapshot().recentEvents.contains("retained-session-adopted"))
+
+            let stoppedStore = try SharedState.open(dataRoot: root, role: .provider)
+            let accountCountAtStop = try stoppedStore.accounts().count
+            try await Task.sleep(for: .milliseconds(20))
+            #expect(try stoppedStore.accounts().count == accountCountAtStop)
+        }
+    }
+
+    @Test func terminationCancellationAppliesAdoptionAfterRollback() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let gate = SuspendedAdopterGate()
+            let bootstrapper = FakeNamespaceBootstrapper()
+            let lifecycle = AgentLifecycle(
+                configuration: AgentConfiguration(
+                    dataRoot: root,
+                    namespaceBootstrapper: bootstrapper,
+                    retainedSessionAdopter: {
+                        await gate.suspendUntilReleased()
+                        try seedAuthorizedAccount(dataRoot: root, accountId: 777_000_123)
+                        return .adopted(accountId: 777_000_123)
+                    }
+                ))
+            try lifecycle.start()
+            await gate.waitUntilStarted()
+            let request = ControlTerminationRequest(
+                expectedAgentInstanceID: try #require(
+                    lifecycle.healthSnapshot().processIdentity?.instanceID),
+                reason: .update,
+                targetBuild: "retained-adoption-test")
+
+            lifecycle.beginTermination(request)
+            var cancellation = request
+            cancellation.action = .cancel
+            lifecycle.cancelTermination(cancellation)
+            await gate.release()
+            _ = await lifecycle.shutdown(reason: .update)
+
+            #expect(lifecycle.currentState == .terminationCancelled)
+            #expect(bootstrapper.startCount(accountId: 777_000_123) == 1)
+            #expect(
+                lifecycle.observedAuthorizationState(accountId: 777_000_123) == .authorized)
+            #expect(
+                lifecycle.healthSnapshot().recentEvents.contains("retained-session-adopted"))
+        }
+    }
+
+    @Test func shippedAgentMainComposesTheRetainedSessionFFIAdopter() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/GramDriveAgentMain/AgentMain.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains("retainedSessionAdopter: {"))
+        #expect(source.contains("switch try await adoptRetainedAuthorization("))
+        #expect(source.contains("config: authConfiguration.sessionConfig(), vault: vault"))
     }
 
     @Test func authDiagnosticsPersistAcrossRelaunchAndRedactAuthPayloads() async throws {
