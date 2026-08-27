@@ -9,13 +9,14 @@
 //! statement itself*: [`WriteTxn::evict_cache_entry`] cannot remove pinned
 //! or unverified content no matter what the caller believes (SYNC-051/052).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use gramdrive_model::identity::{
     AccountId, AccountKey, CanonicalKey, ContentHash, ItemId, ItemKey,
 };
 use gramdrive_model::version::ContentVersion;
-use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Row, TransactionBehavior, params, params_from_iter};
 
 use crate::error::StateError;
 use crate::repo::{
@@ -324,6 +325,33 @@ impl ReadTxn<'_> {
                  SELECT 1 FROM cache_entries WHERE materialization_ref = ?1)",
             )?
             .query_row(params![reference], |row| row.get(0))
+            .map_err(StateError::from)
+    }
+
+    /// The subset of a bounded exact-reference batch currently claimed by
+    /// cache rows.
+    ///
+    /// Generated reclamation snapshots its filesystem candidates first, then
+    /// resolves the complete candidate set in one indexed query. Keeping this
+    /// API exact (rather than prefix-scanning the account cache) preserves the
+    /// `cache_entries_by_materialization_ref` query-plan bound.
+    pub fn cache_references_claimed(
+        &self,
+        references: &[String],
+    ) -> Result<HashSet<String>, StateError> {
+        if references.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let placeholders = std::iter::repeat_n("?", references.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT materialization_ref FROM cache_entries \
+             WHERE materialization_ref IN ({placeholders})"
+        );
+        let mut statement = self.conn().prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(references), |row| row.get(0))?;
+        rows.collect::<Result<HashSet<String>, _>>()
             .map_err(StateError::from)
     }
 
