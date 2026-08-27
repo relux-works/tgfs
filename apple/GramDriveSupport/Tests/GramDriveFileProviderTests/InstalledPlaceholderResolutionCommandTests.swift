@@ -231,6 +231,29 @@ struct InstalledPlaceholderResolutionCommandTests {
     #expect(output.isEmpty)
   }
 
+  @Test("Cancellation returns the fixed provider failure without resolving")
+  func cancellationFailsClosed() async {
+    let identifier = validIdentifier
+    let command = Task {
+      await InstalledPlaceholderResolutionCommand.run(
+        arguments: ["GramDrive", InstalledPlaceholderResolutionCommand.flag],
+        readIdentifier: { identifier },
+        resolve: { _ in
+          try await Task.sleep(for: .seconds(60))
+          Issue.record("cancelled resolver continued to a resolution")
+          return InstalledPlaceholderResolution(
+            userVisibleURL: URL(fileURLWithPath: "/private/should-not-resolve"),
+            roundTripIdentifier: identifier)
+        },
+        emit: { _ in })
+    }
+
+    command.cancel()
+    let exitCode = await command.value
+
+    #expect(exitCode == 4)
+  }
+
   @Test("A production provider-stage throw stays failure")
   func systemAdapterProviderFailureStaysFailure() async {
     let domain = NSFileProviderDomain(
