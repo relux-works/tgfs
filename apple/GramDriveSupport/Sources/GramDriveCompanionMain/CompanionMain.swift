@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import GramDriveAgentCore
 import GramDriveCompanion
@@ -14,19 +15,6 @@ private final class GramDriveApplicationDelegate: NSObject, NSApplicationDelegat
   private var pendingUpdateBuild: String?
   let updateAvailability = UpdateAvailability()
   private var updaterAvailabilityObservation: NSKeyValueObservation?
-
-  func applicationWillFinishLaunching(_ notification: Notification) {
-    guard
-      InstalledPlaceholderResolutionCommand.isRequested(
-        arguments: CommandLine.arguments)
-    else { return }
-    NSApplication.shared.setActivationPolicy(.prohibited)
-    Task {
-      let exitCode = await InstalledPlaceholderResolutionCommand.runSystem()
-      fflush(stdout)
-      exit(exitCode)
-    }
-  }
 
   lazy var updaterController = SPUStandardUpdaterController(
     startingUpdater: true,
@@ -45,10 +33,6 @@ private final class GramDriveApplicationDelegate: NSObject, NSApplicationDelegat
     })
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    guard
-      !InstalledPlaceholderResolutionCommand.isRequested(
-        arguments: CommandLine.arguments)
-    else { return }
     Self.lifecycle.applicationDidFinishLaunching()
     updaterAvailabilityObservation = updaterController.updater.observe(
       \.canCheckForUpdates,
@@ -185,7 +169,6 @@ private final class LiveChangeRelayRegistry: @unchecked Sendable {
 /// Not a File Provider extension and holds no filesystem callbacks: the AC's
 /// "no Telegram operations from filesystem callbacks" holds because this
 /// process has none.
-@main
 struct GramDriveCompanionApp: App {
     @NSApplicationDelegateAdaptor(GramDriveApplicationDelegate.self)
     private var applicationDelegate
@@ -391,6 +374,33 @@ struct GramDriveCompanionApp: App {
                 .appendingPathComponent("GramDrive", isDirectory: true)
         return AgentRuntimeLayout(dataRoot: fallback)
     }
+}
+
+/// Routes the installed-acceptance command before SwiftUI or AppKit starts.
+@main
+private enum GramDriveProcess {
+  @MainActor
+  static func main() {
+    InstalledCompanionProcessRunner.run(
+      commandRequested: InstalledPlaceholderResolutionCommand.isRequested(
+        arguments: CommandLine.arguments),
+      scheduleCommand: { operation in
+        Task { await operation() }
+      },
+      runCommand: {
+        await InstalledPlaceholderResolutionCommand.runSystem()
+      },
+      terminate: { exitCode in
+        fflush(stdout)
+        exit(exitCode)
+      },
+      runApplication: {
+        GramDriveCompanionApp.main()
+      },
+      serviceCallbacks: {
+        dispatchMain()
+      })
+  }
 }
 
 /// Stable, non-sensitive failure categories for the live setup seam. Raw
