@@ -12,6 +12,11 @@ private final class RecordingSignaling: ProviderChangeSignaling, @unchecked Send
     private var requests: [Bool] = []
     private var containers: [[String]] = []
     private var generatedItems: [[String]] = []
+    private var completionErrors: [(any Error)?]
+
+    init(completionErrors: [(any Error)?] = []) {
+        self.completionErrors = completionErrors
+    }
 
     var signalCount: Int {
         lock.lock()
@@ -47,8 +52,9 @@ private final class RecordingSignaling: ProviderChangeSignaling, @unchecked Send
         requests.append(includeRoot)
         containers.append(changedContainers.map(\.rawValue))
         generatedItems.append(evictingGeneratedItems.map(\.rawValue))
+        let error = completionErrors.isEmpty ? nil : completionErrors.removeFirst()
         lock.unlock()
-        completionHandler(nil)
+        completionHandler(error)
     }
 }
 
@@ -103,6 +109,160 @@ private final class DispatchRecorder: @unchecked Sendable {
     }
 }
 
+private final class ScriptedMaterializedEnumerator: NSObject, NSFileProviderEnumerator,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var pages: [[any NSFileProviderItem]]
+    private let holdListing: Bool
+    private let listingError: (any Error)?
+    private var invalidateCount = 0
+    private var firstPageWasEmptyData = false
+    private var hasEnumeratedPage = false
+
+    var wasInvalidated: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return invalidateCount > 0
+    }
+
+    var usedMaterializedInitialPage: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return firstPageWasEmptyData
+    }
+
+    init(
+        pages: [[any NSFileProviderItem]],
+        holdListing: Bool = false,
+        listingError: (any Error)? = nil
+    ) {
+        self.pages = pages
+        self.holdListing = holdListing
+        self.listingError = listingError
+    }
+
+    func invalidate() {
+        lock.lock()
+        invalidateCount += 1
+        lock.unlock()
+    }
+
+    func enumerateItems(
+        for observer: NSFileProviderEnumerationObserver,
+        startingAt page: NSFileProviderPage
+    ) {
+        lock.lock()
+        if !hasEnumeratedPage {
+            firstPageWasEmptyData = page == NSFileProviderPage(Data())
+            hasEnumeratedPage = true
+        }
+        guard !holdListing else {
+            lock.unlock()
+            return
+        }
+        if let listingError {
+            lock.unlock()
+            observer.finishEnumeratingWithError(listingError)
+            return
+        }
+        let items = pages.isEmpty ? [] : pages.removeFirst()
+        let hasNext = !pages.isEmpty
+        lock.unlock()
+        observer.didEnumerate(items)
+        observer.finishEnumerating(upTo: hasNext ? NSFileProviderPage(Data([1])) : nil)
+    }
+
+    func enumerateChanges(
+        for observer: NSFileProviderChangeObserver,
+        from syncAnchor: NSFileProviderSyncAnchor
+    ) {
+        observer.finishEnumeratingWithError(NSFileProviderError(.cannotSynchronize))
+    }
+}
+
+private final class RacyTimeout: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+
+    func schedule(
+        _ action: @escaping @Sendable () -> Void
+    ) -> MaterializedGeneratedItemSelector.CancelTimeout {
+        lock.lock()
+        self.action = action
+        lock.unlock()
+        return {
+            // Deliberately does not suppress `fire()`: this models a submitted
+            // DispatchWorkItem whose cancellation races with execution.
+        }
+    }
+
+    func fire() {
+        lock.lock()
+        let action = self.action
+        lock.unlock()
+        action?()
+    }
+}
+
+private final class ManualTimeout: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+    private var cancelled = false
+
+    func schedule(
+        _ action: @escaping @Sendable () -> Void
+    ) -> MaterializedGeneratedItemSelector.CancelTimeout {
+        lock.lock()
+        self.action = action
+        cancelled = false
+        lock.unlock()
+        return { [weak self] in
+            self?.cancel()
+        }
+    }
+
+    func fire() {
+        lock.lock()
+        let action = cancelled ? nil : self.action
+        lock.unlock()
+        action?()
+    }
+
+    private func cancel() {
+        lock.lock()
+        cancelled = true
+        action = nil
+        lock.unlock()
+    }
+}
+
+private func generatedItem(_ id: String) -> any NSFileProviderItem {
+    GramDriveFileProviderItem(
+        metadata: ItemMetadata(
+            contractVersion: 1,
+            id: id,
+            parent: "parent",
+            kind: .generatedDoc,
+            isDirectory: false,
+            displayName: "generated.json",
+            safeName: "generated.json",
+            metadataVersion: "metadata-v1",
+            mimeType: "application/json",
+            logicalSize: 3,
+            attachmentLogicalKind: nil,
+            attachmentRepresentation: nil,
+            attachmentFidelity: nil,
+            attachmentSourceName: nil,
+            attachmentExactSize: nil,
+            contentVersion: "content-v1",
+            availability: .fetchable,
+            createdAtMs: 1,
+            modifiedAtMs: 2,
+            deletedAtMs: nil),
+        accountRootId: "root")
+}
+
 /// A cancellable token the tests own, standing in for the Darwin
 /// observation.
 private final class RecordingToken: ChangeObservationToken, @unchecked Sendable {
@@ -124,12 +284,43 @@ private final class RecordingToken: ChangeObservationToken, @unchecked Sendable 
 
 @Suite("Change-signal relay")
 struct ChangeSignalRelayTests {
+    @Test("A change without generated candidates signals without reading materialized state")
+    func noGeneratedCandidatesBypassMaterializedEnumeration() {
+        let recorder = DispatchRecorder()
+        let enumerator = ScriptedMaterializedEnumerator(pages: [], holdListing: true)
+        let dispatcher = ProviderChangeDispatcher(
+            materializedEnumerator: enumerator,
+            evict: { identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(nil)
+            },
+            signal: { identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(nil)
+            })
+
+        dispatcher.dispatch(
+            includeRoot: false,
+            changedContainers: [],
+            evictingGeneratedItems: [],
+            completionHandler: { recorder.finish($0) })
+
+        #expect(
+            recorder.events == [
+                "signal:\(NSFileProviderItemIdentifier.workingSet.rawValue)"
+            ])
+        #expect(!enumerator.usedMaterializedInitialPage)
+        #expect(recorder.error == nil)
+    }
+
     @Test("Generated materializations are evicted before deduplicated change signals")
     func generatedEvictionPrecedesSignals() {
         let recorder = DispatchRecorder()
         let generated = NSFileProviderItemIdentifier("messages-md")
         let parent = NSFileProviderItemIdentifier("month-parent")
         let dispatcher = ProviderChangeDispatcher(
+            materializedEnumerator: ScriptedMaterializedEnumerator(
+                pages: [[generatedItem("messages-md")]]),
             evict: { identifier, completion in
                 recorder.record("evict:\(identifier.rawValue)")
                 completion(ProbeDown())
@@ -153,6 +344,146 @@ struct ChangeSignalRelayTests {
                 "signal:month-parent",
             ])
         #expect(recorder.error is ProbeDown)
+    }
+
+    @Test("Startup backlog evicts only generated items actually materialized by File Provider")
+    func startupBacklogIntersectsMaterializedSet() {
+        let recorder = DispatchRecorder()
+        let candidates = (0..<4_140).map {
+            NSFileProviderItemIdentifier("generated-\($0)")
+        }
+        let materialized = ["generated-7", "generated-900", "generated-4139"]
+        let enumerator = ScriptedMaterializedEnumerator(
+            pages: [
+                [generatedItem(materialized[0]), generatedItem("ordinary-attachment")],
+                [generatedItem(materialized[1]), generatedItem(materialized[2])],
+            ])
+        let dispatcher = ProviderChangeDispatcher(
+            materializedEnumerator: enumerator,
+            evict: { identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(nil)
+            },
+            signal: { identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(nil)
+            })
+
+        dispatcher.dispatch(
+            includeRoot: false,
+            changedContainers: [],
+            evictingGeneratedItems: candidates,
+            completionHandler: { recorder.finish($0) })
+
+        #expect(
+            recorder.events == [
+                "evict:generated-7",
+                "evict:generated-900",
+                "evict:generated-4139",
+                "signal:\(NSFileProviderItemIdentifier.workingSet.rawValue)",
+            ],
+            "the build-149 lifetime journal must not become 4,140 serial File Provider evictions")
+        #expect(recorder.error == nil)
+        #expect(
+            enumerator.usedMaterializedInitialPage,
+            "the materialized-set API requires an empty NSData initial page")
+    }
+
+    @Test("A blocked materialized-set read is cancelled and never becomes an empty-set success")
+    func materializedSelectionTimeoutIsBoundedAndFailClosed() {
+        let recorder = DispatchRecorder()
+        let timeout = ManualTimeout()
+        let enumerator = ScriptedMaterializedEnumerator(pages: [], holdListing: true)
+        let dispatcher = ProviderChangeDispatcher(
+            materializedEnumerator: enumerator,
+            scheduleSelectionTimeout: timeout.schedule,
+            evict: { identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(nil)
+            },
+            signal: { identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(nil)
+            })
+
+        dispatcher.dispatch(
+            includeRoot: false,
+            changedContainers: [],
+            evictingGeneratedItems: [NSFileProviderItemIdentifier("generated")],
+            completionHandler: { recorder.finish($0) })
+        #expect(recorder.events.isEmpty)
+
+        timeout.fire()
+
+        #expect(enumerator.wasInvalidated)
+        #expect(
+            recorder.events == [
+                "signal:\(NSFileProviderItemIdentifier.workingSet.rawValue)"
+            ])
+        #expect(recorder.error != nil, "failed selection is not legitimate absence")
+    }
+
+    @Test("A materialized-set enumeration error is preserved while signals still publish")
+    func materializedSelectionErrorIsFailClosed() {
+        let recorder = DispatchRecorder()
+        let enumerator = ScriptedMaterializedEnumerator(
+            pages: [],
+            listingError: ProbeDown())
+        let dispatcher = ProviderChangeDispatcher(
+            materializedEnumerator: enumerator,
+            evict: { identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(nil)
+            },
+            signal: { identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(nil)
+            })
+
+        dispatcher.dispatch(
+            includeRoot: false,
+            changedContainers: [],
+            evictingGeneratedItems: [NSFileProviderItemIdentifier("generated")],
+            completionHandler: { recorder.finish($0) })
+
+        #expect(
+            recorder.events == [
+                "signal:\(NSFileProviderItemIdentifier.workingSet.rawValue)"
+            ])
+        #expect(recorder.error is ProbeDown)
+        #expect(!enumerator.wasInvalidated)
+    }
+
+    @Test("A cancelled watchdog cannot invalidate an already completed materialized read")
+    func lateTimeoutAfterSuccessIsInert() {
+        let recorder = DispatchRecorder()
+        let timeout = RacyTimeout()
+        let enumerator = ScriptedMaterializedEnumerator(
+            pages: [[generatedItem("generated")]])
+        let dispatcher = ProviderChangeDispatcher(
+            materializedEnumerator: enumerator,
+            scheduleSelectionTimeout: timeout.schedule,
+            evict: { identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(nil)
+            },
+            signal: { identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(nil)
+            })
+
+        dispatcher.dispatch(
+            includeRoot: false,
+            changedContainers: [],
+            evictingGeneratedItems: [NSFileProviderItemIdentifier("generated")],
+            completionHandler: { recorder.finish($0) })
+        let completedEvents = recorder.events
+
+        timeout.fire()
+
+        #expect(!enumerator.wasInvalidated)
+        #expect(recorder.events == completedEvents)
+        #expect(recorder.error == nil)
     }
 
     @Test("Start probes once — covering rings missed while not running — and signals")
@@ -327,6 +658,25 @@ struct ChangeSignalRelayTests {
 
         ring?()
         #expect(signaling.signalCount == 1)
+    }
+
+    @Test("A failed materialized-set proof does not advance the relay checkpoint")
+    func signalingFailureRetriesTheSameVersion() throws {
+        let signaling = RecordingSignaling(completionErrors: [SignalDown(), nil])
+        let probe = ScriptedProbe([.success(5), .success(5)])
+        let relay = ChangeSignalRelay(probe: { try probe.next() }, signaling: signaling)
+        var ring: (@Sendable () -> Void)?
+        try relay.start(observe: { handler in
+            ring = handler
+            return RecordingToken()
+        })
+        #expect(signaling.signalCount == 1)
+
+        ring?()
+
+        #expect(
+            signaling.signalCount == 2,
+            "a failed materialized-set read is retried, never laundered into absence")
     }
 
     @Test("Stop cancels the observation")
