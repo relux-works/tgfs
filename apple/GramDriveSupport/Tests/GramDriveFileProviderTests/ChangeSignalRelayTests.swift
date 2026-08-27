@@ -45,13 +45,13 @@ private final class RecordingSignaling: ProviderChangeSignaling, @unchecked Send
     func signalChanges(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
-        evictingGeneratedItems: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [ProviderGeneratedItemChange],
         completionHandler: @escaping @Sendable ((any Error)?) -> Void
     ) {
         lock.lock()
         requests.append(includeRoot)
         containers.append(changedContainers.map(\.rawValue))
-        generatedItems.append(evictingGeneratedItems.map(\.rawValue))
+        generatedItems.append(evictingGeneratedItems.map(\.item.rawValue))
         let error = completionErrors.isEmpty ? nil : completionErrors.removeFirst()
         lock.unlock()
         completionHandler(error)
@@ -87,12 +87,12 @@ private final class DelayedSignaling: ProviderChangeSignaling, @unchecked Sendab
     func signalChanges(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
-        evictingGeneratedItems: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [ProviderGeneratedItemChange],
         completionHandler: @escaping @Sendable ((any Error)?) -> Void
     ) {
         lock.lock()
         requests.append(includeRoot)
-        generatedItems.append(evictingGeneratedItems.map(\.rawValue))
+        generatedItems.append(evictingGeneratedItems.map(\.item.rawValue))
         completions.append(completionHandler)
         lock.unlock()
     }
@@ -153,6 +153,42 @@ private final class DispatchRecorder: @unchecked Sendable {
         lock.lock()
         recordedError = error
         lock.unlock()
+    }
+}
+
+/// Drives the same resolver -> dispatcher boundary as the companion's live
+/// relay while replacing only the two entitlement-bound manager operations.
+private final class ProductionPathSignaling: ProviderChangeSignaling, @unchecked Sendable {
+    private let recorder: DispatchRecorder
+    private let materializedContainerIDs: [String]
+
+    init(recorder: DispatchRecorder, materializedContainerIDs: [String]) {
+        self.recorder = recorder
+        self.materializedContainerIDs = materializedContainerIDs
+    }
+
+    func signalChanges(
+        includeRoot: Bool,
+        changedContainers: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [ProviderGeneratedItemChange],
+        completionHandler: @escaping @Sendable ((any Error)?) -> Void
+    ) {
+        ProviderChangeDispatcher(
+            materializedEnumerator: ScriptedMaterializedEnumerator(
+                pages: [materializedContainerIDs.map(materializedContainer)]),
+            evict: { [recorder] identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(nil)
+            },
+            signal: { [recorder] identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(nil)
+            }
+        ).dispatch(
+            includeRoot: includeRoot,
+            changedContainers: changedContainers,
+            evictingGeneratedItems: evictingGeneratedItems,
+            completionHandler: completionHandler)
     }
 }
 
@@ -284,30 +320,42 @@ private final class ManualTimeout: @unchecked Sendable {
     }
 }
 
-private func generatedItem(_ id: String) -> any NSFileProviderItem {
+/// The real materialized-items API enumerates containers, not files. Keeping
+/// that platform shape explicit is the regression's semantic mutant proof:
+/// matching the generated item identifier itself must stay red.
+private func materializedContainer(_ id: String) -> any NSFileProviderItem {
     GramDriveFileProviderItem(
         metadata: ItemMetadata(
             contractVersion: 1,
             id: id,
-            parent: "parent",
-            kind: .generatedDoc,
-            isDirectory: false,
-            displayName: "generated.json",
-            safeName: "generated.json",
+            parent: "root",
+            kind: .chat,
+            isDirectory: true,
+            displayName: "Container",
+            safeName: "Container",
             metadataVersion: "metadata-v1",
-            mimeType: "application/json",
-            logicalSize: 3,
+            mimeType: nil,
+            logicalSize: nil,
             attachmentLogicalKind: nil,
             attachmentRepresentation: nil,
             attachmentFidelity: nil,
             attachmentSourceName: nil,
             attachmentExactSize: nil,
-            contentVersion: "content-v1",
+            contentVersion: nil,
             availability: .fetchable,
             createdAtMs: 1,
             modifiedAtMs: 2,
             deletedAtMs: nil),
         accountRootId: "root")
+}
+
+private func generatedChange(
+    _ item: String,
+    parent: String = "parent"
+) -> ProviderGeneratedItemChange {
+    ProviderGeneratedItemChange(
+        item: NSFileProviderItemIdentifier(item),
+        parent: NSFileProviderItemIdentifier(parent))
 }
 
 /// A cancellable token the tests own, standing in for the Darwin
@@ -331,6 +379,110 @@ private final class RecordingToken: ChangeObservationToken, @unchecked Sendable 
 
 @Suite("Change-signal relay")
 struct ChangeSignalRelayTests {
+    @Test("Startup bootstrap and later generated versions evict beneath materialized containers")
+    func productionPathEvictsGeneratedVersionsBeforePublication() throws {
+        let account = AccountInfo(
+            accountId: 7,
+            sourceKind: .localTdlib,
+            displayName: "Account",
+            authState: "authorized",
+            namespaceVersion: 1,
+            displayTimezone: "UTC",
+            rootItemId: "root")
+        let store = ScriptedStore(account: account)
+        var generated = ItemMetadata(
+            contractVersion: 1,
+            id: "chat-json",
+            parent: "chat-parent",
+            kind: .generatedDoc,
+            isDirectory: false,
+            displayName: ".chat.json",
+            safeName: ".chat.json",
+            metadataVersion: "m1",
+            mimeType: "application/json",
+            logicalSize: 3,
+            attachmentLogicalKind: nil,
+            attachmentRepresentation: nil,
+            attachmentFidelity: nil,
+            attachmentSourceName: nil,
+            attachmentExactSize: nil,
+            contentVersion: "v1",
+            availability: .fetchable,
+            createdAtMs: 1,
+            modifiedAtMs: 2,
+            deletedAtMs: nil)
+        store.apply(generated)
+        store.apply(
+            ItemMetadata(
+                contractVersion: 1,
+                id: "attachment",
+                parent: "chat-parent",
+                kind: .attachment,
+                isDirectory: false,
+                displayName: "attachment.bin",
+                safeName: "attachment.bin",
+                metadataVersion: "m1",
+                mimeType: "application/octet-stream",
+                logicalSize: 3,
+                attachmentLogicalKind: nil,
+                attachmentRepresentation: nil,
+                attachmentFidelity: nil,
+                attachmentSourceName: nil,
+                attachmentExactSize: 3,
+                contentVersion: "v1",
+                availability: .fetchable,
+                createdAtMs: 1,
+                modifiedAtMs: 2,
+                deletedAtMs: nil))
+        var deleted = generated
+        deleted.id = "deleted-generated"
+        deleted.safeName = ".deleted.json"
+        deleted.deletedAtMs = 3
+        store.apply(deleted)
+
+        let recorder = DispatchRecorder()
+        let relay = ChangeSignalRelay(
+            probe: { try store.dataVersion() },
+            containerProbe: {
+                try ProviderContainerChangeResolver.changes(
+                    store: store, account: account, after: $0)
+            },
+            signaling: ProductionPathSignaling(
+                recorder: recorder,
+                materializedContainerIDs: ["chat-parent"]))
+        var ring: (@Sendable () -> Void)?
+        try relay.start(observe: { handler in
+            ring = handler
+            return RecordingToken()
+        })
+
+        generated.contentVersion = "v2"
+        generated.metadataVersion = "m2"
+        generated.modifiedAtMs = 4
+        store.apply(generated)
+        store.stampedDataVersion = 2
+        ring?()
+
+        #expect(
+            recorder.events.filter { $0.hasPrefix("evict:") }
+                == ["evict:chat-json", "evict:chat-json"],
+            "startup replays the migrated journal and the next version reuses the same path")
+        #expect(
+            !recorder.events.contains("evict:attachment")
+                && !recorder.events.contains("evict:deleted-generated"),
+            "attachments and deleted generated rows are never eviction candidates")
+        #expect(
+            recorder.events.first == "evict:chat-json",
+            "eviction must precede initial generated-version publication")
+        let secondEviction = recorder.events.lastIndex(of: "evict:chat-json")
+        let lastSignal = recorder.events.lastIndex {
+            $0.hasPrefix("signal:")
+        }
+        #expect(
+            secondEviction != nil && lastSignal != nil && secondEviction! < lastSignal!,
+            "the later generated version must also evict before publication")
+    }
+
     @Test("A change without generated candidates signals without reading materialized state")
     func noGeneratedCandidatesBypassMaterializedEnumeration() {
         let recorder = DispatchRecorder()
@@ -363,11 +515,11 @@ struct ChangeSignalRelayTests {
     @Test("Generated materializations are evicted before deduplicated change signals")
     func generatedEvictionPrecedesSignals() {
         let recorder = DispatchRecorder()
-        let generated = NSFileProviderItemIdentifier("messages-md")
+        let generated = generatedChange("messages-md", parent: "month-parent")
         let parent = NSFileProviderItemIdentifier("month-parent")
         let dispatcher = ProviderChangeDispatcher(
             materializedEnumerator: ScriptedMaterializedEnumerator(
-                pages: [[generatedItem("messages-md")]]),
+                pages: [[materializedContainer("month-parent")]]),
             evict: { identifier, completion in
                 recorder.record("evict:\(identifier.rawValue)")
                 completion(ProbeDown())
@@ -397,13 +549,19 @@ struct ChangeSignalRelayTests {
     func startupBacklogIntersectsMaterializedSet() {
         let recorder = DispatchRecorder()
         let candidates = (0..<4_140).map {
-            NSFileProviderItemIdentifier("generated-\($0)")
+            generatedChange("generated-\($0)", parent: "parent-\($0)")
         }
-        let materialized = ["generated-7", "generated-900", "generated-4139"]
+        let materialized = [7, 900, 4_139]
         let enumerator = ScriptedMaterializedEnumerator(
             pages: [
-                [generatedItem(materialized[0]), generatedItem("ordinary-attachment")],
-                [generatedItem(materialized[1]), generatedItem(materialized[2])],
+                [
+                    materializedContainer("parent-\(materialized[0])"),
+                    materializedContainer("ordinary-parent"),
+                ],
+                [
+                    materializedContainer("parent-\(materialized[1])"),
+                    materializedContainer("parent-\(materialized[2])"),
+                ],
             ])
         let dispatcher = ProviderChangeDispatcher(
             materializedEnumerator: enumerator,
@@ -456,7 +614,7 @@ struct ChangeSignalRelayTests {
         dispatcher.dispatch(
             includeRoot: false,
             changedContainers: [],
-            evictingGeneratedItems: [NSFileProviderItemIdentifier("generated")],
+            evictingGeneratedItems: [generatedChange("generated")],
             completionHandler: { recorder.finish($0) })
         #expect(recorder.events.isEmpty)
 
@@ -490,7 +648,7 @@ struct ChangeSignalRelayTests {
         dispatcher.dispatch(
             includeRoot: false,
             changedContainers: [],
-            evictingGeneratedItems: [NSFileProviderItemIdentifier("generated")],
+            evictingGeneratedItems: [generatedChange("generated")],
             completionHandler: { recorder.finish($0) })
 
         #expect(
@@ -506,7 +664,7 @@ struct ChangeSignalRelayTests {
         let recorder = DispatchRecorder()
         let timeout = RacyTimeout()
         let enumerator = ScriptedMaterializedEnumerator(
-            pages: [[generatedItem("generated")]])
+            pages: [[materializedContainer("parent")]])
         let dispatcher = ProviderChangeDispatcher(
             materializedEnumerator: enumerator,
             scheduleSelectionTimeout: timeout.schedule,
@@ -522,7 +680,7 @@ struct ChangeSignalRelayTests {
         dispatcher.dispatch(
             includeRoot: false,
             changedContainers: [],
-            evictingGeneratedItems: [NSFileProviderItemIdentifier("generated")],
+            evictingGeneratedItems: [generatedChange("generated")],
             completionHandler: { recorder.finish($0) })
         let completedEvents = recorder.events
 
@@ -580,7 +738,7 @@ struct ChangeSignalRelayTests {
                     NSFileProviderItemIdentifier("chat-parent"),
                     NSFileProviderItemIdentifier("month-parent"),
                 ],
-                generatedItems: [NSFileProviderItemIdentifier("messages-md")]),
+                generatedItems: [generatedChange("messages-md", parent: "month-parent")]),
         ])
         let relay = ChangeSignalRelay(
             probe: { try probe.next() },
@@ -687,7 +845,8 @@ struct ChangeSignalRelayTests {
         #expect(changes.journal.latestSequence == 3)
         #expect(changes.containers.map { $0.rawValue } == ["chat-parent"])
         #expect(
-            changes.generatedItems.map { $0.rawValue } == ["chat-json"],
+            changes.generatedItems.map(\.item.rawValue) == ["chat-json"]
+                && changes.generatedItems.map(\.parent.rawValue) == ["chat-parent"],
             "ordinary attachments and deleted generated nodes must never be evicted")
     }
 
@@ -734,13 +893,13 @@ struct ChangeSignalRelayTests {
             ProviderContainerChanges(
                 journal: ChangeJournalState(instanceId: "life", latestSequence: 1),
                 containers: [],
-                generatedItems: [NSFileProviderItemIdentifier("generated-a")]),
+                generatedItems: [generatedChange("generated-a")]),
             ProviderContainerChanges(
                 journal: ChangeJournalState(instanceId: "life", latestSequence: 2),
                 containers: [],
                 generatedItems: [
-                    NSFileProviderItemIdentifier("generated-a"),
-                    NSFileProviderItemIdentifier("generated-b"),
+                    generatedChange("generated-a"),
+                    generatedChange("generated-b"),
                 ]),
         ])
         let relay = ChangeSignalRelay(
@@ -782,13 +941,13 @@ struct ChangeSignalRelayTests {
             ProviderContainerChanges(
                 journal: ChangeJournalState(instanceId: "life", latestSequence: 1),
                 containers: [],
-                generatedItems: [NSFileProviderItemIdentifier("generated-a")]),
+                generatedItems: [generatedChange("generated-a")]),
             ProviderContainerChanges(
                 journal: ChangeJournalState(instanceId: "life", latestSequence: 2),
                 containers: [],
                 generatedItems: [
-                    NSFileProviderItemIdentifier("generated-a"),
-                    NSFileProviderItemIdentifier("generated-b"),
+                    generatedChange("generated-a"),
+                    generatedChange("generated-b"),
                 ]),
         ])
         let relay = ChangeSignalRelay(
@@ -833,7 +992,7 @@ struct ChangeSignalRelayTests {
                 ProviderContainerChanges(
                     journal: ChangeJournalState(instanceId: "life", latestSequence: 4),
                     containers: [NSFileProviderItemIdentifier("chat-parent")],
-                    generatedItems: [NSFileProviderItemIdentifier("messages-md")])
+                    generatedItems: [generatedChange("messages-md", parent: "chat-parent")])
             },
             signaling: signaling)
 

@@ -5,6 +5,13 @@
 
 ## 2026-08-27
 
+### 2350 — Generated invalidation follows File Provider's container materialization model (TASK-260827-1jrznq)
+
+- BUILD-151 ROOT CAUSE: the preserved schema-25 failed state has 3,782 live generated rows, 573 current verified generated cache rows, and matching render/item/cache content versions. Every generated row is present in the coalesced journal, so durable publication and startup replay were intact. The defect was the host selection model: `enumeratorForMaterializedItems()` reports materialized containers, while the dispatcher intersected those identifiers with generated file identifiers. The resulting empty intersection published new versions without evicting stale Finder bytes.
+- FIX: journal resolution now carries each changed live generated item together with its current parent container. The production dispatcher intersects those parent identifiers with File Provider's materialized-container enumeration, evicts the corresponding generated children, and only then publishes working-set/root/parent changes. Startup replay and later content-version changes use the same serialized confirmed-checkpoint lane; the eight-second selection watchdog, exact-byte requirement, installed 120-second aggregate deadline, attachment exclusion, and deleted-generated exclusion are unchanged.
+- REGRESSION AND MUTANT: a production-path Swift test drives `ChangeSignalRelay.start`, the real journal resolver, and the real dispatcher with a materialized directory. It requires startup journal bootstrap and a subsequent generated version to evict before publication while an attachment and tombstoned generated row are never evicted. Narrowing selection back to generated item-ID intersection made the named test fail with exit 1 and three assertions; restoration from a task-local copy was byte-verified and the exact rerun exited 0.
+- PRESERVED-STATE BOUNDARY: analysis used read-only SQLite queries and emitted only aggregate counts/schema facts. The signed build-151 app was not launched, and the preserved profile/session/domain, current installed state, Keychain, CloudStorage tree, exact-byte deadline, and retained identifiers/content were not mutated or disclosed.
+
 ### 0220 — Fresh product state adopts one retained authorized TDLib session (BUG-260827-2oajc3)
 
 - ROOT CAUSE: agent startup restored namespace owners only from durable `accounts`; a retained `telegram/account-<id>/tdlib` directory and Keychain database key were therefore unreachable after the product database was absent or recreated.
