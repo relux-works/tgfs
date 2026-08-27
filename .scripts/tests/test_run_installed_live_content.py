@@ -112,6 +112,20 @@ class CandidateSelectionTests(unittest.TestCase):
         (path / "sample.bin").write_bytes(b"test")
         self.db.commit()
 
+    def add_second_attachment(self):
+        self.add_item(
+            10,
+            6,
+            "second.bin",
+            "attachment",
+            availability="fetchable",
+            size=8,
+        )
+        (self.cloud / "Chats" / "Chat" / "2026-07" / "second.bin").write_bytes(
+            b"second"
+        )
+        self.db.commit()
+
     def test_already_cached_item_cannot_false_pass_as_a_placeholder(self):
         self.seed_date_first_tree()
         self.db.execute(
@@ -132,6 +146,103 @@ class CandidateSelectionTests(unittest.TestCase):
             live.select_uncached_dataless_candidate(
                 self.db, self.cloud, dataless_probe=lambda _path: False
             )
+
+    def test_selection_skips_one_timed_out_placeholder_within_the_probe_bound(self):
+        self.seed_date_first_tree()
+        self.add_second_attachment()
+        outcomes = iter(
+            (
+                live.PlaceholderProbeResult(live.PlaceholderState.TIMEOUT, 500),
+                live.PlaceholderProbeResult(live.PlaceholderState.DATALESS, 2),
+            )
+        )
+
+        candidate, _path, facts = live.select_uncached_dataless_candidate(
+            self.db, self.cloud, dataless_probe=lambda _path: next(outcomes)
+        )
+
+        self.assertEqual(candidate.item_id, bytes([10]))
+        self.assertEqual(facts.candidates_considered, 2)
+        self.assertEqual(facts.stat_timeout_count, 1)
+        self.assertEqual(facts.dataless_count, 1)
+
+    def test_candidate_plan_uses_the_bounded_partial_index_without_temp_sort(self):
+        self.seed_date_first_tree()
+        self.db.execute(
+            "CREATE INDEX items_live_fetchable_attachments_by_size "
+            "ON items(logical_size, item_id) "
+            "WHERE kind='attachment' AND availability='fetchable' "
+            "AND deleted_at_ms IS NULL AND logical_size > 0"
+        )
+        plan = " ".join(
+            row[3]
+            for row in self.db.execute(
+                "EXPLAIN QUERY PLAN " + live.CANDIDATE_QUERY,
+                (live.MAX_CANDIDATES,),
+            )
+        ).lower()
+
+        self.assertIn("items_live_fetchable_attachments_by_size", plan)
+        self.assertNotIn("temp b-tree", plan)
+
+    def test_fixed_probe_states_distinguish_missing_platform_error_and_timeout(self):
+        completed = subprocess.CompletedProcess(("probe",), 0, "1073741824\n", "")
+        with mock.patch.object(live.subprocess, "run", return_value=completed):
+            self.assertIs(
+                live.finder_placeholder_probe(self.cloud).state,
+                live.PlaceholderState.DATALESS,
+            )
+        completed = subprocess.CompletedProcess(("probe",), 3, "", "")
+        with mock.patch.object(live.subprocess, "run", return_value=completed):
+            self.assertIs(
+                live.finder_placeholder_probe(self.cloud).state,
+                live.PlaceholderState.MISSING,
+            )
+        completed = subprocess.CompletedProcess(("probe",), 4, "", "")
+        with mock.patch.object(live.subprocess, "run", return_value=completed):
+            self.assertIs(
+                live.finder_placeholder_probe(self.cloud).state,
+                live.PlaceholderState.PLATFORM_ERROR,
+            )
+        with mock.patch.object(
+            live.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(("probe",), 0.5),
+        ):
+            self.assertIs(
+                live.finder_placeholder_probe(self.cloud).state,
+                live.PlaceholderState.TIMEOUT,
+            )
+
+    @unittest.skipUnless(sys.platform == "darwin", "st_flags is a macOS contract")
+    def test_real_probe_child_reports_materialized_and_missing_without_content_reads(self):
+        materialized = live.finder_placeholder_probe(self.cloud)
+        missing = live.finder_placeholder_probe(self.root / "missing-placeholder")
+
+        self.assertIs(materialized.state, live.PlaceholderState.MATERIALIZED)
+        self.assertIs(missing.state, live.PlaceholderState.MISSING)
+        self.assertLessEqual(
+            materialized.elapsed_ms + missing.elapsed_ms,
+            round(live.PLACEHOLDER_PROBE_TIMEOUT_SECONDS * 2000),
+        )
+
+    def test_path_remap_fails_closed_as_identity_mismatch(self):
+        self.seed_date_first_tree()
+        first = self.cloud / "old-placeholder"
+        second = self.cloud / "new-placeholder"
+        with mock.patch.object(live, "item_path", side_effect=(first, second)):
+            with self.assertRaises(live.AcceptanceFailure) as caught:
+                live.select_uncached_dataless_candidate(
+                    self.db,
+                    self.cloud,
+                    dataless_probe=lambda _path: live.PlaceholderProbeResult(
+                        live.PlaceholderState.DATALESS, 1
+                    ),
+                )
+        self.assertEqual(str(caught.exception), "bounded-placeholder-selection-exhausted")
+        self.assertEqual(
+            caught.exception.public_evidence["placeholder_path_mismatch_count"], 1
+        )
 
     def test_placeholder_read_failure_uses_a_fixed_actionable_label(self):
         with self.assertRaises(live.AcceptanceFailure) as caught:
@@ -724,6 +835,46 @@ class InstalledPhaseEndToEndTests(unittest.TestCase):
 
 
 class DeadlineAndCleanupTests(unittest.TestCase):
+    def test_worker_publishes_only_aggregate_bounded_selection_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_path = root / "evidence.json"
+            args = live.argparse.Namespace(
+                phase="before",
+                deadline_seconds=2.0,
+                progress=None,
+                data_root=root,
+                cloud_root=root,
+                state=root / "private.json",
+                evidence=evidence_path,
+            )
+            facts = live.PlaceholderSelectionFacts(
+                candidates_considered=3,
+                missing_count=1,
+                stat_error_count=1,
+                stat_timeout_count=1,
+                probe_elapsed_ms=504,
+            )
+            failure = live.AcceptanceFailure(
+                "bounded-placeholder-selection-exhausted", facts.public_evidence()
+            )
+            with mock.patch.object(live, "run_before", side_effect=failure), mock.patch(
+                "sys.stderr", io.StringIO()
+            ):
+                result = live.run_worker(args)
+
+            evidence = live.json.loads(evidence_path.read_text())
+            self.assertEqual(result, 1)
+            self.assertEqual(
+                evidence["failure_category"],
+                "bounded-placeholder-selection-exhausted",
+            )
+            self.assertEqual(evidence["placeholder_candidates_considered"], 3)
+            self.assertEqual(evidence["placeholder_missing_count"], 1)
+            self.assertEqual(evidence["placeholder_stat_error_count"], 1)
+            self.assertEqual(evidence["placeholder_stat_timeout_count"], 1)
+            live.validate_public_evidence(evidence)
+
     def test_parent_classifies_hard_timeout_with_fixed_category(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -898,9 +1049,10 @@ class DeadlineAndCleanupTests(unittest.TestCase):
                 sys.executable,
                 "-c",
                 (
-                    "import pathlib,subprocess,sys,time;"
-                    "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
-                    "pathlib.Path(sys.argv[1]).write_text(str(p.pid));"
+                    "import os,sys,time;"
+                    "p=os.fork();"
+                    "p == 0 and time.sleep(60);"
+                    "f=open(sys.argv[1],'w');f.write(str(p));f.close();"
                     "time.sleep(60)"
                 ),
                 str(pid_file),
@@ -1124,6 +1276,10 @@ class RepresentativeScaleTests(unittest.TestCase):
                 CREATE UNIQUE INDEX items_sibling_name
                     ON items(parent_item_id, safe_name)
                     WHERE parent_item_id IS NOT NULL AND deleted_at_ms IS NULL;
+                CREATE INDEX items_live_fetchable_attachments_by_size
+                    ON items(logical_size, item_id)
+                    WHERE kind='attachment' AND availability='fetchable'
+                      AND deleted_at_ms IS NULL AND logical_size > 0;
                 CREATE TABLE chat_sync_state (
                     account_id INTEGER NOT NULL,
                     namespace_version INTEGER NOT NULL,
@@ -1249,6 +1405,13 @@ class RepresentativeScaleTests(unittest.TestCase):
             items = live.compare_items_indexed(check)
             cursors = live.compare_cursors_indexed(check)
             storage = live.verify_generated_storage(check, root, deadline)
+            candidate_plan = " ".join(
+                row[3]
+                for row in check.execute(
+                    "EXPLAIN QUERY PLAN " + live.CANDIDATE_QUERY,
+                    (live.MAX_CANDIDATES,),
+                )
+            ).lower()
             candidates = live.candidate_rows(check)
             namespace = live.namespace_facts(check)
             check.close()
@@ -1269,6 +1432,8 @@ class RepresentativeScaleTests(unittest.TestCase):
             self.assertTrue(items.additive_only)
             self.assertTrue(cursors.preserved)
             self.assertEqual(len(candidates), 1)
+            self.assertIn("items_live_fetchable_attachments_by_size", candidate_plan)
+            self.assertNotIn("temp b-tree", candidate_plan)
             self.assertTrue(namespace.hidden_metadata_complete)
             self.assertTrue(namespace.zero_story_containers_omitted)
             self.assertTrue(namespace.story_containers_truthful)

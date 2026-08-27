@@ -645,15 +645,16 @@ fn v22_migrates_through_cache_index_and_durable_readiness_without_rewriting_cach
         .expect("cache count before migration");
     drop(store);
 
-    // Recreate the exact installed v22 boundary. The v23 index and v24
+    // Recreate the exact installed v22 boundary. The v23/v25 indexes and v24
     // readiness table plus their history/version stamps are removed; all
     // representative rows stay put.
     let legacy = Connection::open(&db.path).expect("open v22 boundary");
     legacy
         .execute_batch(
             "DROP INDEX cache_entries_by_materialization_ref;
+             DROP INDEX items_live_fetchable_attachments_by_size;
              DROP TABLE namespace_readiness;
-             DELETE FROM schema_history WHERE version IN (23, 24);
+             DELETE FROM schema_history WHERE version IN (23, 24, 25);
              PRAGMA user_version = 22;",
         )
         .expect("downgrade fixture stamp to v22");

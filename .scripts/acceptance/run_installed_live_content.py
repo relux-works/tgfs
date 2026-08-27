@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import json
 import os
@@ -41,7 +42,9 @@ DEFAULT_CLOUD_ROOT = Path.home() / "Library/CloudStorage/GramDrive-GramDrive"
 DEFAULT_STATE = Path(".temp/installed-live-content-private-state.json")
 DEFAULT_EVIDENCE = Path(".temp/installed-live-content-evidence.json")
 DEFAULT_CACHE_QUOTA_BYTES = 10_000_000_000
-MAX_CANDIDATES = 512
+MAX_CANDIDATES = 20
+PLACEHOLDER_PROBE_TIMEOUT_SECONDS = 0.5
+SF_DATALESS = 0x40000000
 HYDRATION_WAIT_ATTEMPTS = 100
 HYDRATION_WAIT_SECONDS = 0.1
 QUIESCENCE_ATTEMPTS = 30
@@ -162,6 +165,14 @@ PUBLIC_EVIDENCE_FIELDS = {
     "worker_exit_code",
     "child_cleanup_complete",
     "phase",
+    "placeholder_candidates_considered",
+    "placeholder_dataless_count",
+    "placeholder_materialized_count",
+    "placeholder_missing_count",
+    "placeholder_path_mismatch_count",
+    "placeholder_probe_elapsed_ms",
+    "placeholder_stat_error_count",
+    "placeholder_stat_timeout_count",
 }
 PUBLIC_STRING_FIELDS = {
     "app_version",
@@ -181,6 +192,10 @@ PUBLIC_SIGNED_IDENTIFIERS = [
 
 class AcceptanceFailure(RuntimeError):
     """A fixed-label live acceptance failure safe to report."""
+
+    def __init__(self, category: str, public_evidence: dict[str, int] | None = None):
+        super().__init__(category)
+        self.public_evidence = public_evidence or {}
 
 
 class DeadlineExceeded(AcceptanceFailure):
@@ -296,6 +311,58 @@ class Candidate:
     markdown_id: bytes
     ndjson_id: bytes
     chat_json_id: bytes
+
+
+class PlaceholderState(Enum):
+    DATALESS = "dataless"
+    MATERIALIZED = "materialized"
+    MISSING = "missing"
+    PLATFORM_ERROR = "platform-error"
+    TIMEOUT = "timeout"
+
+
+@dataclass(frozen=True)
+class PlaceholderProbeResult:
+    state: PlaceholderState
+    elapsed_ms: int
+
+
+@dataclass
+class PlaceholderSelectionFacts:
+    candidates_considered: int = 0
+    dataless_count: int = 0
+    materialized_count: int = 0
+    missing_count: int = 0
+    path_mismatch_count: int = 0
+    stat_error_count: int = 0
+    stat_timeout_count: int = 0
+    probe_elapsed_ms: int = 0
+
+    def record(self, result: PlaceholderProbeResult) -> None:
+        self.candidates_considered += 1
+        self.probe_elapsed_ms += result.elapsed_ms
+        if result.state is PlaceholderState.DATALESS:
+            self.dataless_count += 1
+        elif result.state is PlaceholderState.MATERIALIZED:
+            self.materialized_count += 1
+        elif result.state is PlaceholderState.MISSING:
+            self.missing_count += 1
+        elif result.state is PlaceholderState.PLATFORM_ERROR:
+            self.stat_error_count += 1
+        elif result.state is PlaceholderState.TIMEOUT:
+            self.stat_timeout_count += 1
+
+    def public_evidence(self) -> dict[str, int]:
+        return {
+            "placeholder_candidates_considered": self.candidates_considered,
+            "placeholder_dataless_count": self.dataless_count,
+            "placeholder_materialized_count": self.materialized_count,
+            "placeholder_missing_count": self.missing_count,
+            "placeholder_path_mismatch_count": self.path_mismatch_count,
+            "placeholder_probe_elapsed_ms": self.probe_elapsed_ms,
+            "placeholder_stat_error_count": self.stat_error_count,
+            "placeholder_stat_timeout_count": self.stat_timeout_count,
+        }
 
 
 @dataclass(frozen=True)
@@ -422,18 +489,72 @@ def item_path(db: sqlite3.Connection, cloud_root: Path, item_id: bytes) -> Path:
     return cloud_root.joinpath(*reversed(names))
 
 
-def finder_dataless(path: Path) -> bool:
+def finder_placeholder_probe(path: Path) -> PlaceholderProbeResult:
+    """Read only ``st_flags`` in a bounded child and return a fixed state."""
+    started = time.monotonic()
+    probe = (
+        "import os,sys; "
+        "\ntry: print(os.lstat(sys.argv[1]).st_flags)"
+        "\nexcept FileNotFoundError: raise SystemExit(3)"
+        "\nexcept OSError: raise SystemExit(4)"
+    )
     try:
         result = subprocess.run(
-            ("stat", "-f", "%Sf", str(path)),
-            check=True,
+            (sys.executable, "-c", probe, str(path)),
+            check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=PLACEHOLDER_PROBE_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        raise AcceptanceFailure("finder-placeholder-stat-failed") from error
-    return "dataless" in result.stdout.lower()
+    except subprocess.TimeoutExpired:
+        return PlaceholderProbeResult(
+            PlaceholderState.TIMEOUT,
+            round((time.monotonic() - started) * 1000),
+        )
+    except OSError:
+        return PlaceholderProbeResult(
+            PlaceholderState.PLATFORM_ERROR,
+            round((time.monotonic() - started) * 1000),
+        )
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    if result.returncode == 3:
+        return PlaceholderProbeResult(PlaceholderState.MISSING, elapsed_ms)
+    if result.returncode != 0:
+        return PlaceholderProbeResult(PlaceholderState.PLATFORM_ERROR, elapsed_ms)
+    try:
+        flags = int(result.stdout.strip())
+    except ValueError:
+        return PlaceholderProbeResult(PlaceholderState.PLATFORM_ERROR, elapsed_ms)
+    state = (
+        PlaceholderState.DATALESS
+        if flags & SF_DATALESS
+        else PlaceholderState.MATERIALIZED
+    )
+    return PlaceholderProbeResult(state, elapsed_ms)
+
+
+def finder_dataless(path: Path) -> bool:
+    """Compatibility boolean for callers that need one strict probe."""
+    result = finder_placeholder_probe(path)
+    if result.state is PlaceholderState.DATALESS:
+        return True
+    if result.state is PlaceholderState.MATERIALIZED:
+        return False
+    raise AcceptanceFailure(f"finder-placeholder-stat-{result.state.value}")
+
+
+def require_dataless_probe(
+    path: Path,
+    probe: Callable[[Path], bool | PlaceholderProbeResult],
+) -> bool:
+    result = probe(path)
+    if isinstance(result, bool):
+        return result
+    if result.state is PlaceholderState.DATALESS:
+        return True
+    if result.state is PlaceholderState.MATERIALIZED:
+        return False
+    raise AcceptanceFailure(f"finder-placeholder-stat-{result.state.value}")
 
 
 def read_placeholder_once(path: Path) -> tuple[str, int]:
@@ -689,9 +810,7 @@ def verify_generated_storage(
     )
 
 
-def candidate_rows(db: sqlite3.Connection) -> list[Candidate]:
-    rows = db.execute(
-        """
+CANDIDATE_QUERY = """
         SELECT att.item_id, att.logical_size, month.item_id, chat.item_id,
                list.item_id, md.item_id, nd.item_id, cj.item_id
         FROM items att
@@ -720,9 +839,11 @@ def candidate_rows(db: sqlite3.Connection) -> list[Candidate]:
           )
         ORDER BY att.logical_size ASC, att.item_id
         LIMIT ?
-        """,
-        (MAX_CANDIDATES,),
-    ).fetchall()
+        """
+
+
+def candidate_rows(db: sqlite3.Connection) -> list[Candidate]:
+    rows = db.execute(CANDIDATE_QUERY, (MAX_CANDIDATES,)).fetchall()
     return [Candidate(*row) for row in rows]
 
 
@@ -808,13 +929,50 @@ def namespace_facts(db: sqlite3.Connection) -> NamespaceFacts:
 def select_uncached_dataless_candidate(
     db: sqlite3.Connection,
     cloud_root: Path,
-    dataless_probe: Callable[[Path], bool] = finder_dataless,
-) -> tuple[Candidate, Path]:
+    dataless_probe: Callable[
+        [Path], bool | PlaceholderProbeResult
+    ] = finder_placeholder_probe,
+) -> tuple[Candidate, Path, PlaceholderSelectionFacts]:
+    facts = PlaceholderSelectionFacts()
     for candidate in candidate_rows(db):
-        path = item_path(db, cloud_root, candidate.item_id)
-        if not cache_verified(db, candidate.item_id) and dataless_probe(path):
-            return candidate, path
-    raise AcceptanceFailure("no-fresh-uncached-dataless-placeholder")
+        try:
+            path = item_path(db, cloud_root, candidate.item_id)
+        except AcceptanceFailure:
+            facts.candidates_considered += 1
+            facts.path_mismatch_count += 1
+            continue
+        if cache_verified(db, candidate.item_id):
+            continue
+        raw_result = dataless_probe(path)
+        result = (
+            raw_result
+            if isinstance(raw_result, PlaceholderProbeResult)
+            else PlaceholderProbeResult(
+                (
+                    PlaceholderState.DATALESS
+                    if raw_result
+                    else PlaceholderState.MATERIALIZED
+                ),
+                0,
+            )
+        )
+        facts.record(result)
+        try:
+            refreshed_path = item_path(db, cloud_root, candidate.item_id)
+        except AcceptanceFailure:
+            facts.path_mismatch_count += 1
+            continue
+        if refreshed_path != path:
+            facts.path_mismatch_count += 1
+            continue
+        if result.state is PlaceholderState.DATALESS:
+            return candidate, path, facts
+    category = (
+        "no-fresh-uncached-dataless-placeholder"
+        if facts.candidates_considered == 0
+        else "bounded-placeholder-selection-exhausted"
+    )
+    raise AcceptanceFailure(category, facts.public_evidence())
 
 
 def scalar_aggregate(db: sqlite3.Connection) -> dict:
@@ -1229,7 +1387,9 @@ def run_before(
     cloud_root: Path,
     state_path: Path,
     evidence_path: Path,
-    dataless_probe: Callable[[Path], bool] = finder_dataless,
+    dataless_probe: Callable[
+        [Path], bool | PlaceholderProbeResult
+    ] = finder_placeholder_probe,
     deadline: Deadline | None = None,
     recorder: StageRecorder | None = None,
 ) -> dict:
@@ -1239,7 +1399,7 @@ def run_before(
     with recorder.stage("select_candidate"):
         db = connection(database, deadline)
         try:
-            candidate, attachment = select_uncached_dataless_candidate(
+            candidate, attachment, selection_facts = select_uncached_dataless_candidate(
                 db, cloud_root, dataless_probe
             )
             ancestor_ids = (candidate.list_id, candidate.chat_id, candidate.month_id)
@@ -1250,7 +1410,7 @@ def run_before(
             markdown = item_path(db, cloud_root, candidate.markdown_id)
             ndjson = item_path(db, cloud_root, candidate.ndjson_id)
             pre_uncached = not cache_verified(db, candidate.item_id)
-            pre_dataless = dataless_probe(attachment)
+            pre_dataless = require_dataless_probe(attachment, dataless_probe)
         finally:
             db.close()
         if not pre_uncached or not pre_dataless:
@@ -1264,7 +1424,7 @@ def run_before(
         after_enumeration = connection(database, deadline)
         try:
             post_uncached = not cache_verified(after_enumeration, candidate.item_id)
-            post_dataless = dataless_probe(attachment)
+            post_dataless = require_dataless_probe(attachment, dataless_probe)
         finally:
             after_enumeration.close()
         if not post_uncached or not post_dataless:
@@ -1363,6 +1523,7 @@ def run_before(
         write_private_json(state_path, private_state)
         evidence = {
             "privacy_safe": True,
+            **selection_facts.public_evidence(),
             "qualifying_chat_count": 1,
             "chat_json_present": namespace.hidden_metadata_complete,
             "active_stories_present": namespace.active_story_container_count > 0,
@@ -1913,6 +2074,8 @@ def run_worker(args: argparse.Namespace) -> int:
             recorder.failed_stage or "none",
             recorder.timings,
         )
+        if isinstance(error, AcceptanceFailure):
+            evidence.update(error.public_evidence)
         write_json(args.evidence, evidence)
         print(f"installed live-content acceptance failed: {label}", file=sys.stderr)
         return 1
