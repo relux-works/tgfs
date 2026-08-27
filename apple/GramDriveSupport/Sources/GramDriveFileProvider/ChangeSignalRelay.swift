@@ -40,6 +40,7 @@ extension NSFileProviderManager: ProviderChangeSignaling {
         completionHandler: @escaping @Sendable ((any Error)?) -> Void
     ) {
         ProviderChangeDispatcher(
+            materializedEnumerator: enumeratorForMaterializedItems(),
             evict: { identifier, completion in
                 self.evictItem(identifier: identifier, completionHandler: completion)
             },
@@ -66,8 +67,18 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
 
     private let evict: Operation
     private let signal: Operation
+    private let materializedEnumerator: any NSFileProviderEnumerator
+    private let scheduleSelectionTimeout: MaterializedGeneratedItemSelector.ScheduleTimeout
 
-    init(evict: @escaping Operation, signal: @escaping Operation) {
+    init(
+        materializedEnumerator: any NSFileProviderEnumerator,
+        scheduleSelectionTimeout: @escaping MaterializedGeneratedItemSelector.ScheduleTimeout =
+            MaterializedGeneratedItemSelector.defaultTimeout,
+        evict: @escaping Operation,
+        signal: @escaping Operation
+    ) {
+        self.materializedEnumerator = materializedEnumerator
+        self.scheduleSelectionTimeout = scheduleSelectionTimeout
         self.evict = evict
         self.signal = signal
     }
@@ -87,24 +98,73 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
         identifiers = identifiers.filter { seen.insert($0.rawValue).inserted }
         let signalIdentifiers = identifiers
 
-        let result = SignalResult()
         var seenGeneratedItems: Set<String> = []
         let generatedItems = evictingGeneratedItems.filter {
             seenGeneratedItems.insert($0.rawValue).inserted
         }
+        let result = SignalResult()
+        guard !generatedItems.isEmpty else {
+            dispatchSignals(
+                signalIdentifiers,
+                result: result,
+                completionHandler: completionHandler)
+            return
+        }
+        MaterializedGeneratedItemSelector(
+            enumerator: materializedEnumerator,
+            scheduleTimeout: scheduleSelectionTimeout
+        ).select(from: generatedItems) { selection in
+            let selected: [NSFileProviderItemIdentifier]
+            switch selection {
+            case .success(let identifiers):
+                selected = identifiers
+            case .failure(let error):
+                // A failed/partial materialized-set read is not an empty set.
+                // Preserve the error so the relay does not advance its
+                // journal checkpoint, but still publish the change signals;
+                // File Provider can then pull the new content versions while
+                // a later doorbell retries the exact eviction selection.
+                result.record(error)
+                selected = []
+            }
+            self.dispatchEvictions(
+                selected,
+                signalIdentifiers: signalIdentifiers,
+                result: result,
+                completionHandler: completionHandler)
+        }
+    }
+
+    private func dispatchEvictions(
+        _ generatedItems: [NSFileProviderItemIdentifier],
+        signalIdentifiers: [NSFileProviderItemIdentifier],
+        result: SignalResult,
+        completionHandler: @escaping Completion
+    ) {
         dispatchSequentially(
             generatedItems,
             at: 0,
             operation: evict,
             result: result
         ) { _ in
-            self.dispatchSequentially(
+            self.dispatchSignals(
                 signalIdentifiers,
-                at: 0,
-                operation: self.signal,
                 result: result,
                 completionHandler: completionHandler)
         }
+    }
+
+    private func dispatchSignals(
+        _ identifiers: [NSFileProviderItemIdentifier],
+        result: SignalResult,
+        completionHandler: @escaping Completion
+    ) {
+        dispatchSequentially(
+            identifiers,
+            at: 0,
+            operation: signal,
+            result: result,
+            completionHandler: completionHandler)
     }
 
     /// Generated documents are reproducible cache-only views. Evict their
@@ -131,6 +191,192 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
                 result: result,
                 completionHandler: completionHandler)
         }
+    }
+}
+
+/// Resolves only the generated candidates that File Provider currently has
+/// materialized. The item-change journal is intentionally coalesced across the
+/// database lifetime, so replaying it after process start may contain thousands
+/// of live generated documents even though Finder has bytes for only a handful.
+/// Enumerating the system-owned materialized set keeps eviction proportional to
+/// real disk state and still guarantees that a stale materialization for a
+/// changed generated version is selected.
+final class MaterializedGeneratedItemSelector: @unchecked Sendable {
+    typealias Completion =
+        @Sendable (
+            Result<[NSFileProviderItemIdentifier], any Error>
+        ) -> Void
+    typealias CancelTimeout = @Sendable () -> Void
+    typealias ScheduleTimeout =
+        @Sendable (
+            @escaping @Sendable () -> Void
+        ) -> CancelTimeout
+
+    static let selectionTimeout: TimeInterval = 8
+    private static let timeoutQueue = DispatchQueue(
+        label: "com.reluxworks.gramdrive.fileprovider.materialized-selection-watchdog",
+        qos: .userInitiated,
+        attributes: .concurrent)
+
+    static let defaultTimeout: ScheduleTimeout = { timeout in
+        let work = TimeoutWorkItem(timeout)
+        timeoutQueue.asyncAfter(
+            deadline: .now() + selectionTimeout,
+            execute: work.item)
+        return { work.cancel() }
+    }
+
+    private let enumerator: any NSFileProviderEnumerator
+    private let scheduleTimeout: ScheduleTimeout
+
+    init(
+        enumerator: any NSFileProviderEnumerator,
+        scheduleTimeout: @escaping ScheduleTimeout = defaultTimeout
+    ) {
+        self.enumerator = enumerator
+        self.scheduleTimeout = scheduleTimeout
+    }
+
+    func select(
+        from candidates: [NSFileProviderItemIdentifier],
+        completion: @escaping Completion
+    ) {
+        let request = MaterializedSelectionRequest(
+            enumerator: enumerator,
+            candidates: candidates,
+            completion: completion)
+        request.start(scheduleTimeout: scheduleTimeout)
+    }
+}
+
+private final class TimeoutWorkItem: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private let operation: @Sendable () -> Void
+    lazy var item = DispatchWorkItem { [weak self] in
+        self?.run()
+    }
+
+    init(_ operation: @escaping @Sendable () -> Void) {
+        self.operation = operation
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+        item.cancel()
+    }
+
+    private func run() {
+        lock.lock()
+        let shouldRun = !cancelled
+        lock.unlock()
+        if shouldRun {
+            operation()
+        }
+    }
+}
+
+private final class MaterializedSelectionRequest: NSObject,
+    NSFileProviderEnumerationObserver, @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let enumerator: any NSFileProviderEnumerator
+    private let candidates: [NSFileProviderItemIdentifier]
+    private let candidateValues: Set<String>
+    private var selectedValues: Set<String> = []
+    private var completion: MaterializedGeneratedItemSelector.Completion?
+    private var cancelTimeout: MaterializedGeneratedItemSelector.CancelTimeout?
+
+    var suggestedPageSize: Int { 256 }
+
+    init(
+        enumerator: any NSFileProviderEnumerator,
+        candidates: [NSFileProviderItemIdentifier],
+        completion: @escaping MaterializedGeneratedItemSelector.Completion
+    ) {
+        self.enumerator = enumerator
+        self.candidates = candidates
+        self.candidateValues = Set(candidates.map(\.rawValue))
+        self.completion = completion
+    }
+
+    func start(
+        scheduleTimeout: MaterializedGeneratedItemSelector.ScheduleTimeout
+    ) {
+        let cancel = scheduleTimeout { [self] in
+            timedOut()
+        }
+        lock.lock()
+        guard completion != nil else {
+            lock.unlock()
+            cancel()
+            return
+        }
+        cancelTimeout = cancel
+        lock.unlock()
+        enumerator.enumerateItems(
+            for: self,
+            startingAt: NSFileProviderPage(Data()))
+    }
+
+    func didEnumerate(_ updatedItems: [any NSFileProviderItem]) {
+        lock.lock()
+        guard completion != nil else {
+            lock.unlock()
+            return
+        }
+        for item in updatedItems where candidateValues.contains(item.itemIdentifier.rawValue) {
+            selectedValues.insert(item.itemIdentifier.rawValue)
+        }
+        lock.unlock()
+    }
+
+    func finishEnumerating(upTo nextPage: NSFileProviderPage?) {
+        if let nextPage {
+            enumerator.enumerateItems(for: self, startingAt: nextPage)
+            return
+        }
+        lock.lock()
+        let selected = selectedValues
+        lock.unlock()
+        resolve(.success(candidates.filter { selected.contains($0.rawValue) }))
+    }
+
+    func finishEnumeratingWithError(_ error: any Error) {
+        resolve(.failure(error))
+    }
+
+    private func timedOut() {
+        guard let (completion, cancelTimeout) = takeCompletion() else { return }
+        enumerator.invalidate()
+        cancelTimeout?()
+        completion(.failure(NSFileProviderError(.cannotSynchronize)))
+    }
+
+    private func resolve(
+        _ result: Result<[NSFileProviderItemIdentifier], any Error>
+    ) {
+        guard let (completion, cancelTimeout) = takeCompletion() else { return }
+        cancelTimeout?()
+        completion(result)
+    }
+
+    private func takeCompletion() -> (
+        MaterializedGeneratedItemSelector.Completion,
+        MaterializedGeneratedItemSelector.CancelTimeout?
+    )? {
+        lock.lock()
+        guard let completion else {
+            lock.unlock()
+            return nil
+        }
+        self.completion = nil
+        let cancelTimeout = self.cancelTimeout
+        self.cancelTimeout = nil
+        lock.unlock()
+        return (completion, cancelTimeout)
     }
 }
 
@@ -263,6 +509,7 @@ public final class ChangeSignalRelay: @unchecked Sendable {
     private var observation: (any ChangeObservationToken)?
     private var lastVersion: Int64?
     private var lastJournal: ChangeJournalState?
+    private var latestDispatch: UUID?
     private let probe: @Sendable () throws -> Int64
     private let containerProbe: ContainerProbe
     private let signaling: any ProviderChangeSignaling
@@ -312,25 +559,42 @@ public final class ChangeSignalRelay: @unchecked Sendable {
     public func check() {
         guard let version = try? probe() else { return }
         lock.lock()
-        let initial = lastVersion == nil
-        let moved = lastVersion != version
+        let priorVersion = lastVersion
+        let initial = priorVersion == nil
+        let moved = priorVersion != version
         let priorJournal = lastJournal
         lock.unlock()
         guard moved else { return }
         guard let containerChanges = try? containerProbe(priorJournal) else {
             return
         }
+        let dispatch = UUID()
         lock.lock()
         lastVersion = version
         lastJournal = containerChanges.journal
+        latestDispatch = dispatch
         lock.unlock()
         signaling.signalChanges(
             includeRoot: initial,
             changedContainers: containerChanges.containers,
             evictingGeneratedItems: containerChanges.generatedItems
-        ) { _ in
-            // Best-effort by design (protocol docs): an unreachable domain
-            // will be enumerated when it reconnects.
+        ) { [weak self] error in
+            guard let self else { return }
+            self.lock.lock()
+            guard self.latestDispatch == dispatch else {
+                self.lock.unlock()
+                return
+            }
+            self.latestDispatch = nil
+            if error != nil {
+                // A materialized-set read failure is not an empty set. Roll
+                // the optimistic checkpoint back so the next doorbell retries
+                // the same generated-version eviction instead of silently
+                // accepting an unproved absence.
+                self.lastVersion = priorVersion
+                self.lastJournal = priorJournal
+            }
+            self.lock.unlock()
         }
     }
 
@@ -345,16 +609,27 @@ public final class ChangeSignalRelay: @unchecked Sendable {
         guard let containerChanges = try? containerProbe(priorJournal) else {
             return
         }
+        let dispatch = UUID()
         lock.lock()
         lastJournal = containerChanges.journal
+        latestDispatch = dispatch
         lock.unlock()
         signaling.signalChanges(
             includeRoot: true,
             changedContainers: containerChanges.containers,
             evictingGeneratedItems: containerChanges.generatedItems
-        ) { _ in
-            // Best-effort: the system re-enumerates an unavailable domain on
-            // reconnect, so a transient File Provider daemon error is safe.
+        ) { [weak self] error in
+            guard let self else { return }
+            self.lock.lock()
+            guard self.latestDispatch == dispatch else {
+                self.lock.unlock()
+                return
+            }
+            self.latestDispatch = nil
+            if error != nil {
+                self.lastJournal = priorJournal
+            }
+            self.lock.unlock()
         }
     }
 
