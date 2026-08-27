@@ -24,6 +24,7 @@ public protocol ProviderChangeSignaling: Sendable {
     func signalChanges(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [NSFileProviderItemIdentifier],
         completionHandler: @escaping @Sendable ((any Error)?) -> Void)
 }
 
@@ -35,7 +36,47 @@ extension NSFileProviderManager: ProviderChangeSignaling {
     public func signalChanges(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [NSFileProviderItemIdentifier],
         completionHandler: @escaping @Sendable ((any Error)?) -> Void
+    ) {
+        ProviderChangeDispatcher(
+            evict: { identifier, completion in
+                self.evictItem(identifier: identifier, completionHandler: completion)
+            },
+            signal: { identifier, completion in
+                self.signalEnumerator(for: identifier, completionHandler: completion)
+            }
+        ).dispatch(
+            includeRoot: includeRoot,
+            changedContainers: changedContainers,
+            evictingGeneratedItems: evictingGeneratedItems,
+            completionHandler: completionHandler)
+    }
+}
+
+/// Orders generated-materialization eviction before the matching journal pull.
+/// The live manager supplies the two File Provider calls above; tests inject
+/// synchronous operations and exercise the same production sequencing.
+final class ProviderChangeDispatcher: @unchecked Sendable {
+    typealias Completion = @Sendable ((any Error)?) -> Void
+    typealias Operation =
+        @Sendable (
+            NSFileProviderItemIdentifier, @escaping Completion
+        ) -> Void
+
+    private let evict: Operation
+    private let signal: Operation
+
+    init(evict: @escaping Operation, signal: @escaping Operation) {
+        self.evict = evict
+        self.signal = signal
+    }
+
+    func dispatch(
+        includeRoot: Bool,
+        changedContainers: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [NSFileProviderItemIdentifier],
+        completionHandler: @escaping Completion
     ) {
         var identifiers: [NSFileProviderItemIdentifier] = [.workingSet]
         if includeRoot {
@@ -44,30 +85,49 @@ extension NSFileProviderManager: ProviderChangeSignaling {
         identifiers.append(contentsOf: changedContainers)
         var seen: Set<String> = []
         identifiers = identifiers.filter { seen.insert($0.rawValue).inserted }
+        let signalIdentifiers = identifiers
 
         let result = SignalResult()
-        signalSequentially(
-            identifiers,
+        var seenGeneratedItems: Set<String> = []
+        let generatedItems = evictingGeneratedItems.filter {
+            seenGeneratedItems.insert($0.rawValue).inserted
+        }
+        dispatchSequentially(
+            generatedItems,
             at: 0,
-            result: result,
-            completionHandler: completionHandler)
+            operation: evict,
+            result: result
+        ) { _ in
+            self.dispatchSequentially(
+                signalIdentifiers,
+                at: 0,
+                operation: self.signal,
+                result: result,
+                completionHandler: completionHandler)
+        }
     }
 
-    private func signalSequentially(
+    /// Generated documents are reproducible cache-only views. Evict their
+    /// previous File Provider materialization before advertising a new
+    /// content version so a Finder open cannot reuse bytes from the prior
+    /// render generation while the change enumeration catches up.
+    private func dispatchSequentially(
         _ identifiers: [NSFileProviderItemIdentifier],
         at index: Int,
+        operation: @escaping Operation,
         result: SignalResult,
-        completionHandler: @escaping @Sendable ((any Error)?) -> Void
+        completionHandler: @escaping Completion
     ) {
         guard index < identifiers.count else {
             completionHandler(result.error)
             return
         }
-        signalEnumerator(for: identifiers[index]) { error in
+        operation(identifiers[index]) { error in
             result.record(error)
-            self.signalSequentially(
+            self.dispatchSequentially(
                 identifiers,
                 at: index + 1,
+                operation: operation,
                 result: result,
                 completionHandler: completionHandler)
         }
@@ -98,13 +158,16 @@ private final class SignalResult: @unchecked Sendable {
 public struct ProviderContainerChanges: Sendable {
     public let journal: ChangeJournalState
     public let containers: [NSFileProviderItemIdentifier]
+    public let generatedItems: [NSFileProviderItemIdentifier]
 
     public init(
         journal: ChangeJournalState,
-        containers: [NSFileProviderItemIdentifier]
+        containers: [NSFileProviderItemIdentifier],
+        generatedItems: [NSFileProviderItemIdentifier] = []
     ) {
         self.journal = journal
         self.containers = containers
+        self.generatedItems = generatedItems
     }
 }
 
@@ -121,6 +184,7 @@ public enum ProviderContainerChangeResolver {
         var sequence =
             prior?.instanceId == current.instanceId ? prior?.latestSequence ?? 0 : 0
         var identifiers: Set<String> = []
+        var generatedItems: Set<String> = []
         while true {
             let page = try store.itemChangesSince(
                 accountId: account.accountId,
@@ -132,6 +196,15 @@ public enum ProviderContainerChangeResolver {
                         forParentCoreItemId: change.metadata.parent,
                         accountRootId: account.rootItemId
                     ).rawValue)
+                if change.metadata.kind == .generatedDoc,
+                    change.metadata.deletedAtMs == nil
+                {
+                    generatedItems.insert(
+                        ItemIdentifierMapping.providerIdentifier(
+                            forCoreItemId: change.metadata.id,
+                            accountRootId: account.rootItemId
+                        ).rawValue)
+                }
             }
             guard let last = page.last else { break }
             sequence = last.sequence
@@ -144,7 +217,9 @@ public enum ProviderContainerChangeResolver {
             latestSequence: max(current.latestSequence, sequence))
         return ProviderContainerChanges(
             journal: position,
-            containers: identifiers.sorted().map(NSFileProviderItemIdentifier.init(rawValue:)))
+            containers: identifiers.sorted().map(NSFileProviderItemIdentifier.init(rawValue:)),
+            generatedItems: generatedItems.sorted().map(
+                NSFileProviderItemIdentifier.init(rawValue:)))
     }
 }
 
@@ -251,7 +326,8 @@ public final class ChangeSignalRelay: @unchecked Sendable {
         lock.unlock()
         signaling.signalChanges(
             includeRoot: initial,
-            changedContainers: containerChanges.containers
+            changedContainers: containerChanges.containers,
+            evictingGeneratedItems: containerChanges.generatedItems
         ) { _ in
             // Best-effort by design (protocol docs): an unreachable domain
             // will be enumerated when it reconnects.
@@ -274,7 +350,8 @@ public final class ChangeSignalRelay: @unchecked Sendable {
         lock.unlock()
         signaling.signalChanges(
             includeRoot: true,
-            changedContainers: containerChanges.containers
+            changedContainers: containerChanges.containers,
+            evictingGeneratedItems: containerChanges.generatedItems
         ) { _ in
             // Best-effort: the system re-enumerates an unavailable domain on
             // reconnect, so a transient File Provider daemon error is safe.
