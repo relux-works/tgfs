@@ -4876,15 +4876,59 @@ fn reconcile_chat_projection_txn(
     chat: ChatKey,
 ) -> Result<(), SessionFailure> {
     let canonical = ItemKey::Canonical(CanonicalKey::Chat(chat)).id();
-    let has_projected_appearance = !txn
+    let stored_live_appearances = txn
         .read()
         .appearances_of(&canonical)
         .map_err(|_| SessionFailure {
             category: "projection-chat-appearance-storage",
             retryable: true,
         })?
-        .is_empty();
-    if !has_projected_appearance {
+        .into_iter()
+        .filter(|appearance| appearance.deleted_at_ms.is_none())
+        .map(|appearance| appearance.id)
+        .collect::<HashSet<_>>();
+    let folders = txn.read().folders(chat.scope).map_err(|_| SessionFailure {
+        category: "projection-catalog-storage",
+        retryable: true,
+    })?;
+    let mut expected_appearances = HashSet::new();
+    for kind in [
+        ChatListKind::Main,
+        ChatListKind::Archive,
+        ChatListKind::Stories,
+    ]
+    .into_iter()
+    .chain(
+        folders
+            .iter()
+            .map(|folder| ChatListKind::Folder(folder.folder_id)),
+    ) {
+        let is_member = txn
+            .read()
+            .chat_list(&ChatListKey {
+                scope: chat.scope,
+                kind,
+            })
+            .map_err(|_| SessionFailure {
+                category: "projection-catalog-storage",
+                retryable: true,
+            })?
+            .iter()
+            .any(|entry| entry.chat_id == chat.chat_id);
+        if is_member {
+            expected_appearances.insert(
+                ItemKey::Appearance(AppearanceKey {
+                    view: kind,
+                    item: CanonicalKey::Chat(chat),
+                })
+                .id(),
+            );
+        }
+    }
+    let projection_is_complete = expected_appearances
+        .iter()
+        .all(|appearance| stored_live_appearances.contains(appearance));
+    if !projection_is_complete {
         return reconcile_projection_scope_txn(txn, chat.scope, None, ProjectionDepth::Deep);
     }
     reconcile_projection_scope_txn(txn, chat.scope, Some(chat.chat_id.0), ProjectionDepth::Deep)
@@ -6354,7 +6398,10 @@ mod tests {
     }
 
     fn store() -> StateStore {
-        let mut store = StateStore::open_in_memory().expect("open");
+        initialized_store(StateStore::open_in_memory().expect("open"))
+    }
+
+    fn initialized_store(mut store: StateStore) -> StateStore {
         let txn = store.write_txn().expect("write");
         txn.upsert_account(&AccountRecord {
             account: scope().account,
@@ -8475,6 +8522,265 @@ mod tests {
             .expect("record");
         assert_eq!(readiness.generation, 1);
         assert!(readiness.convergence_complete);
+    }
+
+    #[test]
+    fn post_ready_projection_convergence_builds_a_fresh_chat_appearance() {
+        let mut store = store();
+        add_main_chat(&mut store, 100, false);
+        let chat_key = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(100),
+        };
+        let canonical = ItemKey::Canonical(CanonicalKey::Chat(chat_key)).id();
+        assert!(
+            store
+                .read_txn()
+                .expect("read fresh state")
+                .appearances_of(&canonical)
+                .expect("fresh appearances")
+                .is_empty()
+        );
+
+        let txn = store.write_txn().expect("publish readiness");
+        txn.publish_namespace_readiness(scope(), 2_000)
+            .expect("readiness");
+        txn.commit().expect("readiness commit");
+
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("fresh convergence slice"),
+            1
+        );
+        let read = store.read_txn().expect("read projected state");
+        let appearances = read.appearances_of(&canonical).expect("appearances");
+        assert_eq!(appearances.len(), 1);
+        assert!(
+            read.children_page(&appearances[0].id, None, u32::MAX)
+                .expect("chat children")
+                .iter()
+                .any(|child| matches!(
+                    child.id.key(),
+                    ItemKey::Appearance(AppearanceKey {
+                        item: CanonicalKey::GeneratedDoc(_),
+                        ..
+                    })
+                )),
+            "fresh full-scope convergence creates generated-document children"
+        );
+    }
+
+    #[test]
+    fn post_ready_projection_convergence_repairs_partial_chat_appearances_and_is_restart_idempotent()
+     {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let database = std::env::temp_dir().join(format!(
+            "gramdrive-partial-chat-appearance-{}-{unique}.sqlite3",
+            std::process::id()
+        ));
+        let folder = gramdrive_model::identity::FolderId(9);
+        let target = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(100),
+        };
+        let sibling = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(200),
+        };
+        let mut store = initialized_store(StateStore::open(&database).expect("open durable store"));
+        let txn = store.write_txn().expect("seed partial appearance fixture");
+        txn.replace_folders(
+            scope(),
+            &[FolderRecord {
+                scope: scope(),
+                folder_id: folder,
+                title: "Pinned".to_owned(),
+                position: 0,
+            }],
+        )
+        .expect("folder");
+        for chat_key in [target, sibling] {
+            txn.upsert_chat(
+                &snapshot_chat_record(
+                    scope(),
+                    &chat(chat_key.chat_id.0, &format!("Chat {}", chat_key.chat_id.0)),
+                )
+                .expect("chat record"),
+            )
+            .expect("chat row");
+        }
+        txn.replace_chat_list(
+            &ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Main,
+            },
+            &[ChatListEntry {
+                chat_id: target.chat_id,
+                sort_order: 10,
+                pinned: false,
+            }],
+        )
+        .expect("target main membership");
+        txn.replace_chat_list(
+            &ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Folder(folder),
+            },
+            &[ChatListEntry {
+                chat_id: sibling.chat_id,
+                sort_order: 20,
+                pinned: false,
+            }],
+        )
+        .expect("sibling folder membership");
+        txn.commit().expect("seed commit");
+        rebuild_projection(&mut store, scope()).expect("initial complete projection");
+
+        let txn = store.write_txn().expect("introduce partial appearance");
+        txn.replace_chat_list(
+            &ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Folder(folder),
+            },
+            &[
+                ChatListEntry {
+                    chat_id: target.chat_id,
+                    sort_order: 30,
+                    pinned: false,
+                },
+                ChatListEntry {
+                    chat_id: sibling.chat_id,
+                    sort_order: 20,
+                    pinned: false,
+                },
+            ],
+        )
+        .expect("current folder membership");
+        txn.publish_namespace_readiness(scope(), 2_000)
+            .expect("readiness");
+        txn.commit().expect("partial fixture commit");
+
+        let target_canonical = ItemKey::Canonical(CanonicalKey::Chat(target)).id();
+        assert_eq!(
+            store
+                .read_txn()
+                .expect("read partial fixture")
+                .appearances_of(&target_canonical)
+                .expect("stored target appearances")
+                .into_iter()
+                .filter(|appearance| appearance.deleted_at_ms.is_none())
+                .count(),
+            1,
+            "the fixture must store only a subset of two current memberships"
+        );
+
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("repairing convergence slice"),
+            1
+        );
+        let main_target = ItemKey::Appearance(AppearanceKey {
+            view: ChatListKind::Main,
+            item: CanonicalKey::Chat(target),
+        })
+        .id();
+        let folder_target = ItemKey::Appearance(AppearanceKey {
+            view: ChatListKind::Folder(folder),
+            item: CanonicalKey::Chat(target),
+        })
+        .id();
+        let folder_sibling = ItemKey::Appearance(AppearanceKey {
+            view: ChatListKind::Folder(folder),
+            item: CanonicalKey::Chat(sibling),
+        })
+        .id();
+        {
+            let read = store.read_txn().expect("read repaired projection");
+            let target_appearances = read
+                .appearances_of(&target_canonical)
+                .expect("target appearances")
+                .into_iter()
+                .filter(|appearance| appearance.deleted_at_ms.is_none())
+                .collect::<Vec<_>>();
+            assert_eq!(target_appearances.len(), 2);
+            for appearance in [&main_target, &folder_target] {
+                let item = read
+                    .item(appearance)
+                    .expect("appearance lookup")
+                    .expect("appearance");
+                assert_eq!(item.deleted_at_ms, None);
+                assert!(
+                    read.children_page(appearance, None, u32::MAX)
+                        .expect("appearance children")
+                        .iter()
+                        .any(|child| matches!(
+                            child.id.key(),
+                            ItemKey::Appearance(AppearanceKey {
+                                item: CanonicalKey::GeneratedDoc(_),
+                                ..
+                            })
+                        )),
+                    "every repaired appearance has its generated-document children"
+                );
+            }
+            assert_eq!(
+                read.item(&folder_sibling)
+                    .expect("sibling lookup")
+                    .expect("unrelated sibling")
+                    .deleted_at_ms,
+                None,
+                "full-scope fallback must not tombstone unrelated siblings"
+            );
+            assert_eq!(
+                read.namespace_readiness(scope())
+                    .expect("readiness")
+                    .expect("readiness row")
+                    .projection_after_chat_id,
+                Some(target.chat_id),
+                "the durable cursor advances only after the repairing transaction succeeds"
+            );
+        }
+
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("remaining chat slice"),
+            1
+        );
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("complete convergence"),
+            0
+        );
+        let journal_before_restart = store
+            .read_txn()
+            .expect("read journal")
+            .change_journal_state()
+            .expect("journal state")
+            .latest_sequence;
+        drop(store);
+
+        let mut store = StateStore::open(&database).expect("restart durable store");
+        assert_eq!(
+            converge_projection_slice(&mut store, scope()).expect("idempotent restart slice"),
+            0
+        );
+        assert_eq!(
+            store
+                .read_txn()
+                .expect("read restarted journal")
+                .change_journal_state()
+                .expect("restarted journal state")
+                .latest_sequence,
+            journal_before_restart,
+            "a completed restart emits no provider-visible projection changes"
+        );
+        drop(store);
+        for path in [
+            database.clone(),
+            database.with_extension("sqlite3-wal"),
+            database.with_extension("sqlite3-shm"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
