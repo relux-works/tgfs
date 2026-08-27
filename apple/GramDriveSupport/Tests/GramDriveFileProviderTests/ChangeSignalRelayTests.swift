@@ -545,6 +545,42 @@ struct ChangeSignalRelayTests {
         #expect(recorder.error is ProbeDown)
     }
 
+    @Test("A materialized parent evicts every changed generated child before publication")
+    func materializedParentEvictsAllGeneratedChildren() {
+        let recorder = DispatchRecorder()
+        let dispatcher = ProviderChangeDispatcher(
+            materializedEnumerator: ScriptedMaterializedEnumerator(
+                pages: [[materializedContainer("chat-parent")]]),
+            evict: { identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(nil)
+            },
+            signal: { identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(nil)
+            })
+
+        dispatcher.dispatch(
+            includeRoot: false,
+            changedContainers: [NSFileProviderItemIdentifier("chat-parent")],
+            evictingGeneratedItems: [
+                generatedChange("messages-md", parent: "chat-parent"),
+                generatedChange("messages-ndjson", parent: "chat-parent"),
+                generatedChange("other-chat-json", parent: "other-parent"),
+            ],
+            completionHandler: { recorder.finish($0) })
+
+        #expect(
+            recorder.events == [
+                "evict:messages-md",
+                "evict:messages-ndjson",
+                "signal:\(NSFileProviderItemIdentifier.workingSet.rawValue)",
+                "signal:chat-parent",
+            ],
+            "all generated siblings must evict before publication; unrelated parents must not")
+        #expect(recorder.error == nil)
+    }
+
     @Test("Startup backlog evicts only generated items actually materialized by File Provider")
     func startupBacklogIntersectsMaterializedSet() {
         let recorder = DispatchRecorder()
