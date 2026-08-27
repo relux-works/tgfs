@@ -58,6 +58,53 @@ private final class RecordingSignaling: ProviderChangeSignaling, @unchecked Send
     }
 }
 
+/// Records requests while leaving their completions under explicit test
+/// control, so relay overlap is deterministic instead of scheduler-dependent.
+private final class DelayedSignaling: ProviderChangeSignaling, @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [Bool] = []
+    private var generatedItems: [[String]] = []
+    private var completions: [(@Sendable ((any Error)?) -> Void)] = []
+
+    var signalCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests.count
+    }
+
+    var includeRootRequests: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    var evictedGeneratedItemRequests: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return generatedItems
+    }
+
+    func signalChanges(
+        includeRoot: Bool,
+        changedContainers: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [NSFileProviderItemIdentifier],
+        completionHandler: @escaping @Sendable ((any Error)?) -> Void
+    ) {
+        lock.lock()
+        requests.append(includeRoot)
+        generatedItems.append(evictingGeneratedItems.map(\.rawValue))
+        completions.append(completionHandler)
+        lock.unlock()
+    }
+
+    func complete(_ index: Int, with error: (any Error)?) {
+        lock.lock()
+        let completion = completions[index]
+        lock.unlock()
+        completion(error)
+    }
+}
+
 /// A scripted probe: each check consumes the next stamped value (or
 /// failure).
 private final class ScriptedProbe: @unchecked Sendable {
@@ -679,6 +726,94 @@ struct ChangeSignalRelayTests {
             "a failed materialized-set read is retried, never laundered into absence")
     }
 
+    @Test("A newer doorbell cannot discard an older failed dispatch checkpoint")
+    func overlappingFailureRetriesTheUnconfirmedJournalRange() throws {
+        let signaling = DelayedSignaling()
+        let probe = ScriptedProbe([.success(1), .success(2), .success(2)])
+        let snapshots = LockedSnapshots([
+            ProviderContainerChanges(
+                journal: ChangeJournalState(instanceId: "life", latestSequence: 1),
+                containers: [],
+                generatedItems: [NSFileProviderItemIdentifier("generated-a")]),
+            ProviderContainerChanges(
+                journal: ChangeJournalState(instanceId: "life", latestSequence: 2),
+                containers: [],
+                generatedItems: [
+                    NSFileProviderItemIdentifier("generated-a"),
+                    NSFileProviderItemIdentifier("generated-b"),
+                ]),
+        ])
+        let relay = ChangeSignalRelay(
+            probe: { try probe.next() },
+            containerProbe: { prior in snapshots.next(after: prior) },
+            signaling: signaling)
+        var ring: (@Sendable () -> Void)?
+        try relay.start(observe: { handler in
+            ring = handler
+            return RecordingToken()
+        })
+        #expect(signaling.signalCount == 1)
+
+        ring?()
+        #expect(
+            signaling.signalCount == 1,
+            "a newer check must wait while the older checkpoint is unconfirmed")
+
+        signaling.complete(0, with: SignalDown())
+        #expect(signaling.signalCount == 2)
+        #expect(
+            signaling.evictedGeneratedItemRequests == [
+                ["generated-a"],
+                ["generated-a", "generated-b"],
+            ],
+            "the retry must restart at the last confirmed journal, not after failed item A")
+        #expect(snapshots.priorSequences == [nil, nil])
+
+        signaling.complete(1, with: nil)
+        ring?()
+        #expect(signaling.signalCount == 2, "the successful retry confirms the newer version")
+    }
+
+    @Test("Agent replacement waits for and retries an older failed journal range")
+    func replacementRetriesTheUnconfirmedJournalRange() throws {
+        let signaling = DelayedSignaling()
+        let probe = ScriptedProbe([.success(1)])
+        let snapshots = LockedSnapshots([
+            ProviderContainerChanges(
+                journal: ChangeJournalState(instanceId: "life", latestSequence: 1),
+                containers: [],
+                generatedItems: [NSFileProviderItemIdentifier("generated-a")]),
+            ProviderContainerChanges(
+                journal: ChangeJournalState(instanceId: "life", latestSequence: 2),
+                containers: [],
+                generatedItems: [
+                    NSFileProviderItemIdentifier("generated-a"),
+                    NSFileProviderItemIdentifier("generated-b"),
+                ]),
+        ])
+        let relay = ChangeSignalRelay(
+            probe: { try probe.next() },
+            containerProbe: { prior in snapshots.next(after: prior) },
+            signaling: signaling)
+        try relay.start(observe: { _ in RecordingToken() })
+
+        relay.signalEnumeratorsAfterAgentReplacement()
+        #expect(
+            signaling.signalCount == 1,
+            "replacement must share the relay's single checkpoint lane")
+
+        signaling.complete(0, with: SignalDown())
+        #expect(signaling.signalCount == 2)
+        #expect(signaling.includeRootRequests == [true, true])
+        #expect(
+            signaling.evictedGeneratedItemRequests == [
+                ["generated-a"],
+                ["generated-a", "generated-b"],
+            ])
+        #expect(snapshots.priorSequences == [nil, nil])
+        signaling.complete(1, with: nil)
+    }
+
     @Test("Stop cancels the observation")
     func stopCancels() throws {
         let relay = ChangeSignalRelay(probe: { 1 }, signaling: RecordingSignaling())
@@ -713,6 +848,7 @@ struct ChangeSignalRelayTests {
 private final class LockedSnapshots: @unchecked Sendable {
     private let lock = NSLock()
     private var snapshots: [ProviderContainerChanges]
+    private var recordedPriorSequences: [Int64?] = []
 
     init(_ snapshots: [ProviderContainerChanges]) {
         self.snapshots = snapshots
@@ -721,6 +857,20 @@ private final class LockedSnapshots: @unchecked Sendable {
     func next() -> ProviderContainerChanges {
         lock.lock()
         defer { lock.unlock() }
+        precondition(!snapshots.isEmpty)
+        return snapshots.removeFirst()
+    }
+
+    var priorSequences: [Int64?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedPriorSequences
+    }
+
+    func next(after prior: ChangeJournalState?) -> ProviderContainerChanges {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedPriorSequences.append(prior?.latestSequence)
         precondition(!snapshots.isEmpty)
         return snapshots.removeFirst()
     }

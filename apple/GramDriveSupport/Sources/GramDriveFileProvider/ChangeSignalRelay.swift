@@ -509,10 +509,17 @@ public final class ChangeSignalRelay: @unchecked Sendable {
     private var observation: (any ChangeObservationToken)?
     private var lastVersion: Int64?
     private var lastJournal: ChangeJournalState?
-    private var latestDispatch: UUID?
+    private var dispatchInFlight = false
+    private var pendingCheck = false
+    private var pendingReplacement = false
     private let probe: @Sendable () throws -> Int64
     private let containerProbe: ContainerProbe
     private let signaling: any ProviderChangeSignaling
+
+    private enum DispatchRequest {
+        case check
+        case replacement
+    }
 
     /// A relay from `probe` (the change stamp of the shared state the
     /// domain serves) to `signaling` (the domain's working-set/root doorbell
@@ -557,44 +564,67 @@ public final class ChangeSignalRelay: @unchecked Sendable {
     /// A failing probe (the store mid-recovery) signals nothing — the next
     /// ring retries, and the durable truth stays in the database.
     public func check() {
-        guard let version = try? probe() else { return }
+        enqueue(.check)
+    }
+
+    private func enqueue(_ request: DispatchRequest) {
+        lock.lock()
+        guard !dispatchInFlight else {
+            switch request {
+            case .check:
+                pendingCheck = true
+            case .replacement:
+                pendingReplacement = true
+            }
+            lock.unlock()
+            return
+        }
+        dispatchInFlight = true
+        lock.unlock()
+        perform(request)
+    }
+
+    private func perform(_ request: DispatchRequest) {
+        switch request {
+        case .check:
+            performCheck()
+        case .replacement:
+            performReplacement()
+        }
+    }
+
+    private func performCheck() {
+        guard let version = try? probe() else {
+            finishDispatch()
+            return
+        }
         lock.lock()
         let priorVersion = lastVersion
         let initial = priorVersion == nil
         let moved = priorVersion != version
         let priorJournal = lastJournal
         lock.unlock()
-        guard moved else { return }
-        guard let containerChanges = try? containerProbe(priorJournal) else {
+        guard moved else {
+            finishDispatch()
             return
         }
-        let dispatch = UUID()
-        lock.lock()
-        lastVersion = version
-        lastJournal = containerChanges.journal
-        latestDispatch = dispatch
-        lock.unlock()
+        guard let containerChanges = try? containerProbe(priorJournal) else {
+            finishDispatch()
+            return
+        }
         signaling.signalChanges(
             includeRoot: initial,
             changedContainers: containerChanges.containers,
             evictingGeneratedItems: containerChanges.generatedItems
         ) { [weak self] error in
             guard let self else { return }
-            self.lock.lock()
-            guard self.latestDispatch == dispatch else {
+            if error == nil {
+                self.lock.lock()
+                self.lastVersion = version
+                self.lastJournal = containerChanges.journal
                 self.lock.unlock()
-                return
             }
-            self.latestDispatch = nil
-            if error != nil {
-                // A materialized-set read failure is not an empty set. Roll
-                // the optimistic checkpoint back so the next doorbell retries
-                // the same generated-version eviction instead of silently
-                // accepting an unproved absence.
-                self.lastVersion = priorVersion
-                self.lastJournal = priorJournal
-            }
-            self.lock.unlock()
+            self.finishDispatch()
         }
     }
 
@@ -603,33 +633,48 @@ public final class ChangeSignalRelay: @unchecked Sendable {
     /// have held an enumerator across the short agent gap, and the matching
     /// replacement's ready hierarchy is the event that makes retry safe.
     public func signalEnumeratorsAfterAgentReplacement() {
+        enqueue(.replacement)
+    }
+
+    private func performReplacement() {
         lock.lock()
         let priorJournal = lastJournal
         lock.unlock()
         guard let containerChanges = try? containerProbe(priorJournal) else {
+            finishDispatch()
             return
         }
-        let dispatch = UUID()
-        lock.lock()
-        lastJournal = containerChanges.journal
-        latestDispatch = dispatch
-        lock.unlock()
         signaling.signalChanges(
             includeRoot: true,
             changedContainers: containerChanges.containers,
             evictingGeneratedItems: containerChanges.generatedItems
         ) { [weak self] error in
             guard let self else { return }
-            self.lock.lock()
-            guard self.latestDispatch == dispatch else {
+            if error == nil {
+                self.lock.lock()
+                self.lastJournal = containerChanges.journal
                 self.lock.unlock()
-                return
             }
-            self.latestDispatch = nil
-            if error != nil {
-                self.lastJournal = priorJournal
-            }
-            self.lock.unlock()
+            self.finishDispatch()
+        }
+    }
+
+    private func finishDispatch() {
+        let next: DispatchRequest?
+        lock.lock()
+        if pendingReplacement {
+            pendingReplacement = false
+            next = .replacement
+        } else if pendingCheck {
+            pendingCheck = false
+            next = .check
+        } else {
+            dispatchInFlight = false
+            next = nil
+        }
+        lock.unlock()
+        if let next {
+            perform(next)
         }
     }
 
