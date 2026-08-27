@@ -11,6 +11,7 @@ private final class RecordingSignaling: ProviderChangeSignaling, @unchecked Send
     private let lock = NSLock()
     private var requests: [Bool] = []
     private var containers: [[String]] = []
+    private var generatedItems: [[String]] = []
 
     var signalCount: Int {
         lock.lock()
@@ -30,14 +31,22 @@ private final class RecordingSignaling: ProviderChangeSignaling, @unchecked Send
         return containers
     }
 
+    var evictedGeneratedItemRequests: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return generatedItems
+    }
+
     func signalChanges(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [NSFileProviderItemIdentifier],
         completionHandler: @escaping @Sendable ((any Error)?) -> Void
     ) {
         lock.lock()
         requests.append(includeRoot)
         containers.append(changedContainers.map(\.rawValue))
+        generatedItems.append(evictingGeneratedItems.map(\.rawValue))
         lock.unlock()
         completionHandler(nil)
     }
@@ -62,6 +71,37 @@ private final class ScriptedProbe: @unchecked Sendable {
 }
 
 private struct ProbeDown: Error {}
+private struct SignalDown: Error {}
+
+private final class DispatchRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedEvents: [String] = []
+    private var recordedError: (any Error)?
+
+    var events: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedEvents
+    }
+
+    var error: (any Error)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedError
+    }
+
+    func record(_ event: String) {
+        lock.lock()
+        recordedEvents.append(event)
+        lock.unlock()
+    }
+
+    func finish(_ error: (any Error)?) {
+        lock.lock()
+        recordedError = error
+        lock.unlock()
+    }
+}
 
 /// A cancellable token the tests own, standing in for the Darwin
 /// observation.
@@ -84,6 +124,37 @@ private final class RecordingToken: ChangeObservationToken, @unchecked Sendable 
 
 @Suite("Change-signal relay")
 struct ChangeSignalRelayTests {
+    @Test("Generated materializations are evicted before deduplicated change signals")
+    func generatedEvictionPrecedesSignals() {
+        let recorder = DispatchRecorder()
+        let generated = NSFileProviderItemIdentifier("messages-md")
+        let parent = NSFileProviderItemIdentifier("month-parent")
+        let dispatcher = ProviderChangeDispatcher(
+            evict: { identifier, completion in
+                recorder.record("evict:\(identifier.rawValue)")
+                completion(ProbeDown())
+            },
+            signal: { identifier, completion in
+                recorder.record("signal:\(identifier.rawValue)")
+                completion(identifier == .workingSet ? SignalDown() : nil)
+            })
+
+        dispatcher.dispatch(
+            includeRoot: true,
+            changedContainers: [.rootContainer, parent, parent],
+            evictingGeneratedItems: [generated, generated],
+            completionHandler: { recorder.finish($0) })
+
+        #expect(
+            recorder.events == [
+                "evict:messages-md",
+                "signal:\(NSFileProviderItemIdentifier.workingSet.rawValue)",
+                "signal:\(NSFileProviderItemIdentifier.rootContainer.rawValue)",
+                "signal:month-parent",
+            ])
+        #expect(recorder.error is ProbeDown)
+    }
+
     @Test("Start probes once — covering rings missed while not running — and signals")
     func startSignalsOnce() throws {
         let signaling = RecordingSignaling()
@@ -130,7 +201,8 @@ struct ChangeSignalRelayTests {
                 containers: [
                     NSFileProviderItemIdentifier("chat-parent"),
                     NSFileProviderItemIdentifier("month-parent"),
-                ]),
+                ],
+                generatedItems: [NSFileProviderItemIdentifier("messages-md")]),
         ])
         let relay = ChangeSignalRelay(
             probe: { try probe.next() },
@@ -143,10 +215,12 @@ struct ChangeSignalRelayTests {
         })
         ring?()
 
-        #expect(signaling.changedContainerRequests == [
-            [],
-            ["chat-parent", "month-parent"],
-        ])
+        #expect(
+            signaling.changedContainerRequests == [
+                [],
+                ["chat-parent", "month-parent"],
+            ])
+        #expect(signaling.evictedGeneratedItemRequests == [[], ["messages-md"]])
     }
 
     @Test("Journal deltas resolve generated metadata to its parent container")
@@ -182,14 +256,61 @@ struct ChangeSignalRelayTests {
                 createdAtMs: 1,
                 modifiedAtMs: 2,
                 deletedAtMs: nil))
+        store.apply(
+            ItemMetadata(
+                contractVersion: 1,
+                id: "attachment",
+                parent: "chat-parent",
+                kind: .attachment,
+                isDirectory: false,
+                displayName: "attachment.bin",
+                safeName: "attachment.bin",
+                metadataVersion: "m1",
+                mimeType: "application/octet-stream",
+                logicalSize: 3,
+                attachmentLogicalKind: nil,
+                attachmentRepresentation: nil,
+                attachmentFidelity: nil,
+                attachmentSourceName: nil,
+                attachmentExactSize: 3,
+                contentVersion: "v1",
+                availability: .fetchable,
+                createdAtMs: 1,
+                modifiedAtMs: 2,
+                deletedAtMs: nil))
+        store.apply(
+            ItemMetadata(
+                contractVersion: 1,
+                id: "deleted-chat-json",
+                parent: "chat-parent",
+                kind: .generatedDoc,
+                isDirectory: false,
+                displayName: ".deleted-chat.json",
+                safeName: ".deleted-chat.json",
+                metadataVersion: "m1",
+                mimeType: "application/json",
+                logicalSize: 3,
+                attachmentLogicalKind: nil,
+                attachmentRepresentation: nil,
+                attachmentFidelity: nil,
+                attachmentSourceName: nil,
+                attachmentExactSize: nil,
+                contentVersion: "v1",
+                availability: .fetchable,
+                createdAtMs: 1,
+                modifiedAtMs: 3,
+                deletedAtMs: 3))
 
         let changes = try ProviderContainerChangeResolver.changes(
             store: store,
             account: account,
             after: ChangeJournalState(instanceId: "life-1", latestSequence: 0))
 
-        #expect(changes.journal.latestSequence == 1)
+        #expect(changes.journal.latestSequence == 3)
         #expect(changes.containers.map { $0.rawValue } == ["chat-parent"])
+        #expect(
+            changes.generatedItems.map { $0.rawValue } == ["chat-json"],
+            "ordinary attachments and deleted generated nodes must never be evicted")
     }
 
     @Test("A failing probe signals nothing; the next successful ring recovers")
@@ -226,7 +347,8 @@ struct ChangeSignalRelayTests {
             containerProbe: { _ in
                 ProviderContainerChanges(
                     journal: ChangeJournalState(instanceId: "life", latestSequence: 4),
-                    containers: [NSFileProviderItemIdentifier("chat-parent")])
+                    containers: [NSFileProviderItemIdentifier("chat-parent")],
+                    generatedItems: [NSFileProviderItemIdentifier("messages-md")])
             },
             signaling: signaling)
 
@@ -234,6 +356,7 @@ struct ChangeSignalRelayTests {
 
         #expect(signaling.includeRootRequests == [true])
         #expect(signaling.changedContainerRequests == [["chat-parent"]])
+        #expect(signaling.evictedGeneratedItemRequests == [["messages-md"]])
     }
 }
 
