@@ -15,6 +15,19 @@ private final class GramDriveApplicationDelegate: NSObject, NSApplicationDelegat
   let updateAvailability = UpdateAvailability()
   private var updaterAvailabilityObservation: NSKeyValueObservation?
 
+  func applicationWillFinishLaunching(_ notification: Notification) {
+    guard
+      InstalledPlaceholderResolutionCommand.isRequested(
+        arguments: CommandLine.arguments)
+    else { return }
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    Task {
+      let exitCode = await InstalledPlaceholderResolutionCommand.runSystem()
+      fflush(stdout)
+      exit(exitCode)
+    }
+  }
+
   lazy var updaterController = SPUStandardUpdaterController(
     startingUpdater: true,
     updaterDelegate: self,
@@ -32,6 +45,10 @@ private final class GramDriveApplicationDelegate: NSObject, NSApplicationDelegat
     })
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    guard
+      !InstalledPlaceholderResolutionCommand.isRequested(
+        arguments: CommandLine.arguments)
+    else { return }
     Self.lifecycle.applicationDidFinishLaunching()
     updaterAvailabilityObservation = updaterController.updater.observe(
       \.canCheckForUpdates,

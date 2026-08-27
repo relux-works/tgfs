@@ -166,6 +166,160 @@ class CandidateSelectionTests(unittest.TestCase):
         self.assertEqual(facts.stat_timeout_count, 1)
         self.assertEqual(facts.dataless_count, 1)
 
+    def test_selection_never_probes_a_twenty_first_candidate(self):
+        self.seed_date_first_tree()
+        for value in range(10, 30):
+            self.add_item(
+                value,
+                6,
+                f"candidate-{value}.bin",
+                "attachment",
+                availability="fetchable",
+                size=value - 5,
+            )
+        self.db.commit()
+        calls = 0
+
+        def dataless_only_after_the_bound(_path):
+            nonlocal calls
+            calls += 1
+            state = (
+                live.PlaceholderState.DATALESS
+                if calls == 21
+                else live.PlaceholderState.MATERIALIZED
+            )
+            return live.PlaceholderProbeResult(state, 1)
+
+        with self.assertRaises(live.AcceptanceFailure) as caught:
+            live.select_uncached_dataless_candidate(
+                self.db, self.cloud, dataless_probe=dataless_only_after_the_bound
+            )
+
+        self.assertEqual(str(caught.exception), "bounded-placeholder-selection-exhausted")
+        self.assertEqual(calls, 20)
+        self.assertEqual(
+            caught.exception.public_evidence["placeholder_candidates_considered"],
+            20,
+        )
+
+    def test_selection_resolves_one_exact_missing_item_then_requires_dataless(self):
+        self.seed_date_first_tree()
+        probes = iter(
+            (
+                live.PlaceholderProbeResult(live.PlaceholderState.MISSING, 1),
+                live.PlaceholderProbeResult(live.PlaceholderState.DATALESS, 2),
+            )
+        )
+        resolved = []
+
+        candidate, _path, facts = live.select_uncached_dataless_candidate(
+            self.db,
+            self.cloud,
+            dataless_probe=lambda _path: next(probes),
+            materialize_missing=lambda item_id: resolved.append(item_id) or True,
+        )
+
+        self.assertEqual(candidate.item_id, bytes([9]))
+        self.assertEqual(resolved, [bytes([9])])
+        self.assertEqual(facts.candidates_considered, 1)
+        self.assertEqual(facts.missing_count, 1)
+        self.assertEqual(facts.dataless_count, 1)
+
+    def test_selection_never_launders_resolver_failure_into_dataless(self):
+        self.seed_date_first_tree()
+
+        with self.assertRaises(live.AcceptanceFailure) as caught:
+            live.select_uncached_dataless_candidate(
+                self.db,
+                self.cloud,
+                dataless_probe=lambda _path: live.PlaceholderProbeResult(
+                    live.PlaceholderState.MISSING, 1
+                ),
+                materialize_missing=lambda _item_id: live.PlaceholderResolveResult(
+                    live.PlaceholderResolveState.TIMEOUT, 2000
+                ),
+            )
+
+        self.assertEqual(str(caught.exception), "bounded-placeholder-selection-exhausted")
+        self.assertEqual(
+            caught.exception.public_evidence["placeholder_resolve_timeout_count"], 1
+        )
+        self.assertEqual(
+            caught.exception.public_evidence["placeholder_dataless_count"], 0
+        )
+
+    def test_selection_reports_identity_mismatch_without_private_identity(self):
+        self.seed_date_first_tree()
+
+        with self.assertRaises(live.AcceptanceFailure) as caught:
+            live.select_uncached_dataless_candidate(
+                self.db,
+                self.cloud,
+                dataless_probe=lambda _path: live.PlaceholderProbeResult(
+                    live.PlaceholderState.MISSING, 1
+                ),
+                materialize_missing=lambda _item_id: live.PlaceholderResolveResult(
+                    live.PlaceholderResolveState.IDENTITY_MISMATCH, 2
+                ),
+            )
+
+        self.assertEqual(str(caught.exception), "bounded-placeholder-selection-exhausted")
+        evidence = caught.exception.public_evidence
+        self.assertEqual(evidence["placeholder_resolve_identity_mismatch_count"], 1)
+        self.assertEqual(evidence["placeholder_dataless_count"], 0)
+        self.assertTrue(set(evidence).issubset(live.PUBLIC_EVIDENCE_FIELDS))
+
+    def test_provider_identifier_is_private_core_golden_text_not_binary_or_hex(self):
+        account_42 = bytes.fromhex("0101000000000000002a")
+        self.assertEqual(
+            live.provider_item_identifier(account_42), "gdaeaqaaaaaaaaaabk"
+        )
+
+    def test_installed_resolver_keeps_identifier_off_argv_and_requires_fixed_output(self):
+        process = live.WorkerProcessResult(0, "resolved\n", "", False, True, 4)
+        with mock.patch.object(
+            live, "run_worker_process", return_value=process
+        ) as run:
+            item_id = bytes.fromhex("0101000000000000002a")
+            result = live.finder_resolve_placeholder(item_id)
+
+        self.assertIs(result.state, live.PlaceholderResolveState.RESOLVED)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            (
+                str(live.DEFAULT_COMPANION_EXECUTABLE),
+                live.PLACEHOLDER_RESOLVE_COMMAND,
+            ),
+        )
+        self.assertNotIn("gdaeaqaaaaaaaaaabk", " ".join(command))
+        self.assertEqual(
+            run.call_args.kwargs["stdin_text"], "gdaeaqaaaaaaaaaabk\n"
+        )
+
+        process = live.WorkerProcessResult(
+            5, "identity-mismatch\n", "", False, True, 4
+        )
+        with mock.patch.object(live, "run_worker_process", return_value=process):
+            mismatch = live.finder_resolve_placeholder(item_id)
+        self.assertIs(
+            mismatch.state, live.PlaceholderResolveState.IDENTITY_MISMATCH
+        )
+
+        process = live.WorkerProcessResult(0, "unexpected\n", "", False, True, 4)
+        with mock.patch.object(live, "run_worker_process", return_value=process):
+            refused = live.finder_resolve_placeholder(item_id)
+        self.assertIs(refused.state, live.PlaceholderResolveState.PLATFORM_ERROR)
+
+        process = live.WorkerProcessResult(-9, "", "", True, True, 4000)
+        with mock.patch.object(live, "run_worker_process", return_value=process):
+            timed_out = live.finder_resolve_placeholder(item_id)
+        self.assertIs(timed_out.state, live.PlaceholderResolveState.TIMEOUT)
+
+        with mock.patch.object(live, "run_worker_process", side_effect=OSError()):
+            spawn_failed = live.finder_resolve_placeholder(item_id)
+        self.assertIs(spawn_failed.state, live.PlaceholderResolveState.PLATFORM_ERROR)
+
     def test_candidate_plan_uses_the_bounded_partial_index_without_temp_sort(self):
         self.seed_date_first_tree()
         self.db.execute(
@@ -212,6 +366,21 @@ class CandidateSelectionTests(unittest.TestCase):
             self.assertIs(
                 live.finder_placeholder_probe(self.cloud).state,
                 live.PlaceholderState.TIMEOUT,
+            )
+
+    def test_probe_read_failures_are_not_laundered_as_placeholder_absence(self):
+        malformed = subprocess.CompletedProcess(("probe",), 0, "not-an-integer\n", "")
+        with mock.patch.object(live.subprocess, "run", return_value=malformed):
+            self.assertIs(
+                live.finder_placeholder_probe(self.cloud).state,
+                live.PlaceholderState.PLATFORM_ERROR,
+            )
+        with mock.patch.object(
+            live.subprocess, "run", side_effect=OSError("spawn refused")
+        ):
+            self.assertIs(
+                live.finder_placeholder_probe(self.cloud).state,
+                live.PlaceholderState.PLATFORM_ERROR,
             )
 
     @unittest.skipUnless(sys.platform == "darwin", "st_flags is a macOS contract")
@@ -832,6 +1001,70 @@ class InstalledPhaseEndToEndTests(unittest.TestCase):
         self.assertTrue(after["relaunch_prior_item_identity_preserved"])
         self.assertTrue(after["relaunch_item_set_additive_only"])
         self.assertTrue(after["relaunch_cursor_progress_preserved"])
+
+    def test_before_fails_closed_when_the_selected_placeholder_reprobe_times_out(self):
+        outcomes = iter(
+            (
+                live.PlaceholderProbeResult(live.PlaceholderState.DATALESS, 1),
+                live.PlaceholderProbeResult(live.PlaceholderState.TIMEOUT, 500),
+            )
+        )
+        self.db.close()
+
+        with self.assertRaises(live.AcceptanceFailure) as caught:
+            live.run_before(
+                self.database,
+                self.data,
+                self.cloud,
+                self.state,
+                self.evidence,
+                dataless_probe=lambda _path: next(outcomes),
+            )
+
+        self.assertEqual(str(caught.exception), "finder-placeholder-stat-timeout")
+        self.assertFalse(self.state.exists())
+
+    def test_before_resolves_the_exact_missing_placeholder_before_one_read(self):
+        original_read = live.read_placeholder_once
+        probes = iter(
+            (
+                live.PlaceholderProbeResult(live.PlaceholderState.MISSING, 1),
+                live.PlaceholderProbeResult(live.PlaceholderState.DATALESS, 1),
+                live.PlaceholderProbeResult(live.PlaceholderState.DATALESS, 1),
+                live.PlaceholderProbeResult(live.PlaceholderState.DATALESS, 1),
+            )
+        )
+        resolved = []
+
+        def read_and_publish(path: Path):
+            result = original_read(path)
+            digest, size = result
+            publisher = sqlite3.connect(self.database)
+            publisher.execute(
+                "INSERT OR REPLACE INTO cache_entries VALUES"
+                "(?, 'attachment-v1', ?, 'verified', ?, 'blob', ?)",
+                (bytes([8]), size, str(path), bytes.fromhex(digest)),
+            )
+            publisher.commit()
+            publisher.close()
+            return result
+
+        self.db.close()
+        with mock.patch.object(
+            live, "read_placeholder_once", side_effect=read_and_publish
+        ):
+            before = live.run_before(
+                self.database,
+                self.data,
+                self.cloud,
+                self.state,
+                self.evidence,
+                dataless_probe=lambda _path: next(probes),
+                placeholder_resolver=lambda item_id: resolved.append(item_id) or True,
+            )
+
+        self.assertTrue(live.evidence_passed("before", before))
+        self.assertEqual(resolved, [bytes([8])])
 
 
 class DeadlineAndCleanupTests(unittest.TestCase):

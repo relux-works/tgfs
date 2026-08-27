@@ -18,6 +18,7 @@ versions, and signing state supplied by the caller.
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -44,6 +45,11 @@ DEFAULT_EVIDENCE = Path(".temp/installed-live-content-evidence.json")
 DEFAULT_CACHE_QUOTA_BYTES = 10_000_000_000
 MAX_CANDIDATES = 20
 PLACEHOLDER_PROBE_TIMEOUT_SECONDS = 0.5
+PLACEHOLDER_RESOLVE_TIMEOUT_SECONDS = 4.0
+DEFAULT_COMPANION_EXECUTABLE = Path(
+    "/Applications/GramDrive.app/Contents/MacOS/GramDrive"
+)
+PLACEHOLDER_RESOLVE_COMMAND = "--acceptance-resolve-placeholder"
 SF_DATALESS = 0x40000000
 HYDRATION_WAIT_ATTEMPTS = 100
 HYDRATION_WAIT_SECONDS = 0.1
@@ -171,6 +177,12 @@ PUBLIC_EVIDENCE_FIELDS = {
     "placeholder_missing_count",
     "placeholder_path_mismatch_count",
     "placeholder_probe_elapsed_ms",
+    "placeholder_resolve_attempt_count",
+    "placeholder_resolve_elapsed_ms",
+    "placeholder_resolve_error_count",
+    "placeholder_resolve_identity_mismatch_count",
+    "placeholder_resolve_success_count",
+    "placeholder_resolve_timeout_count",
     "placeholder_stat_error_count",
     "placeholder_stat_timeout_count",
 }
@@ -327,6 +339,19 @@ class PlaceholderProbeResult:
     elapsed_ms: int
 
 
+class PlaceholderResolveState(Enum):
+    RESOLVED = "resolved"
+    IDENTITY_MISMATCH = "identity-mismatch"
+    PLATFORM_ERROR = "platform-error"
+    TIMEOUT = "timeout"
+
+
+@dataclass(frozen=True)
+class PlaceholderResolveResult:
+    state: PlaceholderResolveState
+    elapsed_ms: int
+
+
 @dataclass
 class PlaceholderSelectionFacts:
     candidates_considered: int = 0
@@ -337,9 +362,14 @@ class PlaceholderSelectionFacts:
     stat_error_count: int = 0
     stat_timeout_count: int = 0
     probe_elapsed_ms: int = 0
+    resolve_attempt_count: int = 0
+    resolve_success_count: int = 0
+    resolve_identity_mismatch_count: int = 0
+    resolve_error_count: int = 0
+    resolve_timeout_count: int = 0
+    resolve_elapsed_ms: int = 0
 
     def record(self, result: PlaceholderProbeResult) -> None:
-        self.candidates_considered += 1
         self.probe_elapsed_ms += result.elapsed_ms
         if result.state is PlaceholderState.DATALESS:
             self.dataless_count += 1
@@ -352,6 +382,18 @@ class PlaceholderSelectionFacts:
         elif result.state is PlaceholderState.TIMEOUT:
             self.stat_timeout_count += 1
 
+    def record_resolve(self, result: PlaceholderResolveResult) -> None:
+        self.resolve_attempt_count += 1
+        self.resolve_elapsed_ms += result.elapsed_ms
+        if result.state is PlaceholderResolveState.RESOLVED:
+            self.resolve_success_count += 1
+        elif result.state is PlaceholderResolveState.IDENTITY_MISMATCH:
+            self.resolve_identity_mismatch_count += 1
+        elif result.state is PlaceholderResolveState.PLATFORM_ERROR:
+            self.resolve_error_count += 1
+        elif result.state is PlaceholderResolveState.TIMEOUT:
+            self.resolve_timeout_count += 1
+
     def public_evidence(self) -> dict[str, int]:
         return {
             "placeholder_candidates_considered": self.candidates_considered,
@@ -362,6 +404,14 @@ class PlaceholderSelectionFacts:
             "placeholder_probe_elapsed_ms": self.probe_elapsed_ms,
             "placeholder_stat_error_count": self.stat_error_count,
             "placeholder_stat_timeout_count": self.stat_timeout_count,
+            "placeholder_resolve_attempt_count": self.resolve_attempt_count,
+            "placeholder_resolve_success_count": self.resolve_success_count,
+            "placeholder_resolve_identity_mismatch_count": (
+                self.resolve_identity_mismatch_count
+            ),
+            "placeholder_resolve_error_count": self.resolve_error_count,
+            "placeholder_resolve_timeout_count": self.resolve_timeout_count,
+            "placeholder_resolve_elapsed_ms": self.resolve_elapsed_ms,
         }
 
 
@@ -531,6 +581,38 @@ def finder_placeholder_probe(path: Path) -> PlaceholderProbeResult:
         else PlaceholderState.MATERIALIZED
     )
     return PlaceholderProbeResult(state, elapsed_ms)
+
+
+def provider_item_identifier(item_id: bytes) -> str:
+    """Return the frozen Apple text form without exposing it to public evidence."""
+    payload = base64.b32encode(item_id).decode("ascii").rstrip("=").lower()
+    return f"gd{payload}"
+
+
+def finder_resolve_placeholder(item_id: bytes) -> PlaceholderResolveResult:
+    """Ask the installed, extension-owning app for one exact user-visible URL."""
+    started = time.monotonic()
+    try:
+        result = run_worker_process(
+            (str(DEFAULT_COMPANION_EXECUTABLE), PLACEHOLDER_RESOLVE_COMMAND),
+            PLACEHOLDER_RESOLVE_TIMEOUT_SECONDS,
+            stdin_text=f"{provider_item_identifier(item_id)}\n",
+        )
+    except OSError:
+        return PlaceholderResolveResult(
+            PlaceholderResolveState.PLATFORM_ERROR,
+            round((time.monotonic() - started) * 1000),
+        )
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    if result.timed_out or not result.cleanup_complete:
+        state = PlaceholderResolveState.TIMEOUT
+    elif result.returncode == 0 and result.stdout.strip() == "resolved":
+        state = PlaceholderResolveState.RESOLVED
+    elif result.returncode == 5 and result.stdout.strip() == "identity-mismatch":
+        state = PlaceholderResolveState.IDENTITY_MISMATCH
+    else:
+        state = PlaceholderResolveState.PLATFORM_ERROR
+    return PlaceholderResolveResult(state, elapsed_ms)
 
 
 def finder_dataless(path: Path) -> bool:
@@ -932,6 +1014,9 @@ def select_uncached_dataless_candidate(
     dataless_probe: Callable[
         [Path], bool | PlaceholderProbeResult
     ] = finder_placeholder_probe,
+    materialize_missing: Callable[
+        [bytes], bool | PlaceholderResolveResult
+    ] | None = None,
 ) -> tuple[Candidate, Path, PlaceholderSelectionFacts]:
     facts = PlaceholderSelectionFacts()
     for candidate in candidate_rows(db):
@@ -943,6 +1028,7 @@ def select_uncached_dataless_candidate(
             continue
         if cache_verified(db, candidate.item_id):
             continue
+        facts.candidates_considered += 1
         raw_result = dataless_probe(path)
         result = (
             raw_result
@@ -957,6 +1043,37 @@ def select_uncached_dataless_candidate(
             )
         )
         facts.record(result)
+        if result.state is PlaceholderState.MISSING and materialize_missing is not None:
+            raw_resolve = materialize_missing(candidate.item_id)
+            resolve = (
+                raw_resolve
+                if isinstance(raw_resolve, PlaceholderResolveResult)
+                else PlaceholderResolveResult(
+                    (
+                        PlaceholderResolveState.RESOLVED
+                        if raw_resolve
+                        else PlaceholderResolveState.PLATFORM_ERROR
+                    ),
+                    0,
+                )
+            )
+            facts.record_resolve(resolve)
+            if resolve.state is not PlaceholderResolveState.RESOLVED:
+                continue
+            result = dataless_probe(path)
+            result = (
+                result
+                if isinstance(result, PlaceholderProbeResult)
+                else PlaceholderProbeResult(
+                    (
+                        PlaceholderState.DATALESS
+                        if result
+                        else PlaceholderState.MATERIALIZED
+                    ),
+                    0,
+                )
+            )
+            facts.record(result)
         try:
             refreshed_path = item_path(db, cloud_root, candidate.item_id)
         except AcceptanceFailure:
@@ -1390,6 +1507,9 @@ def run_before(
     dataless_probe: Callable[
         [Path], bool | PlaceholderProbeResult
     ] = finder_placeholder_probe,
+    placeholder_resolver: Callable[
+        [bytes], bool | PlaceholderResolveResult
+    ] | None = None,
     deadline: Deadline | None = None,
     recorder: StageRecorder | None = None,
 ) -> dict:
@@ -1400,7 +1520,11 @@ def run_before(
         db = connection(database, deadline)
         try:
             candidate, attachment, selection_facts = select_uncached_dataless_candidate(
-                db, cloud_root, dataless_probe
+                db,
+                cloud_root,
+                dataless_probe,
+                materialize_missing=placeholder_resolver
+                or finder_resolve_placeholder,
             )
             ancestor_ids = (candidate.list_id, candidate.chat_id, candidate.month_id)
             ancestor_paths = [cloud_root]
@@ -1958,20 +2082,25 @@ def collect_worker_output(
         return "", ""
 
 
-def run_worker_process(command: Sequence[str], timeout: float) -> WorkerProcessResult:
+def run_worker_process(
+    command: Sequence[str], timeout: float, stdin_text: str | None = None
+) -> WorkerProcessResult:
     started = time.monotonic()
     overall_deadline = started + timeout
     cleanup_reserve = worker_cleanup_reserve(timeout)
     execution_timeout = max(0.001, timeout - cleanup_reserve)
     process = subprocess.Popen(
         command,
+        stdin=subprocess.PIPE if stdin_text is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(timeout=execution_timeout)
+        stdout, stderr = process.communicate(
+            input=stdin_text, timeout=execution_timeout
+        )
         return WorkerProcessResult(
             returncode=process.returncode,
             stdout=stdout,
