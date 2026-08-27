@@ -6,6 +6,10 @@ accounting, LRU eviction of unpinned content (POL-2). Drives any
 `DriveSource` through the contract; persists durable transfer state via
 `gramdrive-state`.
 
+The crate has no default Cargo features. `test-seams` exposes deterministic
+cross-crate concurrency barriers for native regression tests only; product
+builds must not enable it.
+
 ## Modules
 
 - `transfer` — the durable transfer state machine (TASK-260715-g4k3zm;

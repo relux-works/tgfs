@@ -24,7 +24,9 @@ use gramdrive_engine::cache::{
 use gramdrive_engine::fetch::{
     AttemptEnd, Clock, FetchCoordinator, RunOutcome, Staging, StagingError, StagingHost,
 };
-use gramdrive_engine::render_pipeline::{GeneratedFileLease, reclaim_unreferenced_generations};
+use gramdrive_engine::render_pipeline::{
+    GeneratedFileLease, GeneratedFileLeaseAcquire, reclaim_unreferenced_generations,
+};
 use gramdrive_engine::transfer::{Priority, TransferMachine};
 use gramdrive_model::ByteRange;
 use gramdrive_model::identity::{
@@ -63,6 +65,7 @@ type ContentGenerationKey = (String, String);
 // accounting and eviction eligibility are durable properties of the cache
 // entry itself. Coarsening avoids a write transaction for every open.
 const CACHE_TOUCH_GRANULARITY_MS: i64 = 60_000;
+const GENERATED_LEASE_WAIT: StdDuration = StdDuration::from_millis(250);
 
 /// A verified materialization returned to a native provider host.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -811,7 +814,14 @@ impl Hydrator {
             cache_only,
         } = admission;
 
-        if let Some(hit) = cached_file(&mut store, &item, &version, extent, now_ms())? {
+        if let Some(hit) = cached_file(
+            &mut store,
+            &item,
+            &version,
+            extent,
+            now_ms(),
+            token.as_ref(),
+        )? {
             listener.on_progress(TransferProgress {
                 bytes_transferred: hit.file.byte_count,
                 bytes_total: Some(hit.file.byte_count),
@@ -901,7 +911,14 @@ impl Hydrator {
                 return Err(cancelled());
             }
 
-            if let Some(hit) = cached_file(&mut store, &item, &version, extent, now_ms())? {
+            if let Some(hit) = cached_file(
+                &mut store,
+                &item,
+                &version,
+                extent,
+                now_ms(),
+                token.as_ref(),
+            )? {
                 if let Some(reader) = reader {
                     let _ = self.coordinator.close(reader);
                 }
@@ -2634,6 +2651,7 @@ fn cached_file(
     version: &ContentVersion,
     extent: u64,
     now: i64,
+    token: &CancellationToken,
 ) -> Result<Option<CachedFile>, DriveError> {
     let entry = {
         let read = store.read_txn().map_err(state_error)?;
@@ -2687,9 +2705,19 @@ fn cached_file(
         // concurrent publication swept this old generation first, treat it as
         // a normal generated cache miss so admission can report the version
         // conflict rather than returning a path that has already vanished.
-        match GeneratedFileLease::acquire(Path::new(&reference)) {
-            Some(lease) => Some(lease),
-            None => return Ok(None),
+        match GeneratedFileLease::acquire_bounded(
+            Path::new(&reference),
+            GENERATED_LEASE_WAIT,
+            || token.is_cancelled(),
+        ) {
+            GeneratedFileLeaseAcquire::Acquired(lease) => Some(lease),
+            GeneratedFileLeaseAcquire::Missing => return Ok(None),
+            GeneratedFileLeaseAcquire::Busy => {
+                return Err(DriveError::VersionConflict {
+                    detail: "generated publication is briefly refreshing this version".to_owned(),
+                });
+            }
+            GeneratedFileLeaseAcquire::Cancelled => return Err(cancelled()),
         }
     } else {
         None
@@ -4591,6 +4619,213 @@ mod tests {
         hydrator
             .release_hydration_lease(first_lease)
             .expect("duplicate teardown is bounded and idempotent");
+    }
+
+    #[tokio::test]
+    async fn same_base_reclaim_snapshots_before_reserving_and_hydration_stays_bounded() {
+        use gramdrive_engine::render_pipeline::{
+            set_reclaim_before_snapshot_hook, set_reclaim_before_unlink_hook,
+        };
+
+        let root = TempRoot::new();
+        let database = seed(&root, b"attachment seed");
+        let layout = shared_state_layout(root.text().to_owned()).expect("layout");
+        let document = ItemKey::Appearance(gramdrive_model::identity::AppearanceKey {
+            view: ChatListKind::Main,
+            item: CanonicalKey::GeneratedDoc(GeneratedDocKey {
+                chat: chat_key(),
+                partition: DocPartition::Chat,
+                format: DocFormat::Json,
+                schema_family: SchemaFamily(1),
+            }),
+        })
+        .id();
+        let base = Path::new(&layout.cache_dir).join("generated/7/1/100");
+        let current = base.join("current/chat.json");
+        fs::create_dir_all(current.parent().expect("current parent")).expect("current directory");
+        let bytes = b"{\"schema\":\"gramdrive.chat\",\"generation\":1}\n";
+        fs::write(&current, bytes).expect("current bytes");
+        let content_version = ContentVersion::new("chat-json-v1").expect("version");
+        let mut store = StateStore::open(&database).expect("state");
+        let tx = store.write_txn().expect("generated fixture transaction");
+        tx.upsert_item(&ItemRecord {
+            aggregate_size: None,
+            id: document.clone(),
+            parent: Some(root_id()),
+            display_name: ".chat.json".to_owned(),
+            safe_name: ".chat.json".to_owned(),
+            metadata_version: gramdrive_model::version::MetadataVersion::new("chat-json-m1")
+                .expect("metadata version"),
+            content: Some(FileFacts {
+                mime_type: Some("application/json".to_owned()),
+                logical_size: Some(bytes.len() as u64),
+                content_version: Some(content_version.clone()),
+            }),
+            availability: ItemAvailability::Fetchable,
+            created_at_ms: Some(10),
+            modified_at_ms: Some(20),
+            deleted_at_ms: None,
+        })
+        .expect("generated item");
+        tx.upsert_cache_entry(&CacheEntryRecord {
+            item: document.clone(),
+            account: scope().account,
+            content_version: content_version.clone(),
+            kind: CacheKind::GeneratedDoc,
+            size: bytes.len() as u64,
+            blob_hash: None,
+            verification: CacheVerification::Verified,
+            pin: None,
+            last_access_at_ms: 20,
+            materialized_at_ms: 20,
+            materialization_ref: Some(current.to_string_lossy().into_owned()),
+        })
+        .expect("generated cache entry");
+        tx.commit().expect("commit generated fixture");
+        drop(store);
+        let hydrator = Hydrator::shared(root.text()).expect("production hydrator");
+
+        let stale = base.join("stale-before-snapshot/chat.json");
+        fs::create_dir_all(stale.parent().expect("stale parent")).expect("stale directory");
+        fs::write(&stale, b"stale").expect("stale bytes");
+        let (snapshot_arrived, snapshot_arrived_wait) = std::sync::mpsc::sync_channel(0);
+        let (snapshot_release, snapshot_release_wait) = std::sync::mpsc::sync_channel(0);
+        let snapshot_release_wait = Arc::new(Mutex::new(snapshot_release_wait));
+        let hooked_base = base.clone();
+        set_reclaim_before_snapshot_hook(Some(Arc::new(move |candidate_base| {
+            if candidate_base == hooked_base {
+                snapshot_arrived
+                    .send(())
+                    .expect("announce snapshot boundary");
+                snapshot_release_wait
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv()
+                    .expect("release snapshot boundary");
+            }
+        })));
+        let reclaim_database = database.clone();
+        let reclaim_base = base.clone();
+        let reclaim = std::thread::spawn(move || {
+            let mut store = StateStore::open(&reclaim_database).expect("reclaim state");
+            reclaim_unreferenced_generations(&mut store, &reclaim_base)
+                .expect("database-first reclaim");
+        });
+        snapshot_arrived_wait
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("reclaim reaches pre-SQLite snapshot boundary");
+
+        let unrelated_base = Path::new(&layout.cache_dir).join("generated/7/1/200");
+        let unrelated_stale = unrelated_base.join("stale/chat.json");
+        fs::create_dir_all(unrelated_stale.parent().expect("unrelated parent"))
+            .expect("unrelated directory");
+        fs::write(&unrelated_stale, b"unrelated stale").expect("unrelated bytes");
+        let mut unrelated_store = StateStore::open(&database).expect("unrelated state");
+        reclaim_unreferenced_generations(&mut unrelated_store, &unrelated_base)
+            .expect("unrelated background reclaim");
+        assert!(
+            !unrelated_stale.exists(),
+            "unrelated background work progresses while the target snapshot is pinned"
+        );
+
+        let started = Instant::now();
+        let hydrated = tokio::time::timeout(
+            StdDuration::from_millis(500),
+            hydrator.hydrate_inner(
+                7,
+                document.text().to_owned(),
+                Some(content_version.as_str().to_owned()),
+                Arc::new(NoopProgress),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("same-base hydration remains below 500 ms")
+        .expect("pre-reservation hydration returns exact cache bytes");
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+        assert_eq!(
+            fs::read(&hydrated.path).expect("exact hydrated bytes"),
+            bytes
+        );
+        snapshot_release.send(()).expect("release snapshot reclaim");
+        reclaim.join().expect("snapshot reclaim thread");
+        set_reclaim_before_snapshot_hook(None);
+        assert!(!stale.exists(), "standalone reclaim eventually progresses");
+
+        let reserved_stale = base.join("stale-under-reservation/chat.json");
+        fs::create_dir_all(reserved_stale.parent().expect("reserved stale parent"))
+            .expect("reserved stale directory");
+        fs::write(&reserved_stale, b"reserved stale").expect("reserved stale bytes");
+        let (unlink_arrived, unlink_arrived_wait) = std::sync::mpsc::sync_channel(0);
+        let (unlink_release, unlink_release_wait) = std::sync::mpsc::sync_channel(0);
+        let unlink_release_wait = Arc::new(Mutex::new(unlink_release_wait));
+        let hooked_stale = reserved_stale.clone();
+        set_reclaim_before_unlink_hook(Some(Arc::new(move |path| {
+            if path == hooked_stale {
+                unlink_arrived.send(()).expect("announce reserved unlink");
+                unlink_release_wait
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv()
+                    .expect("release reserved unlink");
+            }
+        })));
+        let reclaim_database = database.clone();
+        let reclaim_base = base.clone();
+        let reserved_reclaim = std::thread::spawn(move || {
+            let mut store = StateStore::open(&reclaim_database).expect("reserved reclaim state");
+            reclaim_unreferenced_generations(&mut store, &reclaim_base).expect("reserved reclaim");
+        });
+        unlink_arrived_wait
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("reclaim owns same-base reservation");
+
+        let busy_started = Instant::now();
+        let busy = hydrator
+            .hydrate_inner(
+                7,
+                document.text().to_owned(),
+                Some(content_version.as_str().to_owned()),
+                Arc::new(NoopProgress),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("long reservation returns a typed refresh retry");
+        assert!(matches!(busy, DriveError::VersionConflict { .. }));
+        assert!(busy_started.elapsed() < StdDuration::from_millis(500));
+
+        let cancel_token = CancellationToken::new();
+        let cancel_from_thread = Arc::clone(&cancel_token);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(StdDuration::from_millis(20));
+            cancel_from_thread.cancel();
+        });
+        let cancel_started = Instant::now();
+        let cancelled = hydrator
+            .hydrate_inner(
+                7,
+                document.text().to_owned(),
+                Some(content_version.as_str().to_owned()),
+                Arc::new(NoopProgress),
+                cancel_token,
+            )
+            .await
+            .expect_err("cancellation interrupts the bounded reservation wait");
+        assert!(matches!(cancelled, DriveError::Cancelled { .. }));
+        assert!(cancel_started.elapsed() < StdDuration::from_millis(100));
+        canceller.join().expect("canceller thread");
+
+        unlink_release.send(()).expect("release reserved reclaim");
+        reserved_reclaim.join().expect("reserved reclaim thread");
+        set_reclaim_before_unlink_hook(None);
+        assert!(
+            !reserved_stale.exists(),
+            "reserved reclaim eventually unlinks"
+        );
+        assert_eq!(fs::read(&current).expect("current generated bytes"), bytes);
+        hydrator
+            .release_hydration_lease(hydrated.lease_id.expect("generated lease id"))
+            .expect("release exact-byte hydration lease");
     }
 
     #[test]

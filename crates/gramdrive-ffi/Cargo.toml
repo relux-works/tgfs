@@ -53,6 +53,7 @@ uniffi = { workspace = true, features = ["tokio"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
+gramdrive-engine = { workspace = true, features = ["test-seams"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
 
 [lints]

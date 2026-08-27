@@ -8,13 +8,14 @@
 //! the transaction leaves only unreachable staged bytes; a crash after it sees
 //! the complete pair.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use gramdrive_model::hash::sha256;
 use gramdrive_model::identity::{
@@ -42,10 +43,22 @@ static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
 /// replacing a cache row cannot reclaim the old immutable generation midway
 /// through the clone. A process crash drops every claim, after which normal
 /// publication or startup reconciliation reclaims the orphan.
-static GENERATED_FILE_LEASES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+static GENERATED_FILE_LEASES: OnceLock<(Mutex<GeneratedFileLeaseState>, Condvar)> = OnceLock::new();
 
-fn generated_file_leases() -> &'static Mutex<HashMap<PathBuf, usize>> {
-    GENERATED_FILE_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct GeneratedFileLeaseState {
+    leases: HashMap<PathBuf, usize>,
+    reserved_bases: HashSet<PathBuf>,
+    base_epochs: HashMap<PathBuf, u64>,
+}
+
+fn generated_file_leases() -> &'static (Mutex<GeneratedFileLeaseState>, Condvar) {
+    GENERATED_FILE_LEASES.get_or_init(|| {
+        (
+            Mutex::new(GeneratedFileLeaseState::default()),
+            Condvar::new(),
+        )
+    })
 }
 
 /// Keeps one generated document materialization alive across a native
@@ -56,20 +69,71 @@ pub struct GeneratedFileLease {
     path: PathBuf,
 }
 
+/// Result of a bounded generated-file hand-off attempt.
+#[derive(Debug)]
+pub enum GeneratedFileLeaseAcquire {
+    /// The exact path is protected until the returned lease is dropped.
+    Acquired(GeneratedFileLease),
+    /// The path did not exist when the base was available for hand-off.
+    Missing,
+    /// A same-base publication/reclaim reservation outlived the caller's
+    /// bounded foreground wait.
+    Busy,
+    /// The caller cancelled while waiting for the short-lived reservation.
+    Cancelled,
+}
+
 impl GeneratedFileLease {
     /// Attempts to claim an existing generated file. The existence check and
-    /// claim share the reclamation lock, so a publication sweep cannot remove
-    /// the file between them.
+    /// claim are ordered against a short publication reservation. Managed
+    /// reclaim cannot remove the file between the check and claim: it must
+    /// reserve the base first, while a later reservation observes this lease.
     pub fn acquire(path: &Path) -> Option<Self> {
-        let mut leases = generated_file_leases()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !path.is_file() {
-            return None;
+        match Self::acquire_bounded(path, Duration::ZERO, || false) {
+            GeneratedFileLeaseAcquire::Acquired(lease) => Some(lease),
+            GeneratedFileLeaseAcquire::Missing
+            | GeneratedFileLeaseAcquire::Busy
+            | GeneratedFileLeaseAcquire::Cancelled => None,
         }
-        let path = path.to_path_buf();
-        *leases.entry(path.clone()).or_default() += 1;
-        Some(Self { path })
+    }
+
+    /// Waits for one short same-base reservation without converting that
+    /// transient ownership into a missing generated source.
+    pub fn acquire_bounded(
+        path: &Path,
+        timeout: Duration,
+        cancelled: impl Fn() -> bool,
+    ) -> GeneratedFileLeaseAcquire {
+        let Some(base) = generated_file_base(path) else {
+            return GeneratedFileLeaseAcquire::Missing;
+        };
+        let started = Instant::now();
+        let (state_lock, released) = generated_file_leases();
+        let mut state = state_lock.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if cancelled() {
+                return GeneratedFileLeaseAcquire::Cancelled;
+            }
+            if !state.reserved_bases.contains(base) {
+                if !path.is_file() {
+                    return GeneratedFileLeaseAcquire::Missing;
+                }
+                let path = path.to_path_buf();
+                *state.leases.entry(path.clone()).or_default() += 1;
+                return GeneratedFileLeaseAcquire::Acquired(Self { path });
+            }
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return GeneratedFileLeaseAcquire::Busy;
+            };
+            if remaining.is_zero() {
+                return GeneratedFileLeaseAcquire::Busy;
+            }
+            let poll = remaining.min(Duration::from_millis(10));
+            let (next, _) = released
+                .wait_timeout(state, poll)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+        }
     }
 
     /// The managed file protected by this lease.
@@ -80,38 +144,251 @@ impl GeneratedFileLease {
 
 impl Drop for GeneratedFileLease {
     fn drop(&mut self) {
-        let mut leases = generated_file_leases()
+        let mut state = generated_file_leases()
+            .0
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(count) = leases.get_mut(&self.path) else {
+        let Some(count) = state.leases.get_mut(&self.path) else {
             return;
         };
         if *count == 1 {
-            leases.remove(&self.path);
+            state.leases.remove(&self.path);
         } else {
             *count -= 1;
         }
     }
 }
 
-#[cfg(test)]
-type ReclaimBeforeUnlinkHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+/// Reserves one generated-document base against native hand-offs without
+/// holding the lease mutex across SQLite or filesystem work.
+struct GeneratedPublicationGuard {
+    base: PathBuf,
+    leased_paths: HashSet<PathBuf>,
+}
+
+impl GeneratedPublicationGuard {
+    fn acquire(base: &Path) -> Result<Self, RenderPipelineError> {
+        Self::reserve(base, true, None)
+    }
+
+    fn observe_reclaim_epoch(base: &Path) -> Option<u64> {
+        let state = generated_file_leases()
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (!state.reserved_bases.contains(base))
+            .then(|| state.base_epochs.get(base).copied().unwrap_or_default())
+    }
+
+    fn acquire_for_reclaim(base: &Path, observed_epoch: u64) -> Result<Self, RenderPipelineError> {
+        Self::reserve(base, false, Some(observed_epoch))
+    }
+
+    fn reserve(
+        base: &Path,
+        require_unleased: bool,
+        observed_epoch: Option<u64>,
+    ) -> Result<Self, RenderPipelineError> {
+        let mut state = generated_file_leases()
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.reserved_bases.contains(base) {
+            return Err(RenderPipelineError::PublicationLeased);
+        }
+        if observed_epoch.is_some_and(|observed| {
+            state.base_epochs.get(base).copied().unwrap_or_default() != observed
+        }) {
+            return Err(RenderPipelineError::PublicationLeased);
+        }
+        let leased_paths = state
+            .leases
+            .iter()
+            .filter(|(path, count)| **count > 0 && generated_file_belongs_to(base, path))
+            .map(|(path, _)| path.clone())
+            .collect::<HashSet<_>>();
+        if require_unleased && !leased_paths.is_empty() {
+            return Err(RenderPipelineError::PublicationLeased);
+        }
+        let base = base.to_path_buf();
+        state.reserved_bases.insert(base.clone());
+        Ok(Self { base, leased_paths })
+    }
+}
+
+impl Drop for GeneratedPublicationGuard {
+    fn drop(&mut self) {
+        let (state_lock, released) = generated_file_leases();
+        let mut state = state_lock.lock().unwrap_or_else(|error| error.into_inner());
+        state.reserved_bases.remove(&self.base);
+        let epoch = state.base_epochs.entry(self.base.clone()).or_default();
+        *epoch = epoch.wrapping_add(1);
+        drop(state);
+        released.notify_all();
+    }
+}
+
+fn generated_file_base(path: &Path) -> Option<&Path> {
+    path.parent().and_then(Path::parent)
+}
+
+fn generated_file_belongs_to(base: &Path, path: &Path) -> bool {
+    generated_file_base(path) == Some(base)
+}
+
+const RECLAIM_SCAN_ENTRY_LIMIT: usize = 128;
+
+struct GeneratedReclaimPlan {
+    candidates: Vec<PathBuf>,
+    generation_directories: HashSet<PathBuf>,
+}
+
+impl GeneratedReclaimPlan {
+    fn collect(base: &Path) -> Result<Self, std::io::Error> {
+        let mut candidates = Vec::new();
+        let mut generation_directories = HashSet::new();
+        let mut inspected = 0usize;
+        'generations: for generation in fs::read_dir(base)? {
+            if inspected >= RECLAIM_SCAN_ENTRY_LIMIT {
+                break;
+            }
+            inspected = inspected.saturating_add(1);
+            let generation = generation?;
+            if !generation.file_type()?.is_dir()
+                || generation
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            let generation_path = generation.path();
+            generation_directories.insert(generation_path.clone());
+            for entry in fs::read_dir(&generation_path)? {
+                if inspected >= RECLAIM_SCAN_ENTRY_LIMIT {
+                    break 'generations;
+                }
+                inspected = inspected.saturating_add(1);
+                let entry = entry?;
+                if entry.file_type()?.is_file()
+                    && entry.file_name().to_str().is_some_and(|name| {
+                        matches!(
+                            name,
+                            "Messages.md" | "Messages.ndjson" | ".chat.json" | "chat.json"
+                        )
+                    })
+                {
+                    candidates.push(entry.path());
+                }
+            }
+        }
+        Ok(Self {
+            candidates,
+            generation_directories,
+        })
+    }
+
+    fn references(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn reclaim(
+        self,
+        base: &Path,
+        leased_paths: &HashSet<PathBuf>,
+        claimed_references: &HashSet<String>,
+    ) -> Result<(), std::io::Error> {
+        let mut changed = false;
+        for path in self.candidates {
+            if leased_paths.contains(&path)
+                || claimed_references.contains(path.to_string_lossy().as_ref())
+            {
+                continue;
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            notify_reclaim_before_unlink(&path);
+            match fs::remove_file(&path) {
+                Ok(()) => changed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for generation in self.generation_directories {
+            if fs::remove_dir(generation).is_ok() {
+                changed = true;
+            }
+        }
+        if changed {
+            OpenOptions::new().read(true).open(base)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+/// Callback used to pin a reclaim after it owns the base reservation and
+/// immediately before it unlinks one verified-unclaimed candidate.
+pub type ReclaimBeforeUnlinkHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+/// Deterministic barrier immediately before standalone reclaim opens its
+/// database snapshot. Exposed only to cross-crate regression tests.
+#[cfg(any(test, feature = "test-seams"))]
+pub type ReclaimBeforeSnapshotHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(any(test, feature = "test-seams"))]
+static RECLAIM_BEFORE_SNAPSHOT_HOOK: OnceLock<Mutex<Option<ReclaimBeforeSnapshotHook>>> =
+    OnceLock::new();
+
+#[cfg(any(test, feature = "test-seams"))]
+fn reclaim_before_snapshot_hook() -> &'static Mutex<Option<ReclaimBeforeSnapshotHook>> {
+    RECLAIM_BEFORE_SNAPSHOT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Installs or clears the deterministic standalone-reclaim snapshot barrier.
+#[cfg(any(test, feature = "test-seams"))]
+pub fn set_reclaim_before_snapshot_hook(hook: Option<ReclaimBeforeSnapshotHook>) {
+    *reclaim_before_snapshot_hook()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = hook;
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn notify_reclaim_before_snapshot(base: &Path) {
+    let hook = reclaim_before_snapshot_hook()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(base);
+    }
+}
 
 /// Test-only barrier for pinning the exact point at which reclamation owns the
-/// lease mutex and has decided that an old path is no longer database-claimed.
+/// base reservation and has decided that an old path is no longer claimed.
 /// Production has no callback at this boundary; the hook exists solely to
 /// prove that a concurrent native hand-off cannot acquire a lease before the
 /// subsequent unlink.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 static RECLAIM_BEFORE_UNLINK_HOOK: OnceLock<Mutex<Option<ReclaimBeforeUnlinkHook>>> =
     OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 fn reclaim_before_unlink_hook() -> &'static Mutex<Option<ReclaimBeforeUnlinkHook>> {
     RECLAIM_BEFORE_UNLINK_HOOK.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(test)]
+/// Installs or clears the deterministic reserved pre-unlink barrier.
+#[cfg(any(test, feature = "test-seams"))]
+pub fn set_reclaim_before_unlink_hook(hook: Option<ReclaimBeforeUnlinkHook>) {
+    *reclaim_before_unlink_hook()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = hook;
+}
+
+#[cfg(any(test, feature = "test-seams"))]
 fn notify_reclaim_before_unlink(path: &Path) {
     let hook = reclaim_before_unlink_hook()
         .lock()
@@ -339,7 +616,20 @@ pub fn publish_chat_metadata(
         chat_json::RENDERER_VERSION
     ))
     .map_err(RenderPipelineError::MetadataVersion)?;
+    let base = staged
+        .directory
+        .parent()
+        .ok_or_else(|| std::io::Error::other("chat generation has no managed parent"))?;
+    let reclaim = GeneratedReclaimPlan::collect(base)?;
+    // File Provider cancels an in-progress materialization when the same
+    // item's content version changes. A native hydration lease therefore
+    // defers this one document's publication; the dirty worklist retains the
+    // replacement and other chats remain eligible in the same bounded tick.
+    // Acquire SQLite first. A contending WAL writer may hold this call for the
+    // configured busy timeout, and must never hold the process-wide lease
+    // mutex or a publication reservation while it waits.
     let txn = store.write_txn()?;
+    let publication = GeneratedPublicationGuard::acquire(base)?;
     let current = txn
         .read()
         .chat(&rendered.source.key)?
@@ -412,14 +702,13 @@ pub fn publish_chat_metadata(
         })?;
         published_items = published_items.saturating_add(1);
     }
+    // This bounded exact-reference read uses the writer transaction already
+    // owned above. It cannot wait on SQLite, and captures this publication's
+    // new claims before commit while the same-base reservation prevents a
+    // competing publication or reclaim from crossing the boundary.
+    let claimed = txn.read().cache_references_claimed(&reclaim.references())?;
     txn.commit()?;
-    reclaim_unreferenced_generations(
-        store,
-        staged
-            .directory
-            .parent()
-            .ok_or_else(|| std::io::Error::other("chat generation has no managed parent"))?,
-    )?;
+    reclaim.reclaim(base, &publication.leased_paths, &claimed)?;
     Ok(ChatMetadataPublication { published_items })
 }
 
@@ -432,7 +721,7 @@ fn validate_chat_catalog(
     catalog: &[RenderCatalogEntry],
     rendered: &RenderedChatMetadata,
 ) -> Result<(), RenderPipelineError> {
-    let mut views = std::collections::HashSet::new();
+    let mut views = HashSet::new();
     for entry in catalog {
         let ItemKey::Appearance(AppearanceKey {
             view,
@@ -628,61 +917,32 @@ pub fn reclaim_unreferenced_generations(
     store: &mut StateStore,
     base: &Path,
 ) -> Result<(), RenderPipelineError> {
-    let mut changed = false;
-    for generation in fs::read_dir(base)? {
-        let generation = generation?;
-        if !generation.file_type()?.is_dir()
-            || generation
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with('.'))
-        {
-            continue;
-        }
-        for entry in fs::read_dir(generation.path())? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file()
-                || !entry.file_name().to_str().is_some_and(|name| {
-                    matches!(
-                        name,
-                        "Messages.md" | "Messages.ndjson" | ".chat.json" | "chat.json"
-                    )
-                })
-            {
-                continue;
-            }
-            let path = entry.path();
-            // Hold this mutex through the database check and unlink. A
-            // concurrent hydration's `GeneratedFileLease::acquire` takes the
-            // same mutex, so exactly one side wins: a lease keeps the path
-            // alive for File Provider, or reclaim removes it before hydration
-            // can expose it as a staged path.
-            let leases = generated_file_leases()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if leases.contains_key(&path) {
-                continue;
-            }
-            let reference = path.to_string_lossy();
-            let claimed = store
-                .read_txn()?
-                .cache_reference_claimed(reference.as_ref())?;
-            if !claimed {
-                #[cfg(test)]
-                notify_reclaim_before_unlink(&path);
-                fs::remove_file(&path)?;
-                changed = true;
-            }
-            drop(leases);
-        }
-        if fs::remove_dir(generation.path()).is_ok() {
-            changed = true;
-        }
-    }
-    if changed {
-        OpenOptions::new().read(true).open(base)?.sync_all()?;
-    }
-    Ok(())
+    // Capture the epoch before any filesystem or SQLite work. Publication
+    // advances it whenever a same-base reservation ends. The final reserve
+    // therefore refuses a stale snapshot if a publisher committed/retried
+    // anywhere between this observation and deletion.
+    let Some(observed_epoch) = GeneratedPublicationGuard::observe_reclaim_epoch(base) else {
+        return Ok(());
+    };
+    let reclaim = GeneratedReclaimPlan::collect(base)?;
+    #[cfg(any(test, feature = "test-seams"))]
+    notify_reclaim_before_snapshot(base);
+    let claimed = {
+        let read = store.read_txn()?;
+        read.cache_references_claimed(&reclaim.references())?
+    };
+    let reservation = match GeneratedPublicationGuard::acquire_for_reclaim(base, observed_epoch) {
+        Ok(reservation) => reservation,
+        // Another publication/reclaim already owns this base and will perform
+        // the same orphan sweep. Release/cancellation teardown is therefore a
+        // bounded idempotent no-op, never a second waiter or user-visible
+        // storage failure.
+        Err(RenderPipelineError::PublicationLeased) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    reclaim
+        .reclaim(base, &reservation.leased_paths, &claimed)
+        .map_err(RenderPipelineError::Io)
 }
 
 /// Atomically publishes every appearance of both monthly documents.
@@ -699,7 +959,19 @@ pub fn publish_month(
         rendered.render_generation, rendered.input_watermark_seq
     ))
     .map_err(RenderPipelineError::MetadataVersion)?;
+    let base = staged
+        .directory
+        .parent()
+        .ok_or_else(|| std::io::Error::other("month generation has no managed parent"))?;
+    let reclaim = GeneratedReclaimPlan::collect(base)?;
+    // The Markdown/NDJSON pair is one atomic provider publication. A lease on
+    // either current file keeps both versions stable until the native clone
+    // releases, then the still-dirty pair is retried on a later render tick.
     let txn = store.write_txn()?;
+    // Keep the global lease mutex out of SQLite's busy-wait path. Once the
+    // writer is owned, the reservation closes the hand-off race without
+    // retaining the mutex through any database or filesystem operation.
+    let publication = GeneratedPublicationGuard::acquire(base)?;
     let DocPartition::Month { year, month } = rendered.partition else {
         return Err(RenderPipelineError::InvalidPartition);
     };
@@ -811,14 +1083,10 @@ pub fn publish_month(
         })?;
         published_items = published_items.saturating_add(1);
     }
+    // Same already-owned/zero-wait bounded snapshot as chat JSON publication.
+    let claimed = txn.read().cache_references_claimed(&reclaim.references())?;
     txn.commit()?;
-    reclaim_unreferenced_generations(
-        store,
-        staged
-            .directory
-            .parent()
-            .ok_or_else(|| std::io::Error::other("month generation has no managed parent"))?,
-    )?;
+    reclaim.reclaim(base, &publication.leased_paths, &claimed)?;
     Ok(MonthPublication {
         clean,
         published_items,
@@ -921,6 +1189,10 @@ pub enum RenderPipelineError {
     PolicyChanged,
     /// Canonical chat metadata changed after composition.
     MetadataChanged,
+    /// File Provider is cloning the current generation. The staged
+    /// replacement remains unclaimed and the durable worklist remains dirty
+    /// for a later bounded retry.
+    PublicationLeased,
     /// The staged files do not contain the rendered pair being published.
     StagedContentMismatch,
     /// A chat-list appearance was missing or duplicated one monthly format.
@@ -985,6 +1257,9 @@ impl fmt::Display for RenderPipelineError {
             Self::MetadataChanged => {
                 formatter.write_str("chat metadata changed after the JSON snapshot")
             }
+            Self::PublicationLeased => {
+                formatter.write_str("generated publication is leased by File Provider")
+            }
             Self::StagedContentMismatch => {
                 formatter.write_str("staged files differ from rendered month bytes")
             }
@@ -1012,6 +1287,7 @@ impl std::error::Error for RenderPipelineError {
             | Self::ProvenanceMismatch
             | Self::PolicyChanged
             | Self::MetadataChanged
+            | Self::PublicationLeased
             | Self::StagedContentMismatch
             | Self::IncompleteCatalog
             | Self::SizeOverflow { .. } => None,
@@ -1064,7 +1340,7 @@ mod tests {
             if path == stale_for_hook {
                 reclaim_arrived
                     .send(())
-                    .expect("announce reclamation owns the lease mutex");
+                    .expect("announce reclamation owns the base reservation");
                 reclaim_release_wait
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -1081,6 +1357,14 @@ mod tests {
         reclaim_arrived_wait
             .recv_timeout(Duration::from_secs(1))
             .expect("reclaim must reach the protected pre-unlink boundary");
+        let mut concurrent_store = StateStore::open_in_memory().expect("concurrent state store");
+        let concurrent_started = std::time::Instant::now();
+        reclaim_unreferenced_generations(&mut concurrent_store, &base)
+            .expect("concurrent release/reclaim is already covered by the owner");
+        assert!(
+            concurrent_started.elapsed() < Duration::from_millis(100),
+            "concurrent cancellation teardown cannot wait behind the owner"
+        );
 
         let stale_for_hydration = stale.clone();
         let (acquire_result, acquire_result_wait) = mpsc::sync_channel(1);
@@ -1109,25 +1393,16 @@ mod tests {
             .collect::<Vec<_>>();
         drop(foreground_result);
         assert!(
-            acquire_result_wait
+            !acquire_result_wait
                 .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "hydration must wait while reclaim owns the decision and unlink"
+                .expect("same-base hydration receives a bounded retryable miss"),
+            "when reclaim wins, hydration must not receive a path pending unlink"
         );
-        assert!(
-            foreground_result_wait
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "all twenty foreground hand-offs must wait at the same real lease boundary"
-        );
-
-        reclaim_release.send(()).expect("release reclaim");
-        reclaim.join().expect("reclaim thread");
         let mut completed = (0..20)
             .map(|_| {
                 foreground_result_wait
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("foreground generated lease completes within the service bound")
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("unrelated foreground lease completes during blocked reclaim")
             })
             .collect::<Vec<(usize, bool)>>();
         completed.sort_unstable_by_key(|(index, _)| *index);
@@ -1145,12 +1420,8 @@ mod tests {
                 }),
             "all twenty generated reads retain their own exact bytes"
         );
-        assert!(
-            !acquire_result_wait
-                .recv_timeout(Duration::from_secs(1))
-                .expect("hydration result after reclaim"),
-            "when reclaim wins, hydration receives a miss instead of a vanished path"
-        );
+        reclaim_release.send(()).expect("release reclaim");
+        reclaim.join().expect("reclaim thread");
         hydration.join().expect("hydration thread");
         for foreground in foreground {
             foreground.join().expect("foreground hydration thread");

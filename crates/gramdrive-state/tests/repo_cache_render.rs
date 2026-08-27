@@ -333,6 +333,15 @@ fn materialization_ref_reference_tracks_shared_objects() {
             .materialization_ref_referenced("object-absent")
             .expect("ref")
     );
+    assert_eq!(
+        read.cache_references_claimed(&[
+            "object-absent".to_owned(),
+            "object-shared".to_owned(),
+            "second-absent".to_owned(),
+        ])
+        .expect("bounded exact-reference snapshot"),
+        std::collections::HashSet::from(["object-shared".to_owned()])
+    );
     drop(read);
 
     // Evicting one referrer leaves the object still referenced by the other.

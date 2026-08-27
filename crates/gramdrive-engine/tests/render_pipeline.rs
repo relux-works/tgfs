@@ -18,7 +18,7 @@ use gramdrive_engine::render::markdown::{
 use gramdrive_engine::render_pipeline::{
     DecodedRevision, GeneratedFileLease, MessagePayloadDecoder, RenderPipelineError,
     compose_chat_metadata, compose_month, publish_chat_metadata, publish_month,
-    reclaim_unreferenced_generations, stage_chat_metadata, stage_month,
+    stage_chat_metadata, stage_month,
 };
 use gramdrive_engine::state::StateStore;
 use gramdrive_engine::state::repo::{
@@ -267,7 +267,7 @@ fn chat_metadata_is_privacy_bounded_and_publishes_stable_fetch_facts() {
 }
 
 #[test]
-fn publication_defers_generated_reclaim_until_the_hydration_lease_releases() {
+fn publication_defers_generated_version_churn_until_the_hydration_lease_releases() {
     let root = temp_root();
     let mut store = seeded_store();
     let source = store
@@ -281,6 +281,7 @@ fn publication_defers_generated_reclaim_until_the_hydration_lease_releases() {
     publish_chat_metadata(&mut store, &first, &first_staged, 5_000).expect("publish first");
     let first_bytes = std::fs::read(&first_staged.path).expect("first bytes");
     let lease = GeneratedFileLease::acquire(&first_staged.path).expect("claim staged file");
+    let first_version = first.content_version.clone();
 
     let tx = store.write_txn().expect("write");
     let mut changed = source;
@@ -290,29 +291,38 @@ fn publication_defers_generated_reclaim_until_the_hydration_lease_releases() {
     tx.commit().expect("commit");
     let replacement = compose_chat_metadata(&changed).expect("compose replacement");
     let replacement_staged = stage_chat_metadata(&root, &replacement).expect("stage replacement");
-    publish_chat_metadata(&mut store, &replacement, &replacement_staged, 6_000)
-        .expect("publish replacement");
+    let error = publish_chat_metadata(&mut store, &replacement, &replacement_staged, 6_000)
+        .expect_err("an active File Provider clone defers version publication");
+    assert!(matches!(error, RenderPipelineError::PublicationLeased));
 
     assert!(
         first_staged.path.exists(),
-        "the active hand-off path survives publication"
+        "the active hand-off path survives deferred publication"
     );
     assert_eq!(
         std::fs::read(&first_staged.path).expect("leased bytes"),
         first_bytes,
         "the clone source remains exact while its lease is active"
     );
+    let still_published = store
+        .read_txn()
+        .expect("read deferred publication")
+        .cache_entry(&chat_doc())
+        .expect("cache query")
+        .expect("published cache row");
+    assert_eq!(still_published.content_version, first_version);
+    assert_eq!(
+        still_published.materialization_ref.as_deref(),
+        first_staged.path.to_str(),
+        "the provider-visible generation must not move during its clone"
+    );
 
-    let base = first_staged
-        .directory
-        .parent()
-        .expect("generation base")
-        .to_path_buf();
     drop(lease);
-    reclaim_unreferenced_generations(&mut store, &base).expect("reclaim after hand-off");
+    publish_chat_metadata(&mut store, &replacement, &replacement_staged, 7_000)
+        .expect("publish replacement after hand-off");
     assert!(
         !first_staged.path.exists(),
-        "releasing the last hand-off lease leaves no obsolete generation"
+        "the first post-release publication reclaims the obsolete generation"
     );
     assert!(
         replacement_staged.path.exists(),
@@ -489,6 +499,20 @@ fn one_snapshot_replays_identically_and_publishes_the_pair_atomically() {
             .expect("cache row");
         assert!(cache.materialization_ref.is_some());
     }
+    let published_cache = catalog
+        .iter()
+        .map(|entry| {
+            let cache = tx
+                .cache_entry(&entry.item)
+                .expect("cache")
+                .expect("cache row");
+            (
+                entry.item.clone(),
+                cache.content_version,
+                cache.materialization_ref,
+            )
+        })
+        .collect::<Vec<_>>();
     drop(tx);
 
     let tx = store.write_txn().expect("write changed July");
@@ -504,6 +528,32 @@ fn one_snapshot_replays_identically_and_publishes_the_pair_atomically() {
         compose_month(&changed_snapshot, 2026, 7, &Decoder).expect("compose changed month");
     let changed_staged =
         stage_month(&root, &changed_snapshot, &changed_rendered).expect("stage changed month");
+    let markdown_bytes = std::fs::read(&staged.markdown).expect("published markdown bytes");
+    let lease = GeneratedFileLease::acquire(&staged.markdown).expect("markdown hydration lease");
+    assert!(matches!(
+        publish_month(
+            &mut store,
+            &changed_snapshot,
+            &changed_rendered,
+            &changed_staged,
+            6_000,
+        ),
+        Err(RenderPipelineError::PublicationLeased)
+    ));
+    {
+        let tx = store.read_txn().expect("read deferred monthly publication");
+        for (item, content_version, materialization_ref) in &published_cache {
+            let cache = tx.cache_entry(item).expect("cache").expect("cache row");
+            assert_eq!(&cache.content_version, content_version);
+            assert_eq!(&cache.materialization_ref, materialization_ref);
+        }
+    }
+    assert_eq!(
+        std::fs::read(&staged.markdown).expect("leased markdown bytes"),
+        markdown_bytes,
+        "leasing either monthly format keeps the provider-visible pair stable"
+    );
+    drop(lease);
     publish_month(
         &mut store,
         &changed_snapshot,

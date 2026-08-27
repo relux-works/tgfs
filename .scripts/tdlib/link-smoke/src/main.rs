@@ -115,8 +115,10 @@ fn main() {
         let Some(message) = receive(1.0) else { continue };
         if let Some(version) = version_from_response(&message) {
             println!("TDLib version: {version}");
-            // Best-effort clean shutdown; the process exits regardless.
-            send(client_id, r#"{"@type":"close"}"#);
+            // This probe never authorizes the client. Asking that pre-auth
+            // client to close can abort inside TDLib even though the runtime
+            // linkage and version proof already succeeded. `process::exit`
+            // terminates the probe and its private TDLib threads together.
             std::process::exit(0);
         }
     }

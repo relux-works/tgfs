@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Deterministic cross-crate concurrency barriers used only by native regression
+# tests. Product builds enable no features.
+test-seams = []
+
 [dependencies]
 gramdrive-model = { workspace = true }
 gramdrive-render = { workspace = true }

@@ -27,8 +27,8 @@ use gramdrive_engine::render::markdown::{
     ServiceAction as RenderServiceAction, TelegramRepresentation as RenderRepresentation,
 };
 use gramdrive_engine::render_pipeline::{
-    DecodedRevision, MessagePayloadDecoder, compose_chat_metadata, compose_month,
-    publish_chat_metadata, publish_month, stage_chat_metadata, stage_month,
+    DecodedRevision, MessagePayloadDecoder, RenderPipelineError, compose_chat_metadata,
+    compose_month, publish_chat_metadata, publish_month, stage_chat_metadata, stage_month,
 };
 use gramdrive_engine::render_plan::{DocClass, dirty_affected, plan_worklist};
 use gramdrive_model::identity::{
@@ -3450,9 +3450,11 @@ fn render_pending_months(
         let rendered = compose_chat_metadata(&source).map_err(|_| SessionFailure::RENDER)?;
         let staged =
             stage_chat_metadata(cache_root, &rendered).map_err(|_| SessionFailure::RENDER)?;
-        publish_chat_metadata(store, &rendered, &staged, published_at_ms)
-            .map_err(|_| SessionFailure::RENDER)?;
-        published = true;
+        match publish_chat_metadata(store, &rendered, &staged, published_at_ms) {
+            Ok(_) => published = true,
+            Err(RenderPipelineError::PublicationLeased) => continue,
+            Err(_) => return Err(SessionFailure::RENDER),
+        }
     }
     for (chat, year, month) in months {
         let source = store
@@ -3513,9 +3515,11 @@ fn render_pending_months(
             compose_month(&snapshot, year, month, &decoder).map_err(|_| SessionFailure::RENDER)?;
         let staged =
             stage_month(cache_root, &snapshot, &rendered).map_err(|_| SessionFailure::RENDER)?;
-        publish_month(store, &snapshot, &rendered, &staged, published_at_ms)
-            .map_err(|_| SessionFailure::RENDER)?;
-        published = true;
+        match publish_month(store, &snapshot, &rendered, &staged, published_at_ms) {
+            Ok(_) => published = true,
+            Err(RenderPipelineError::PublicationLeased) => continue,
+            Err(_) => return Err(SessionFailure::RENDER),
+        }
     }
     Ok(published)
 }
@@ -6017,7 +6021,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{CancellationToken, ProgressListener, TransferProgress};
     use gramdrive_engine::backfill::WaitReason;
+    use gramdrive_engine::render_pipeline::GeneratedFileLease;
     use gramdrive_model::identity::{
         AccountKey, AccountScope, ActiveStoriesKey, AppearanceKey, AttachmentIndex, ContentHash,
         MessageId, MonthDirKey, NamespaceVersion, StoryAppearanceKey,
@@ -6028,6 +6034,12 @@ mod tests {
     #[derive(Default)]
     struct RecordingNamespaceProgress {
         values: Mutex<Vec<NamespaceProgress>>,
+    }
+
+    struct NoopHydrationProgress;
+
+    impl ProgressListener for NoopHydrationProgress {
+        fn on_progress(&self, _progress: TransferProgress) {}
     }
 
     impl NamespaceProgressListener for RecordingNamespaceProgress {
@@ -10027,6 +10039,609 @@ mod tests {
             "an idle publication tick must not produce provider signaling"
         );
         let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn leased_generated_document_defers_its_version_without_blocking_other_render_work() {
+        let mut store = store();
+        let target = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(100),
+        };
+        let background = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(200),
+        };
+        add_main_chat(&mut store, target.chat_id.0, false);
+        add_main_chat(&mut store, background.chat_id.0, false);
+        rebuild_projection(&mut store, scope()).expect("initial projection");
+        apply_history_commit(
+            &mut store,
+            scope(),
+            &HistoryCommit {
+                chat_id: background.chat_id.0,
+                records: vec![message_at(
+                    background.chat_id.0,
+                    1,
+                    "backfill-1",
+                    1_700_000_000,
+                )],
+                window: Some(CrawlWindow {
+                    oldest_message_id: 1,
+                    newest_message_id: 1,
+                }),
+                history_complete: false,
+                skipped_malformed: 0,
+            },
+            1_500,
+        )
+        .expect("initial active-backfill page");
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "gramdrive-leased-render-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        assert!(render_pending_months(&mut store, &cache_root, 2_000).expect("initial render"));
+        for tick in 1..=4 {
+            if !render_pending_months(&mut store, &cache_root, 2_000 + tick)
+                .expect("drain initial bounded worklist")
+            {
+                break;
+            }
+        }
+        assert!(
+            store
+                .read_txn()
+                .expect("read drained worklist")
+                .dirty_render_items(u32::MAX)
+                .expect("drained worklist")
+                .is_empty(),
+            "the contention fixture starts from fully published documents"
+        );
+
+        let (target_item, target_path, target_version, background_item, background_version) = {
+            let read = store.read_txn().expect("read initial publications");
+            let target_item = read
+                .chat_render_catalog(target)
+                .expect("target catalog")
+                .into_iter()
+                .next()
+                .expect("target generated document")
+                .item;
+            let background_item = read
+                .month_render_catalog(background, 2023, 11)
+                .expect("background monthly catalog")
+                .into_iter()
+                .find(|entry| entry.format == gramdrive_model::identity::DocFormat::Markdown)
+                .expect("background Markdown document")
+                .item;
+            let target_cache = read
+                .cache_entry(&target_item)
+                .expect("target cache read")
+                .expect("target cache row");
+            let target_path = target_cache
+                .materialization_ref
+                .expect("target materialization path");
+            (
+                target_item.clone(),
+                target_path,
+                target_cache.content_version,
+                background_item.clone(),
+                read.cache_entry(&background_item)
+                    .expect("background cache read")
+                    .expect("background cache row")
+                    .content_version,
+            )
+        };
+        let target_bytes = std::fs::read(&target_path).expect("target generated bytes");
+        let lease = GeneratedFileLease::acquire(Path::new(&target_path)).expect("hydration lease");
+
+        let txn = store.write_txn().expect("dirty target metadata");
+        let mut record = txn
+            .read()
+            .chat(&target)
+            .expect("target chat read")
+            .expect("target chat row");
+        record.title = "target-v2".to_owned();
+        record.metadata_version = MetadataVersion::new("target-v2").expect("metadata version");
+        txn.upsert_chat(&record).expect("target chat update");
+        txn.mark_render_dirty(&target_item)
+            .expect("dirty target document");
+        txn.commit().expect("commit concurrent work");
+        apply_history_commit(
+            &mut store,
+            scope(),
+            &HistoryCommit {
+                chat_id: background.chat_id.0,
+                records: vec![message_at(
+                    background.chat_id.0,
+                    2,
+                    "backfill-2",
+                    1_700_000_001,
+                )],
+                window: Some(CrawlWindow {
+                    oldest_message_id: 1,
+                    newest_message_id: 2,
+                }),
+                history_complete: false,
+                skipped_malformed: 0,
+            },
+            2_500,
+        )
+        .expect("concurrent active-backfill page");
+
+        assert!(
+            render_pending_months(&mut store, &cache_root, 3_000)
+                .expect("render around leased target"),
+            "the unleased background document must still publish in the same bounded tick"
+        );
+        {
+            let read = store.read_txn().expect("read deferred target");
+            let target_cache = read
+                .cache_entry(&target_item)
+                .expect("target cache read")
+                .expect("target cache row");
+            assert_eq!(target_cache.content_version, target_version);
+            assert_eq!(
+                target_cache.materialization_ref.as_deref(),
+                Some(target_path.as_str())
+            );
+            assert!(
+                read.render_state(&target_item)
+                    .expect("target render state")
+                    .expect("target render row")
+                    .dirty,
+                "the deferred target remains durably eligible for the next tick"
+            );
+            let background_cache = read
+                .cache_entry(&background_item)
+                .expect("background cache read")
+                .expect("background cache row");
+            assert_ne!(background_cache.content_version, background_version);
+            assert!(
+                !read
+                    .render_state(&background_item)
+                    .expect("background render state")
+                    .expect("background render row")
+                    .dirty,
+                "historical backfill continues while the foreground clone is active"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&target_path).expect("leased target bytes"),
+            target_bytes,
+            "the File Provider clone source remains exact and version-stable"
+        );
+
+        drop(lease);
+        assert!(render_pending_months(&mut store, &cache_root, 4_000).expect("retry target"));
+        let read = store.read_txn().expect("read retried target");
+        let target_cache = read
+            .cache_entry(&target_item)
+            .expect("target cache read")
+            .expect("target cache row");
+        assert_ne!(target_cache.content_version, target_version);
+        assert!(
+            !read
+                .render_state(&target_item)
+                .expect("target render state")
+                .expect("target render row")
+                .dirty
+        );
+        drop(read);
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn leased_month_member_keeps_pair_atomic_while_other_backfill_publishes_then_retries() {
+        let mut store = store();
+        let target = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(300),
+        };
+        let background = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(400),
+        };
+        for chat in [target, background] {
+            add_main_chat(&mut store, chat.chat_id.0, false);
+            apply_history_commit(
+                &mut store,
+                scope(),
+                &HistoryCommit {
+                    chat_id: chat.chat_id.0,
+                    records: vec![message_at(chat.chat_id.0, 1, "initial", 1_700_000_000)],
+                    window: Some(CrawlWindow {
+                        oldest_message_id: 1,
+                        newest_message_id: 1,
+                    }),
+                    history_complete: false,
+                    skipped_malformed: 0,
+                },
+                1_500,
+            )
+            .expect("initial history page");
+        }
+        rebuild_projection(&mut store, scope()).expect("initial projection");
+        let cache_root = std::env::temp_dir().join(format!(
+            "gramdrive-leased-month-pair-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        assert!(render_pending_months(&mut store, &cache_root, 2_000).expect("initial render"));
+        for tick in 1..=4 {
+            if !render_pending_months(&mut store, &cache_root, 2_000 + tick)
+                .expect("drain initial monthly worklist")
+            {
+                break;
+            }
+        }
+        assert!(
+            store
+                .read_txn()
+                .expect("read drained monthly worklist")
+                .dirty_render_items(u32::MAX)
+                .expect("drained monthly worklist")
+                .is_empty(),
+            "the monthly contention fixture starts fully published"
+        );
+
+        let target_catalog = store
+            .read_txn()
+            .expect("read target catalog")
+            .month_render_catalog(target, 2023, 11)
+            .expect("target monthly catalog");
+        assert_eq!(
+            target_catalog.len(),
+            2,
+            "fixture needs one complete format pair"
+        );
+        let target_before = {
+            let read = store.read_txn().expect("read target pair");
+            target_catalog
+                .iter()
+                .map(|entry| {
+                    let cache = read
+                        .cache_entry(&entry.item)
+                        .expect("target cache query")
+                        .expect("target cache row");
+                    let path = cache
+                        .materialization_ref
+                        .expect("target materialization reference");
+                    (
+                        entry.format,
+                        entry.item.clone(),
+                        cache.content_version,
+                        path.clone(),
+                        std::fs::read(path).expect("target exact bytes"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let markdown_path = target_before
+            .iter()
+            .find(|(format, ..)| *format == gramdrive_model::identity::DocFormat::Markdown)
+            .map(|(_, _, _, path, _)| path)
+            .expect("target Markdown path");
+        let lease = GeneratedFileLease::acquire(Path::new(markdown_path))
+            .expect("lease one monthly pair member");
+
+        for chat in [target, background] {
+            apply_history_commit(
+                &mut store,
+                scope(),
+                &HistoryCommit {
+                    chat_id: chat.chat_id.0,
+                    records: vec![message_at(chat.chat_id.0, 2, "next", 1_700_000_001)],
+                    window: Some(CrawlWindow {
+                        oldest_message_id: 1,
+                        newest_message_id: 2,
+                    }),
+                    history_complete: false,
+                    skipped_malformed: 0,
+                },
+                2_500,
+            )
+            .expect("concurrent backfill page");
+        }
+        let background_before = {
+            let read = store.read_txn().expect("read background before");
+            read.month_render_catalog(background, 2023, 11)
+                .expect("background catalog")
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.item.clone(),
+                        read.cache_entry(&entry.item)
+                            .expect("background cache query")
+                            .expect("background cache row")
+                            .content_version,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            render_pending_months(&mut store, &cache_root, 3_000)
+                .expect("render with leased monthly pair"),
+            "unrelated historical work must publish in the same bounded tick"
+        );
+        {
+            let read = store.read_txn().expect("read deferred pair");
+            for (_, item, version, path, bytes) in &target_before {
+                let cache = read
+                    .cache_entry(item)
+                    .expect("target cache query")
+                    .expect("target cache row");
+                assert_eq!(&cache.content_version, version);
+                assert_eq!(cache.materialization_ref.as_deref(), Some(path.as_str()));
+                assert_eq!(std::fs::read(path).expect("leased pair bytes"), *bytes);
+                assert!(
+                    read.render_state(item)
+                        .expect("target render query")
+                        .expect("target render row")
+                        .dirty,
+                    "both monthly members remain durably retryable"
+                );
+            }
+            for (item, version) in &background_before {
+                let cache = read
+                    .cache_entry(item)
+                    .expect("background cache query")
+                    .expect("background cache row");
+                assert_ne!(&cache.content_version, version);
+                assert!(
+                    !read
+                        .render_state(item)
+                        .expect("background render query")
+                        .expect("background render row")
+                        .dirty,
+                    "unrelated backfill publication makes durable progress"
+                );
+            }
+        }
+
+        drop(lease);
+        assert!(render_pending_months(&mut store, &cache_root, 4_000).expect("retry pair"));
+        let read = store.read_txn().expect("read published replacement pair");
+        let replacement_refs = target_before
+            .iter()
+            .map(|(_, item, version, old_path, _)| {
+                let cache = read
+                    .cache_entry(item)
+                    .expect("replacement cache query")
+                    .expect("replacement cache row");
+                assert_ne!(&cache.content_version, version);
+                assert!(
+                    !read
+                        .render_state(item)
+                        .expect("replacement render query")
+                        .expect("replacement render row")
+                        .dirty
+                );
+                assert!(
+                    !Path::new(old_path).exists(),
+                    "old pair generation is reclaimed"
+                );
+                cache
+                    .materialization_ref
+                    .expect("replacement materialization reference")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            Path::new(&replacement_refs[0]).parent(),
+            Path::new(&replacement_refs[1]).parent(),
+            "Markdown and NDJSON publish from one immutable generation"
+        );
+        drop(read);
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn wal_blocked_publication_does_not_hold_lease_mutex_from_foreground_cache_hit() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let data_root = std::env::temp_dir().join(format!(
+            "gramdrive-publication-lock-order-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let root_text = data_root.to_string_lossy().into_owned();
+        let layout = shared_state_layout(root_text.clone()).expect("shared layout");
+        std::fs::create_dir_all(&layout.state_dir).expect("state directory");
+        let mut store = initialized_store(
+            StateStore::open(&layout.database_file).expect("open durable contention state"),
+        );
+        let foreground = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(500),
+        };
+        let background = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(600),
+        };
+        add_main_chat(&mut store, foreground.chat_id.0, false);
+        add_main_chat(&mut store, background.chat_id.0, false);
+        apply_history_commit(
+            &mut store,
+            scope(),
+            &HistoryCommit {
+                chat_id: background.chat_id.0,
+                records: vec![message_at(
+                    background.chat_id.0,
+                    1,
+                    "foreground-month",
+                    1_700_000_000,
+                )],
+                window: Some(CrawlWindow {
+                    oldest_message_id: 1,
+                    newest_message_id: 1,
+                }),
+                history_complete: false,
+                skipped_malformed: 0,
+            },
+            1_500,
+        )
+        .expect("foreground monthly cache fixture");
+        rebuild_projection(&mut store, scope()).expect("initial projection");
+        assert!(
+            render_pending_months(&mut store, Path::new(&layout.cache_dir), 2_000)
+                .expect("initial publication")
+        );
+        while render_pending_months(&mut store, Path::new(&layout.cache_dir), 2_001)
+            .expect("drain initial worklist")
+        {}
+
+        let foreground_item = store
+            .read_txn()
+            .expect("read foreground catalog")
+            .month_render_catalog(background, 2023, 11)
+            .expect("foreground catalog")
+            .into_iter()
+            .find(|entry| entry.format == gramdrive_model::identity::DocFormat::Markdown)
+            .expect("foreground generated document")
+            .item;
+        let foreground_cache = store
+            .read_txn()
+            .expect("read foreground cache")
+            .cache_entry(&foreground_item)
+            .expect("foreground cache query")
+            .expect("foreground cache row");
+        let foreground_version = foreground_cache.content_version;
+        let foreground_path = foreground_cache
+            .materialization_ref
+            .expect("foreground materialization reference");
+        let foreground_bytes = std::fs::read(&foreground_path).expect("foreground exact bytes");
+
+        let background_item = store
+            .read_txn()
+            .expect("read background catalog")
+            .chat_render_catalog(background)
+            .expect("background catalog")
+            .into_iter()
+            .next()
+            .expect("background generated document")
+            .item;
+        let publication_base = store
+            .read_txn()
+            .expect("read background cache")
+            .cache_entry(&background_item)
+            .expect("background cache query")
+            .expect("background cache row")
+            .materialization_ref
+            .and_then(|path| {
+                Path::new(&path)
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+            .expect("background publication base");
+        let generation_count_before = std::fs::read_dir(&publication_base)
+            .expect("initial publication base")
+            .count();
+        let txn = store.write_txn().expect("dirty background publication");
+        let mut background_record = txn
+            .read()
+            .chat(&background)
+            .expect("background chat query")
+            .expect("background chat row");
+        background_record.title = "background-v2".to_owned();
+        background_record.metadata_version =
+            MetadataVersion::new("background-v2").expect("background metadata version");
+        txn.upsert_chat(&background_record)
+            .expect("background chat update");
+        txn.mark_render_dirty(&background_item)
+            .expect("dirty background render");
+        txn.commit().expect("commit dirty background");
+        drop(store);
+
+        let hydrator = Hydrator::shared(&root_text).expect("hydrator");
+        let (writer_ready, writer_ready_wait) = std::sync::mpsc::sync_channel(0);
+        let (writer_release, writer_release_wait) = std::sync::mpsc::sync_channel(0);
+        let writer_database = layout.database_file.clone();
+        let writer = std::thread::spawn(move || {
+            let mut store = StateStore::open(&writer_database).expect("WAL writer state");
+            let held = store.write_txn().expect("hold WAL writer");
+            writer_ready.send(()).expect("announce WAL writer");
+            writer_release_wait.recv().expect("release WAL writer");
+            drop(held);
+        });
+        writer_ready_wait
+            .recv_timeout(Duration::from_secs(1))
+            .expect("WAL writer owns BEGIN IMMEDIATE");
+
+        let (publication_done, publication_done_wait) = std::sync::mpsc::sync_channel(1);
+        let publication_database = layout.database_file.clone();
+        let publication_cache = layout.cache_dir.clone();
+        let publisher = std::thread::spawn(move || {
+            let mut store = StateStore::open(&publication_database).expect("publication state");
+            let result = render_pending_months(&mut store, Path::new(&publication_cache), 3_000);
+            publication_done.send(result).expect("report publication");
+        });
+        let staged_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::fs::read_dir(&publication_base)
+            .expect("publication base during publication")
+            .count()
+            <= generation_count_before
+        {
+            assert!(
+                std::time::Instant::now() < staged_deadline,
+                "background publication stages its replacement before the foreground read"
+            );
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            publication_done_wait
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "background publication remains blocked behind the held WAL writer"
+        );
+
+        let started = std::time::Instant::now();
+        let hydrated = tokio::time::timeout(
+            Duration::from_millis(500),
+            Arc::clone(&hydrator).hydrate(
+                scope().account.account_id.0,
+                foreground_item.text().to_owned(),
+                Some(foreground_version.as_str().to_owned()),
+                Arc::new(NoopHydrationProgress),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("foreground cache hit stays below the production latency bound")
+        .expect("foreground generated cache hit");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "foreground lease cannot inherit SQLite's five-second busy timeout"
+        );
+        assert_eq!(hydrated.path, foreground_path);
+        assert_eq!(
+            std::fs::read(&hydrated.path).expect("hydrated exact bytes"),
+            foreground_bytes
+        );
+
+        writer_release.send(()).expect("release WAL writer");
+        writer.join().expect("WAL writer thread");
+        assert!(
+            publication_done_wait
+                .recv_timeout(Duration::from_secs(2))
+                .expect("publication result after WAL release")
+                .expect("retryable publication succeeds"),
+            "background publication makes progress after the writer releases"
+        );
+        publisher.join().expect("publisher thread");
+        hydrator
+            .release_hydration_lease(hydrated.lease_id.expect("generated lease id"))
+            .expect("release foreground lease");
+        drop(hydrator);
+        let _ = std::fs::remove_dir_all(data_root);
     }
 
     #[test]
