@@ -249,6 +249,13 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "durable_namespace_readiness",
         step: MigrationStep::Sql(include_str!("schema/v24.sql")),
     },
+    // v25 — the installed foreground acceptance samples a small live
+    // attachment without scanning/sorting the account-wide item projection.
+    Migration {
+        version: 25,
+        name: "live_fetchable_attachment_size_lookup",
+        step: MigrationStep::Sql(include_str!("schema/v25.sql")),
+    },
 ];
 
 /// [`SCHEMA_VERSION`] and [`MIGRATIONS`] are one fact stated twice, so the
@@ -1685,6 +1692,60 @@ mod tests {
             .expect("decision read");
         assert_eq!(phase, "committed");
         assert_eq!(version_of(&conn), 22);
+    }
+
+    #[test]
+    fn v25_indexes_only_live_fetchable_attachments_in_size_order() {
+        let mut conn = memory_v1();
+        run(&mut conn, MIGRATIONS, 24).expect("migrate installed database to v24");
+        let before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'items_live_fetchable_attachments_by_size'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pre-migration index probe");
+        assert_eq!(before, 0);
+
+        run(&mut conn, MIGRATIONS, 25).expect("migrate installed database to v25");
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'items_live_fetchable_attachments_by_size'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bounded attachment index");
+        assert!(sql.contains("logical_size, item_id"));
+        assert!(sql.contains("kind = 'attachment'"));
+        assert!(sql.contains("availability = 'fetchable'"));
+        assert!(sql.contains("deleted_at_ms IS NULL"));
+        assert_eq!(version_of(&conn), 25);
+    }
+
+    #[test]
+    fn v25_refuses_a_preexisting_wrong_index_instead_of_claiming_it() {
+        let mut conn = memory_v1();
+        run(&mut conn, MIGRATIONS, 24).expect("migrate installed database to v24");
+        conn.execute_batch(
+            "CREATE INDEX items_live_fetchable_attachments_by_size
+             ON items(item_id);",
+        )
+        .expect("forge a same-named but semantically wrong index");
+
+        let error = run(&mut conn, MIGRATIONS, 25).expect_err("wrong index must fail closed");
+        assert!(matches!(
+            error,
+            StateError::MigrationFailed {
+                version: 25,
+                name: "live_fetchable_attachment_size_lookup",
+                ..
+            }
+        ));
+        assert_eq!(version_of(&conn), 24);
     }
 
     #[test]
