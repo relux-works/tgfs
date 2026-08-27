@@ -164,6 +164,7 @@ var packageTargets: [Target] = [
         .testTarget(
             name: "GramDriveFileProviderTests",
             dependencies: [
+                "GramDriveCompanion",
                 "GramDriveFileProvider",
                 "GramDriveSupport",
                 .product(name: "GramDriveCore", package: "GramDriveCore"),
