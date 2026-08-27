@@ -4453,6 +4453,26 @@ fn apply_update_batch(
                 entries.insert(*chat_id, entry);
             }
             MembershipChange::Removed { list, chat_id } => {
+                // A live position stream is not a complete membership
+                // snapshot. During startup/backfill TDLib can transiently
+                // report an order-0 position before the stable list arrives;
+                // treating that absence as authoritative used to remove the
+                // final membership and let account-wide reconciliation
+                // tombstone the whole Finder subtree. Only the canonical
+                // chat's durable departure/deletion marker is a positive
+                // witness for destructive removal. Missing chat state is
+                // unknown, not absence, and therefore also fails closed.
+                let departure_witnessed = txn
+                    .read()
+                    .chat(&ChatKey {
+                        scope,
+                        chat_id: ChatId(*chat_id),
+                    })
+                    .map_err(|_| SessionFailure::STORAGE)?
+                    .is_some_and(|chat| chat.left_at_ms.is_some() || chat.deleted_at_ms.is_some());
+                if !departure_witnessed {
+                    continue;
+                }
                 let existed = entries.remove(chat_id).is_some();
                 provider_changed |= existed;
                 projection_changed |= existed;
@@ -6159,6 +6179,168 @@ mod tests {
                 sort_order: 9,
                 pinned: true,
             }]
+        );
+    }
+
+    #[test]
+    fn unwitnessed_live_final_membership_removal_preserves_projected_subtree() {
+        let mut store = store();
+        add_main_chat(&mut store, 100, false);
+        apply_story_commit(
+            &mut store,
+            scope(),
+            &StoryCommit::ActiveSnapshot {
+                chat_id: 100,
+                order: 70,
+                stories: vec![story(191, false, StoryContentKind::Video)],
+            },
+            1_000,
+        )
+        .expect("active story");
+        rebuild_projection(&mut store, scope()).expect("ready projection");
+        let txn = store.write_txn().expect("seed readiness cursor");
+        let readiness = txn
+            .publish_namespace_readiness(scope(), 1_100)
+            .expect("publish readiness");
+        txn.advance_namespace_projection(
+            scope(),
+            readiness.generation,
+            Some(ChatId(100)),
+            true,
+            1_101,
+        )
+        .expect("advance readiness cursor");
+        txn.commit().expect("commit readiness cursor");
+        let readiness_before = store
+            .read_txn()
+            .expect("read readiness before refresh")
+            .namespace_readiness(scope())
+            .expect("readiness lookup before refresh")
+            .expect("readiness before refresh");
+        let guarded_live_before = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM items
+                  WHERE deleted_at_ms IS NULL
+                    AND kind IN ('chat', 'active_stories', 'generated_doc', 'story_appearance')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("guarded live kinds before refresh");
+        assert!(
+            guarded_live_before >= 4,
+            "the fixture must exercise the installed four-kind deletion shape"
+        );
+
+        let anchor = store
+            .read_txn()
+            .expect("read journal anchor")
+            .change_journal_state()
+            .expect("journal anchor")
+            .latest_sequence;
+        let batch = UpdateBatch {
+            memberships: vec![MembershipChange::Removed {
+                list: ChatListKind::Main,
+                chat_id: 100,
+            }],
+            ..UpdateBatch::default()
+        };
+
+        assert!(
+            !apply_update_batch(&mut store, scope(), &batch).expect("unwitnessed live removal"),
+            "an unstable membership refresh cannot signal a provider deletion"
+        );
+        let tombstone_count = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM items WHERE deleted_at_ms IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("tombstone count");
+        let guarded_live_after = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM items
+                  WHERE deleted_at_ms IS NULL
+                    AND kind IN ('chat', 'active_stories', 'generated_doc', 'story_appearance')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("guarded live kinds after refresh");
+        let read = store.read_txn().expect("read preserved projection");
+        assert_eq!(
+            read.namespace_readiness(scope())
+                .expect("readiness lookup after refresh")
+                .expect("readiness after refresh"),
+            readiness_before,
+            "the rejected live absence cannot regress readiness or its durable cursor"
+        );
+        assert_eq!(
+            read.chat_list(&ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Main,
+            })
+            .expect("preserved membership")
+            .len(),
+            1,
+            "membership remains resumable until a positive departure witness arrives"
+        );
+        assert_eq!(
+            tombstone_count, 0,
+            "the chat, Active Stories, generated document, and story appearance stay live"
+        );
+        assert_eq!(guarded_live_after, guarded_live_before);
+        assert!(
+            read.item_changes_since(scope().account, anchor, u32::MAX)
+                .expect("provider changes")
+                .iter()
+                .all(|change| change.item.deleted_at_ms.is_none()),
+            "the production live-update path emits no didDeleteItems"
+        );
+        drop(read);
+
+        let txn = store.write_txn().expect("record departure witness");
+        let mut departed =
+            snapshot_chat_record(scope(), &chat(100, "Chat 100")).expect("departed chat record");
+        departed.left_at_ms = Some(2_000);
+        txn.upsert_chat(&departed).expect("departure witness");
+        txn.commit().expect("commit departure witness");
+
+        assert!(
+            apply_update_batch(&mut store, scope(), &batch).expect("witnessed live removal"),
+            "a positive departure witness still publishes the legitimate deletion"
+        );
+        let read = store.read_txn().expect("read witnessed removal");
+        assert!(
+            read.chat_list(&ChatListKey {
+                scope: scope(),
+                kind: ChatListKind::Main,
+            })
+            .expect("removed membership")
+            .is_empty()
+        );
+        assert!(
+            read.item_changes_since(scope().account, anchor, u32::MAX)
+                .expect("witnessed provider changes")
+                .iter()
+                .any(|change| change.item.deleted_at_ms.is_some()),
+            "the witnessed subtree removal emits provider deletion changes"
+        );
+        drop(read);
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT count(DISTINCT kind) FROM items
+                      WHERE deleted_at_ms IS NOT NULL
+                        AND kind IN ('chat', 'active_stories', 'generated_doc', 'story_appearance')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("witnessed tombstone kinds"),
+            4,
+            "the positive witness removes the legitimate four-kind subtree"
         );
     }
 
