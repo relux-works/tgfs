@@ -24,7 +24,7 @@ public protocol ProviderChangeSignaling: Sendable {
     func signalChanges(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
-        evictingGeneratedItems: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [ProviderGeneratedItemChange],
         completionHandler: @escaping @Sendable ((any Error)?) -> Void)
 }
 
@@ -36,7 +36,7 @@ extension NSFileProviderManager: ProviderChangeSignaling {
     public func signalChanges(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
-        evictingGeneratedItems: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [ProviderGeneratedItemChange],
         completionHandler: @escaping @Sendable ((any Error)?) -> Void
     ) {
         ProviderChangeDispatcher(
@@ -86,7 +86,7 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
     func dispatch(
         includeRoot: Bool,
         changedContainers: [NSFileProviderItemIdentifier],
-        evictingGeneratedItems: [NSFileProviderItemIdentifier],
+        evictingGeneratedItems: [ProviderGeneratedItemChange],
         completionHandler: @escaping Completion
     ) {
         var identifiers: [NSFileProviderItemIdentifier] = [.workingSet]
@@ -100,7 +100,7 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
 
         var seenGeneratedItems: Set<String> = []
         let generatedItems = evictingGeneratedItems.filter {
-            seenGeneratedItems.insert($0.rawValue).inserted
+            seenGeneratedItems.insert($0.item.rawValue).inserted
         }
         let result = SignalResult()
         guard !generatedItems.isEmpty else {
@@ -194,13 +194,18 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
     }
 }
 
-/// Resolves only the generated candidates that File Provider currently has
-/// materialized. The item-change journal is intentionally coalesced across the
-/// database lifetime, so replaying it after process start may contain thousands
-/// of live generated documents even though Finder has bytes for only a handful.
-/// Enumerating the system-owned materialized set keeps eviction proportional to
-/// real disk state and still guarantees that a stale materialization for a
-/// changed generated version is selected.
+/// Resolves generated candidates whose parent containers File Provider has
+/// materialized. Apple's materialized-items enumerator reports materialized
+/// *containers*, not materialized files. A generated child beneath one of
+/// those containers may therefore have stale Finder bytes and must be evicted
+/// before its new content version is published through change enumeration.
+///
+/// The item-change journal is intentionally coalesced across the database
+/// lifetime, so replaying it after process start may contain thousands of live
+/// generated documents. Intersecting their parents with the system-owned
+/// materialized-container set keeps eviction scoped to Finder-visible
+/// subtrees without inventing a file-level materialization API the platform
+/// does not provide.
 final class MaterializedGeneratedItemSelector: @unchecked Sendable {
     typealias Completion =
         @Sendable (
@@ -238,7 +243,7 @@ final class MaterializedGeneratedItemSelector: @unchecked Sendable {
     }
 
     func select(
-        from candidates: [NSFileProviderItemIdentifier],
+        from candidates: [ProviderGeneratedItemChange],
         completion: @escaping Completion
     ) {
         let request = MaterializedSelectionRequest(
@@ -283,9 +288,9 @@ private final class MaterializedSelectionRequest: NSObject,
 {
     private let lock = NSLock()
     private let enumerator: any NSFileProviderEnumerator
-    private let candidates: [NSFileProviderItemIdentifier]
-    private let candidateValues: Set<String>
-    private var selectedValues: Set<String> = []
+    private let candidates: [ProviderGeneratedItemChange]
+    private let candidatesByParent: [String: [NSFileProviderItemIdentifier]]
+    private var selectedItemValues: Set<String> = []
     private var completion: MaterializedGeneratedItemSelector.Completion?
     private var cancelTimeout: MaterializedGeneratedItemSelector.CancelTimeout?
 
@@ -293,12 +298,13 @@ private final class MaterializedSelectionRequest: NSObject,
 
     init(
         enumerator: any NSFileProviderEnumerator,
-        candidates: [NSFileProviderItemIdentifier],
+        candidates: [ProviderGeneratedItemChange],
         completion: @escaping MaterializedGeneratedItemSelector.Completion
     ) {
         self.enumerator = enumerator
         self.candidates = candidates
-        self.candidateValues = Set(candidates.map(\.rawValue))
+        self.candidatesByParent = Dictionary(grouping: candidates, by: { $0.parent.rawValue })
+            .mapValues { $0.map(\.item) }
         self.completion = completion
     }
 
@@ -327,8 +333,10 @@ private final class MaterializedSelectionRequest: NSObject,
             lock.unlock()
             return
         }
-        for item in updatedItems where candidateValues.contains(item.itemIdentifier.rawValue) {
-            selectedValues.insert(item.itemIdentifier.rawValue)
+        for container in updatedItems {
+            for item in candidatesByParent[container.itemIdentifier.rawValue] ?? [] {
+                selectedItemValues.insert(item.rawValue)
+            }
         }
         lock.unlock()
     }
@@ -339,9 +347,9 @@ private final class MaterializedSelectionRequest: NSObject,
             return
         }
         lock.lock()
-        let selected = selectedValues
+        let selected = selectedItemValues
         lock.unlock()
-        resolve(.success(candidates.filter { selected.contains($0.rawValue) }))
+        resolve(.success(candidates.map(\.item).filter { selected.contains($0.rawValue) }))
     }
 
     func finishEnumeratingWithError(_ error: any Error) {
@@ -401,15 +409,28 @@ private final class SignalResult: @unchecked Sendable {
 }
 
 /// Journal position plus the parent containers whose child metadata moved.
+public struct ProviderGeneratedItemChange: Sendable, Equatable {
+    public let item: NSFileProviderItemIdentifier
+    public let parent: NSFileProviderItemIdentifier
+
+    public init(
+        item: NSFileProviderItemIdentifier,
+        parent: NSFileProviderItemIdentifier
+    ) {
+        self.item = item
+        self.parent = parent
+    }
+}
+
 public struct ProviderContainerChanges: Sendable {
     public let journal: ChangeJournalState
     public let containers: [NSFileProviderItemIdentifier]
-    public let generatedItems: [NSFileProviderItemIdentifier]
+    public let generatedItems: [ProviderGeneratedItemChange]
 
     public init(
         journal: ChangeJournalState,
         containers: [NSFileProviderItemIdentifier],
-        generatedItems: [NSFileProviderItemIdentifier] = []
+        generatedItems: [ProviderGeneratedItemChange] = []
     ) {
         self.journal = journal
         self.containers = containers
@@ -430,7 +451,7 @@ public enum ProviderContainerChangeResolver {
         var sequence =
             prior?.instanceId == current.instanceId ? prior?.latestSequence ?? 0 : 0
         var identifiers: Set<String> = []
-        var generatedItems: Set<String> = []
+        var generatedItems: [String: ProviderGeneratedItemChange] = [:]
         while true {
             let page = try store.itemChangesSince(
                 accountId: account.accountId,
@@ -445,11 +466,14 @@ public enum ProviderContainerChangeResolver {
                 if change.metadata.kind == .generatedDoc,
                     change.metadata.deletedAtMs == nil
                 {
-                    generatedItems.insert(
-                        ItemIdentifierMapping.providerIdentifier(
-                            forCoreItemId: change.metadata.id,
-                            accountRootId: account.rootItemId
-                        ).rawValue)
+                    let item = ItemIdentifierMapping.providerIdentifier(
+                        forCoreItemId: change.metadata.id,
+                        accountRootId: account.rootItemId)
+                    let parent = ItemIdentifierMapping.parentIdentifier(
+                        forParentCoreItemId: change.metadata.parent,
+                        accountRootId: account.rootItemId)
+                    generatedItems[item.rawValue] = ProviderGeneratedItemChange(
+                        item: item, parent: parent)
                 }
             }
             guard let last = page.last else { break }
@@ -464,8 +488,9 @@ public enum ProviderContainerChangeResolver {
         return ProviderContainerChanges(
             journal: position,
             containers: identifiers.sorted().map(NSFileProviderItemIdentifier.init(rawValue:)),
-            generatedItems: generatedItems.sorted().map(
-                NSFileProviderItemIdentifier.init(rawValue:)))
+            generatedItems: generatedItems.values.sorted {
+                $0.item.rawValue < $1.item.rawValue
+            })
     }
 }
 
