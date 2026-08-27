@@ -1,4 +1,3 @@
-import Dispatch
 import Foundation
 import Testing
 
@@ -7,35 +6,38 @@ import Testing
 @Suite("Installed companion process runner")
 struct InstalledCompanionProcessRunnerTests {
   @Test("Headless routing schedules the async command and services its callback")
-  func headlessRoutingExecutesCommandThroughCallbackLoop() {
-    let terminated = DispatchSemaphore(value: 0)
+  func headlessRoutingExecutesCommandThroughCallbackLoop() async throws {
+    let scheduler = ScheduledOperationProbe()
     let result = ProcessResultProbe()
     var applicationRuns = 0
+    var callbackLoops = 0
 
     InstalledCompanionProcessRunner.run(
       commandRequested: true,
       scheduleCommand: { operation in
-        Task.detached { await operation() }
+        scheduler.schedule(operation)
       },
       runCommand: {
         await result.awaitCallbackService()
-        return 0
+        return 73
       },
       terminate: { exitCode in
         result.record(exitCode)
-        terminated.signal()
       },
       runApplication: {
         applicationRuns += 1
       },
       serviceCallbacks: {
-        #expect(result.waitForCommandStart(timeout: .now() + .milliseconds(1_500)))
+        #expect(scheduler.scheduleCount == 1)
+        #expect(result.exitCode == nil)
+        callbackLoops += 1
         result.serviceCallback()
-        #expect(terminated.wait(timeout: .now() + .milliseconds(1_500)) == .success)
       })
 
-    #expect(result.exitCode == 0)
+    #expect(callbackLoops == 1)
     #expect(applicationRuns == 0)
+    try await scheduler.runScheduledOperation()
+    #expect(result.exitCode == 73)
   }
 
   @Test("Ordinary routing invokes only the SwiftUI application")
@@ -60,9 +62,34 @@ struct InstalledCompanionProcessRunnerTests {
   }
 }
 
+private final class ScheduledOperationProbe: @unchecked Sendable {
+  typealias Operation = @Sendable () async -> Void
+
+  private let lock = NSLock()
+  private var operation: Operation?
+  private var count = 0
+
+  var scheduleCount: Int {
+    lock.withLock { count }
+  }
+
+  func schedule(_ operation: @escaping Operation) {
+    lock.withLock {
+      self.operation = operation
+      count += 1
+    }
+  }
+
+  func runScheduledOperation() async throws {
+    let scheduledOperation: Operation? = lock.withLock { self.operation }
+    let executedOperation = try #require(scheduledOperation)
+    await executedOperation()
+  }
+}
+
 private final class ProcessResultProbe: @unchecked Sendable {
   private let lock = NSLock()
-  private let commandStarted = DispatchSemaphore(value: 0)
+  private var callbackWasServiced = false
   private var callbackContinuation: CheckedContinuation<Void, Never>?
   private var value: Int32?
 
@@ -76,17 +103,18 @@ private final class ProcessResultProbe: @unchecked Sendable {
 
   func awaitCallbackService() async {
     await withCheckedContinuation { continuation in
-      lock.withLock { callbackContinuation = continuation }
-      commandStarted.signal()
+      let resumeImmediately = lock.withLock {
+        guard !callbackWasServiced else { return true }
+        callbackContinuation = continuation
+        return false
+      }
+      if resumeImmediately { continuation.resume() }
     }
-  }
-
-  func waitForCommandStart(timeout: DispatchTime) -> Bool {
-    commandStarted.wait(timeout: timeout) == .success
   }
 
   func serviceCallback() {
     let continuation = lock.withLock {
+      callbackWasServiced = true
       let continuation = callbackContinuation
       callbackContinuation = nil
       return continuation
