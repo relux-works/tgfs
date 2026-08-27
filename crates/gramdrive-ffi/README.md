@@ -223,7 +223,10 @@ callbacks wait for TDLib.
 Namespace bootstrap publishes a shallow list projection and durable readiness
 in one transaction. A strict-subset Main/folder/archive snapshot without a
 positive departure witness rolls back membership, readiness, and cursors and
-emits no provider deletion. Once ready, deep chat projection advances one
+emits no provider deletion. Live position removals use the same destructive
+boundary: an order-0/removed delta without a durable chat departure or deletion
+witness preserves the last-known-good membership and subtree until a stable Set
+or positive witness arrives. Once ready, deep chat projection advances one
 bounded durable slice per content-loop turn, so restart resumes from the last
 committed chat instead of replaying a full pre-ready projection. Authorization
 progress is emitted immediately after the native boundary and is independent of
