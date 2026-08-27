@@ -8,6 +8,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+use gramdrive_model::identity::ItemId;
+
 /// The version of this FFI contract, independent of crate versions.
 ///
 /// Native consumers pin against this; bump rules are in README.md
@@ -63,7 +65,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // 0.18.0: bounded retained-session discovery/adoption lets agent startup
     // reconstruct minimal durable account and Finder-root state after product
     // state loss, but only after TDLib reaches Ready without user input.
-    minor: 18,
+    // 0.19.0: native hosts can validate the frozen ItemId text contract through
+    // the authoritative core codec before passing an opaque provider identity
+    // to a platform API. Additive, hence minor.
+    minor: 19,
     patch: 0,
 };
 
@@ -83,6 +88,18 @@ pub struct ContractVersion {
 #[uniffi::export]
 pub fn contract_version() -> ContractVersion {
     CONTRACT_VERSION
+}
+
+/// Whether `text` is the exact canonical text form of a structured [`ItemId`].
+///
+/// Native provider hosts use this before handing an opaque identifier to an OS
+/// API. This is deliberately the model's authoritative parser rather than a
+/// host-language Base32 approximation: it validates the prefix, alphabet,
+/// unpadded trailing bits, format version, item tags, field widths, and absence
+/// of trailing bytes without exposing the decoded identity.
+#[uniffi::export]
+pub fn is_canonical_item_identifier(text: String) -> bool {
+    ItemId::parse_text(&text).is_ok()
 }
 
 /// The boundary error: every fallible exported operation fails with one of
@@ -385,6 +402,7 @@ impl DriveCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gramdrive_model::identity::{AccountId, AccountKey, CanonicalKey, ItemKey};
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -414,6 +432,20 @@ mod tests {
     #[test]
     fn contract_version_is_exposed() {
         assert_eq!(contract_version(), CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn canonical_item_identifier_accepts_only_core_codec_output() {
+        let minted = ItemKey::Canonical(CanonicalKey::Account(AccountKey {
+            account_id: AccountId(42),
+        }))
+        .id()
+        .text();
+        assert!(is_canonical_item_identifier(minted));
+
+        assert!(!is_canonical_item_identifier("gdm".to_owned()));
+        assert!(!is_canonical_item_identifier("gdaebah".to_owned()));
+        assert!(!is_canonical_item_identifier("gdaebag".to_owned()));
     }
 
     #[test]
