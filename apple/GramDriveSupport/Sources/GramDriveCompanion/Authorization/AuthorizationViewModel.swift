@@ -52,6 +52,7 @@ public final class AuthorizationViewModel {
 
     private let backend: any CompanionBackend
     private let teardownTimeout: Duration
+    private let teardownSleep: @Sendable (Duration) async -> Void
     private var session: (any AuthorizationSession)?
     private var consumeTask: Task<Void, Never>?
     private var activeSessionID: UUID?
@@ -61,6 +62,19 @@ public final class AuthorizationViewModel {
     public init(backend: any CompanionBackend, teardownTimeout: Duration = .seconds(15)) {
         self.backend = backend
         self.teardownTimeout = teardownTimeout
+        teardownSleep = { duration in
+            try? await Task.sleep(for: duration)
+        }
+    }
+
+    init(
+        backend: any CompanionBackend,
+        teardownTimeout: Duration,
+        teardownSleep: @escaping @Sendable (Duration) async -> Void
+    ) {
+        self.backend = backend
+        self.teardownTimeout = teardownTimeout
+        self.teardownSleep = teardownSleep
     }
 
     /// The advice for the current rejection, if any.
@@ -322,13 +336,14 @@ public final class AuthorizationViewModel {
         timedOut: @autoclosure @escaping @Sendable () -> Value
     ) async -> Value {
         let gate = AuthorizationDeadlineGate<Value>(timedOut: timedOut)
+        let deadlineSleep = teardownSleep
         return await withCheckedContinuation { continuation in
             gate.install(continuation)
             Task.detached { [gate] in
                 gate.resolve(await operation())
             }
             Task.detached { [gate, timeout] in
-                try? await Task.sleep(for: timeout)
+                await deadlineSleep(timeout)
                 gate.timeout()
             }
         }

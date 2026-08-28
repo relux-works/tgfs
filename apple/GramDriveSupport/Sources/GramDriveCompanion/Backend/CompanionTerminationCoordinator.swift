@@ -70,6 +70,7 @@ public final class CompanionTerminationCoordinator {
     private let pollInterval: Duration
     private let timeout: Duration
     private let cancellationTimeout: Duration
+    private let explicitCancellationJoinObserver: @Sendable () -> Void
     private var drainTask: Task<DrainResult, Never>?
     private var activeRequest: ControlTerminationRequest?
     private var explicitCancellationTask: Task<CommandOutcome, Never>?
@@ -93,7 +94,7 @@ public final class CompanionTerminationCoordinator {
         }
     }
 
-    public init(
+    public convenience init(
         prepare: @escaping @Sendable (ControlTerminationRequest) async -> CommandOutcome,
         cancel: @escaping @Sendable (ControlTerminationRequest) async -> CommandOutcome = {
             _ in .unavailable(.dropped)
@@ -107,6 +108,32 @@ public final class CompanionTerminationCoordinator {
         timeout: Duration = .seconds(20),
         cancellationTimeout: Duration = .seconds(5)
     ) {
+        self.init(
+            prepare: prepare,
+            cancel: cancel,
+            commit: commit,
+            health: health,
+            recoverCurrentBuild: recoverCurrentBuild,
+            pollInterval: pollInterval,
+            timeout: timeout,
+            cancellationTimeout: cancellationTimeout,
+            explicitCancellationJoinObserver: {}
+        )
+    }
+
+    init(
+        prepare: @escaping @Sendable (ControlTerminationRequest) async -> CommandOutcome,
+        cancel: @escaping @Sendable (ControlTerminationRequest) async -> CommandOutcome,
+        commit: @escaping @Sendable (ControlTerminationRequest) async -> CommandOutcome = {
+            _ in .unavailable(.dropped)
+        },
+        health: @escaping @Sendable () async -> HealthReadout,
+        recoverCurrentBuild: @escaping @Sendable () async -> Bool = { false },
+        pollInterval: Duration = .milliseconds(100),
+        timeout: Duration = .seconds(20),
+        cancellationTimeout: Duration = .seconds(5),
+        explicitCancellationJoinObserver: @escaping @Sendable () -> Void
+    ) {
         self.prepare = prepare
         self.cancel = cancel
         self.commit = commit
@@ -115,6 +142,7 @@ public final class CompanionTerminationCoordinator {
         self.pollInterval = pollInterval
         self.timeout = timeout
         self.cancellationTimeout = cancellationTimeout
+        self.explicitCancellationJoinObserver = explicitCancellationJoinObserver
     }
 
     /// Creates the production coordinator over the companion's live IPC
@@ -155,6 +183,7 @@ public final class CompanionTerminationCoordinator {
         let cancellationTimeout = self.cancellationTimeout
         let commit = self.commit
         let recoverCurrentBuild = self.recoverCurrentBuild
+        let joinObserver = explicitCancellationJoinObserver
         let task = Task<DrainResult, Never> { @MainActor [self] in
             // Capture the process identity after the task has been installed
             // as the join point. This preserves one drain for simultaneous
@@ -200,6 +229,7 @@ public final class CompanionTerminationCoordinator {
             let acceptanceDeadline = ContinuousClock.now + .seconds(1)
             while ContinuousClock.now < deadline {
                 if let explicitCancellationTask {
+                    joinObserver()
                     return await Self.cancelAndReconcile(
                         request: request,
                         cancel: cancel,
