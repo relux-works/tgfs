@@ -103,17 +103,28 @@ private final class TerminationProbe: @unchecked Sendable {
     }
 }
 
-private final class DelayedCancellationProbe: @unchecked Sendable {
+private final class SuspendedCancellationProbe: @unchecked Sendable {
     private let lock = NSLock()
-    private let cancellationDelay: Duration
+    let drainReconciliationStarted: AsyncStream<Void>
+    let cancellationStarted: AsyncStream<Void>
+    let cancellationJoined: AsyncStream<Void>
+
+    private let drainContinuation: AsyncStream<Void>.Continuation
+    private let cancellationContinuation: AsyncStream<Void>.Continuation
+    private let joinContinuation: AsyncStream<Void>.Continuation
     private var recorded: [ControlTerminationRequest] = []
     private var cancellationInvocations = 0
+    private var prepared = false
+    private var drainWaiter: CheckedContinuation<Void, Never>?
+    private var cancellationWaiter: CheckedContinuation<Void, Never>?
     private var currentSnapshot = CompanionTerminationCoordinatorTests.drainingSnapshot(
         state: .running
     )
 
-    init(cancellationDelay: Duration) {
-        self.cancellationDelay = cancellationDelay
+    init() {
+        (drainReconciliationStarted, drainContinuation) = AsyncStream.makeStream(of: Void.self)
+        (cancellationStarted, cancellationContinuation) = AsyncStream.makeStream(of: Void.self)
+        (cancellationJoined, joinContinuation) = AsyncStream.makeStream(of: Void.self)
     }
 
     var requests: [ControlTerminationRequest] {
@@ -129,13 +140,22 @@ private final class DelayedCancellationProbe: @unchecked Sendable {
             recorded.append(request)
             currentSnapshot.terminationRequestID = request.requestID
             currentSnapshot.state = .draining
+            prepared = true
         }
         return .completed
     }
 
     func cancel(_ request: ControlTerminationRequest) async -> CommandOutcome {
-        lock.withLock { cancellationInvocations += 1 }
-        try? await Task.sleep(for: cancellationDelay)
+        let invocation = lock.withLock {
+            cancellationInvocations += 1
+            return cancellationInvocations
+        }
+        if invocation == 1 {
+            await withCheckedContinuation { continuation in
+                lock.withLock { cancellationWaiter = continuation }
+                cancellationContinuation.yield(())
+            }
+        }
         lock.withLock {
             recorded.append(request)
             currentSnapshot.terminationRequestID = request.requestID
@@ -145,7 +165,36 @@ private final class DelayedCancellationProbe: @unchecked Sendable {
     }
 
     func health() async -> HealthReadout {
-        lock.withLock { .running(currentSnapshot) }
+        let shouldHold = lock.withLock { prepared && cancellationInvocations == 0 }
+        if shouldHold {
+            await withCheckedContinuation { continuation in
+                lock.withLock { drainWaiter = continuation }
+                drainContinuation.yield(())
+            }
+        }
+        return lock.withLock { .running(currentSnapshot) }
+    }
+
+    func releaseDrainReconciliation() {
+        let waiter = lock.withLock {
+            let waiter = drainWaiter
+            drainWaiter = nil
+            return waiter
+        }
+        waiter?.resume()
+    }
+
+    func releaseCancellation() {
+        let waiter = lock.withLock {
+            let waiter = cancellationWaiter
+            cancellationWaiter = nil
+            return waiter
+        }
+        waiter?.resume()
+    }
+
+    func observeCancellationJoin() {
+        joinContinuation.yield(())
     }
 }
 
@@ -623,23 +672,34 @@ private final class DelayedCancellationProbe: @unchecked Sendable {
         #expect(probe.requests.count == 1)
     }
 
-    @Test func explicitCancellationSharesOneInFlightCommandWithDrainReconciliation() async throws {
-        let probe = DelayedCancellationProbe(cancellationDelay: .milliseconds(50))
+    @Test func explicitCancellationSharesOneInFlightCommandWithDrainReconciliation() async {
+        let probe = SuspendedCancellationProbe()
         let coordinator = CompanionTerminationCoordinator(
             prepare: { await probe.prepare($0) },
             cancel: { await probe.cancel($0) },
             health: { await probe.health() },
             pollInterval: .milliseconds(1),
             timeout: .seconds(1),
-            cancellationTimeout: .seconds(1)
+            cancellationTimeout: .seconds(1),
+            explicitCancellationJoinObserver: { probe.observeCancellationJoin() }
         )
 
         async let terminationAllowed = coordinator.requestTermination(.userQuit)
-        try await Self.waitUntil { probe.requests.count == 1 }
+        var drainStarts = probe.drainReconciliationStarted.makeAsyncIterator()
+        _ = await drainStarts.next()
         async let cancellationAllowed = coordinator.cancelTermination()
+        var cancellationStarts = probe.cancellationStarted.makeAsyncIterator()
+        var cancellationJoins = probe.cancellationJoined.makeAsyncIterator()
+        _ = await cancellationStarts.next()
+        probe.releaseDrainReconciliation()
+        _ = await cancellationJoins.next()
+        #expect(probe.cancellationInvocationCount == 1)
+        probe.releaseCancellation()
 
-        #expect(!(await cancellationAllowed))
-        #expect(!(await terminationAllowed))
+        let cancellationResult = await cancellationAllowed
+        let terminationResult = await terminationAllowed
+        #expect(!cancellationResult)
+        #expect(!terminationResult)
         #expect(probe.cancellationInvocationCount == 1)
         #expect(probe.requests.map(\.action) == [.prepare, .cancel])
         guard probe.requests.count == 2 else { return }

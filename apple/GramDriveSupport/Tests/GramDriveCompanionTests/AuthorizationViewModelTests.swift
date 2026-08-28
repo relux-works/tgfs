@@ -92,9 +92,9 @@ private func settle(_ model: AuthorizationViewModel) async {
         }
         #expect(model.state.kind == "wait-qr-confirmation")
 
-        var acknowledgements = first.cancelAcknowledgements.makeAsyncIterator()
+        var stalls = first.cancelStalls.makeAsyncIterator()
         let restart = Task { @MainActor in await model.begin() }
-        _ = await acknowledgements.next()
+        _ = await stalls.next()
         #expect(model.isSubmitting)
         #expect(sessions.creationCount == 1)
 
@@ -127,9 +127,9 @@ private func settle(_ model: AuthorizationViewModel) async {
         }
         #expect(model.state.kind == "wait-qr-confirmation")
 
-        var acknowledgements = first.cancelAcknowledgements.makeAsyncIterator()
+        var stalls = first.cancelStalls.makeAsyncIterator()
         let restart = Task { @MainActor in await model.begin() }
-        _ = await acknowledgements.next()
+        _ = await stalls.next()
         #expect(model.state == .starting, "the click must acknowledge before teardown completes")
         #expect(model.isSubmitting)
 
@@ -143,18 +143,27 @@ private func settle(_ model: AuthorizationViewModel) async {
     @Test func repeatedCancellationKeepsSubmissionStateUntilStalledTeardownExpires() async {
         let session = DelayedClosingAuthorizationSession(initialState: .waitPhoneNumber)
         let backend = InMemoryCompanionBackend(session: { session })
-        // This only controls test scheduling: the assertion must run while the
-        // first cancellation is in flight, even when the full suite is busy.
-        let model = AuthorizationViewModel(backend: backend, teardownTimeout: .milliseconds(250))
+        let deadline = SuspendedAuthorizationDeadline()
+        let model = AuthorizationViewModel(
+            backend: backend,
+            teardownTimeout: .milliseconds(20),
+            teardownSleep: { duration in await deadline.sleep(for: duration) }
+        )
 
         await model.begin()
-        var acknowledgements = session.cancelAcknowledgements.makeAsyncIterator()
+        var stalls = session.cancelStalls.makeAsyncIterator()
+        var deadlineWaits = deadline.waits.makeAsyncIterator()
         let firstCancellation = Task { @MainActor in await model.cancel() }
-        _ = await acknowledgements.next()
-        let repeatedCancellation = Task { @MainActor in await model.cancel() }
-        await repeatedCancellation.value
+        _ = await stalls.next()
+        _ = await deadlineWaits.next()
+
+        // Invoke directly on MainActor after both waits are installed. Creating
+        // another unstructured task here lets the deadline continuation race
+        // that task under full-suite load and observes scheduling, not state.
+        await model.cancel()
 
         #expect(model.isSubmitting, "a coalesced cancel must not clear the first cancel's progress")
+        deadline.expire()
         await firstCancellation.value
         #expect(model.unavailable == .timedOut)
         #expect(model.state == .idle)
@@ -189,17 +198,17 @@ private final class SessionSequence: @unchecked Sendable {
 
 private final class DelayedClosingAuthorizationSession: AuthorizationSession, @unchecked Sendable {
     let states: AsyncStream<CompanionAuthState>
-    let cancelAcknowledgements: AsyncStream<Void>
+    let cancelStalls: AsyncStream<Void>
 
     private let stateContinuation: AsyncStream<CompanionAuthState>.Continuation
-    private let acknowledgementContinuation: AsyncStream<Void>.Continuation
+    private let stallContinuation: AsyncStream<Void>.Continuation
     private let lock = NSLock()
     private var closeWaiter: CheckedContinuation<Void, Never>?
     private var released = false
 
     init(initialState: CompanionAuthState) {
         (states, stateContinuation) = AsyncStream.makeStream(of: CompanionAuthState.self)
-        (cancelAcknowledgements, acknowledgementContinuation) =
+        (cancelStalls, stallContinuation) =
             AsyncStream.makeStream(of: Void.self)
         stateContinuation.yield(initialState)
     }
@@ -211,7 +220,6 @@ private final class DelayedClosingAuthorizationSession: AuthorizationSession, @u
     func cancel() async -> ControlChannelUnavailable? {
         // Models the production ordering: TDLib accepts cancel first, then
         // reports terminal closure after the auth pump releases its slot.
-        acknowledgementContinuation.yield(())
         await withCheckedContinuation { continuation in
             lock.lock()
             if released {
@@ -220,6 +228,7 @@ private final class DelayedClosingAuthorizationSession: AuthorizationSession, @u
             } else {
                 closeWaiter = continuation
                 lock.unlock()
+                stallContinuation.yield(())
             }
         }
         return nil
@@ -228,13 +237,53 @@ private final class DelayedClosingAuthorizationSession: AuthorizationSession, @u
     func releaseAfterClose() {
         stateContinuation.yield(.closed)
         stateContinuation.finish()
-        acknowledgementContinuation.finish()
+        stallContinuation.finish()
         lock.lock()
         released = true
         let waiter = closeWaiter
         closeWaiter = nil
         lock.unlock()
         waiter?.resume()
+    }
+}
+
+private final class SuspendedAuthorizationDeadline: @unchecked Sendable {
+    let waits: AsyncStream<Void>
+
+    private let waitContinuation: AsyncStream<Void>.Continuation
+    private let lock = NSLock()
+    private var sleepers: [CheckedContinuation<Void, Never>] = []
+    private var expired = false
+
+    init() {
+        (waits, waitContinuation) = AsyncStream.makeStream(of: Void.self)
+    }
+
+    func sleep(for _: Duration) async {
+        await withCheckedContinuation { continuation in
+            let shouldResume = lock.withLock {
+                guard !expired else { return true }
+                sleepers.append(continuation)
+                return false
+            }
+            if shouldResume {
+                continuation.resume()
+            } else {
+                waitContinuation.yield(())
+            }
+        }
+    }
+
+    func expire() {
+        let pendingSleepers = lock.withLock {
+            expired = true
+            let pendingSleepers = sleepers
+            sleepers.removeAll()
+            return pendingSleepers
+        }
+        for sleeper in pendingSleepers {
+            sleeper.resume()
+        }
     }
 }
 
