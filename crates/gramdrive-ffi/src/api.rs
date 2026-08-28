@@ -68,7 +68,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     // 0.19.0: native hosts can validate the frozen ItemId text contract through
     // the authoritative core codec before passing an opaque provider identity
     // to a platform API. Additive, hence minor.
-    minor: 19,
+    // 0.20.0: a targeted current live-generated-document snapshot lets a
+    // provider repair initial publication for installed rows that predate the
+    // item-change journal. Additive, read-only, and account-scoped.
+    minor: 20,
     patch: 0,
 };
 

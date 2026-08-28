@@ -11,7 +11,7 @@
 //! at upsert time.
 
 use gramdrive_model::identity::{
-    AccountScope, AppearanceKey, CanonicalKey, ChatKey, ChatListKey, ChatListKind,
+    AccountKey, AccountScope, AppearanceKey, CanonicalKey, ChatKey, ChatListKey, ChatListKind,
     FolderCatalogKey, ItemId, ItemKey, StoryAppearanceLocation,
 };
 use gramdrive_model::version::{ContentVersion, MetadataVersion, directory_metadata_version};
@@ -457,6 +457,25 @@ fn finish_item(raw: RawItem) -> Result<ItemRecord, StateError> {
 }
 
 impl ReadTxn<'_> {
+    /// Every live generated document for one account, in deterministic tree
+    /// order. The provider's initial publication uses this targeted snapshot
+    /// because installed rows may predate the item-change journal; later
+    /// publications continue to use journal deltas.
+    pub fn live_generated_items(&self, account: AccountKey) -> Result<Vec<ItemRecord>, StateError> {
+        let mut statement = self.conn().prepare_cached(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items INDEXED BY items_v21_live_generated_docs_by_parent
+             WHERE account_id = ?1 AND kind = 'generated_doc'
+               AND deleted_at_ms IS NULL
+             ORDER BY parent_item_id, item_id"
+        ))?;
+        let rows = statement.query_map(params![account.account_id.0], read_item)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(finish_item(row?)?);
+        }
+        Ok(items)
+    }
+
     /// The immutable provenance of an item's first tombstone, when present.
     /// Schema v18 backfills every installed tombstone and enforces the
     /// deleted/provenance invariant for future writes.

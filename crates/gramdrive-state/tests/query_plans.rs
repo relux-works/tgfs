@@ -60,6 +60,15 @@ const REQUIRED_QUERIES: &[RequiredQuery] = &[
               WHERE parent_item_id = ?1 AND safe_name = ?2 AND deleted_at_ms IS NULL",
     },
     RequiredQuery {
+        name: "initial_live_generated_snapshot",
+        serves: "installed initial publication without depending on historical journal coverage",
+        sql: "SELECT item_id, parent_item_id
+              FROM items INDEXED BY items_v21_live_generated_docs_by_parent
+              WHERE account_id = ?1 AND kind = 'generated_doc'
+                AND deleted_at_ms IS NULL
+              ORDER BY parent_item_id, item_id",
+    },
+    RequiredQuery {
         name: "appearances_of_canonical",
         serves: "propagating a canonical change to every view (SYNC-026)",
         sql: "SELECT item_id, view_kind FROM items WHERE canonical_item_id = ?1",

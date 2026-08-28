@@ -2,6 +2,7 @@ import FileProvider
 import Foundation
 import GramDriveAgentCore
 import GramDriveCore
+import GramDriveSupport
 import Testing
 
 @testable import GramDriveCompanion
@@ -163,12 +164,12 @@ private final class DispatchRecorder: @unchecked Sendable {
 private final class ProductionPathSignaling: ProviderChangeSignaling, @unchecked Sendable {
     private let recorder: DispatchRecorder
     private let materializedContainerIDs: [String]
-    private let didEvict: @Sendable (String) -> Void
+    private let didEvict: @Sendable (String) throws -> Void
 
     init(
         recorder: DispatchRecorder,
         materializedContainerIDs: [String],
-        didEvict: @escaping @Sendable (String) -> Void = { _ in }
+        didEvict: @escaping @Sendable (String) throws -> Void = { _ in }
     ) {
         self.recorder = recorder
         self.materializedContainerIDs = materializedContainerIDs
@@ -186,8 +187,12 @@ private final class ProductionPathSignaling: ProviderChangeSignaling, @unchecked
                 pages: [materializedContainerIDs.map(materializedContainer)]),
             evict: { [recorder, didEvict] identifier, completion in
                 recorder.record("evict:\(identifier.rawValue)")
-                didEvict(identifier.rawValue)
-                completion(nil)
+                do {
+                    try didEvict(identifier.rawValue)
+                    completion(nil)
+                } catch {
+                    completion(error)
+                }
             },
             signal: { [recorder] identifier, completion in
                 recorder.record("signal:\(identifier.rawValue)")
@@ -217,26 +222,138 @@ private final class StartupHealthScript: @unchecked Sendable {
     }
 }
 
-private final class InstalledGeneratedBytes: @unchecked Sendable {
+private struct GeneratedBoundarySeed {
+    let values: [String: String]
+
+    subscript(_ key: String) -> String {
+        get throws {
+            guard let value = values[key] else {
+                throw GeneratedBoundaryFixtureError("seeder omitted \(key)")
+            }
+            return value
+        }
+    }
+
+    static func create(at dataRoot: URL) throws -> Self {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let process = Process()
+        process.currentDirectoryURL = repositoryRoot
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            "cargo", "run", "--quiet", "-p", "gramdrive-ffi", "--example",
+            "shared_state_seed", "--", dataRoot.path, "generated-initial",
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let bytes = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let text = String(decoding: bytes, as: UTF8.self)
+        guard process.terminationStatus == 0 else {
+            throw GeneratedBoundaryFixtureError(
+                "production fixture seeder exited \(process.terminationStatus): \(text)")
+        }
+        let values = Dictionary(
+            uniqueKeysWithValues: text.split(separator: "\n").compactMap { line in
+                let pair = line.split(separator: "=", maxSplits: 1).map(String.init)
+                return pair.count == 2 ? (pair[0], pair[1]) : nil
+            })
+        return Self(values: values)
+    }
+}
+
+private struct GeneratedBoundaryFixtureError: Error, CustomStringConvertible {
+    let description: String
+
+    init(_ description: String) {
+        self.description = description
+    }
+}
+
+/// File-backed stand-in for macOS' system-owned replica. Existing files bypass
+/// the extension; after the mocked entitlement-bound eviction, `open` drives
+/// the production content fetch and persists the returned materialization.
+private final class InstalledGeneratedMaterializations: @unchecked Sendable {
     private let lock = NSLock()
-    private let current: [String: Data]
-    private var materialized: [String: Data]
+    private let urls: [String: URL]
 
-    init(current: [String: Data], materialized: [String: Data]) {
-        self.current = current
-        self.materialized = materialized
+    init(directory: URL, initial: [String: (name: String, bytes: Data)]) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var urls: [String: URL] = [:]
+        for (identifier, value) in initial {
+            let url = directory.appendingPathComponent(value.name, isDirectory: false)
+            try value.bytes.write(to: url)
+            urls[identifier] = url
+        }
+        self.urls = urls
     }
 
-    func evict(_ identifier: String) {
+    func evict(_ identifier: String) throws {
         lock.lock()
-        materialized[identifier] = current[identifier]
+        let url = urls[identifier]
         lock.unlock()
+        guard let url, FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
     }
 
-    func bytes(for identifier: String) -> Data? {
+    func existingBytes(for identifier: String) throws -> Data? {
         lock.lock()
-        defer { lock.unlock() }
-        return materialized[identifier]
+        let url = urls[identifier]
+        lock.unlock()
+        guard let url, FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try Data(contentsOf: url)
+    }
+
+    @MainActor
+    func open(
+        _ identifier: String,
+        fetch: () async throws -> URL
+    ) async throws -> Data {
+        let url = lock.withLock { urls[identifier] }
+        guard let url else {
+            throw GeneratedBoundaryFixtureError("no materialization slot for \(identifier)")
+        }
+        if FileManager.default.fileExists(atPath: url.path) {
+            return try Data(contentsOf: url)
+        }
+        let fetched = try await fetch()
+        try FileManager.default.copyItem(at: fetched, to: url)
+        return try Data(contentsOf: url)
+    }
+}
+
+/// Direct in-process composition of the same production hydrator hosted by
+/// the companion's IPC server. The socket and descriptor transfer are tested
+/// separately; this regression needs the verified-cache selection itself.
+private final class CoreHydrationRequestAdapter: HydrationRequesting, @unchecked Sendable {
+    private let hydrator: CoreContentHydrator
+
+    init(hydrator: CoreContentHydrator) {
+        self.hydrator = hydrator
+    }
+
+    func hydrate(
+        _ request: HydrationRequest,
+        onProgress: @escaping @Sendable (HydrationProgress) -> Void
+    ) async throws -> HydratedContent {
+        try await hydrator.hydrate(
+            request, progress: onProgress, token: CancellationToken())
+    }
+
+    func hydrateAndMaterialize(
+        _ request: HydrationRequest,
+        onProgress: @escaping @Sendable (HydrationProgress) -> Void,
+        materialize: @escaping @Sendable (HydratedContent) throws -> URL
+    ) async throws -> URL {
+        let content = try await hydrate(request, onProgress: onProgress)
+        defer { hydrator.release(content) }
+        return try materialize(content)
     }
 }
 
@@ -439,67 +556,103 @@ private final class RecordingToken: ChangeObservationToken, @unchecked Sendable 
 @Suite("Change-signal relay")
 struct ChangeSignalRelayTests {
     @MainActor
-    @Test("Installed startup waits for retained state before publishing exact generated bytes")
+    @Test("Installed initial publication repairs generated bytes absent from the journal")
     func installedStartupPublishesExactGeneratedBytesAfterReadinessConverges() async throws {
-        let account = AccountInfo(
-            accountId: 7,
-            sourceKind: .localTdlib,
-            displayName: "Account",
-            authState: "authorized",
-            namespaceVersion: 1,
-            displayTimezone: "UTC",
-            rootItemId: "root")
-        let store = ScriptedStore(account: account)
-        let generated = ItemMetadata(
-            contractVersion: 1,
-            id: "chat-json",
-            parent: "chat-parent",
-            kind: .generatedDoc,
-            isDirectory: false,
-            displayName: ".chat.json",
-            safeName: ".chat.json",
-            metadataVersion: "m2",
-            mimeType: "application/json",
-            logicalSize: 3,
-            attachmentLogicalKind: nil,
-            attachmentRepresentation: nil,
-            attachmentFidelity: nil,
-            attachmentSourceName: nil,
-            attachmentExactSize: nil,
-            contentVersion: "v2",
-            availability: .fetchable,
-            createdAtMs: 1,
-            modifiedAtMs: 4,
-            deletedAtMs: nil)
-        store.apply(generated)
-        var unrelated = generated
-        unrelated.id = "unrelated-generated"
-        unrelated.parent = "other-parent"
-        unrelated.safeName = "other.json"
-        store.apply(unrelated)
-        var deleted = generated
-        deleted.id = "deleted-generated"
-        deleted.safeName = "deleted.json"
-        deleted.deletedAtMs = 5
-        store.apply(deleted)
-        var attachment = generated
-        attachment.id = "attachment"
-        attachment.kind = .attachment
-        attachment.safeName = "attachment.bin"
-        attachment.attachmentExactSize = 3
-        store.apply(attachment)
+        let dataRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gramdrive-build154-boundary-\(UUID().uuidString)")
+        let scratch = dataRoot.appendingPathComponent("provider-scratch", isDirectory: true)
+        let replica = dataRoot.appendingPathComponent("system-replica", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dataRoot) }
 
-        let current = Data("new".utf8)
-        let stale = Data("old".utf8)
+        let seed = try GeneratedBoundarySeed.create(at: dataRoot)
+        #expect(try seed["journal_latest_sequence"] == "0")
+        let store = try SharedStateStore.open(dataRoot: dataRoot.path, role: .provider)
+        guard let account = try store.account(accountId: 7) else {
+            throw GeneratedBoundaryFixtureError("real FFI store omitted synthetic account")
+        }
+        let journal = try store.changeJournalState()
+        #expect(journal.latestSequence == 0, "the regression must not manufacture a journal row")
+
+        func providerIdentifier(_ key: String) throws -> String {
+            ItemIdentifierMapping.providerIdentifier(
+                forCoreItemId: try seed[key],
+                accountRootId: account.rootItemId
+            ).rawValue
+        }
+
+        let markdown = try providerIdentifier("markdown")
+        let ndjson = try providerIdentifier("ndjson")
+        let chatJSON = try providerIdentifier("chat_json")
+        let unrelated = try providerIdentifier("unrelated")
+        let deleted = try providerIdentifier("deleted")
+        let attachment = try providerIdentifier("attachment")
+        let chatParent = try providerIdentifier("chat_parent")
+        let current: [String: (bytes: Data, version: String)] = [
+            markdown: (Data("# synthetic g2\n".utf8), "markdown-v2"),
+            ndjson: (Data("{\"synthetic\":2}\n".utf8), "ndjson-v2"),
+            chatJSON: (Data("{\"generation\":2}\n".utf8), "chat-json-v2"),
+        ]
+        for (identifier, expected) in current {
+            let coreID = ItemIdentifierMapping.coreItemId(
+                for: NSFileProviderItemIdentifier(identifier),
+                accountRootId: account.rootItemId)
+            let metadata = try #require(try store.item(id: coreID))
+            #expect(metadata.contentVersion == expected.version)
+            #expect(metadata.logicalSize == UInt64(expected.bytes.count))
+        }
+        let liveGenerated = try store.liveGeneratedItems(accountId: account.accountId)
+        #expect(
+            Set(liveGenerated.map(\.id)).isSuperset(
+                of: Set(
+                    current.keys.map { key in
+                        ItemIdentifierMapping.coreItemId(
+                            for: NSFileProviderItemIdentifier(key),
+                            accountRootId: account.rootItemId)
+                    })))
+
+        let stale = Data("synthetic-g1".utf8)
         let unchanged = Data("keep".utf8)
-        let bytes = InstalledGeneratedBytes(
-            current: ["chat-json": current],
-            materialized: [
-                "chat-json": stale,
-                "unrelated-generated": unchanged,
-                "deleted-generated": unchanged,
-                "attachment": unchanged,
+        let materializations = try InstalledGeneratedMaterializations(
+            directory: replica,
+            initial: [
+                markdown: ("markdown.materialized", stale),
+                ndjson: ("ndjson.materialized", stale),
+                chatJSON: ("chat-json.materialized", stale),
+                unrelated: ("unrelated.materialized", unchanged),
+                deleted: ("deleted.materialized", unchanged),
+                attachment: ("attachment.materialized", unchanged),
             ])
+        for identifier in current.keys {
+            #expect(try materializations.existingBytes(for: identifier) == stale)
+        }
+
+        let core = try DriveCore(config: CoreConfig(dataDir: dataRoot.path))
+        let hydration = CoreHydrationRequestAdapter(
+            hydrator: CoreContentHydrator(hydrator: try core.hydrator()))
+        let fetcher = ContentFetcher(
+            hydration: hydration,
+            scratchDirectory: { scratch })
+        func productionFetch(_ identifier: String) async throws -> (URL, NSFileProviderItemVersion)
+        {
+            let future = TestFuture<FetchOutcome>()
+            _ = fetcher.fetchContents(
+                itemIdentifier: NSFileProviderItemIdentifier(identifier),
+                requestedVersion: nil,
+                context: { (account: account, store: store) },
+                completionHandler: { url, item, error in
+                    future.fulfill(FetchOutcome(url: url, item: item, error: error))
+                })
+            let outcome = await future.settled
+            if let error = outcome.error {
+                throw error
+            }
+            guard let url = outcome.url, let item = outcome.fetchedItem else {
+                throw GeneratedBoundaryFixtureError("production fetch returned no materialization")
+            }
+            return (url, item.itemVersion)
+        }
+
         let recorder = DispatchRecorder()
         let retainedRelays = RelayRetainer()
         let setup = CoalescingFileProviderDomainSetup {
@@ -511,8 +664,8 @@ struct ChangeSignalRelayTests {
                 },
                 signaling: ProductionPathSignaling(
                     recorder: recorder,
-                    materializedContainerIDs: ["chat-parent"],
-                    didEvict: { bytes.evict($0) }))
+                    materializedContainerIDs: [chatParent],
+                    didEvict: { try materializations.evict($0) }))
             try relay.start(observe: { _ in RecordingToken() })
             retainedRelays.retain(relay)
             return FileProviderDomainSetupResult(
@@ -537,12 +690,20 @@ struct ChangeSignalRelayTests {
 
         await model.startAgentSession()
 
-        #expect(bytes.bytes(for: "chat-json") == current)
-        #expect(bytes.bytes(for: "attachment") == unchanged)
-        #expect(bytes.bytes(for: "deleted-generated") == unchanged)
-        #expect(bytes.bytes(for: "unrelated-generated") == unchanged)
+        for (identifier, expected) in current {
+            let exposed = try await materializations.open(identifier) {
+                let (url, version) = try await productionFetch(identifier)
+                #expect(version.contentVersion == Data(expected.version.utf8))
+                return url
+            }
+            #expect(exposed == expected.bytes)
+        }
+        #expect(try materializations.existingBytes(for: attachment) == unchanged)
+        #expect(try materializations.existingBytes(for: deleted) == unchanged)
+        #expect(try materializations.existingBytes(for: unrelated) == unchanged)
         #expect(
-            recorder.events.first == "evict:chat-json",
+            Array(recorder.events.prefix(3))
+                == current.keys.sorted().map { "evict:\($0)" },
             "the retained-state startup must evict stale bytes before change publication")
     }
 
