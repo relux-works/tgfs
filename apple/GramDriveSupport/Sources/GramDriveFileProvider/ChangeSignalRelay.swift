@@ -30,6 +30,7 @@ public protocol ProviderChangeSignaling: Sendable {
 
 /// `NSFileProviderManager` is a stateless handle onto the system's file
 /// provider daemon; its methods are documented callable from any thread.
+// swift-format-ignore: AvoidRetroactiveConformances
 extension NSFileProviderManager: @retroactive @unchecked Sendable {}
 
 extension NSFileProviderManager: ProviderChangeSignaling {
@@ -480,6 +481,23 @@ public enum ProviderContainerChangeResolver {
             sequence = last.sequence
             if page.count < Int(pageSize) || sequence >= current.latestSequence {
                 break
+            }
+        }
+        // An upgraded installed database can contain generated documents
+        // whose current rows predate the item-change journal. Snapshot this
+        // narrow class exactly once, before the first provider publication;
+        // all later checks remain journal-delta-only.
+        if prior == nil {
+            for metadata in try store.liveGeneratedItems(accountId: account.accountId) {
+                guard let parentID = metadata.parent else { continue }
+                let item = ItemIdentifierMapping.providerIdentifier(
+                    forCoreItemId: metadata.id,
+                    accountRootId: account.rootItemId)
+                let parent = ItemIdentifierMapping.parentIdentifier(
+                    forParentCoreItemId: parentID,
+                    accountRootId: account.rootItemId)
+                generatedItems[item.rawValue] = ProviderGeneratedItemChange(
+                    item: item, parent: parent)
             }
         }
         let position = ChangeJournalState(

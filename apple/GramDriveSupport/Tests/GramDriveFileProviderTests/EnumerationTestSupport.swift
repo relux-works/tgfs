@@ -265,6 +265,16 @@ final class ScriptedStore: SharedStateStoreProtocol, @unchecked Sendable {
             }
     }
 
+    func liveGeneratedItems(accountId: Int64) throws -> [ItemMetadata] {
+        lock.lock()
+        defer { lock.unlock() }
+        return itemsById.values
+            .filter { $0.kind == .generatedDoc && $0.deletedAtMs == nil }
+            .sorted {
+                ($0.parent ?? "", $0.id) < ($1.parent ?? "", $1.id)
+            }
+    }
+
     func layout() -> SharedStateLayout {
         SharedStateLayout(
             dataRoot: "/scripted",

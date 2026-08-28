@@ -84,6 +84,20 @@ make gates          # print every suite and the exact command behind each step
 make fmt            # apply rustfmt (the gate only checks formatting)
 ```
 
+The non-shipping shared-state fixture seeder drives the coordinator's real
+Rust write path for cross-language smoke and File Provider boundary tests:
+
+```sh
+cargo run -p gramdrive-ffi --example shared_state_seed -- \
+  .temp/shared-state-fixture seed
+cargo run -p gramdrive-ffi --example shared_state_seed -- \
+  .temp/generated-boundary-fixture generated-initial
+```
+
+Both modes write only beneath the supplied data root. The generated-boundary
+mode is consumed by the Swift regression and emits synthetic identifiers plus
+aggregate journal provenance; disposable outputs belong under `.temp/`.
+
 `make check` is shorthand for
 `python3 .scripts/acceptance/run_automated.py --suite all --run-id local-all`.
 Every step runs even after one fails, because the useful output of a gate run is

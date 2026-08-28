@@ -753,6 +753,28 @@ impl SharedStateStore {
             .collect()
     }
 
+    /// The current live generated-document projection for one account.
+    ///
+    /// This is deliberately separate from the change journal: an installed
+    /// database may contain generated rows created before that journal was
+    /// introduced. File Provider consumes this bounded-to-one-kind snapshot
+    /// only for initial publication, then returns to journal deltas.
+    pub fn live_generated_items(&self, account_id: i64) -> Result<Vec<ItemMetadata>, DriveError> {
+        let key = AccountKey {
+            account_id: AccountId(account_id),
+        };
+        let mut store = self.store()?;
+        let txn = store.read_txn().map_err(map_state_error)?;
+        txn.live_generated_items(key)
+            .map_err(map_state_error)?
+            .into_iter()
+            .map(|record| {
+                let pin = read_pin(&txn, &record.id)?;
+                item_metadata(&txn, record, pin)
+            })
+            .collect()
+    }
+
     /// The database's connection-relative change stamp.
     ///
     /// The value differs from one previously returned by *this handle*
@@ -1458,6 +1480,74 @@ mod tests {
             Some("sender-photo.jpg")
         );
         assert_eq!(file.attachment_exact_size, Some(2_048));
+    }
+
+    #[test]
+    fn initial_generated_snapshot_is_current_kind_scoped_and_tombstone_free() {
+        let root = TempRoot::new();
+        seed(&root);
+        let layout = shared_state_layout(root.as_str().to_owned()).expect("layout");
+        let mut writer = StateStore::open(&layout.database_file).expect("open writer");
+        let chat = ChatKey {
+            scope: scope(),
+            chat_id: ChatId(100),
+        };
+        let live = ItemKey::Canonical(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+            chat,
+            partition: DocPartition::Chat,
+            format: DocFormat::Json,
+            schema_family: SchemaFamily(1),
+        }))
+        .id();
+        let deleted = ItemKey::Canonical(CanonicalKey::GeneratedDoc(GeneratedDocKey {
+            chat,
+            partition: DocPartition::Month {
+                year: 2026,
+                month: 8,
+            },
+            format: DocFormat::Markdown,
+            schema_family: SchemaFamily(1),
+        }))
+        .id();
+        let generated = |id: ItemId, name: &str, deleted_at_ms| ItemRecord {
+            aggregate_size: None,
+            id,
+            parent: Some(chat_dir_id()),
+            display_name: name.to_owned(),
+            safe_name: name.to_owned(),
+            metadata_version: MetadataVersion::new("generated-m1").expect("version"),
+            content: Some(FileFacts {
+                mime_type: Some("application/json".to_owned()),
+                logical_size: Some(16),
+                content_version: Some(
+                    ContentVersion::new("generated-c1").expect("content version"),
+                ),
+            }),
+            availability: StoredItemAvailability::Fetchable,
+            created_at_ms: Some(1_000),
+            modified_at_ms: Some(2_000),
+            deleted_at_ms,
+        };
+        let txn = writer.write_txn().expect("write txn");
+        txn.upsert_item(&generated(live.clone(), ".chat.json", None))
+            .expect("live generated");
+        txn.upsert_item(&generated(deleted, "Messages.md", Some(3_000)))
+            .expect("deleted generated");
+        txn.commit().expect("commit");
+        drop(writer);
+
+        let store = SharedStateStore::open(root.as_str().to_owned(), StateRole::Provider)
+            .expect("open provider");
+        let snapshot = store.live_generated_items(7).expect("generated snapshot");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, live.text());
+        assert_eq!(snapshot[0].kind, ItemKind::GeneratedDoc);
+        assert!(
+            store
+                .live_generated_items(8)
+                .expect("other account")
+                .is_empty()
+        );
     }
 
     #[test]

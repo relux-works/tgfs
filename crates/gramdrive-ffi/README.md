@@ -293,6 +293,11 @@ one durable SQLite database with no shared-memory assumptions
   (`instance_id`) distinguishes database lives, so an anchor surviving a
   quarantine-and-reseed expires explicitly instead of pointing at
   unrelated sequences.
+- **`live_generated_items(account)`** is the read-only, account-scoped current
+  snapshot used only for File Provider's initial publication. It closes the
+  upgrade boundary where a live generated row predates the change journal;
+  later publication remains journal-delta-only. The query excludes ordinary
+  attachments and tombstones and returns no message payload bytes.
 - **`quarantine_corrupt_state(data_root, role)`** is corruption recovery:
   it re-probes the file itself and, only if SQLite reports it corrupt,
   moves database + sidecars into `state/quarantine/` for a fresh start
