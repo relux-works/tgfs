@@ -332,12 +332,25 @@ class CandidateSelectionTests(unittest.TestCase):
             row[3]
             for row in self.db.execute(
                 "EXPLAIN QUERY PLAN " + live.CANDIDATE_QUERY,
-                (live.MAX_CANDIDATES,),
+                (
+                    live.MAX_GENERATED_VERIFICATION_BYTES,
+                    live.MAX_CANDIDATES,
+                ),
             )
         ).lower()
 
         self.assertIn("items_live_fetchable_attachments_by_size", plan)
         self.assertNotIn("temp b-tree", plan)
+
+    def test_candidate_query_excludes_an_oversized_generated_document_set(self):
+        self.seed_date_first_tree()
+        self.db.execute(
+            "UPDATE items SET logical_size=? WHERE item_id=?",
+            (live.MAX_GENERATED_VERIFICATION_BYTES, bytes([7])),
+        )
+        self.db.commit()
+
+        self.assertEqual(live.candidate_rows(self.db), [])
 
     def test_fixed_probe_states_distinguish_missing_platform_error_and_timeout(self):
         completed = subprocess.CompletedProcess(("probe",), 0, "1073741824\n", "")
@@ -416,6 +429,55 @@ class CandidateSelectionTests(unittest.TestCase):
     def test_placeholder_read_failure_uses_a_fixed_actionable_label(self):
         with self.assertRaises(live.AcceptanceFailure) as caught:
             live.read_placeholder_once(self.root / "missing-placeholder")
+        self.assertEqual(str(caught.exception), "placeholder-hydration-read-failed")
+
+
+class BoundedPlaceholderReadTests(unittest.TestCase):
+    def test_bounded_child_returns_exact_bytes_for_every_private_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+
+            records = live.read_placeholder_paths_bounded(
+                (first, second), 1.0, "generated-document-verification-timeout"
+            )
+
+        self.assertEqual(records[0][1], 5)
+        self.assertEqual(records[1][1], 6)
+        self.assertNotEqual(records[0][0], records[1][0])
+
+    def test_bounded_child_kills_a_blocked_read_and_fails_closed(self):
+        prior_children = {child.pid for child in live.multiprocessing.active_children()}
+        started = time.monotonic()
+
+        with self.assertRaises(live.AcceptanceFailure) as caught:
+            live.read_placeholder_paths_bounded(
+                (Path("/dev/zero"),),
+                0.01,
+                "generated-document-verification-timeout",
+            )
+
+        elapsed = time.monotonic() - started
+        current_children = {
+            child.pid for child in live.multiprocessing.active_children()
+        }
+        self.assertEqual(
+            str(caught.exception), "generated-document-verification-timeout"
+        )
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(current_children, prior_children)
+
+    def test_bounded_child_does_not_launder_a_read_failure_as_absence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            with self.assertRaises(live.AcceptanceFailure) as caught:
+                live.read_placeholder_paths_bounded(
+                    (missing,), 1.0, "foreground-hydration-timeout"
+                )
+
         self.assertEqual(str(caught.exception), "placeholder-hydration-read-failed")
 
 
@@ -1001,6 +1063,171 @@ class InstalledPhaseEndToEndTests(unittest.TestCase):
         self.assertTrue(after["relaunch_prior_item_identity_preserved"])
         self.assertTrue(after["relaunch_item_set_additive_only"])
         self.assertTrue(after["relaunch_cursor_progress_preserved"])
+
+    def test_large_profile_generated_verification_cannot_starve_foreground_hydration(
+        self,
+    ):
+        class VirtualClock:
+            def __init__(self):
+                self.value = 1_000.0
+
+            def __call__(self):
+                return self.value
+
+            def advance(self, seconds: float):
+                self.value += seconds
+
+        large_payload = b"x" * 8_388_608
+        large_finder = live.item_path(self.db, self.cloud, bytes([6]))
+        large_cache = Path(
+            self.db.execute(
+                "SELECT materialization_ref FROM cache_entries WHERE item_id=?",
+                (bytes([6]),),
+            ).fetchone()[0]
+        )
+        large_finder.write_bytes(large_payload)
+        large_cache.write_bytes(large_payload)
+        self.db.execute(
+            "UPDATE items SET logical_size=? WHERE item_id=?",
+            (len(large_payload), bytes([6])),
+        )
+        self.db.execute(
+            "UPDATE cache_entries SET size=?, blob_hash=? WHERE item_id=?",
+            (
+                len(large_payload),
+                hashlib.sha256(large_payload).digest(),
+                bytes([6]),
+            ),
+        )
+        (self.data / "agent/settings.json").write_text(
+            '{"cacheQuotaBytes": 33554432}\n'
+        )
+
+        self.add_item(13, 2, "Bounded", "chat")
+        self.add_item(14, 13, ".chat.json", "generated_doc", payload=b'{"chat":2}\n')
+        self.add_item(15, 13, "2026-08", "month_dir")
+        self.add_item(16, 15, "Messages.md", "generated_doc", payload=b"# Bounded\n")
+        self.add_item(
+            17,
+            15,
+            "Messages.ndjson",
+            "generated_doc",
+            payload=b'{"bounded":true}\n',
+        )
+        self.add_item(
+            18,
+            15,
+            "bounded.bin",
+            "attachment",
+            availability="fetchable",
+            payload=b"bounded",
+            generated=False,
+        )
+        self.db.commit()
+
+        clock = VirtualClock()
+        legacy_generated_finder_paths = {
+            live.item_path(self.db, self.cloud, bytes([item_id]))
+            for item_id in (4, 6, 7)
+        }
+        bounded_generated_finder_paths = {
+            live.item_path(self.db, self.cloud, bytes([item_id]))
+            for item_id in (14, 16, 17)
+        }
+        bounded_attachment = live.item_path(self.db, self.cloud, bytes([18]))
+        attachment_ids = {
+            self.attachment: bytes([8]),
+            bounded_attachment: bytes([18]),
+        }
+        foreground_published = False
+        legacy_generated_calls = 0
+        observed_legacy_generated_seconds = 72.547
+
+        def bounded_large_profile_read(paths, timeout, timeout_category):
+            nonlocal foreground_published, legacy_generated_calls
+            paths = tuple(paths)
+            if len(paths) == 1 and paths[0] in attachment_ids:
+                self.assertEqual(timeout, live.FOREGROUND_HYDRATION_TIMEOUT_SECONDS)
+                clock.advance(timeout - 0.001)
+                records = tuple(live.read_placeholder_once(path) for path in paths)
+                digest, size = records[0]
+                item_id = attachment_ids[paths[0]]
+                publisher = sqlite3.connect(self.database)
+                publisher.execute(
+                    "INSERT OR REPLACE INTO cache_entries VALUES"
+                    "(?, 'attachment-v1', ?, 'verified', ?, 'blob', ?)",
+                    (item_id, size, str(paths[0]), bytes.fromhex(digest)),
+                )
+                publisher.commit()
+                publisher.close()
+                foreground_published = True
+                return records
+
+            self.assertTrue(
+                foreground_published,
+                "generated verification started before foreground publication",
+            )
+            self.assertEqual(timeout, live.GENERATED_DOCUMENT_VERIFY_TIMEOUT_SECONDS)
+            finder_path = paths[-1]
+            if finder_path in legacy_generated_finder_paths:
+                legacy_generated_calls += 1
+                # The observed generated aggregate was 72.547s. Even granting
+                # two reads the largest successful 9.999s duration leaves the
+                # third above the production 10s per-document bound.
+                if legacy_generated_calls == 3:
+                    residual = observed_legacy_generated_seconds - 2 * (
+                        timeout - 0.001
+                    )
+                    self.assertGreater(residual, timeout)
+                    clock.advance(timeout)
+                    raise live.AcceptanceFailure(timeout_category)
+            else:
+                self.assertIn(finder_path, bounded_generated_finder_paths)
+            clock.advance(timeout - 0.001)
+            return tuple(live.read_placeholder_once(path) for path in paths)
+
+        self.db.close()
+        with mock.patch.object(
+            live.time, "monotonic", side_effect=clock
+        ), mock.patch.object(
+            live,
+            "read_placeholder_paths_bounded",
+            side_effect=bounded_large_profile_read,
+        ):
+            self.assertEqual(live.DEFAULT_OVERALL_DEADLINE_SECONDS, 120.0)
+            worker_budget = live.DEFAULT_OVERALL_DEADLINE_SECONDS - (
+                live.worker_cleanup_reserve(live.DEFAULT_OVERALL_DEADLINE_SECONDS)
+            )
+            self.assertEqual(worker_budget, 118.0)
+            self.assertLess(
+                live.FOREGROUND_HYDRATION_TIMEOUT_SECONDS
+                + 3 * live.GENERATED_DOCUMENT_VERIFY_TIMEOUT_SECONDS,
+                worker_budget,
+            )
+            deadline = live.Deadline(worker_budget)
+            recorder = live.StageRecorder("before", deadline)
+            before = live.run_before(
+                self.database,
+                self.data,
+                self.cloud,
+                self.state,
+                self.evidence,
+                dataless_probe=lambda _path: True,
+                deadline=deadline,
+                recorder=recorder,
+            )
+            deadline_remaining_ms = deadline.remaining_ms()
+
+        self.assertTrue(live.evidence_passed("before", before), before)
+        private = json.loads(self.state.read_text())
+        self.assertEqual(private["sample_item"], bytes([18]).hex())
+        self.assertEqual(deadline_remaining_ms, 28_004)
+        self.assertEqual(recorder.timings["hydrate_attachment"], 59_999)
+        self.assertEqual(recorder.timings["verify_generated_documents"], 29_997)
+        self.assertLessEqual(
+            before["generated_verification_bytes"],
+            before["generated_verification_byte_limit"],
+        )
 
     def test_before_fails_closed_when_the_selected_placeholder_reprobe_times_out(self):
         outcomes = iter(
@@ -1642,7 +1869,10 @@ class RepresentativeScaleTests(unittest.TestCase):
                 row[3]
                 for row in check.execute(
                     "EXPLAIN QUERY PLAN " + live.CANDIDATE_QUERY,
-                    (live.MAX_CANDIDATES,),
+                    (
+                        live.MAX_GENERATED_VERIFICATION_BYTES,
+                        live.MAX_CANDIDATES,
+                    ),
                 )
             ).lower()
             candidates = live.candidate_rows(check)
@@ -1717,6 +1947,10 @@ class RelaunchComparisonTests(unittest.TestCase):
             "hydrated_size_matches": True,
             "hydrated_bytes_verified": True,
             "generated_document_open_count": 3,
+            "generated_verification_bytes": 1024,
+            "generated_verification_byte_limit": (
+                live.MAX_GENERATED_VERIFICATION_BYTES
+            ),
             "generated_exact_bytes_verified": True,
             "generated_metadata_truthful": True,
             "generated_storage_within_quota": True,
@@ -1741,6 +1975,12 @@ class RelaunchComparisonTests(unittest.TestCase):
             "generated_dates_stable": True,
         }
         self.assertTrue(live.evidence_passed("after", evidence))
+
+        evidence["generated_verification_bytes"] = (
+            evidence["generated_verification_byte_limit"] + 1
+        )
+        self.assertFalse(live.evidence_passed("after", evidence))
+        evidence["generated_verification_bytes"] = 1024
 
         evidence["relaunch_prior_item_identity_preserved"] = False
         self.assertFalse(live.evidence_passed("after", evidence))

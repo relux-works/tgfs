@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import signal
@@ -44,8 +45,11 @@ DEFAULT_STATE = Path(".temp/installed-live-content-private-state.json")
 DEFAULT_EVIDENCE = Path(".temp/installed-live-content-evidence.json")
 DEFAULT_CACHE_QUOTA_BYTES = 10_000_000_000
 MAX_CANDIDATES = 20
+MAX_GENERATED_VERIFICATION_BYTES = 8 * 1024 * 1024
 PLACEHOLDER_PROBE_TIMEOUT_SECONDS = 0.5
 PLACEHOLDER_RESOLVE_TIMEOUT_SECONDS = 4.0
+FOREGROUND_HYDRATION_TIMEOUT_SECONDS = 60.0
+GENERATED_DOCUMENT_VERIFY_TIMEOUT_SECONDS = 10.0
 DEFAULT_COMPANION_EXECUTABLE = Path(
     "/Applications/GramDrive.app/Contents/MacOS/GramDrive"
 )
@@ -65,10 +69,10 @@ PHASE_STAGES = {
     "before": (
         "select_candidate",
         "enumerate_ancestors",
-        "verify_generated_documents",
-        "verify_generated_storage",
         "hydrate_attachment",
         "publish_hydration",
+        "verify_generated_documents",
+        "verify_generated_storage",
         "snapshot_identity_and_cursors",
         "verify_namespace",
         "write_evidence",
@@ -123,6 +127,8 @@ PUBLIC_EVIDENCE_FIELDS = {
     "generated_storage_within_quota",
     "generated_scan_entry_count",
     "generated_scan_entry_limit",
+    "generated_verification_byte_limit",
+    "generated_verification_bytes",
     "hydrated_bytes_verified",
     "hydrated_size_matches",
     "hydration_count",
@@ -653,6 +659,50 @@ def read_placeholder_once(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), byte_count
 
 
+def _read_placeholder_paths_child(paths: tuple[str, ...], sender) -> None:
+    """Read exact bytes in a killable child that stays in the worker group."""
+    try:
+        records = tuple(read_placeholder_once(Path(path)) for path in paths)
+        sender.send(("ok", records))
+    except BaseException:
+        sender.send(("error", ()))
+    finally:
+        sender.close()
+
+
+def read_placeholder_paths_bounded(
+    paths: Sequence[Path],
+    timeout: float,
+    timeout_category: str,
+) -> tuple[tuple[str, int], ...]:
+    """Read private paths exactly with a hard, process-killable stage bound."""
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_read_placeholder_paths_child,
+        args=(tuple(str(path) for path in paths), sender),
+    )
+    process.start()
+    sender.close()
+    process.join(timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(0.25)
+        if process.is_alive():
+            process.kill()
+            process.join(0.25)
+        receiver.close()
+        raise AcceptanceFailure(timeout_category)
+    if process.exitcode != 0 or not receiver.poll():
+        receiver.close()
+        raise AcceptanceFailure("placeholder-hydration-read-failed")
+    state, records = receiver.recv()
+    receiver.close()
+    if state != "ok":
+        raise AcceptanceFailure("placeholder-hydration-read-failed")
+    return records
+
+
 def verify_generated_documents(
     db: sqlite3.Connection,
     cloud_root: Path,
@@ -702,11 +752,15 @@ def verify_generated_documents(
             or not materialization_ref
         ):
             raise AcceptanceFailure("generated-metadata-contract-failed")
-        expected_digest, expected_size = read_placeholder_once(
-            Path(materialization_ref)
-        )
-        finder_digest, finder_size = read_placeholder_once(
-            item_path(db, cloud_root, item_id)
+        (expected_digest, expected_size), (finder_digest, finder_size) = (
+            read_placeholder_paths_bounded(
+                (
+                    Path(materialization_ref),
+                    item_path(db, cloud_root, item_id),
+                ),
+                GENERATED_DOCUMENT_VERIFY_TIMEOUT_SECONDS,
+                "generated-document-verification-timeout",
+            )
         )
         if (
             expected_digest != finder_digest
@@ -914,6 +968,11 @@ CANDIDATE_QUERY = """
           AND att.deleted_at_ms IS NULL
           AND md.logical_size > 0
           AND nd.logical_size > 0
+          AND cj.logical_size > 0
+          AND md.deleted_at_ms IS NULL
+          AND nd.deleted_at_ms IS NULL
+          AND cj.deleted_at_ms IS NULL
+          AND md.logical_size + nd.logical_size + cj.logical_size <= ?
           AND NOT EXISTS (
               SELECT 1 FROM cache_entries cached
               WHERE cached.item_id=att.item_id
@@ -925,7 +984,10 @@ CANDIDATE_QUERY = """
 
 
 def candidate_rows(db: sqlite3.Connection) -> list[Candidate]:
-    rows = db.execute(CANDIDATE_QUERY, (MAX_CANDIDATES,)).fetchall()
+    rows = db.execute(
+        CANDIDATE_QUERY,
+        (MAX_GENERATED_VERIFICATION_BYTES, MAX_CANDIDATES),
+    ).fetchall()
     return [Candidate(*row) for row in rows]
 
 
@@ -1554,39 +1616,16 @@ def run_before(
         if not post_uncached or not post_dataless:
             raise AcceptanceFailure("enumeration-materialized-sampled-placeholder")
 
-    with recorder.stage("verify_generated_documents"):
-        generated_db = connection(database, deadline)
-        try:
-            generated_records = verify_generated_documents(
-                generated_db,
-                cloud_root,
-                (candidate.markdown_id, candidate.ndjson_id, candidate.chat_json_id),
-            )
-        finally:
-            generated_db.close()
-        markdown_size = next(
-            record["logical_size"]
-            for record in generated_records
-            if record["mime_type"] == "text/markdown"
-        )
-        ndjson_size = next(
-            record["logical_size"]
-            for record in generated_records
-            if record["mime_type"] == "application/x-ndjson"
-        )
-
-    with recorder.stage("verify_generated_storage"):
-        storage_db = connection(database, deadline)
-        try:
-            generated_storage = verify_generated_storage(
-                storage_db, data_root, deadline
-            )
-        finally:
-            storage_db.close()
-
+    # Give the selected foreground demand the provider before generated Finder
+    # opens can enqueue large profile documents ahead of it. Exact generated
+    # bytes are still verified below inside the same aggregate deadline.
     with recorder.stage("hydrate_attachment"):
         hydration_started = time.monotonic()
-        hydrated_digest, byte_count = read_placeholder_once(attachment)
+        ((hydrated_digest, byte_count),) = read_placeholder_paths_bounded(
+            (attachment,),
+            FOREGROUND_HYDRATION_TIMEOUT_SECONDS,
+            "foreground-hydration-timeout",
+        )
         hydration_ms = round((time.monotonic() - hydration_started) * 1000)
 
     with recorder.stage("publish_hydration"):
@@ -1612,6 +1651,39 @@ def run_before(
             )
         if blob is None:
             raise AcceptanceFailure("hydration-cache-publication-timeout")
+
+    with recorder.stage("verify_generated_documents"):
+        generated_db = connection(database, deadline)
+        try:
+            generated_records = verify_generated_documents(
+                generated_db,
+                cloud_root,
+                (candidate.markdown_id, candidate.ndjson_id, candidate.chat_json_id),
+            )
+        finally:
+            generated_db.close()
+        markdown_size = next(
+            record["logical_size"]
+            for record in generated_records
+            if record["mime_type"] == "text/markdown"
+        )
+        ndjson_size = next(
+            record["logical_size"]
+            for record in generated_records
+            if record["mime_type"] == "application/x-ndjson"
+        )
+        generated_verification_bytes = sum(
+            record["logical_size"] for record in generated_records
+        )
+
+    with recorder.stage("verify_generated_storage"):
+        storage_db = connection(database, deadline)
+        try:
+            generated_storage = verify_generated_storage(
+                storage_db, data_root, deadline
+            )
+        finally:
+            storage_db.close()
 
     with recorder.stage("snapshot_identity_and_cursors"):
         indexed_counts = create_indexed_snapshot(
@@ -1669,6 +1741,10 @@ def run_before(
             ),
             "hydration_count": 1,
             "generated_document_open_count": len(generated_records),
+            "generated_verification_bytes": generated_verification_bytes,
+            "generated_verification_byte_limit": (
+                MAX_GENERATED_VERIFICATION_BYTES
+            ),
             "generated_exact_bytes_verified": True,
             "generated_metadata_truthful": True,
             "generated_storage_bytes": generated_storage.physical_bytes,
@@ -1978,6 +2054,10 @@ def evidence_passed(phase: str, evidence: dict) -> bool:
     if evidence.get("hydration_count") != 1:
         return False
     if evidence.get("generated_document_open_count") != 3:
+        return False
+    if evidence.get("generated_verification_bytes", sys.maxsize) > evidence.get(
+        "generated_verification_byte_limit", -1
+    ):
         return False
     if evidence.get("generated_orphan_file_count") != 0:
         return False
