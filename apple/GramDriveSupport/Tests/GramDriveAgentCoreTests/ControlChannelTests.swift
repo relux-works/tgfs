@@ -146,6 +146,45 @@ private final class LockedCount: @unchecked Sendable {
   }
 }
 
+private struct RegistrationHoldRequestResult: Sendable {
+  let event: ControlEvent
+  let startupReturnedBeforeRelease: Bool
+  let stagesBeforeRelease: [ControlServerStartupEvent]
+}
+
+/// A result bridge for a blocking job owned by a test scheduler.
+private final class BlockingOperationResult<Value: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var result: Result<Value, any Error>?
+  private var continuation: CheckedContinuation<Value, any Error>?
+
+  func resolve(_ result: Result<Value, any Error>) {
+    lock.lock()
+    guard self.result == nil else {
+      lock.unlock()
+      return
+    }
+    self.result = result
+    let continuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+    continuation?.resume(with: result)
+  }
+
+  func value() async throws -> Value {
+    try await withCheckedThrowingContinuation { continuation in
+      lock.lock()
+      if let result {
+        lock.unlock()
+        continuation.resume(with: result)
+      } else {
+        self.continuation = continuation
+        lock.unlock()
+      }
+    }
+  }
+}
+
 /// The control channel end to end: the real server and the real client
 /// over a substitute socket, with scripted seams playing the engine
 /// (BUG-260720-3i74u1).
@@ -162,6 +201,32 @@ private final class LockedCount: @unchecked Sendable {
     label: "com.reluxworks.gramdrive.tests.control-client",
     qos: .userInitiated,
     attributes: .concurrent)
+
+  /// Schedules a real blocking operation directly on libdispatch. Awaiting the
+  /// result does not need a Swift cooperative executor worker.
+  private static func dispatchBlocking<Value: Sendable>(
+    _ operation: @escaping @Sendable () throws -> Value
+  ) -> BlockingOperationResult<Value> {
+    let result = BlockingOperationResult<Value>()
+    blockingClientQueue.async {
+      result.resolve(Result { try operation() })
+    }
+    return result
+  }
+
+  /// A controlled two-worker scheduler for the historical coordination shape.
+  /// It models the old parent-resumption dependency without pretending that a
+  /// semaphore changes Swift's global cooperative executor policy.
+  private static func schedulerBlocking<Value: Sendable>(
+    _ scheduler: OperationQueue,
+    operation: @escaping @Sendable () throws -> Value
+  ) -> BlockingOperationResult<Value> {
+    let result = BlockingOperationResult<Value>()
+    scheduler.addOperation {
+      result.resolve(Result { try operation() })
+    }
+    return result
+  }
 
   /// A per-test socket home under the system temp dir.
   private static func tempRoot() throws -> URL {
@@ -370,7 +435,7 @@ private final class LockedCount: @unchecked Sendable {
     let writtenRequests = LockedCount()
     let events = LockedControlServerEvents()
 
-    let startup = Task.detached {
+    let startup = Self.dispatchBlocking {
       try ControlServer.start(
         socketURL: socket,
         handlers: Self.handlers(),
@@ -408,7 +473,7 @@ private final class LockedCount: @unchecked Sendable {
     #expect(events.snapshot == [.listenerRegistered])
 
     releaseRegistration.signal()
-    let server = try await startup.value
+    let server = try await startup.value()
     defer { server.stop() }
     do {
       for response in try await requests.value {
@@ -440,12 +505,11 @@ private final class LockedCount: @unchecked Sendable {
     try FileManager.default.createDirectory(
       at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
     let releaseRegistration = DispatchSemaphore(value: 0)
-    let registrationEntered = LockedFlag()
+    let registrationEntered = DispatchSemaphore(value: 0)
     let startupReturned = LockedFlag()
-    let requestWritten = LockedFlag()
     let events = LockedControlServerEvents()
 
-    let startup = Task.detached {
+    let startup = Self.dispatchBlocking {
       defer { startupReturned.set() }
       return try ControlServer.start(
         socketURL: socket,
@@ -453,37 +517,35 @@ private final class LockedCount: @unchecked Sendable {
         startupObservation: ControlServerStartupObservation { event in
           events.append(event)
           guard event == .listenerRegistered else { return }
-          registrationEntered.set()
+          registrationEntered.signal()
           releaseRegistration.wait()
         })
     }
-    await Self.waitUntil("listener registration", condition: { registrationEntered.value })
-
     // The socket was bound before the source registration callback. Connect
-    // and write while that callback is held, then prove `start` has not leaked
-    // a server reference during this socket-visible interval.
-    let request = Task.detached {
+    // and write while that callback is held. The client captures pre-release
+    // state and releases registration itself, so its unchanged two-second read
+    // deadline is independent of cooperative parent-task resumption.
+    let request = Self.dispatchBlocking {
+      registrationEntered.wait()
       let descriptor = try ControlClient.connect(socketURL: socket, receiveTimeout: .seconds(2))
       defer { close(descriptor) }
       try ControlClient.writeLine(
         ControlRequest(operation: .status), to: descriptor, path: socket.path)
-      requestWritten.set()
+      let startupReturnedBeforeRelease = startupReturned.value
+      let stagesBeforeRelease = events.snapshot
+      releaseRegistration.signal()
       var buffer = Data()
-      return try ControlClient.readEvent(from: descriptor, path: socket.path, buffer: &buffer)
+      return RegistrationHoldRequestResult(
+        event: try ControlClient.readEvent(from: descriptor, path: socket.path, buffer: &buffer),
+        startupReturnedBeforeRelease: startupReturnedBeforeRelease,
+        stagesBeforeRelease: stagesBeforeRelease)
     }
-    await Self.waitUntil("status request write", condition: { requestWritten.value })
-    #expect(startupReturned.value == false)
-    #expect(events.snapshot == [.listenerRegistered])
-
-    releaseRegistration.signal()
-    let server = try await startup.value
+    let requestResult = try await request.value()
+    let server = try await startup.value()
     defer { server.stop() }
-    #expect(try await request.value == .status(Self.snapshot()))
-    await Self.waitUntil(
-      "status response dispatch",
-      condition: {
-        events.snapshot.contains(.statusResponseCompleted)
-      })
+    #expect(requestResult.startupReturnedBeforeRelease == false)
+    #expect(requestResult.stagesBeforeRelease == [.listenerRegistered])
+    #expect(requestResult.event == .status(Self.snapshot()))
     #expect(
       events.snapshot == [
         .listenerRegistered,
@@ -491,6 +553,80 @@ private final class LockedCount: @unchecked Sendable {
         .workStarted,
         .statusResponseCompleted,
       ])
+  }
+
+  /// The historical shape delegated startup, client I/O, and the parent
+  /// release to one cooperative scheduler. With two workers, the real
+  /// registration callback and the real response read occupy both workers, so
+  /// the queued parent-resumption release cannot run. This is deliberately
+  /// expected-red evidence. The normal test above uses the same socket,
+  /// registration hold, and two-second client deadline, but releases from the
+  /// dedicated Dispatch client before reading the response.
+  @Test func controlledParentResumptionRegistrationHoldExpectedRedProof() async throws {
+    guard
+      ProcessInfo.processInfo.environment[
+        "GRAMDRIVE_EXPECTED_RED_PARENT_RESUMPTION_REGISTRATION_HOLD"
+      ] == "1"
+    else { return }
+
+    let root = try Self.tempRoot()
+    let socket = ControlContract.socketURL(dataRoot: root)
+    try FileManager.default.createDirectory(
+      at: socket.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let scheduler = OperationQueue()
+    scheduler.name = "com.reluxworks.gramdrive.tests.cooperative-parent-resumption"
+    scheduler.maxConcurrentOperationCount = 2
+    let releaseRegistration = DispatchSemaphore(value: 0)
+    let registrationEntered = LockedFlag()
+    let requestWritten = LockedFlag()
+    let parentReleaseStarted = LockedFlag()
+
+    let startup = Self.schedulerBlocking(scheduler) {
+      try ControlServer.start(
+        socketURL: socket,
+        handlers: Self.handlers(),
+        startupObservation: ControlServerStartupObservation { event in
+          guard event == .listenerRegistered else { return }
+          registrationEntered.set()
+          releaseRegistration.wait()
+        })
+    }
+    await Self.waitUntil(
+      "expected-red listener registration",
+      condition: { registrationEntered.value })
+
+    let request = Self.schedulerBlocking(scheduler) {
+      let descriptor = try ControlClient.connect(
+        socketURL: socket,
+        receiveTimeout: .seconds(2))
+      defer { close(descriptor) }
+      try ControlClient.writeLine(
+        ControlRequest(operation: .status), to: descriptor, path: socket.path)
+      requestWritten.set()
+      var buffer = Data()
+      return try ControlClient.readEvent(from: descriptor, path: socket.path, buffer: &buffer)
+    }
+    await Self.waitUntil(
+      "expected-red status request write",
+      condition: { requestWritten.value })
+
+    let parentRelease = Self.schedulerBlocking(scheduler) {
+      parentReleaseStarted.set()
+      releaseRegistration.signal()
+    }
+
+    // Expected red: under the controlled scheduler, the historical parent
+    // release is queued behind the two blocking operations. This is a real
+    // scheduler-capacity assertion, not a semaphore lease tautology.
+    #expect(parentReleaseStarted.value)
+
+    // Direct cleanup makes every real operation join after the expected-red
+    // assertion; no listener or scheduled operation is left behind.
+    releaseRegistration.signal()
+    let server = try await startup.value()
+    defer { server.stop() }
+    #expect(try await request.value() == .status(Self.snapshot()))
+    _ = try await parentRelease.value()
   }
 
   @Test func startRemovesTheSocketWhenListenerRegistrationIsCancelled() throws {
@@ -579,7 +715,7 @@ private final class LockedCount: @unchecked Sendable {
     let commitWritten = LockedFlag()
     let prepared = LockedPreparedTermination()
 
-    let startup = Task.detached {
+    let startup = Self.dispatchBlocking {
       try ControlServer.start(
         socketURL: socket,
         handlers: ControlServerHandlers(
@@ -611,7 +747,7 @@ private final class LockedCount: @unchecked Sendable {
     await Self.waitUntil("coalesced commit write", condition: { commitWritten.value })
 
     releaseRegistration.signal()
-    let server = try await startup.value
+    let server = try await startup.value()
     defer { server.stop() }
     let (prepareEvent, commitEvent) = try await responses.value
     #expect(prepareEvent == .commandDone)

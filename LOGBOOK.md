@@ -3,6 +3,15 @@
 > Institutional memory. Concise, factual, high-signal.
 > Newest entries first. One block per insight.
 
+## 2026-08-30
+
+### 0633 — Control registration proof distinguishes parent resumption from dedicated Dispatch (BUG-260830-39sy4c)
+
+- ROOT CAUSE: the test-only registration hold used blocking `Task.detached` startup/client jobs while a suspended parent test task was responsible for releasing the real `DispatchSource` registration callback. That historical shape could consume its cooperative scheduling capacity before the unchanged two-second socket read received a response.
+- FIX: registration-hold startup and client socket I/O now use the existing dedicated Dispatch queue. The client observes the real registration callback, writes the request, captures the pre-release server/event state, releases registration itself, then performs the unchanged two-second response read. Production `ControlServer`, auth protocol, retry policy, and deadlines are untouched.
+- CONTROLLED RED/GREEN: the opt-in expected-red probe uses a real two-worker `OperationQueue`, not semaphore leases, to model the historical parent-resumption shape. Its real registration callback and real client response read consume the two scheduler slots; the queued parent-release operation therefore cannot start, producing the deliberate red assertion. Direct cleanup releases registration and joins startup, client, and queued release. The normal dedicated-Dispatch test uses the same socket, registration hold, and two-second deadline and passes.
+- VALIDATION: the opt-in expected-red command exits 1 by design; the dedicated-Dispatch registration test passed five focused repetitions; `swift test --filter ControlChannelTests` passed 31 tests. Strict SwiftFormat and `git diff --check` passed after formatting. Only synthetic temporary socket directories and staged build artifacts were used; no installed profile, session, credentials, or production endpoint was inspected or changed.
+
 ## 2026-08-28
 
 ### 0742 — Foreground attachment hydration precedes generated verification (BUG-260828-rghu1x)
