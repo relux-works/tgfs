@@ -2877,3 +2877,40 @@
   ruleset round-trip/rollback rehearsal, and live protected landing were not
   claimed by this worker. They require the separately provisioned three-App,
   KMS/broker, append-only evidence, and staging-repository infrastructure.
+
+### 0830 — Signed fast-forward lander bootstrap rework and disposable proof
+
+- REVIEW CONSTRAINT: revision 1 was correctly rejected because the canonical
+  production backend, independent attestors/receiver, durable pre-update audit,
+  typed GitHub reads, and executable rollout proof do not exist. Replacing them
+  with more fixture claims would repeat the rejected forced fit.
+- BOOTSTRAP AUTHORITY: an owner directive explicitly allowed the existing
+  organization-admin PAT for this self-hosting iteration only, behind a fixed
+  owner-only Keychain/Unix-socket broker. The lander receives only opaque
+  one-use handles; caller argv/environment cannot select a socket, URL,
+  repository, ref, SHA, service, force mode, body, or credential. The permanent
+  independent three-App/KMS design remains required before normal operation.
+- AUDIT AND READS: the real backend now recovers pending create-only audit
+  intents before eligibility, persists intent before credential acquisition or
+  update, and writes a correlatable completion only after exact post-read.
+  Broker reads exhaust fixed REST/GraphQL pages, includes both rename paths,
+  verifies the exact introduced set and SSH signatures in a disposable clone,
+  reads independent signed evidence files, and fails closed on malformed or
+  incomplete state. Live PR 63 read proof returned one introduced commit and
+  two checks without persisting response/user content.
+- DISPOSABLE PROOF: public repository
+  `relux-works/tgfs-ff-lander-rehearsal-260830-042445` proved exact prospective
+  ruleset PUT/GET, advertisement equality, one empty-pack old/new main update,
+  stale-old refusal, exact candidate post-read, unchanged Git object set,
+  rule-suite `result=bypass`, exact ruleset-only rollback, unchanged merge
+  settings, and forward-only main. Live GitHub response proof discovered a
+  second terminal flush-pkt and the server-normalized
+  `require_extra_approval_for_unattributed_changes:true`; both are now asserted
+  exactly. Three failed task-created rehearsal repos were marker-checked and
+  deleted; the green repository is retained for independent review.
+- VALIDATION: Rust 15/15, Python 9/9, strict Clippy, release build, repo 2/2,
+  security 1/1, formatting, and diff checks exited 0. Invalid real argv probes
+  each produced the expected process exit 64. Canonical invocation without the
+  fixed broker produced expected refusal exit 77. The production ruleset/main
+  bypass is deliberately not executed by an unreviewed developer head; it is
+  the bounded post-review exact-head action from the owner directive.

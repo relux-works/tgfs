@@ -1,6 +1,7 @@
 //! Fixed, fail-closed landing core for the sole `relux-works/tgfs` lane.
 
 mod attestation;
+mod backend;
 mod eligibility;
 mod protocol;
 mod rollout;
@@ -17,6 +18,7 @@ pub use rollout::{
 };
 
 use attestation::PinnedAttestors;
+use backend::BootstrapBackend;
 use eligibility::Attempt;
 use protocol::{Advertisement, ReceiveStatus};
 
@@ -24,7 +26,7 @@ use protocol::{Advertisement, ReceiveStatus};
 pub const EX_USAGE: i32 = 64;
 /// Process exit used when a security or protocol gate refuses the landing.
 pub const EX_REFUSED: i32 = 77;
-const FIXED_REPOSITORY_ID: u64 = 81_611_324;
+const FIXED_REPOSITORY_ID: u64 = 1_301_059_839;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrNumber(u64);
@@ -50,8 +52,9 @@ where
 
 trait FixedBackend {
     fn now_unix(&self) -> i64;
+    fn recover_pending_audits(&mut self) -> Result<(), BackendError>;
     fn read_attempt(&mut self, pr: u64) -> Result<Attempt, BackendError>;
-    fn audit_ready(&mut self) -> Result<(), BackendError>;
+    fn begin_audit(&mut self, record: &AuditRecord) -> Result<AuditIntent, BackendError>;
     fn mint_short_lived_token(&mut self) -> Result<SecretToken, BackendError>;
     fn advertise_receive_pack(&mut self, token: &SecretToken) -> Result<Vec<u8>, BackendError>;
     fn send_receive_pack(
@@ -60,7 +63,11 @@ trait FixedBackend {
         request: &[u8],
     ) -> Result<Vec<u8>, BackendError>;
     fn read_main(&mut self) -> Result<String, BackendError>;
-    fn append_audit(&mut self, record: AuditRecord) -> Result<(), BackendError>;
+    fn finish_audit(
+        &mut self,
+        intent: &AuditIntent,
+        outcome: AuditOutcome,
+    ) -> Result<(), BackendError>;
 }
 
 #[derive(Debug)]
@@ -75,51 +82,19 @@ impl Drop for SecretToken {
 #[derive(Debug)]
 struct BackendError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct AuditRecord {
     pr: u64,
     old_id: String,
     new_id: String,
 }
 
-struct SealedProductionBackend;
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AuditIntent(String);
 
-impl FixedBackend for SealedProductionBackend {
-    fn now_unix(&self) -> i64 {
-        0
-    }
-
-    fn read_attempt(&mut self, _pr: u64) -> Result<Attempt, BackendError> {
-        Err(BackendError)
-    }
-
-    fn audit_ready(&mut self) -> Result<(), BackendError> {
-        Err(BackendError)
-    }
-
-    fn mint_short_lived_token(&mut self) -> Result<SecretToken, BackendError> {
-        Err(BackendError)
-    }
-
-    fn advertise_receive_pack(&mut self, _token: &SecretToken) -> Result<Vec<u8>, BackendError> {
-        Err(BackendError)
-    }
-
-    fn send_receive_pack(
-        &mut self,
-        _token: &SecretToken,
-        _request: &[u8],
-    ) -> Result<Vec<u8>, BackendError> {
-        Err(BackendError)
-    }
-
-    fn read_main(&mut self) -> Result<String, BackendError> {
-        Err(BackendError)
-    }
-
-    fn append_audit(&mut self, _record: AuditRecord) -> Result<(), BackendError> {
-        Err(BackendError)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditOutcome {
+    Landed,
 }
 
 fn run<B: FixedBackend>(args: Vec<OsString>, backend: &mut B, keys: &PinnedAttestors) -> i32 {
@@ -127,6 +102,9 @@ fn run<B: FixedBackend>(args: Vec<OsString>, backend: &mut B, keys: &PinnedAttes
         Ok(pr) => pr,
         Err(()) => return EX_USAGE,
     };
+    if backend.recover_pending_audits().is_err() {
+        return EX_REFUSED;
+    }
     let attempt = match backend.read_attempt(pr.0) {
         Ok(attempt) => attempt,
         Err(_) => return EX_REFUSED,
@@ -139,13 +117,21 @@ fn run<B: FixedBackend>(args: Vec<OsString>, backend: &mut B, keys: &PinnedAttes
         keys,
     )
     .is_err()
-        || backend.audit_ready().is_err()
     {
         return EX_REFUSED;
     }
 
     let expected_old = attempt.final_snapshot.main.clone();
     let candidate = attempt.final_snapshot.pull.candidate.clone();
+    let audit_record = AuditRecord {
+        pr: pr.0,
+        old_id: expected_old.clone(),
+        new_id: candidate.clone(),
+    };
+    let audit_intent = match backend.begin_audit(&audit_record) {
+        Ok(intent) => intent,
+        Err(_) => return EX_REFUSED,
+    };
     let token = match backend.mint_short_lived_token() {
         Ok(token) => token,
         Err(_) => return EX_REFUSED,
@@ -179,11 +165,7 @@ fn run<B: FixedBackend>(args: Vec<OsString>, backend: &mut B, keys: &PinnedAttes
         return EX_REFUSED;
     }
     if backend
-        .append_audit(AuditRecord {
-            pr: pr.0,
-            old_id: expected_old,
-            new_id: candidate,
-        })
+        .finish_audit(&audit_intent, AuditOutcome::Landed)
         .is_err()
     {
         return EX_REFUSED;
@@ -206,11 +188,8 @@ where
         Ok(keys) => keys,
         Err(()) => return EX_REFUSED,
     };
-    // This source build is intentionally disabled until release engineering
-    // replaces the sealed backend with the reviewed fixed deployment wiring.
-    // Crucially, canonical argv still enters the exact production pipeline;
-    // the disabled backend fails on its first read and cannot mint a token.
-    run(args, &mut SealedProductionBackend, &keys)
+    let mut backend = BootstrapBackend::production();
+    run(args, &mut backend, &keys)
 }
 
 #[cfg(test)]

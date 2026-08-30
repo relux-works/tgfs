@@ -186,7 +186,7 @@ pub struct Snapshot {
     pub statuses: PageSet<StatusContext>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Attempt {
     pub(crate) initial_snapshot: Snapshot,
     pub(crate) final_snapshot: Snapshot,

@@ -163,8 +163,9 @@ fn fixture() -> Fixture {
 #[derive(Clone, Copy)]
 enum Failure {
     None,
+    Recover,
     Read,
-    AuditReady,
+    AuditBegin,
     Mint,
     Advertise,
     Send,
@@ -182,6 +183,9 @@ struct Backend {
     mints: usize,
     sends: usize,
     audits: usize,
+    recoveries: usize,
+    durable_intents: usize,
+    completions: usize,
     request: Vec<u8>,
 }
 
@@ -197,6 +201,9 @@ impl Backend {
             mints: 0,
             sends: 0,
             audits: 0,
+            recoveries: 0,
+            durable_intents: 0,
+            completions: 0,
             request: Vec::new(),
         }
     }
@@ -205,6 +212,15 @@ impl Backend {
 impl FixedBackend for Backend {
     fn now_unix(&self) -> i64 {
         NOW
+    }
+
+    fn recover_pending_audits(&mut self) -> Result<(), BackendError> {
+        self.recoveries += 1;
+        if matches!(self.failure, Failure::Recover) {
+            Err(BackendError)
+        } else {
+            Ok(())
+        }
     }
 
     fn read_attempt(&mut self, _pr: u64) -> Result<Attempt, BackendError> {
@@ -216,11 +232,12 @@ impl FixedBackend for Backend {
         }
     }
 
-    fn audit_ready(&mut self) -> Result<(), BackendError> {
-        if matches!(self.failure, Failure::AuditReady) {
+    fn begin_audit(&mut self, _record: &AuditRecord) -> Result<AuditIntent, BackendError> {
+        if matches!(self.failure, Failure::AuditBegin) {
             Err(BackendError)
         } else {
-            Ok(())
+            self.durable_intents += 1;
+            Ok(AuditIntent("intent-1".into()))
         }
     }
 
@@ -272,11 +289,17 @@ impl FixedBackend for Backend {
         }
     }
 
-    fn append_audit(&mut self, _record: AuditRecord) -> Result<(), BackendError> {
+    fn finish_audit(
+        &mut self,
+        _intent: &AuditIntent,
+        outcome: AuditOutcome,
+    ) -> Result<(), BackendError> {
         self.audits += 1;
+        assert_eq!(outcome, AuditOutcome::Landed);
         if matches!(self.failure, Failure::AuditAppend) {
             Err(BackendError)
         } else {
+            self.completions += 1;
             Ok(())
         }
     }
@@ -316,8 +339,15 @@ fn canonical_entry_lands_with_one_fixed_empty_pack_update() {
     let mut backend = Backend::valid(fixture.attempt.clone());
     assert_eq!(execute(&fixture, &mut backend), 0);
     assert_eq!(
-        (backend.reads, backend.mints, backend.sends, backend.audits),
-        (1, 1, 1, 1)
+        (
+            backend.recoveries,
+            backend.reads,
+            backend.durable_intents,
+            backend.mints,
+            backend.sends,
+            backend.completions
+        ),
+        (1, 1, 1, 1, 1, 1)
     );
     assert_eq!(backend.request, fixed_update(OLD, NEW).unwrap_or_default());
     assert!(
@@ -377,6 +407,11 @@ fn advertisement_and_report_status_parsers_reject_protocol_mutants() {
         ]))
         .is_err()
     );
+    let mut github_status = encode_lines(&[b"unpack ok\n", b"ok refs/heads/main\n"]);
+    github_status.extend_from_slice(b"0000");
+    assert_eq!(ReceiveStatus::parse(&github_status), Ok(ReceiveStatus));
+    github_status.extend_from_slice(b"0000");
+    assert!(ReceiveStatus::parse(&github_status).is_err());
 }
 
 #[test]
@@ -549,15 +584,50 @@ fn read_audit_and_broker_failures_are_closed_refusals() {
     let fixture = fixture();
     for failure in [
         Failure::Read,
-        Failure::AuditReady,
+        Failure::Recover,
+        Failure::AuditBegin,
         Failure::Mint,
         Failure::AuditAppend,
     ] {
         let mut backend = Backend::valid(fixture.attempt.clone());
         backend.failure = failure;
         assert_eq!(execute(&fixture, &mut backend), EX_REFUSED);
-        assert!(backend.sends <= 1);
+        if matches!(failure, Failure::Recover | Failure::AuditBegin) {
+            assert_eq!(backend.sends, 0);
+        }
     }
+}
+
+#[test]
+fn durable_intent_exists_before_every_possible_update_and_failed_finalization_is_recoverable() {
+    let fixture = fixture();
+    let mut unavailable = Backend::valid(fixture.attempt.clone());
+    unavailable.failure = Failure::AuditBegin;
+    assert_eq!(execute(&fixture, &mut unavailable), EX_REFUSED);
+    assert_eq!(
+        (
+            unavailable.durable_intents,
+            unavailable.mints,
+            unavailable.sends
+        ),
+        (0, 0, 0)
+    );
+
+    let mut interrupted = Backend::valid(fixture.attempt.clone());
+    interrupted.failure = Failure::AuditAppend;
+    assert_eq!(execute(&fixture, &mut interrupted), EX_REFUSED);
+    assert_eq!(
+        (
+            interrupted.durable_intents,
+            interrupted.sends,
+            interrupted.completions
+        ),
+        (1, 1, 0)
+    );
+
+    interrupted.failure = Failure::None;
+    assert!(interrupted.recover_pending_audits().is_ok());
+    assert_eq!(interrupted.recoveries, 2);
 }
 
 #[test]

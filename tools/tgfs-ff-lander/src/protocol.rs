@@ -132,7 +132,13 @@ pub(crate) struct ReceiveStatus;
 
 impl ReceiveStatus {
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        let lines = parse_lines(bytes)?;
+        let lines = match parse_lines(bytes) {
+            Ok(lines) => lines,
+            Err(ProtocolError::Malformed) if bytes.ends_with(b"00000000") => {
+                parse_lines(&bytes[..bytes.len() - 4])?
+            }
+            Err(error) => return Err(error),
+        };
         if lines.len() != 2
             || lines[0].as_slice() != b"unpack ok\n"
             || lines[1].as_slice() != b"ok refs/heads/main\n"

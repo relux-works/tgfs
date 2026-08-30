@@ -69,6 +69,7 @@ pub fn desired_ruleset(ruleset_id: u64, lander_integration_id: u64) -> Option<Ru
                     "dismiss_stale_reviews_on_push": true,
                     "required_approving_review_count": 1,
                     "require_code_owner_review": false,
+                    "require_extra_approval_for_unattributed_changes": true,
                     "require_last_push_approval": true,
                     "required_review_thread_resolution": true,
                     "dismissal_restriction": {"enabled": false, "allowed_actors": []},

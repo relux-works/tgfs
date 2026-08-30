@@ -9,11 +9,21 @@ The crate deliberately exposes no generic HTTP/Git write client. Production
 wiring supplies typed read capabilities, a private token broker, and the fixed
 receive-pack exchange from inside the executable image.
 
-The checked-in binary is release-disabled: its sealed backend always refuses
-before token minting. Release engineering must replace that private backend
-with reviewed, repository-fixed wiring and pinned policy/bypass digests; no
-runtime flag or environment variable enables it. This prevents a source build
-from accidentally becoming a bypass-capable lander.
+The checked-in binary connects only to the owner-scoped fixed Unix socket
+`/tmp/tgfs-ff-lander-bootstrap-<effective-uid>/bootstrap.sock`. The separate
+bootstrap broker owns the Keychain credential and returns only opaque one-use
+handles; the PAT never crosses the socket. Missing broker, insecure socket
+permissions, incomplete reads, or missing signed attestation inputs are closed
+refusals. No runtime flag or environment variable can select another socket,
+repository, ref, service, request body, or credential.
+
+The owner-authorized bootstrap broker is `.scripts/tgfs_ff_bootstrap_broker.py`.
+It is a temporary self-hosting boundary, not the permanent three-App design.
+It performs fixed REST/GraphQL pagination, a disposable local SSH verification,
+durable create-only audit intent/recovery, Keychain-backed authentication, and
+the fixed smart-HTTP exchange. It accepts no arguments and emits no token or
+GitHub response content. Install fresh independently signed `policy.json` and
+`push-<PR>.json` under its owner-only runtime evidence directory before use.
 
 ## Capability boundaries
 
@@ -39,4 +49,16 @@ libraries.
 ```sh
 cargo test --manifest-path tools/tgfs-ff-lander/Cargo.toml
 cargo clippy --manifest-path tools/tgfs-ff-lander/Cargo.toml --all-targets -- -D warnings
+python3 -m unittest discover -s .scripts/tests -p 'test_tgfs_ff_*py'
 ```
+
+The destructive rehearsal is explicit and separate:
+
+```sh
+python3 .scripts/tgfs_ff_rehearsal.py
+```
+
+It creates one task-named public repository, proves exact ruleset PUT/GET,
+empty-pack success, stale-old refusal, unchanged object set, bypass rule-suite
+attribution, and exact ruleset-only rollback. It retains the successful repo
+for independent review and prints only privacy-safe identifiers and booleans.
