@@ -65,21 +65,44 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
         @Sendable (
             NSFileProviderItemIdentifier, @escaping Completion
         ) -> Void
+    typealias ScheduleEvictionTurn =
+        @Sendable (@escaping @Sendable () -> Void) -> Void
+
+    /// Keep each File Provider daemon turn below the monthly Markdown/NDJSON
+    /// pair width. A retained-profile bootstrap can contain thousands of
+    /// generated candidates; recursively issuing every `evictItem` callback
+    /// in one lane prevents the daemon from scheduling unrelated
+    /// `fetchContents` requests even though the agent answers those requests
+    /// promptly.
+    static let maxEvictionsPerTurn = 2
+    private static let evictionTurnDelay: DispatchTimeInterval = .milliseconds(10)
+    private static let evictionQueue = DispatchQueue(
+        label: "com.reluxworks.gramdrive.fileprovider.generated-eviction",
+        qos: .utility)
+    static let defaultEvictionTurnScheduler: ScheduleEvictionTurn = { continuation in
+        evictionQueue.asyncAfter(
+            deadline: .now() + evictionTurnDelay,
+            execute: continuation)
+    }
 
     private let evict: Operation
     private let signal: Operation
     private let materializedEnumerator: any NSFileProviderEnumerator
     private let scheduleSelectionTimeout: MaterializedGeneratedItemSelector.ScheduleTimeout
+    private let scheduleEvictionTurn: ScheduleEvictionTurn
 
     init(
         materializedEnumerator: any NSFileProviderEnumerator,
         scheduleSelectionTimeout: @escaping MaterializedGeneratedItemSelector.ScheduleTimeout =
             MaterializedGeneratedItemSelector.defaultTimeout,
+        scheduleEvictionTurn: @escaping ScheduleEvictionTurn =
+            ProviderChangeDispatcher.defaultEvictionTurnScheduler,
         evict: @escaping Operation,
         signal: @escaping Operation
     ) {
         self.materializedEnumerator = materializedEnumerator
         self.scheduleSelectionTimeout = scheduleSelectionTimeout
+        self.scheduleEvictionTurn = scheduleEvictionTurn
         self.evict = evict
         self.signal = signal
     }
@@ -145,6 +168,7 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
         dispatchSequentially(
             generatedItems,
             at: 0,
+            remainingInTurn: Self.maxEvictionsPerTurn,
             operation: evict,
             result: result
         ) { _ in
@@ -163,6 +187,7 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
         dispatchSequentially(
             identifiers,
             at: 0,
+            remainingInTurn: nil,
             operation: signal,
             result: result,
             completionHandler: completionHandler)
@@ -175,6 +200,7 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
     private func dispatchSequentially(
         _ identifiers: [NSFileProviderItemIdentifier],
         at index: Int,
+        remainingInTurn: Int?,
         operation: @escaping Operation,
         result: SignalResult,
         completionHandler: @escaping Completion
@@ -183,11 +209,24 @@ final class ProviderChangeDispatcher: @unchecked Sendable {
             completionHandler(result.error)
             return
         }
+        if remainingInTurn == 0 {
+            scheduleEvictionTurn { [self] in
+                dispatchSequentially(
+                    identifiers,
+                    at: index,
+                    remainingInTurn: Self.maxEvictionsPerTurn,
+                    operation: operation,
+                    result: result,
+                    completionHandler: completionHandler)
+            }
+            return
+        }
         operation(identifiers[index]) { error in
             result.record(error)
             self.dispatchSequentially(
                 identifiers,
                 at: index + 1,
+                remainingInTurn: remainingInTurn.map { $0 - 1 },
                 operation: operation,
                 result: result,
                 completionHandler: completionHandler)
