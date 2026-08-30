@@ -2849,3 +2849,68 @@
 - TEST STABILITY: the original 500ms assertion began before the synchronous materialized-container selection and could therefore include unrelated parallel-suite executor delay before Finder had submitted its first callback. The regression now launches all 20 real `ContentFetcher.fetchContents` requests from the first actual `ProviderChangeDispatcher` yield on a dedicated utility-QoS replay lane and records each interval from production callback entry to completion. The replay remains 160 items in both before/relaunch phases; exact bytes, all three formats, 40 requested/40 background hints, zero demand/in-flight work, eventual completion, and at least 79 background turns remain required.
 - NEGATIVE PROOF: the compile-valid `maxEvictionsPerTurn = 160` mutant never reaches the first yield within 500ms, so the exact regression exited 1 in 0.542 seconds. The restored two-item implementation passed four focused fresh runs; all 19 relay tests, fresh canonical Apple 2/2 (including 553 Swift tests), and canonical repository 2/2 also exited 0.
 - PRIVACY BOUNDARY: this rework used only synthetic fixtures and source-local build caches. It did not install, launch, inspect, reset, or mutate any live profile/session, Keychain, File Provider domain, CloudStorage content, or installed app. Signed installed acceptance remains downstream.
+## 2026-08-30 — TASK-260830-13d48r signed fast-forward lander
+
+- SCOPE: added the isolated `tools/tgfs-ff-lander` Rust crate. Its canonical
+  argv is only `land --pr N`; invalid and alternate transport arguments exit
+  64 before reads or token minting. The private transaction binds the final
+  observed `main` OID to the advertised and wire `old-id`, emits one
+  `refs/heads/main` update with only `report-status` and an empty pack, requires
+  exact receive status, and checks the post-read candidate OID.
+- SECURITY: eligibility fails closed on incomplete pagination, fork/head/base,
+  ancestry, workflow paths, SSH/GitHub signature evidence, latest-review and
+  permission state, unresolved threads, source-bound checks/status
+  substitution, and independently signed policy/push attestations. Policy and
+  push statements use distinct pinned verification keys and bind source
+  coverage, ruleset IDs/timestamps, delivery GUID/timing, reconciliation
+  watermark, and retention freshness.
+- ROLLOUT: helpers produce only the exact ruleset mutation. Repository merge
+  settings and `main` remain assertions; rollback requires App suspension and
+  preserves a legitimately advanced `main`.
+- VALIDATION: `cargo test --manifest-path tools/tgfs-ff-lander/Cargo.toml`
+  (14 passed), standalone release build, rustfmt check, Clippy `-D warnings`,
+  and `git diff --check` exited 0. The first Clippy baseline truthfully exited
+  101; its two findings were corrected before the green rerun. Real binary
+  negative argv probes exited 64; canonical argv exited 77 because the
+  checked-in release is deliberately disabled before broker wiring.
+- EXTERNAL GATE: disposable GitHub App/ruleset attribution, bypass audit,
+  ruleset round-trip/rollback rehearsal, and live protected landing were not
+  claimed by this worker. They require the separately provisioned three-App,
+  KMS/broker, append-only evidence, and staging-repository infrastructure.
+
+### 0830 — Signed fast-forward lander bootstrap rework and disposable proof
+
+- REVIEW CONSTRAINT: revision 1 was correctly rejected because the canonical
+  production backend, independent attestors/receiver, durable pre-update audit,
+  typed GitHub reads, and executable rollout proof do not exist. Replacing them
+  with more fixture claims would repeat the rejected forced fit.
+- BOOTSTRAP AUTHORITY: an owner directive explicitly allowed the existing
+  organization-admin PAT for this self-hosting iteration only, behind a fixed
+  owner-only Keychain/Unix-socket broker. The lander receives only opaque
+  one-use handles; caller argv/environment cannot select a socket, URL,
+  repository, ref, SHA, service, force mode, body, or credential. The permanent
+  independent three-App/KMS design remains required before normal operation.
+- AUDIT AND READS: the real backend now recovers pending create-only audit
+  intents before eligibility, persists intent before credential acquisition or
+  update, and writes a correlatable completion only after exact post-read.
+  Broker reads exhaust fixed REST/GraphQL pages, includes both rename paths,
+  verifies the exact introduced set and SSH signatures in a disposable clone,
+  reads independent signed evidence files, and fails closed on malformed or
+  incomplete state. Live PR 63 read proof returned one introduced commit and
+  two checks without persisting response/user content.
+- DISPOSABLE PROOF: public repository
+  `relux-works/tgfs-ff-lander-rehearsal-260830-042445` proved exact prospective
+  ruleset PUT/GET, advertisement equality, one empty-pack old/new main update,
+  stale-old refusal, exact candidate post-read, unchanged Git object set,
+  rule-suite `result=bypass`, exact ruleset-only rollback, unchanged merge
+  settings, and forward-only main. Live GitHub response proof discovered a
+  second terminal flush-pkt and the server-normalized
+  `require_extra_approval_for_unattributed_changes:true`; both are now asserted
+  exactly. Three failed task-created rehearsal repos were marker-checked and
+  deleted; the green repository is retained for independent review.
+- VALIDATION: Rust 15/15, Python 9/9, strict Clippy, release build, repo 2/2,
+  security 1/1, formatting, and diff checks exited 0. Invalid real argv probes
+  each produced the expected process exit 64. Canonical invocation without the
+  fixed broker produced expected refusal exit 77. The production ruleset/main
+  bypass is deliberately not executed by an unreviewed developer head; it is
+  the bounded post-review exact-head action from the owner directive.
