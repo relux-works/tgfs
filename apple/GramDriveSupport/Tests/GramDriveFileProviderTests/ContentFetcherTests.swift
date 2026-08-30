@@ -186,6 +186,146 @@ private struct Harness {
         future.fulfill(FetchOutcome(url: url, item: item, error: error))
       })
   }
+
+  /// Starts the real production entry point and records only its callback
+  /// interval. Test-executor wakeup time is deliberately outside this
+  /// interval: Finder's latency budget begins when File Provider invokes the
+  /// callback, not when an unrelated parallel test is next scheduled.
+  func startTimed(
+    _ identifier: NSFileProviderItemIdentifier,
+    future: TestFuture<TimedFetchOutcome>
+  ) -> Progress {
+    let started = ContinuousClock.now
+    return fetcher.fetchContents(
+      itemIdentifier: identifier,
+      requestedVersion: nil,
+      context: { [store] in (account: makeAccount(), store: store) },
+      completionHandler: { url, item, error in
+        future.fulfill(
+          TimedFetchOutcome(
+            outcome: FetchOutcome(url: url, item: item, error: error),
+            elapsed: ContinuousClock.now - started))
+      })
+  }
+}
+
+private struct TimedFetchOutcome: @unchecked Sendable {
+  let outcome: FetchOutcome
+  let elapsed: Duration
+}
+
+private final class TimedFetchLauncher: @unchecked Sendable {
+  private let harness: Harness
+  private let requests: [(String, TestFuture<TimedFetchOutcome>)]
+
+  init(
+    harness: Harness,
+    requests: [(String, TestFuture<TimedFetchOutcome>)]
+  ) {
+    self.harness = harness
+    self.requests = requests
+  }
+
+  func launch() {
+    for (id, future) in requests {
+      _ = harness.startTimed(NSFileProviderItemIdentifier(id), future: future)
+    }
+  }
+}
+
+/// A materialized-container listing for the production change dispatcher.
+/// Every replay parent is visible so the test exercises the expensive
+/// eviction path rather than the empty-intersection shortcut.
+private final class SaturatedMaterializedEnumerator: NSObject,
+  NSFileProviderEnumerator, @unchecked Sendable
+{
+  private let items: [any NSFileProviderItem]
+
+  init(parentCount: Int) {
+    self.items = (0..<parentCount).map { index in
+      GramDriveFileProviderItem(
+        metadata: ItemMetadata(
+          contractVersion: 1,
+          id: "replay-parent-\(index)",
+          parent: rootId,
+          kind: .chat,
+          isDirectory: true,
+          displayName: "Month",
+          safeName: "Month",
+          metadataVersion: "m1",
+          mimeType: nil,
+          logicalSize: nil,
+          attachmentLogicalKind: nil,
+          attachmentRepresentation: nil,
+          attachmentFidelity: nil,
+          attachmentSourceName: nil,
+          attachmentExactSize: nil,
+          contentVersion: nil,
+          availability: .fetchable,
+          createdAtMs: 1,
+          modifiedAtMs: 1,
+          deletedAtMs: nil),
+        accountRootId: rootId)
+    }
+  }
+
+  func invalidate() {}
+
+  func enumerateItems(
+    for observer: NSFileProviderEnumerationObserver,
+    startingAt page: NSFileProviderPage
+  ) {
+    observer.didEnumerate(items)
+    observer.finishEnumerating(upTo: nil)
+  }
+
+  func enumerateChanges(
+    for observer: NSFileProviderChangeObserver,
+    from syncAnchor: NSFileProviderSyncAnchor
+  ) {
+    observer.finishEnumeratingWithError(NSFileProviderError(.cannotSynchronize))
+  }
+}
+
+private final class ReplayTurnScheduler: @unchecked Sendable {
+  private let lock = NSLock()
+  private let queue = DispatchQueue(
+    label: "content-fetch-tests.generated-replay",
+    qos: .utility)
+  private let launchForegroundReads: @Sendable () -> Void
+  let firstTurn = TestFuture<Bool>()
+  private var turns = 0
+
+  init(launchForegroundReads: @escaping @Sendable () -> Void) {
+    self.launchForegroundReads = launchForegroundReads
+  }
+
+  var turnCount: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return turns
+  }
+
+  func schedule(_ continuation: @escaping @Sendable () -> Void) {
+    lock.lock()
+    turns += 1
+    let isFirstTurn = turns == 1
+    lock.unlock()
+    if isFirstTurn {
+      // The first foreground request is submitted from the exact yield which
+      // admits it. This keeps the production regression sensitive to a
+      // non-yielding relay but excludes unrelated full-suite executor noise.
+      firstTurn.fulfill(true)
+      launchForegroundReads()
+    }
+    queue.asyncAfter(deadline: .now() + .milliseconds(1), execute: continuation)
+  }
+
+  func failIfFirstTurnIsNotReached(within interval: DispatchTimeInterval) {
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + interval) {
+      self.firstTurn.fulfill(false)
+    }
+  }
 }
 
 @Suite("Content fetch")
@@ -390,6 +530,122 @@ struct ContentFetcherTests {
       #expect(harness.historyPriority.snapshot().filter { $0.priority == .requested }.count == 20)
       #expect(harness.historyPriority.snapshot().filter { $0.priority == .background }.count == 20)
       #expect(harness.fetcher.demandedChatCount == 0)
+    }
+  }
+
+  @Test(
+    "Twenty production generated fetches beat saturated eviction replay before and after relaunch")
+  func generatedFetchesBeatSaturatedEvictionReplayAcrossRelaunch() async throws {
+    try await withFetchScratchDirectory { scratch in
+      var configuration = ContentFetcherConfiguration()
+      configuration.maxConcurrentFetches = 4
+      let harness = Harness(scratch: scratch, configuration: configuration)
+      let formats: [(String, String)] = [
+        ("Messages.md", "text/markdown"),
+        ("Messages.ndjson", "application/x-ndjson"),
+        (".chat.json", "application/json"),
+      ]
+      var expected: [String: Data] = [:]
+      var stagedContent: [String: HydratedContent] = [:]
+
+      for index in 0..<40 {
+        let id = "relaunch-generated-\(index)"
+        let format = formats[index % formats.count]
+        let bytes = Data("{\"format\":\"\(format.0)\",\"read\":\(index)}\n".utf8)
+        let version = "relaunch-v\(index)"
+        let staged = try stageContent(
+          bytes, in: scratch, name: "relaunch-generated-\(index).bin")
+        expected[id] = bytes
+        harness.store.apply(
+          generatedFile(
+            id: id,
+            name: format.0,
+            mimeType: format.1,
+            size: UInt64(bytes.count),
+            contentVersion: version,
+            chatId: Int64(20_000 + index)))
+        stagedContent[id] = HydratedContent(
+          stagedPath: staged,
+          contentVersion: version,
+          byteCount: UInt64(bytes.count))
+      }
+      let contentByID = stagedContent
+      for _ in 0..<40 {
+        harness.hydration.enqueue { request, _ in
+          guard let content = contentByID[request.itemId] else {
+            throw HydrationFailure(category: .internalError, detail: "unknown test item")
+          }
+          return content
+        }
+      }
+
+      for phase in 0..<2 {
+        let replayCount = 160
+        let replayFinished = TestFuture<Bool>()
+        let requests = (0..<20).map { offset in
+          (
+            "relaunch-generated-\(phase * 20 + offset)",
+            TestFuture<TimedFetchOutcome>()
+          )
+        }
+        let launcher = TimedFetchLauncher(harness: harness, requests: requests)
+        let scheduler = ReplayTurnScheduler(launchForegroundReads: launcher.launch)
+        let dispatcher = ProviderChangeDispatcher(
+          materializedEnumerator: SaturatedMaterializedEnumerator(
+            parentCount: replayCount),
+          scheduleEvictionTurn: scheduler.schedule,
+          evict: { _, completion in
+            // Models the daemon service time retained build-157 evidence
+            // measured. Without a bounded yield, 160 calls occupy this
+            // production lane for well beyond the foreground bound.
+            usleep(5_000)
+            completion(nil)
+          },
+          signal: { _, completion in completion(nil) })
+        let replay = (0..<replayCount).map { index in
+          ProviderGeneratedItemChange(
+            item: NSFileProviderItemIdentifier("replay-generated-\(index)"),
+            parent: NSFileProviderItemIdentifier("replay-parent-\(index)"))
+        }
+
+        DispatchQueue(
+          label: "content-fetch-tests.replay-dispatch-\(phase)", qos: .utility
+        ).async {
+          dispatcher.dispatch(
+            includeRoot: phase == 0,
+            changedContainers: replay.map(\.parent),
+            evictingGeneratedItems: replay,
+            completionHandler: { replayFinished.fulfill($0 == nil) })
+        }
+        scheduler.failIfFirstTurnIsNotReached(within: .milliseconds(500))
+        let reachedFirstTurn = await scheduler.firstTurn.settled
+        #expect(reachedFirstTurn)
+        guard reachedFirstTurn else { return }
+
+        var readLatencies: [Duration] = []
+        for (id, future) in requests {
+          let timed = await future.settled
+          readLatencies.append(timed.elapsed)
+          #expect(timed.outcome.error == nil)
+          let url = try #require(timed.outcome.url)
+          #expect(try Data(contentsOf: url) == expected[id])
+        }
+        let orderedLatencies = readLatencies.sorted()
+        let p95 = orderedLatencies[18]
+        #expect(p95 < .milliseconds(500))
+        #expect(orderedLatencies.last! < .milliseconds(500))
+        #expect(scheduler.turnCount >= 1)
+        #expect(await replayFinished.settled)
+        #expect(scheduler.turnCount >= 79)
+      }
+
+      #expect(harness.hydration.requests.count == 40)
+      #expect(
+        harness.historyPriority.snapshot().filter { $0.priority == .requested }.count == 40)
+      #expect(
+        harness.historyPriority.snapshot().filter { $0.priority == .background }.count == 40)
+      #expect(harness.fetcher.demandedChatCount == 0)
+      #expect(harness.fetcher.inFlightCount == 0)
     }
   }
 
@@ -834,7 +1090,8 @@ struct ContentFetcherTests {
     }
   }
 
-  @Test("Open unavailable live content keeps its durable item and retries after availability clears")
+  @Test(
+    "Open unavailable live content keeps its durable item and retries after availability clears")
   func unavailableLiveItemPreservesIdentityAndRetries() async throws {
     try await withFetchScratchDirectory { scratch in
       let harness = Harness(scratch: scratch)

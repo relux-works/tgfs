@@ -185,6 +185,7 @@ private final class ProductionPathSignaling: ProviderChangeSignaling, @unchecked
         ProviderChangeDispatcher(
             materializedEnumerator: ScriptedMaterializedEnumerator(
                 pages: [materializedContainerIDs.map(materializedContainer)]),
+            scheduleEvictionTurn: { $0() },
             evict: { [recorder, didEvict] identifier, completion in
                 recorder.record("evict:\(identifier.rawValue)")
                 do {
@@ -929,6 +930,7 @@ struct ChangeSignalRelayTests {
             ])
         let dispatcher = ProviderChangeDispatcher(
             materializedEnumerator: enumerator,
+            scheduleEvictionTurn: { $0() },
             evict: { identifier, completion in
                 recorder.record("evict:\(identifier.rawValue)")
                 completion(nil)
