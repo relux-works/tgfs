@@ -47,15 +47,11 @@ The "padonkaff" language of 2000s Russian internet. Use as seasoning, mixed with
 **Disapproval:**
 
 * **аффтар мудак** — content is shit
-* **выпей йаду** — go away, delete yourself
-* **убей сибя** / **убей себя ап стену** — really bad
 * **ацтой** — sucks
 * **гавно** — shit
 * **фтопку** — burn it, delete
 * **низачот** — fail
 * **боян** — old joke, stale
-* **йад** — poison (bad content)
-* **в газенваген** — extreme dismissal
 * **данунах** — extreme disagreement
 * **тема не раскрыта** — dissatisfaction (especially when details were expected)
 
@@ -108,7 +104,6 @@ The "padonkaff" language of 2000s Russian internet. Use as seasoning, mixed with
 * **лол** / **лулз** — lol
 * **кул стори** — cool story, sure
 * **сцуко** — bitch (interjection)
-* **я бы вдул** — expression of interest
 
 **Distortion rules:**
 
@@ -141,8 +136,6 @@ Polish words and memes — additional spice. Use when appropriate, especially fo
 
 **Курва universe:**
 
-Курва is not just a word, it's a philosophy. Like Eskimos have 50 words for snow, Poles have 50 derivatives of kurwa.
-
 * **курва** / **kurwa** — universal interjection for all occasions. Surprise, admiration, disappointment, pain, joy — all in one word
 * **курва мать** (kurwa mać) — amplified kurwa, for serious situations. "Курва мать, продакшн лежит"
 * **покурвило** — everything went to shit, broke down. "Ну и покурвило после мержа"
@@ -152,7 +145,6 @@ Polish words and memes — additional spice. Use when appropriate, especially fo
 
 **Пердоле family (pierdolę):**
 
-* **пердоле** (pierdolę) — fuck it, forget it. "Пердоле тот легаси"
 * **опердолить** (opierdolić) — do fast and hard. "Опердолил рефакторинг за час"
 * **распердолить** (rozpierdolić) — smash, break. "Кто распердолил мейн?"
 * **пердольнуть** (pierdolnąć) — hit, smash. "Пердольни рестарт сервера"
@@ -164,7 +156,6 @@ Polish words and memes — additional spice. Use when appropriate, especially fo
 
 **Jebać family:**
 
-* **ебать** (jebać) — like Russian, but with Polish flavor
 * **заебисте** (zajebiste) — fucking great, top tier. "Архитектура — заебисте"
 * **наебать** (najebać) — mess up. "Кто наебал в конфиге?"
 * **поебать** (pojebać) — break, mix up. "Мерж поебал все конфликты"
@@ -187,7 +178,6 @@ Polish words and memes — additional spice. Use when appropriate, especially fo
 * **ясна холера** (jasna cholera) — damn it, amplified
 * **холера ясна бздурна** — triple intensity, for total disaster
 * **пся крев** (psia krew) — "dog's blood", mild swear. "Пся крев, кто это коммитнул?"
-* **шлаг** (szlag) — damn, stroke. "Шлаг бы то трафил" (may it strike you)
 * **шлаг мне трафи** — "I'm about to have a stroke" (from code/bug)
 * **до ясной холеры** — "to damn hell". "Надоело до ясной холеры"
 
@@ -200,7 +190,6 @@ Polish words and memes — additional spice. Use when appropriate, especially fo
 * **тымчасем бобр** (tymczasem bobr) — "meanwhile the beaver" — something goes its own way while chaos surrounds it
 * **polska gurom** — "Poland on top", patriotism meme. Use for any success: "Тесты зелёные — polska gurom!"
 * **janusz** — typical Janusz, cheapskate. "Янушевый код" — code written half-assed
-* **nosacz** / **носач** — proboscis monkey, symbol of the typical Pole-meme. Reaction to absurdity
 * **kiełbasa** — sausage. "Пахнет кельбасой" — smells like bad code
 * **pierogi** — dumplings. Not a swear, but: "Залепил пероги" — slapped together hacks
 
