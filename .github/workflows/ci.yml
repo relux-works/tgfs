@@ -37,34 +37,19 @@ concurrency:
 
 jobs:
   rust-core:
-    # SELF-HOSTED (TASK-260719-1dwaj8). GitHub-hosted runners are blocked by
-    # org billing (macOS and Linux both: runs 29700024728 / 29700024758 failed
-    # at start with the billing error), so every job runs on the persistent
-    # self-hosted mac runner `relux-gramdrive` (label gramdrive-mac).
-    #
-    # DEVIATION from the arm64 reference host (POL-5 / DEC-017): that runner is
-    # an x86_64 Mac, and this job's gates (fmt, clippy, test, architecture,
-    # cargo-deny/POL-6, traceability, script self-tests — everything except the
-    # secret scan below) compile and test the platform-neutral core natively
-    # for x86_64. The shipped target is unchanged: arm64 artifacts are
-    # cross-compiled and arch-verified (lipo/file(1)) in native-ci and release.
+    # TASK-261115-esaarl: these platform-neutral gates need no runner-local
+    # state. The gramdrive-mac label has no runner; use a fresh hosted Mac.
+    # Standard hosted minutes are free for this public repository.
     name: rust-core
-    runs-on: [self-hosted, gramdrive-mac]
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install the pinned Rust toolchain
-        # The bootstrap restores a missing runner-owned rustup installation
-        # without sourcing an interactive shell profile, then installs the
+        # The bootstrap restores a missing rustup installation without
+        # sourcing an interactive shell profile, then explicitly installs the
         # exact channel/components declared in rust-toolchain.toml.
-        #
-        # No hosted-cache step (the Swatinem/rust-cache the hosted runner used):
-        # the cache service sits behind the same blocked billing, and on a
-        # persistent runner incremental state lives in the machine-local
-        # CARGO_TARGET_DIR the runner's .env sets — still speed only, never
-        # correctness, for the same reason as before: toolchain and lockfile
-        # are pinned, and cargo fingerprints rebuilds.
         run: .github/scripts/bootstrap-rust-toolchain.sh
 
       - name: Install cargo-deny (pinned)
@@ -91,15 +76,9 @@ jobs:
   secret-scan:
     # Portable, no Rust toolchain. Its own component because it is the only
     # gate needing gitleaks, and it is a merge-boundary check.
-    #
-    # DECISION (TASK-260719-1dwaj8): this job moves to the self-hosted mac
-    # runner rather than staying on ubuntu-24.04 — the billing block covers
-    # hosted Linux minutes too (this exact job failed at start with the billing
-    # error on run 29700024728), and gitleaks is portable. Same version pin,
-    # same checksum discipline; the binary is the darwin_x64 release asset and
-    # the checksum tool is macOS's shasum.
+    # macos-latest is arm64; install the matching pinned gitleaks release.
     name: secret-scan
-    runs-on: [self-hosted, gramdrive-mac]
+    runs-on: macos-latest
     steps:
       - name: Checkout full history
         # gitleaks git scans every commit; a shallow clone would silently scan
@@ -115,10 +94,10 @@ jobs:
         # download fails the step instead of scanning with an unknown binary.
         env:
           GITLEAKS_VERSION: 8.30.1
-          GITLEAKS_SHA256: dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709
+          GITLEAKS_SHA256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
         run: |
           set -euo pipefail
-          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_darwin_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_darwin_arm64.tar.gz"
           curl -sSfL "$url" -o gitleaks.tar.gz
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | shasum -a 256 -c -
           mkdir -p "$HOME/.local/bin"

@@ -125,8 +125,15 @@ the same way locally:
 
 | Job | Runner | Suite | Provenance artifact |
 |-----|--------|-------|---------------------|
-| `rust-core` | `macos-15` (arm64, POL-5 reference host) | `all` — toolchain, format, lint, test, architecture, cargo-deny (POL-6), traceability, script self-tests | `acceptance-ci-all` |
-| `secret-scan` | `ubuntu-24.04` | `security` — gitleaks over committed history | `acceptance-ci-security` |
+| `rust-core` | GitHub-hosted `macos-latest` (arm64) | `all` — toolchain, format, lint, test, architecture, cargo-deny (POL-6), traceability, script self-tests | `acceptance-ci-all` |
+| `secret-scan` | GitHub-hosted `macos-latest` (arm64) | `security` — gitleaks over committed history | `acceptance-ci-security` |
+
+These two jobs need no local keychain, credentials, seeded artifacts, or machine
+paths. They use fresh hosted Macs because the former `gramdrive-mac` runner
+label has no runner. Standard hosted runners are free for public repositories
+([GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)).
+Native CI, candidate signing, and release workflows keep their separate runner
+and local-state requirements; this change does not migrate those workflows.
 
 Design notes:
 
@@ -136,10 +143,8 @@ Design notes:
 - **Pinned, so cache cannot change a verdict.** The Rust toolchain is pinned by
   `rust-toolchain.toml`, dependencies by `Cargo.lock`, `cargo-deny` and
   `gitleaks` by exact version (gitleaks additionally by sha256), and every action
-  by commit SHA. The cargo cache is keyed on the toolchain and lockfile, so a hit
-  can only ever hold artifacts built from identical inputs — it speeds up a run,
-  it cannot alter its result.
-- **Self-healing Rust bootstrap.** Every Rust-consuming self-hosted job runs
+  by commit SHA. Core CI does not rely on a pre-existing machine cache.
+- **Self-healing Rust bootstrap.** Every Rust-consuming core/native CI job runs
   `.github/scripts/bootstrap-rust-toolchain.sh`. If the runner-owned `rustup`
   binary is absent, it downloads the fixed rustup 1.29.0 archive and verifies
   its committed SHA-256 before execution, then installs the exact
@@ -319,7 +324,7 @@ Available utilities:
 | `rustfmt` + `clippy` (pinned components) | Formatting and lints. Config: `rustfmt.toml`, `clippy.toml`, and `[workspace.lints]` in `Cargo.toml` — levels live in the manifest so editors agree with the gate | `cargo fmt --all` to fix; the `format` and `lint` gate steps to check | Exit non-zero on a formatting diff or any warning (`-D warnings`) |
 | `swift` + `swift-format` | Build/test the macOS support package and lint task-scoped Swift changes using the repository's existing four-space style and accepted retroactive File Provider conformance | After `make package`: `cd apple/GramDriveSupport && swift test`; lint a changed file with `swift-format lint --strict --configuration '{"version":1,"indentation":{"spaces":4},"lineLength":100,"respectsExistingLineBreaks":true,"rules":{"AvoidRetroactiveConformances":false}}' PATH` | SwiftPM artifacts and coverage profiles under `apple/GramDriveSupport/.build/`; formatter emits diagnostics only |
 | `.scripts/check_toolchain.py` | Asserts the pinned toolchain is actually in effect — `rust-toolchain.toml` only binds when rustup drives cargo — and that `cargo-deny` meets the minimum version | `python3 .scripts/check_toolchain.py` (repo root; stdlib only) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
-| `.github/scripts/bootstrap-rust-toolchain.sh` | Restores missing `rustup` on a clean self-hosted macOS runner with the fixed Rustup 1.29.0 archive verified by committed SHA-256, then installs the channel/components from `rust-toolchain.toml` and exports Cargo's bin directory for later CI steps | `.github/scripts/bootstrap-rust-toolchain.sh` (GitHub Actions macOS job; requires `curl` and `shasum`) | Exit 0 with active toolchain, `rustc`, and `cargo` versions; no shell-profile mutation or execution of an unverified download |
+| `.github/scripts/bootstrap-rust-toolchain.sh` | Restores missing `rustup` on a clean macOS runner with the fixed Rustup 1.29.0 archive verified by committed SHA-256, then installs the channel/components from `rust-toolchain.toml` and exports Cargo's bin directory for later CI steps | `.github/scripts/bootstrap-rust-toolchain.sh` (GitHub Actions macOS job; requires `curl` and `shasum`) | Exit 0 with active toolchain, `rustc`, and `cargo` versions; no shell-profile mutation or execution of an unverified download |
 | `.scripts/check_crate_architecture.py` | Enforces `crates/README.md`: dependency direction, no cycles, no platform leakage in core crates, testkit dev-only, per-crate README sections, shared lint-set opt-in | `python3 .scripts/check_crate_architecture.py` (repo root; stdlib only, needs `cargo` on PATH) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
 | `cargo-deny` (installed via `brew install cargo-deny`) | Supply-chain gate, config in `deny.toml`: POL-6 licenses (permissive-only), RustSec advisories, bans, and sources (crates.io only) | `cargo deny check` (repo root), or one check: `cargo deny check licenses` | `advisories ok, bans ok, licenses ok, sources ok`, or non-zero exit with the offending dependency tree |
 | `.scripts/validate_traceability.py` | Validates `docs/TRACEABILITY.md` against `.spec/` and `.task-board/`: every requirement mapped exactly once, no orphan board elements, no stale requirement references on the board | `python3 .scripts/validate_traceability.py` (repo root; stdlib only) | Exit 0 + summary line, or exit 1 with itemized errors (CI-suitable) |
